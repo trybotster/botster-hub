@@ -266,6 +266,9 @@ impl EventOwnerWork {
             .try_lock()
             .expect("test probe is available")
             .take();
+        // A staged generation of an unloaded package is discarded with it; its
+        // funding is released only after the router lock is released.
+        let mut discarded_pending = None;
         if !self.metadata_applied {
             let mut inner = match router.inner.lock() {
                 Ok(inner) => inner,
@@ -279,9 +282,17 @@ impl EventOwnerWork {
             if op.kind == OwnerOpKind::Unload {
                 self.retired_payloads =
                     apply_unload(&mut inner, &router.counters, &op.owner, op.generation);
+                if inner
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.owner == op.owner)
+                {
+                    discarded_pending = inner.pending.take();
+                }
             }
             self.metadata_applied = true;
         }
+        drop(discarded_pending);
 
         #[cfg(test)]
         if let Some(probe) = &mut probe {
@@ -503,6 +514,80 @@ struct RouterInner {
     outstanding_pulls: HashSet<u64>,
     package_generation: HashMap<String, u64>,
     producer_age_lists: HashMap<(String, u64), ProducerAgeList>,
+    /// The one staged package generation that is admitted but not live.
+    pending: Option<PendingGeneration>,
+}
+
+/// A package event generation that passed admission and reserved its
+/// capacity, but that ingress and live admission cannot see yet.
+///
+/// Package mutations are serialized by the control plane's document owner,
+/// so at most one exists. Its storage is charged to the staging attempt's
+/// prepared-byte reservation, held here so the charge lives exactly as long
+/// as this entry.
+struct PendingGeneration {
+    owner: String,
+    generation: u64,
+    contracts: Vec<EmittedContract>,
+    subscriptions: Vec<EventSubscription>,
+    /// Capacity held for the replacement per plugin: `max(0, new - removed)`.
+    plugin_reserve: Vec<(String, usize)>,
+    /// Capacity held for the replacement per event: `max(0, new - removed)`.
+    event_reserve: Vec<((String, String), usize)>,
+    _funding: Box<dyn Send>,
+}
+
+impl PendingGeneration {
+    fn plugin_reserve(&self, plugin_key: &str) -> usize {
+        self.plugin_reserve
+            .iter()
+            .find(|(key, _)| key == plugin_key)
+            .map_or(0, |(_, reserve)| *reserve)
+    }
+
+    fn event_reserve(&self, key: &(String, String)) -> usize {
+        self.event_reserve
+            .iter()
+            .find(|(event, _)| event == key)
+            .map_or(0, |(_, reserve)| *reserve)
+    }
+}
+
+/// A staged generation owned by one package-mutation attempt. Only
+/// activation or abort consumes it; dropping it leaves the pending entry for
+/// that attempt's restore or the package's unload to clear.
+#[must_use]
+#[derive(Debug)]
+pub struct StagedGeneration {
+    owner: String,
+    generation: u64,
+}
+
+impl StagedGeneration {
+    /// The generation the staged subscriptions will carry once active.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Why a package generation could not be staged. Nothing changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageError {
+    Rejected(EventPlaneStatus),
+    /// Another generation is already staged: an invariant break, since
+    /// package mutations are serialized.
+    AlreadyStaged,
+    /// The retained staging storage exceeds the attempt's reservation.
+    Unfunded { required: usize, reserved: usize },
+}
+
+/// Why activation failed: only a poisoned router lock or an invariant break.
+#[derive(Debug)]
+pub enum ActivationError {
+    Faulted,
+    NotStaged,
+    Replace(EventPlaneReplaceError),
 }
 
 /// Send + Sync router. Owner and plugin callback APIs use `try_lock` only.
@@ -595,6 +680,7 @@ impl PackageEventRouter {
                 outstanding_pulls: HashSet::new(),
                 package_generation: HashMap::new(),
                 producer_age_lists,
+                pending: None,
             }),
             counters,
             delivery_wake: AtomicBool::new(false),
@@ -751,6 +837,176 @@ impl PackageEventRouter {
             cleanup: None,
             unloaded: true,
         })
+    }
+
+    /// Stage a package's next event generation without making it live.
+    ///
+    /// Admission runs exactly as for a replacement, and the capacity the
+    /// replacement needs beyond what its unload frees is reserved, so
+    /// activation cannot fail on admission. Ingress and live admission do not
+    /// see staged contracts or subscriptions. `funding` stays with the pending
+    /// entry; staging is refused when the retained entry exceeds
+    /// `reserved_bytes`. Every refusal leaves the router unchanged.
+    pub fn stage_package_generation(
+        &self,
+        owner: &str,
+        mut contracts: Vec<EmittedContract>,
+        mut subscriptions: Vec<EventSubscription>,
+        funding: Box<dyn Send>,
+        reserved_bytes: usize,
+    ) -> Result<StagedGeneration, StageError> {
+        if owner == HUB_EVENT_OWNER {
+            return Err(StageError::Rejected(EventPlaneStatus::RejectedForeign));
+        }
+        let mut inner = lock_inner(&self.inner).map_err(StageError::Rejected)?;
+        if inner.pending.is_some() {
+            self.counters.record_stage_overlap();
+            return Err(StageError::AlreadyStaged);
+        }
+        for contract in &contracts {
+            if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
+                return Err(StageError::Rejected(EventPlaneStatus::RejectedForeign));
+            }
+        }
+        preview_package_replacement(&mut inner, owner, &contracts, &subscriptions)
+            .map_err(StageError::Rejected)?;
+        let (removed_plugins, removed_events) = replacement_removals(&inner, owner);
+        let mut plugin_reserve: Vec<(String, usize)> = Vec::new();
+        let mut event_reserve: Vec<((String, String), usize)> = Vec::new();
+        for subscription in &subscriptions {
+            add_reserve(&mut plugin_reserve, &subscription.plugin_key);
+            add_reserve(
+                &mut event_reserve,
+                &(subscription.owner.clone(), subscription.name.clone()),
+            );
+        }
+        plugin_reserve.retain_mut(|(plugin_key, reserve)| {
+            *reserve =
+                reserve.saturating_sub(removed_plugins.get(plugin_key).copied().unwrap_or(0));
+            *reserve > 0
+        });
+        event_reserve.retain_mut(|(key, reserve)| {
+            *reserve = reserve.saturating_sub(removed_events.get(key).copied().unwrap_or(0));
+            *reserve > 0
+        });
+        contracts.shrink_to_fit();
+        subscriptions.shrink_to_fit();
+        plugin_reserve.shrink_to_fit();
+        event_reserve.shrink_to_fit();
+        let required =
+            pending_retained_bytes(&contracts, &subscriptions, &plugin_reserve, &event_reserve)
+                .unwrap_or(usize::MAX);
+        if required > reserved_bytes {
+            return Err(StageError::Unfunded {
+                required,
+                reserved: reserved_bytes,
+            });
+        }
+        let generation = inner
+            .package_generation
+            .get(owner)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        inner.pending = Some(PendingGeneration {
+            owner: owner.to_string(),
+            generation,
+            contracts,
+            subscriptions,
+            plugin_reserve,
+            event_reserve,
+            _funding: funding,
+        });
+        Ok(StagedGeneration {
+            owner: owner.to_string(),
+            generation,
+        })
+    }
+
+    /// Make a staged generation live. Host workers only.
+    ///
+    /// The router lock is taken blocking, as `EventOwnerWork::run` already
+    /// does: the owner loop holds it only for short critical sections and
+    /// never waits on a Host worker, so this cannot stall the owner. The
+    /// previous generation is unloaded and the staged one committed under
+    /// that one lock; payload destruction and the funding release run after
+    /// it is released. Capacity was reserved at stage, so a commit failure
+    /// is an invariant break.
+    pub fn activate_staged_generation(
+        &self,
+        staged: StagedGeneration,
+    ) -> Result<u64, ActivationError> {
+        let mut inner = self.inner.lock().map_err(|_| ActivationError::Faulted)?;
+        let Some(pending) = take_staged(&mut inner, &staged) else {
+            return Err(ActivationError::NotStaged);
+        };
+        let PendingGeneration {
+            owner,
+            generation,
+            contracts,
+            subscriptions,
+            _funding: funding,
+            ..
+        } = pending;
+        let unload_generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
+        let retired_payloads = apply_unload(&mut inner, &self.counters, &owner, unload_generation);
+        let mut result = commit_package_generation_locked(
+            &mut inner,
+            &self.counters,
+            &owner,
+            contracts,
+            subscriptions,
+        );
+        drop(inner);
+        drop(funding);
+        if result.is_ok_and(|committed| committed != generation) {
+            // The install recorded the staged generation, so a different
+            // committed one would refuse every delivery.
+            result = Err(EventPlaneStatus::RejectedInvalid);
+        }
+        if let Err(status) = &result {
+            self.counters.record_replacement_stranded();
+            crate::hub_log::hub_log!(
+                "event_plane_replacement_stranded owner={owner} status={} total={}",
+                status.as_str(),
+                self.counters.replacements_stranded()
+            );
+        }
+        let mut work = EventOwnerWork::new(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner,
+            generation: unload_generation,
+        });
+        work.metadata_applied = true;
+        work.retired_payloads = retired_payloads;
+        if let Err(cleanup) = work.run(self) {
+            return Err(ActivationError::Replace(EventPlaneReplaceError {
+                result,
+                cleanup: Some(cleanup),
+                unloaded: true,
+            }));
+        }
+        result.map_err(|status| {
+            ActivationError::Replace(EventPlaneReplaceError {
+                result: Err(status),
+                cleanup: None,
+                unloaded: true,
+            })
+        })
+    }
+
+    /// Discard a staged generation and release its capacity and funding.
+    /// Host workers only; the lock is taken blocking as for activation.
+    /// Returns whether the staged generation was still pending.
+    pub fn abort_staged_generation(&self, staged: StagedGeneration) -> bool {
+        let pending = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take_staged(&mut inner, &staged)
+        };
+        pending.is_some()
     }
 
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
@@ -1674,29 +1930,14 @@ fn restore_admission(inner: &mut RouterInner, snapshot: AdmissionSnapshot) {
     }
 }
 
-fn preview_package_replacement(
+/// Holders an unload of `owner`'s live generation would remove, per plugin
+/// and per event, by the exact predicate the unload applies: this plugin's
+/// own subscriptions and other plugins' subscriptions to its events.
+fn replacement_removals(
     inner: &mut RouterInner,
     owner: &str,
-    contracts: &[EmittedContract],
-    subscriptions: &[EventSubscription],
-) -> Result<(), EventPlaneStatus> {
-    #[cfg(test)]
-    {
-        inner.preview_visits = PreviewVisits::default();
-    }
+) -> (HashMap<String, usize>, HashMap<(String, String), usize>) {
     let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
-    let mut proposed_contracts = HashMap::new();
-    for contract in contracts {
-        #[cfg(test)]
-        {
-            inner.preview_visits.contracts += 1;
-        }
-        if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
-            return Err(EventPlaneStatus::RejectedForeign);
-        }
-        // Match commit order: the last proposed contract for a name wins.
-        proposed_contracts.insert(contract.name.as_str(), contract);
-    }
     let mut removed_plugins: HashMap<String, usize> = HashMap::new();
     let mut removed_events: HashMap<(String, String), usize> = HashMap::new();
     for key in unload_subscription_keys(inner, owner) {
@@ -1721,6 +1962,105 @@ fn preview_package_replacement(
             }
         }
     }
+    (removed_plugins, removed_events)
+}
+
+/// Count one more staged holder under `key`.
+fn add_reserve<K: PartialEq + Clone>(reserves: &mut Vec<(K, usize)>, key: &K) {
+    match reserves.iter_mut().find(|(existing, _)| existing == key) {
+        Some((_, count)) => *count += 1,
+        None => reserves.push((key.clone(), 1)),
+    }
+}
+
+/// Remove the pending generation only if it is this staged one.
+fn take_staged(inner: &mut RouterInner, staged: &StagedGeneration) -> Option<PendingGeneration> {
+    if inner
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.owner == staged.owner && pending.generation == staged.generation)
+    {
+        inner.pending.take()
+    } else {
+        None
+    }
+}
+
+/// Heap and inline bytes a pending generation retains, by capacity.
+fn pending_retained_bytes(
+    contracts: &[EmittedContract],
+    subscriptions: &[EventSubscription],
+    plugin_reserve: &[(String, usize)],
+    event_reserve: &[((String, String), usize)],
+) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<PendingGeneration>()
+        .checked_add(contracts.len().checked_mul(std::mem::size_of::<EmittedContract>())?)?
+        .checked_add(
+            subscriptions
+                .len()
+                .checked_mul(std::mem::size_of::<EventSubscription>())?,
+        )?
+        .checked_add(
+            plugin_reserve
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())?,
+        )?
+        .checked_add(
+            event_reserve
+                .len()
+                .checked_mul(std::mem::size_of::<((String, String), usize)>())?,
+        )?;
+    for contract in contracts {
+        bytes = bytes
+            .checked_add(contract.owner.capacity())?
+            .checked_add(contract.name.capacity())?
+            .checked_add(crate::lua_memory::layout::btree_nodes_checked::<EventAudience, ()>(
+                contract.audience.len(),
+            )?)?
+            .checked_add(contract.schema.retained_bytes()?)?;
+    }
+    for subscription in subscriptions {
+        bytes = bytes
+            .checked_add(subscription.plugin_key.capacity())?
+            .checked_add(subscription.owner.capacity())?
+            .checked_add(subscription.name.capacity())?
+            .checked_add(subscription.handler_id.capacity())?;
+    }
+    for (plugin_key, _) in plugin_reserve {
+        bytes = bytes.checked_add(plugin_key.capacity())?;
+    }
+    for ((owner, name), _) in event_reserve {
+        bytes = bytes
+            .checked_add(owner.capacity())?
+            .checked_add(name.capacity())?;
+    }
+    Some(bytes)
+}
+
+fn preview_package_replacement(
+    inner: &mut RouterInner,
+    owner: &str,
+    contracts: &[EmittedContract],
+    subscriptions: &[EventSubscription],
+) -> Result<(), EventPlaneStatus> {
+    #[cfg(test)]
+    {
+        inner.preview_visits = PreviewVisits::default();
+    }
+    let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
+    let mut proposed_contracts = HashMap::new();
+    for contract in contracts {
+        #[cfg(test)]
+        {
+            inner.preview_visits.contracts += 1;
+        }
+        if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
+            return Err(EventPlaneStatus::RejectedForeign);
+        }
+        // Match commit order: the last proposed contract for a name wins.
+        proposed_contracts.insert(contract.name.as_str(), contract);
+    }
+    let (removed_plugins, removed_events) = replacement_removals(inner, owner);
     let mut plugin_counts = HashMap::new();
     let mut event_counts = HashMap::new();
     for subscription in subscriptions {
