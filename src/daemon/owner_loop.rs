@@ -2680,6 +2680,7 @@ mod tests {
                                             resources: Vec::new(),
                                             entrypoint: Some("terminal-probe".into()),
                                             metadata: None,
+                                            log_generation: None,
                                         },
                                     )
                                     .unwrap();
@@ -6503,6 +6504,10 @@ mod tests {
                         break response;
                     }
                     crate::daemon::control::pending::ControlPoll::ReadyHost(response, charge) => {
+                        drop(charge);
+                        break response;
+                    }
+                    crate::daemon::control::pending::ControlPoll::ReadyCallback(response, charge) => {
                         drop(charge);
                         break response;
                     }
@@ -12107,8 +12112,9 @@ return botster.register({tools = {{
                 | crate::daemon::control::pending::ControlPoll::SubmitPluginHost(_) => {
                     panic!("attach must not carry a plugin-result charge")
                 }
-                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
-                    panic!("attach must not carry a host-result charge")
+                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _)
+                | crate::daemon::control::pending::ControlPoll::ReadyCallback(_, _) => {
+                    panic!("attach must not carry a retained charge")
                 }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(Instant::now() < deadline, "attach continuation timed out");
