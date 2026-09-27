@@ -63,7 +63,8 @@ pub(crate) fn handle(
         input.rejected = true;
     }
     let ticket = core_limit.map(|max_logical_bytes| {
-        let reservation = permit.retain_prepared_reservation();
+        let reservation =
+            permit.retain_prepared_reservation(crate::host_executor::ReservationHolder::Status);
         #[cfg(test)]
         let result_gate = TEST_STATUS_CORE_RESULT_GATE.with(|slot| slot.borrow_mut().take());
         runtime.submit_core_for_owner(waiter_id, move |core| {
@@ -1183,12 +1184,14 @@ mod tests {
         else {
             panic!("Status continuation");
         };
-        assert!(
+        assert_eq!(
             continuation
                 .permit
                 .as_ref()
                 .unwrap()
-                .has_retained_prepared_reservation()
+                .holders(crate::host_executor::ReservationHolder::Status),
+            1,
+            "the Core snapshot holds the reservation as a Status holder"
         );
         let mut completion = None;
         let parts = continuation
@@ -1288,7 +1291,7 @@ mod tests {
                     capabilities: None,
                 }],
             })),
-            permit.retain_prepared_reservation(),
+            permit.retain_prepared_reservation(crate::host_executor::ReservationHolder::Status),
         ));
         state
             .pending_runtime
@@ -1403,7 +1406,7 @@ mod tests {
                 logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
                 records: Vec::new(),
             })),
-            permit.retain_prepared_reservation(),
+            permit.retain_prepared_reservation(crate::host_executor::ReservationHolder::Status),
         ));
         let live = input.logical_bytes(usize::MAX).unwrap();
         let terminal = daemon
@@ -1480,7 +1483,7 @@ mod tests {
                     logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
                     records: Vec::new(),
                 })),
-                permit.retain_prepared_reservation(),
+                permit.retain_prepared_reservation(crate::host_executor::ReservationHolder::Status),
             ));
             let captured = capture_current_sources(daemon, &state, &mut input, limit);
             let rows = input.seed.as_ref().unwrap().quarantines.clone();
@@ -1504,7 +1507,7 @@ mod tests {
                     logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
                     records: Vec::new(),
                 })),
-                permit.retain_prepared_reservation(),
+                permit.retain_prepared_reservation(crate::host_executor::ReservationHolder::Status),
             ));
             let live = input.logical_bytes(usize::MAX).unwrap();
             drop(input);

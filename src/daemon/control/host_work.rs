@@ -2128,7 +2128,11 @@ fn staging_funding(
         return crate::runtime::package_effect::StagingFunding::none();
     }
     crate::runtime::package_effect::StagingFunding::new(
-        std::sync::Arc::new(permit.retain_prepared_reservation()),
+        std::sync::Arc::new(
+            permit.retain_prepared_reservation(
+                crate::host_executor::ReservationHolder::StagingFunding,
+            ),
+        ),
         reserved.saturating_sub(held_bytes),
     )
 }

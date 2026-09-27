@@ -3,7 +3,9 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::host_executor::{HostCommand, HostJobIdentity, HostRetainedPrepared, HostWorkPermit};
+use crate::host_executor::{
+    HostCommand, HostJobIdentity, HostRetainedPrepared, HostWorkPermit, ReservationHolder,
+};
 use crate::package_entity_fanout::{FamilySnapshotWork, LeasedFanoutMutation};
 use crate::package_event_router::{CausalOp, LeaseIdentity};
 
@@ -88,6 +90,67 @@ mod tests {
         family.high_water_seq = 20;
         family.resync.rearm(Instant::now());
         model
+    }
+
+    /// Entity work never overlaps a gating holder of its own permit: each
+    /// outstanding StagingFunding or EntityWork holder is a typed Fault,
+    /// counted by kind. A Status holder never gates.
+    #[test]
+    fn an_outstanding_gating_holder_faults_entity_work() {
+        use crate::host_executor::ReservationHolder;
+
+        let runtime = super::super::tests::family_runtime("retained-holder-invariant");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        assert!(!runtime.retained_holder_fault(&permit));
+
+        let status = permit.retain_prepared_reservation(ReservationHolder::Status);
+        assert!(
+            !runtime.retained_holder_fault(&permit),
+            "a Status holder never gates"
+        );
+        assert_eq!(
+            runtime
+                .host_executor()
+                .outstanding_holder_faults(ReservationHolder::Status),
+            0
+        );
+
+        for holder in [
+            ReservationHolder::StagingFunding,
+            ReservationHolder::EntityWork,
+        ] {
+            let before = runtime.host_executor().outstanding_holder_faults(holder);
+            let retained = permit.retain_prepared_reservation(holder);
+            assert!(matches!(
+                runtime.begin_entity_model(
+                    identity(),
+                    Operation::TakeFanout { retained: None },
+                    &permit,
+                ),
+                Err((CausalTransitionStatus::Fault, _))
+            ));
+            assert!(matches!(
+                runtime.begin_detached_entity_cleanup(
+                    identity(),
+                    Operation::Cleanup {
+                        detached: true,
+                        retained: None,
+                        next: None,
+                        fault: None,
+                    },
+                    &permit,
+                ),
+                Err((CausalTransitionStatus::Fault, _))
+            ));
+            assert_eq!(
+                runtime.host_executor().outstanding_holder_faults(holder),
+                before + 2,
+                "{holder:?}: each refusal is counted"
+            );
+            drop(retained);
+            assert!(!runtime.retained_holder_fault(&permit));
+        }
+        drop(status);
     }
 
     #[test]
@@ -1440,8 +1503,8 @@ impl super::HubRuntime {
         {
             return Err((CausalTransitionStatus::Fault, operation));
         }
-        if permit.has_retained_prepared_reservation() {
-            return Err((CausalTransitionStatus::Waiting, operation));
+        if self.retained_holder_fault(permit) {
+            return Err((CausalTransitionStatus::Fault, operation));
         }
         let reservation = match self.reserve_causal_transition() {
             Ok(reservation) => reservation,
@@ -1566,6 +1629,27 @@ impl super::HubRuntime {
         work.completed(work.0.identity, work.kind())
     }
 
+    /// Entity work never overlaps a gating holder of its own permit's
+    /// reservation. Every production holder is released before its phase's
+    /// completion is published, or on the owner before the permit is reused
+    /// (see the caller inventory in the commit that added this check), so an
+    /// outstanding one is an invariant break: a typed Fault, counted and
+    /// logged with its kind, never a wait. A Status holder never gates.
+    fn retained_holder_fault(&self, permit: &HostWorkPermit) -> bool {
+        let mut outstanding = false;
+        for holder in ReservationHolder::ALL {
+            let count = permit.holders(holder);
+            if holder.gates_entity_work() && count > 0 {
+                outstanding = true;
+                permit.record_outstanding_holder_fault(holder);
+                crate::hub_log::hub_log!(
+                    "retained_reservation_outstanding holder={holder:?} count={count}"
+                );
+            }
+        }
+        outstanding
+    }
+
     pub(crate) fn begin_entity_model(
         &self,
         identity: HostJobIdentity,
@@ -1578,10 +1662,10 @@ impl super::HubRuntime {
         if operation.input_bytes() > permit.reserved_prepared_bytes() {
             return Err((CausalTransitionStatus::Fault, operation));
         }
-        if self.entity_model_owner.active.borrow().is_some()
-            || !self.causal_queue.is_empty()
-            || permit.has_retained_prepared_reservation()
-        {
+        if self.retained_holder_fault(permit) {
+            return Err((CausalTransitionStatus::Fault, operation));
+        }
+        if self.entity_model_owner.active.borrow().is_some() || !self.causal_queue.is_empty() {
             return Err((CausalTransitionStatus::Waiting, operation));
         }
         let reservation = match self.reserve_causal_transition() {
@@ -1774,7 +1858,7 @@ impl Work {
                 #[cfg(test)]
                 fail_after_operation: false,
             }),
-            _prepared: permit.retain_prepared_reservation(),
+            _prepared: permit.retain_prepared_reservation(ReservationHolder::EntityWork),
             terminal_disposed: std::sync::atomic::AtomicBool::new(false),
         }))
     }

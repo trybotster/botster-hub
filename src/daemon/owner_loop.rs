@@ -6319,6 +6319,25 @@ mod tests {
                             break completion;
                         }
                         crate::host_executor::HostCompletionPoll::Empty => {
+                            // A Pending request with no Host job in flight
+                            // can only be parked: waiting here would spin.
+                            if runtime.host_executor().jobs_in_flight() == 0 {
+                                panic!(
+                                    "Pending with nothing in flight: waiter {:?}; family cleanup waiter: {}; entity causal waiter: {}; entity model waiter: {}",
+                                    state.current_waiter_id,
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .family_cleanup_waiters
+                                        .contains_key(&waiter)),
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .plugin_entities
+                                        .causal_waiters
+                                        .contains(&waiter)),
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .plugin_entities
+                                        .model_waiters
+                                        .contains(&waiter)),
+                                );
+                            }
                             std::thread::yield_now();
                         }
                         crate::host_executor::HostCompletionPoll::Stopped => {
@@ -10793,6 +10812,26 @@ return botster.register({tools = {{
         assert!(package_quarantine_rows(&daemon, &state).is_empty());
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The package driver reports a request parked with no Host job in
+    /// flight instead of spinning: here the commit waits on another writer's
+    /// document reservation.
+    #[test]
+    #[should_panic(expected = "Pending with nothing in flight")]
+    fn the_package_driver_diagnoses_a_parked_request() {
+        let root = unique_package_control_dir("parked-driver");
+        let package_dir = root.join("parked.package");
+        write_package_control_manifest(&package_dir, "parked.package", serde_json::json!({}));
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(crate::owner_identity::WaiterId(u64::MAX));
+        let _ = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        );
     }
 
     /// An explicit enable resolves a durable quarantine, as a reload does.
