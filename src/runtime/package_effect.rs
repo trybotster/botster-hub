@@ -356,7 +356,9 @@ impl HostPackageRuntime {
 
     fn remove_log_generation(&self, package_name: &str, generation: Option<u64>) {
         if let Some(generation) = generation {
-            self.host_api.logs.remove_generation(package_name, generation);
+            self.host_api
+                .logs
+                .remove_generation(package_name, generation);
         }
     }
 
