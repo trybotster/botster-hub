@@ -283,10 +283,9 @@ pub(crate) struct PackageRecoveryRequired {
     pub(crate) quarantined_at_ms: u64,
     _effect: PackageRuntimeEffect,
     _permit: HostWorkPermit,
-    /// A staged generation whose quarantine phase never ran. The operator
-    /// resolve's router unload discards the pending entry; the token is then
-    /// released with this record.
-    _staged: Option<crate::package_event_router::StagedGeneration>,
+    /// A staged generation whose quarantine phase never ran. The next package
+    /// effect takes it and aborts its router entry before staging.
+    staged: Option<crate::package_event_router::StagedGeneration>,
 }
 
 impl PackageRecoveryRequired {
@@ -311,7 +310,7 @@ impl PackageRecoveryRequired {
                 .collect(),
             _effect: effect,
             _permit: permit,
-            _staged: None,
+            staged: None,
         }
     }
 }
@@ -1123,6 +1122,11 @@ impl HostMutationContinuation {
                     let mut host_runtime = runtime.host_package_runtime();
                     host_runtime
                         .fund_staging(staging_funding(&permit, committed.reply.logical_bytes));
+                    // Ownership of a retained staged generation moves to the
+                    // job, which settles it before staging.
+                    if let Some(staged) = take_retained_staged(state) {
+                        host_runtime.settle_before_staging(staged);
+                    }
                     let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
                         effect,
                         runtime: host_runtime,
@@ -1668,13 +1672,27 @@ fn retain_unsubmitted_quarantine(
     poll
 }
 
+/// Take the one staged generation a recovery record retains, if any. At
+/// most one exists: the router holds a single pending generation.
+fn take_retained_staged(
+    state: &mut DaemonControlState,
+) -> Option<crate::package_event_router::StagedGeneration> {
+    state
+        .host_recovery
+        .values_mut()
+        .find_map(|recovery| match recovery {
+            HostRecoveryRequired::Package(record) => record.staged.take(),
+            _ => None,
+        })
+}
+
 fn keep_staged_with_recovery(
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
     staged: Option<crate::package_event_router::StagedGeneration>,
 ) {
     if let Some(HostRecoveryRequired::Package(record)) = state.host_recovery.get_mut(&waiter_id) {
-        record._staged = staged;
+        record.staged = staged;
     }
 }
 

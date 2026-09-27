@@ -10605,6 +10605,50 @@ return botster.register({tools = {{
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// An explicit reload resolves an unsubmitted quarantine directly: the
+    /// generation the failed attempt left staged moves from the recovery
+    /// record to the reload's Host job, which aborts it before staging.
+    #[test]
+    fn an_explicit_reload_resolves_an_unsubmitted_quarantine() {
+        let name = "unsubmitted.reload";
+        let root = unique_package_control_dir(name);
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        install_and_enable_lua_package(&root, &mut daemon, &mut state, name);
+
+        crate::runtime::package_effect::panic_after_stage_for(name);
+        crate::daemon::control::host_work::lose_document_before_next_restore();
+        crate::daemon::control::host_work::fail_next_quarantine_submission();
+        let _ = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: name.to_string(),
+            },
+        );
+        assert!(daemon.runtime().unwrap().stranded_packages().contains(name));
+
+        let reloaded = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect("the explicit reload resolves the quarantine");
+        assert!(reloaded.error.is_none(), "{reloaded:?}");
+        assert!(plugin_is_loaded(&daemon, name));
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(
+            state.host_recovery.is_empty(),
+            "the reload releases the recovery record"
+        );
+        assert!(package_quarantine_rows(&daemon, &state).is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// When the quarantine phase cannot be submitted, the package is already
     /// stranded: it stays loaded but inert, and Status lists it loaded. The
     /// resolve still runs, unloads it, and releases the retained token.

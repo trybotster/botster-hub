@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.46:
+Use this command for version 0.1.47:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.46
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.47
 ```
 
 ```js
@@ -81,12 +81,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.46"
+    "@trybotster/hub-test-support": "0.1.47"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.46` carries host-control protocol 10
+`@trybotster/hub-test-support@0.1.47` carries host-control protocol 11
 (`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
 Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
 GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
@@ -95,7 +95,7 @@ revision 50). History attach delivers `attach_state`, `modes`,
 `process_exit`. No-history attach delivers `snapshot_ready` then the GHOSTSNP
 finish record as one `snapshot_history` page. Import-visible state matches
 the ReadScreen oracles; do not dual-use a history-bearing golden as
-no-history. Protocol version is 10. The package includes paged snapshot
+no-history. Protocol version is 11. The package includes paged snapshot
 readback (`capture_snapshot`, `read_snapshot_page`), typed
 `HistoryUnavailableReason` values, explicit session-type execution modes,
 spawn-point session-type listing (`list_session_types_for_target`), and the
@@ -117,7 +117,12 @@ terminal text. Version 0.1.6 / conformance revision 13 uses superseded JSON
 number arrays, while version 0.1.5 / revision 12 exposes lossy string
 history. Neither is current binary-history contract authority.
 
-Version 0.1.46 carries protocol version 10 / conformance revision 50 with
+Protocol 11 adds the operator `resolve_quarantine` request (response kind
+`quarantine_resolved`), Status `quarantines` (repository session-type roots
+and packages, with `durable` and `loaded`), and the package event-plane
+counters in `observability`.
+
+Version 0.1.47 carries protocol version 11 / conformance revision 50 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,
