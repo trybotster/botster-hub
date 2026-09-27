@@ -41,10 +41,25 @@ pub(crate) const SOCKET_OWNER_LOCK_SUFFIX: &str = ".owner";
 
 /// Exclusive ownership of one Hub socket path for this process lifetime.
 ///
-/// Dropping the lock closes the descriptor, which releases the `flock`. The
-/// lock file stays on disk so the next contender locks the same inode.
+/// Dropping the lock unlocks the `flock` explicitly, then closes the
+/// descriptor. A child forked by another thread holds a copy of the open file
+/// description until it execs, so closing alone could leave the lock held and
+/// block the next Hub. The lock file stays on disk so the next contender locks
+/// the same inode.
 pub(crate) struct SocketOwnerLock {
     file: fs::File,
+}
+
+impl Drop for SocketOwnerLock {
+    fn drop(&mut self) {
+        // The pathname is kept: an unlink here would let one contender lock
+        // the orphaned inode while another locks a fresh file at the same path.
+        let _ = self.file.sync_all();
+        // SAFETY: `flock` takes a valid open descriptor and an integer flag.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl SocketOwnerLock {
@@ -57,15 +72,6 @@ impl SocketOwnerLock {
             .unwrap_or_default();
         name.push(SOCKET_OWNER_LOCK_SUFFIX);
         socket_path.with_file_name(name)
-    }
-}
-
-impl Drop for SocketOwnerLock {
-    fn drop(&mut self) {
-        // Closing the descriptor releases the lock. The pathname is kept: an
-        // unlink here would let one contender lock the orphaned inode while
-        // another locks a fresh file at the same path.
-        let _ = self.file.sync_all();
     }
 }
 
@@ -387,6 +393,22 @@ impl From<ClientDaemonTransportError> for UnixInboundError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_released_socket_owner_does_not_block_while_a_descriptor_copy_survives() {
+        let socket = temp_socket_path("r");
+        let owner = acquire_socket_owner_lock(&socket).expect("owner");
+        // The same open file description a forked child inherits.
+        let inherited = owner
+            .file
+            .try_clone()
+            .expect("copy of the locked description");
+        drop(owner);
+        let reopened = acquire_socket_owner_lock(&socket);
+        drop(inherited);
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+        let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
 
     fn temp_socket_path(tag: &str) -> PathBuf {
         static NEXT_TEST_SOCKET: std::sync::atomic::AtomicU64 =
