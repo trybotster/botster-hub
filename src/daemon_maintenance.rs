@@ -1269,10 +1269,6 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     );
     match admission {
         PluginAdmissionResult::Queued { .. } => {
-            crate::hub_log::hub_log!(
-                "session_family_admitted plugin={plugin_key} request_id={} sequence={sequence} kind={kind:?}",
-                request_id.0
-            );
             state
                 .session_family
                 .touch_consumer(&plugin_key, |consumer| {
@@ -1673,10 +1669,6 @@ fn apply_plugin_completion(
         return;
     };
     let success = matches!(completion.result, PluginInvocationResult::Completed(_));
-    crate::hub_log::hub_log!(
-        "session_family_completed plugin={plugin_key} request_id={} success={success}",
-        request_id.0
-    );
     state
         .session_family
         .touch_existing_consumer(&plugin_key, |consumer| {
@@ -2155,18 +2147,6 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         return;
     }
     state.session_family.fanout_bytes = state.session_family.fanout_bytes.saturating_add(bytes);
-    crate::hub_log::hub_log!(
-        "session_family_delta_queued sequence={} type={} id={}",
-        change.cursor.sequence,
-        frame
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(""),
-        frame
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-    );
     state.session_family.pending_fanout.push_back(FanoutJob {
         frame,
         after: None,
