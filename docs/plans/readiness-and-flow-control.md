@@ -1,6 +1,6 @@
 # Readiness and flow control
 
-Status: accepted by review (verdict a27dfa2c), 2026-09-27; pending the orchestrator and the user for scope. The design is accepted; the implementation tests in section 4 remain acceptance criteria. Design only. No production code changes in this phase.
+Status: design accepted by review (verdict a27dfa2c), 2026-09-27. User decision (2026-09-27): every step in section 4 lands before cutover. S13 was added after that acceptance and carries its own review status. The implementation tests in section 4 remain acceptance criteria.
 Scope: botster-hub at `1ec61b94`, and botster-core at `origin/main` `19edeb1`. Hub pins Core `549b3f62`. The unlanded roll branch `delivery/core-roll-85b3507-20260927` moves the pin to `85b3507`.
 
 ## 0. Summary
@@ -34,7 +34,7 @@ Legend for "at the bound": **BP** = the producer stalls (lossless); **REF** = ty
 | parent reader thread → data-plane thread | thread (`sync_channel` + wake queue) | 64 events; wake queue 512 | BP when a consumer is attached; DROP with a `Backpressure{SessionIo}` summary when none is attached |
 | data plane → route queue | — | 64 frames / 4 MiB per route (`frame.rs:20-22`) | DROP+RS: visual frames dropped, `ROUTE_RESYNC`, new capture; teardown `Overflowed` if still over. **Backpressure ends here.** |
 | route → adapter slot | — | 1 frame; 512 refused writes; 10 s reader progress | stall resync, then `Stalled` teardown |
-| Unix: slot → connection task → socket | thread (slot + `Notify`) | 1 slot | BP to the route (Writable wake) |
+| Unix: slot → connection task → socket | thread (slot + `Notify`) | 1 slot; after S13, the route's output credit | BP to the route (Writable wake). After S13: a write needs output credit for the whole frame; with too little, the adapter refuses with `WouldBlock`, and a credit grant raises the Writable wake |
 | WebRTC: slot → channel task → rtc driver | thread, and task | 128/64 KiB per channel, 2 MiB/1 MiB per peer | BP by watermark edges. **UNB** below: rtc send buffer (`usize::MAX`, never set) and SCTP pending queue; the watermarks are checked per frame, not per 12 KiB chunk |
 
 ### 1.2 Terminal input: client → PTY
@@ -98,7 +98,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 5. **Unbounded queues:** the WebRTC rtc send buffer and SCTP pending queue, the Unix `queued_events`, the worker control mpsc, keyless input inside the worker, and the async capability result mpsc.
 6. **Silent drops:** the worker egress after a socket error, and the event retire on `LockBusy`.
 7. **Refused maintenance reads stall (live defect).** When the bounded Core request queue is full (`CoreTicketPoll::Refused`), the Observe, journal-pull, and baseline slices clear their read and return without marking themselves again (`daemon_maintenance.rs:955, 1004, 1111`). A freed queue slot publishes no owner wake. The read then waits for an unrelated wake. This is confirmed by code reading, and no test proves it yet. Step S4 fixes it: the slice becomes `Wait(Signal(DataPlaneCapacity))`, and a test that fills the request queue proves the fix.
-8. **The Unix client connection has no per-route flow control.** One Unix socket carries every terminal route plus the control frames (responses, events, entities). With C1's source backpressure, a client whose terminal budget is full can only stop reading the whole socket. Control frames then wait head-of-line behind a flooding route. WebRTC avoids this with one data channel per route. Step S13 adds a per-route credit window.
+8. **The Unix client connection has no per-route flow control.** One Unix socket carries every terminal route plus the control frames (responses, events, entities). With C1's source backpressure, a client whose terminal budget is full can only stop reading the whole socket, so control frames wait head-of-line behind a flooding route. In the other direction, S5 stops the Hub reading the socket while one route's input ingress is full, and every later frame on that socket waits. WebRTC avoids both with one data channel per route. Step S13 adds per-route credit in both directions (section 4.4).
 
 ### 1.6 Duplicate bounds (recorded; no value changes in this plan)
 
@@ -327,15 +327,15 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 | **S10** | Core + Hub | Derive `exit_hold` (2.4.4); `journal_advanced` as a wake (2.4.3) | hand-mirrored flags | post-exit capture tests; journal pull with no host poll | 0.5 d |
 | **S11** | Core | Data-plane fd reactor for worker and plugin-process sockets | 1 crossing per session; one reader thread per worker | worker process and plugin process suites | 2 to 3 d |
 | **S12** | Core | Coalesce adjacent `Output` frames in route egress | a line-buffered flood (`seq` to a tty) makes 7-byte frames, so the 64-frame route bound limits throughput, not the 4 MiB byte bound | a line-buffered flood fills the route by bytes, not by frame count; frame order and input-result order are kept | 0.5 d |
-| **S13** | Hub + client | Per-terminal-route credit on the Unix connection. The client grants credit for a route as it consumes that route's frames. The window is the client's existing terminal budget (256 wakes / 8 MiB), so no new number. At zero credit the Hub adapter refuses the route's write (`WouldBlock`). The frames then wait in Core's route egress, which drives C1's source backpressure, while control frames keep flowing. A credit grant raises the adapter's Writable wake, registered before the adapter's final write attempt (2.2). A client that grants nothing is a reader with no progress and ends `Stalled` at `READER_PROGRESS_DEADLINE`. This is a protocol change, a cold cut: the Hub client crate and the TUI change together. It replaces the TUI's interim whole-socket blocking reader | a flooding route blocks control frames head-of-line | with one route flooding and zero credit, a control request is answered while that route is held; a grant between the refused write and the park is not lost (ablation: raise after the park check); zero credit drives Core source backpressure, with 0 resyncs; a client that never grants ends `Stalled` | 1.5 d |
+| **S13** | Hub + client | Per-route credit in both directions on the Unix connection; the contract is in section 4.4. It replaces S5's whole-socket read pause for Unix and the TUI's interim blocking reader | a flooding route blocks control frames; one route's full input ingress blocks every later frame on the socket | see section 4.4 | 2 d |
 
 ### 4.1 Cutover split
 
 **User decision (2026-09-27): every step, S6 to S12 included, lands before cutover, without lowering quality.** The split below remains the priority order: the first table fixes live defects.
 
-The total is about 15.25 to 17.25 writer-days of new work.
+The total is about 15.75 to 17.75 writer-days of new work.
 
-**Must land before cutover: about 7.25 writer-days of new work.** These steps fix every live defect in the catalogue.
+**First priority: about 7.25 writer-days of new work.** These steps fix every live defect in the catalogue.
 
 | Step | New work | Why before cutover |
 | --- | --- | --- |
@@ -349,9 +349,9 @@ The total is about 15.25 to 17.25 writer-days of new work.
 | S4b | 1.25 d | deletes the incidental wakes that hid the cursor defect; causal herd; capability-event wake |
 | S5 | 1 d | a paste burst ends the route |
 
-Every step in this list fixes a live defect. If time forces a cut, only S4b can move after cutover without leaving a known hang: its defects waste CPU (the causal herd and incidental wakes), and the capability-event wake has no production consumer until plugin-platform slice 3. S4a stays before cutover, because it fixes two hangs.
+Every step in this list fixes a live defect.
 
-**Second priority: about 8 to 10 writer-days.**
+**Second priority, also before cutover: about 8.5 to 10.5 writer-days.**
 
 | Step | Size | Note |
 | --- | --- | --- |
@@ -361,13 +361,40 @@ Every step in this list fixes a live defect. If time forces a cut, only S4b can 
 | S10 | 0.5 d | derived `exit_hold`; `journal_advanced` as a wake |
 | S11 | 2 to 3 d | follows the process host |
 | S12 | 0.5 d | coalesce small `Output` frames |
-| S13 | 1.5 d | per-route credit on the Unix connection |
+| S13 | 2 d | per-route credit in both directions on the Unix connection |
 
 ### 4.2 Order constraints
 
 - **C1 must reach Hub in the same roll as Core `2845aec`.** The roll branch (`85b3507`) already contains `2845aec`. Landing S0 without C1 brings the flood storm into the Hub build. The orchestrator confirms that the roll already waits on C1.
 - **S1 lands in two parts.** S1a (the types, `OwnerSignal`, the interleaving harness, and the `PackageEvents` emit key) needs no Core change. S1b (the `PluginEngine` waits for `Backpressured` and `LockBusy`) requires C2 through S0: the incidental completion notification is not a retry edge, so S1b does not land before C2.
 - **S3 and S4a require S1a**, the types and the test harness. **S2 requires S1b**, because it uses `LockBusy`. S4b follows S2, S3, and S4a, so that it only deletes.
+
+### 4.4 S13: per-route credit on the Unix connection
+
+Credit flows in both directions, so neither side ever has to stop reading the socket. Control frames therefore always flow.
+
+**Output credit (Hub → client, terminal frames).**
+- **One shared budget.** The client already has one terminal budget, `WakeBudget` (items and bytes, shared by every route and by retained frames; TUI `hub_io.rs:193-255`). Every grant is carved from that budget. At all times, the outstanding grants plus the in-flight, queued, and retained terminal frames of every route fit the budget. The client reserves budget when it grants, and gets it back when a granted frame is consumed or disposed, or when the route closes. No quota is multiplied per route.
+- **Allocation.** At bind (attach or reattach), the client grants the new route an equal share of the free budget. As frames are consumed, the returned budget goes to routes with pending demand in round-robin order. The same rule applies at attach and at reattach.
+- **Initial grant and debit.** A route starts at zero credit. The client's first grant follows the attach acknowledgement. The Hub debits one item plus the frame's bytes when a write is committed. A write needs credit for the whole frame: with nonzero but insufficient credit, the adapter refuses with `WouldBlock`. The client's budget (8 MiB) is at least the largest route frame (`MAX_ROUTE_EGRESS_BYTES`, 4 MiB), so every frame can eventually fit. A refused write debits nothing, so there is nothing to roll back.
+- **Wake.** The adapter arms the route's credit wake before its final write attempt (2.2). A grant arriving before that attempt is visible to it, and a grant arriving between the refusal and the park moves the armed epoch.
+- **Fencing and close.** A grant names the route's subscription id and generation. A grant for a retired generation is ignored. On close, `PROCESS_EXIT`, or teardown, both sides drop the route's credit, and the client returns the reserved budget.
+- **Representation.** A grant is one small frame: route id, generation, and an item and byte increment. The client coalesces the grants of several consumed frames into one. Grants are control frames, so they are never behind credit themselves.
+- **Stalled client.** A client that grants nothing is a reader with no progress, and it ends `Stalled` at `READER_PROGRESS_DEADLINE`.
+
+**Input credit (client → Hub, terminal input frames).**
+- **Window.** The Hub grants each route input credit equal to its adapter ingress capacity (the existing `MIN_ADAPTER_INGRESS_BUFFER_FRAMES`, 64 frames). It returns one unit as Core removes each frame (the S5 room wake). The client never sends input beyond its credit.
+- **The reader never pauses.** A compliant client can never overflow a route's ingress, so the Hub keeps reading the socket and output grants always get through. Input beyond credit is a protocol violation that closes the connection typed; the Hub does not stop reading and does not buffer. For Unix, this replaces S5's read pause. S5's pause stays only as the interim step before S13 lands.
+- **Coupling before S9.** While the worker's main loop is blocked on full output, it applies no input (1.2). The route's input credit is then not returned, so the client stops sending input on that route only. Control frames and output grants still flow. When the client consumes output and grants credit, output drains and the worker applies input again. If the client never consumes output, the route ends `Stalled` at the deadline. No path waits on an incidental wake or buffers without bound.
+
+**Tests.**
+1. Two routes flood while a pre-attach frame is retained. The aggregate budget is fully allocated, and a control request is still answered. Budget is conserved throughout (ablation: grant each route the whole budget).
+2. Input and output saturate on one route at once. A credit grant queued behind pending input reaches the Hub, input and output both resume, and a control request completes with no resync and no route loss.
+3. A route with nonzero but insufficient credit gets `WouldBlock`.
+4. A late grant for a retired generation is ignored.
+5. A grant before the final write attempt is used, and a grant between the refusal and the park wakes the adapter (ablation: raise after the park check).
+6. A client that sends input beyond its credit is closed typed.
+7. A client that never grants credit ends `Stalled`.
 
 ### 4.3 Execution (orchestrator assignment, 2026-09-27)
 
