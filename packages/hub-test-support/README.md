@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.47:
+Use this command for version 0.1.48:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.47
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.48
 ```
 
 ```js
@@ -81,16 +81,16 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.47"
+    "@trybotster/hub-test-support": "0.1.48"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.47` carries host-control protocol 11
+`@trybotster/hub-test-support@0.1.48` carries host-control protocol 11
 (`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
 Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
 GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
-revision 50). History attach delivers `attach_state`, `modes`,
+revision 51). History attach delivers `attach_state`, `modes`,
 `snapshot_ready`, `snapshot_history` pages, `snapshot_finish`, `output`, and
 `process_exit`. No-history attach delivers `snapshot_ready` then the GHOSTSNP
 finish record as one `snapshot_history` page. Import-visible state matches
@@ -122,7 +122,7 @@ Protocol 11 adds the operator `resolve_quarantine` request (response kind
 and packages, with `durable` and `loaded`), and the package event-plane
 counters in `observability`.
 
-Version 0.1.47 carries protocol version 11 / conformance revision 50 with
+Version 0.1.48 carries protocol version 11 / conformance revision 51 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,

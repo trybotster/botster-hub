@@ -56,11 +56,11 @@ mod typescript;
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
 pub const PROTOCOL_VERSION: u16 = 11;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 50;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 51;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
 /// Protocol 10 is a cold cut: the floor equals the current revision.
-pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 50;
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 51;
 /// Maximum byte length of a `request_id`: a canonical positive decimal `u64`, no leading zeros.
 pub const MAX_REQUEST_ID_BYTES: usize = 20;
 /// Outstanding (unanswered) control requests one connection may hold.
@@ -5256,16 +5256,16 @@ mod tests {
         );
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
         let mut old_revision = previous.clone();
-        old_revision.conformance_fixture_revision = 49;
+        old_revision.conformance_fixture_revision = 50;
         let error = ensure_compatible(&requirement, &old_revision)
-            .expect_err("event requirement rejects revision 49");
+            .expect_err("event requirement rejects revision 50");
         assert!(
             error
                 .diagnostic
                 .contains("unsupported conformance fixture revision")
         );
         let error = ensure_compatible(&requirement, &previous)
-            .expect_err("event requirement rejects the missing feature at revision 50");
+            .expect_err("event requirement rejects the missing feature at revision 51");
         assert!(
             error
                 .diagnostic
@@ -5548,26 +5548,23 @@ mod tests {
     #[test]
     fn protocol_eleven_rejects_protocol_ten_and_pins_the_conformance_floor() {
         assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 51);
 
         let protocol_ten = DaemonCompatibilityRequirement {
             protocol_version: 10,
-            minimum_conformance_fixture_revision: 49,
+            minimum_conformance_fixture_revision: 50,
             ..DaemonCompatibilityRequirement::current()
         };
         let error = ensure_compatible(&protocol_ten, &DaemonCompatibility::current())
             .expect_err("protocol-10 client must fail closed against protocol 11");
         assert!(error.diagnostic.contains("unsupported protocol version 11"));
 
-        let hub_at_forty_nine = DaemonCompatibility {
-            conformance_fixture_revision: 49,
+        let hub_at_fifty = DaemonCompatibility {
+            conformance_fixture_revision: 50,
             ..DaemonCompatibility::current()
         };
-        ensure_compatible(
-            &DaemonCompatibilityRequirement::current(),
-            &hub_at_forty_nine,
-        )
-        .expect_err("a protocol-11 client rejects a revision-49 Hub");
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &hub_at_fifty)
+            .expect_err("a protocol-11 client rejects a revision-50 Hub");
     }
 
     #[test]
@@ -6215,8 +6212,8 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
         assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 51);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 51);
     }
 
     #[test]
@@ -8568,7 +8565,7 @@ mod tests {
     #[test]
     fn protocol_eleven_and_conformance_fifty_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 51);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -8632,8 +8629,8 @@ mod tests {
         // conformance revision with a floor. Protocol 11 is a cold cut, so the
         // default floor equals the current revision.
         assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 51);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 51);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -8676,11 +8673,11 @@ mod tests {
         );
 
         let pinned_at_fifty = DaemonCompatibilityRequirement {
-            minimum_conformance_fixture_revision: 50,
+            minimum_conformance_fixture_revision: 51,
             ..DaemonCompatibilityRequirement::current()
         };
         ensure_compatible(&pinned_at_fifty, &DaemonCompatibility::current())
-            .expect("a protocol-11 client pinned at conformance 50 accepts a revision-50 Hub");
+            .expect("a protocol-11 client pinned at conformance 51 accepts a revision-51 Hub");
 
         assert_eq!(
             daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {
