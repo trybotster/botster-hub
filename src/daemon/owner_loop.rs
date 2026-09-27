@@ -6507,7 +6507,10 @@ mod tests {
                         drop(charge);
                         break response;
                     }
-                    crate::daemon::control::pending::ControlPoll::ReadyCallback(response, charge) => {
+                    crate::daemon::control::pending::ControlPoll::ReadyCallback(
+                        response,
+                        charge,
+                    ) => {
                         drop(charge);
                         break response;
                     }
