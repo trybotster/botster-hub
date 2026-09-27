@@ -296,6 +296,8 @@ pub(crate) struct HostPackageRuntimeRestore {
     pub(crate) original: DaemonTransportError,
     pub(crate) runtime: HostPackageRuntime,
     pub(crate) config: HubConfig,
+    /// The failed effect's staged event generation, aborted before restoring.
+    pub(crate) staged: Option<crate::package_event_router::StagedGeneration>,
 }
 
 /// One typed host result.
@@ -439,7 +441,14 @@ fn execute_package_runtime_restore(
         original,
         mut runtime,
         config,
+        staged,
     } = job;
+    // Release the failed attempt's staged generation, its reserved capacity
+    // and its funding, before the restore stages anything of its own. This
+    // runs on the Host worker, where the router lock may be taken blocking.
+    if let Some(staged) = staged {
+        runtime.abort_staged(staged);
+    }
     let rollbacks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
             &mut runtime,
@@ -458,6 +467,16 @@ fn execute_package_runtime_restore(
             )),
         }]
     });
+    if !rollbacks.is_empty() {
+        // Compensation failed: no version of these packages may keep serving.
+        // Unload them here, on the Host worker; their recorded router unloads
+        // clear any staged generation and retire their queued events.
+        crate::daemon::control::packages::mutations::quarantine_after_failed_compensation(
+            &mut runtime,
+            entrypoints,
+            &effect,
+        );
+    }
     HostMutationResult::PackageRuntimeRestored {
         effect,
         original,
@@ -598,6 +617,20 @@ pub(crate) enum PackageRuntimeEffect {
 }
 
 impl PackageRuntimeEffect {
+    /// Every package whose runtime this effect changes.
+    pub(crate) fn package_names(&self) -> Vec<&str> {
+        match self {
+            Self::Enable { package_name, .. }
+            | Self::Disable { package_name }
+            | Self::Remove { package_name }
+            | Self::Reload { package_name, .. } => vec![package_name.as_str()],
+            Self::Refresh { packages, .. } => packages
+                .iter()
+                .map(|package| package.package_name.as_str())
+                .collect(),
+        }
+    }
+
     pub(crate) fn restore_command(
         &self,
         data_directory: PathBuf,

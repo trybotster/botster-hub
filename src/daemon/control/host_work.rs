@@ -849,9 +849,12 @@ impl HostMutationContinuation {
                     let runtime = daemon
                         .runtime()
                         .expect("a committed package has a running runtime");
+                    let mut host_runtime = runtime.host_package_runtime();
+                    host_runtime
+                        .fund_staging(staging_funding(&permit, committed.reply.logical_bytes));
                     let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
                         effect,
-                        runtime: runtime.host_package_runtime(),
+                        runtime: host_runtime,
                         config: runtime.config().clone(),
                         packages: daemon.package_registry_view(),
                         reply: committed.reply,
@@ -871,12 +874,24 @@ impl HostMutationContinuation {
                 let runtime = daemon
                     .runtime()
                     .expect("package recovery retains its runtime");
+                let mut host_runtime = runtime.host_package_runtime();
+                host_runtime.fund_staging(staging_funding(&permit, 0));
+                // The failed effect's staged generation, if any, moves to the
+                // restore, which aborts it before it stages its own.
+                let staged = match state.staged_package_generation.take() {
+                    Some((owner, staged)) if owner == waiter_id => Some(staged),
+                    other => {
+                        state.staged_package_generation = other;
+                        None
+                    }
+                };
                 let command =
                     HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
                         effect,
                         original,
-                        runtime: runtime.host_package_runtime(),
+                        runtime: host_runtime,
                         config: runtime.config().clone(),
+                        staged,
                     });
                 submit_phase(daemon, state, waiter_id, command, permit, next_phase)
             }
@@ -898,8 +913,13 @@ impl HostMutationContinuation {
             HostMutationResult::PackageEffectFailed {
                 effect,
                 error,
-                cleanup,
+                mut cleanup,
             } => {
+                // A generation staged but not activated stays with this
+                // attempt until its restore aborts it or its unload clears it.
+                if let Some(staged) = cleanup.staged.take() {
+                    state.staged_package_generation = Some((waiter_id, staged));
+                }
                 daemon
                     .runtime_mut()
                     .expect("package effect retains its runtime")
@@ -1466,6 +1486,27 @@ fn submit_event_cleanup(
     }
 }
 
+/// Staging funding from the attempt's prepared-byte reservation: a handle
+/// that keeps it alive with the pending generation, and the reserved bytes
+/// the attempt does not already hold (`held_bytes`). With no reservation the
+/// funding is zero, so any staged storage is refused before it changes state.
+fn staging_funding(
+    permit: &HostWorkPermit,
+    held_bytes: usize,
+) -> crate::runtime::package_effect::StagingFunding {
+    let reserved = permit.reserved_prepared_bytes();
+    if reserved == 0 {
+        return crate::runtime::package_effect::StagingFunding {
+            retained: Box::new(()),
+            reserved_bytes: 0,
+        };
+    }
+    crate::runtime::package_effect::StagingFunding {
+        retained: Box::new(permit.retain_prepared_reservation()),
+        reserved_bytes: reserved.saturating_sub(held_bytes),
+    }
+}
+
 fn submit_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -1585,9 +1626,17 @@ fn finish_error(
 /// plugin, or to find the socket binding its entrypoint restart needs.
 fn package_load_refusal(error: &DaemonTransportError) -> Option<HostMutationError> {
     match error {
-        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error))
-        | DaemonTransportError::PluginLoadRefused { error, .. } => Some(HostMutationError {
-            code: error.code().to_string(),
+        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error)) => {
+            Some(HostMutationError {
+                code: error.code().to_string(),
+                message: error.to_string(),
+                event: None,
+            })
+        }
+        // The message names the package, so a stranded event plane names
+        // exactly which package runs without its subscriptions.
+        DaemonTransportError::PluginNotSwapped { error: load, .. } => Some(HostMutationError {
+            code: load.code().to_string(),
             message: error.to_string(),
             event: None,
         }),

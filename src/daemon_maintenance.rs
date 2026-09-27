@@ -1341,17 +1341,19 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     };
     for delivery in batch {
         let request_id = package_event_request_id(&delivery);
-        let Some(handler) = runtime.package_event_handler(
-            &delivery.holder.plugin_key,
-            &delivery.owner,
-            &delivery.name,
-            &delivery.holder.handler_id,
-        ) else {
-            let mut flight = event_flight(&delivery, None, request_id.0);
-            if !retire_event_holder(runtime, &mut flight) {
-                queue_event_retirement(runtime, state, flight);
+        // Only the consumer generation the delivery matched may handle it.
+        let handler = match runtime.package_event_handler(&delivery) {
+            Ok(handler) => handler,
+            Err(refusal) => {
+                runtime
+                    .event_plane_counters()
+                    .record_delivery_refusal(refusal);
+                let mut flight = event_flight(&delivery, None, request_id.0);
+                if !retire_event_holder(runtime, &mut flight) {
+                    queue_event_retirement(runtime, state, flight);
+                }
+                continue;
             }
-            continue;
         };
         let reservation = match runtime.reserve_causal_transition() {
             Ok(reservation) => reservation,
@@ -1382,7 +1384,10 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         let metadata = Some(BoundaryJson(
             serde_json::json!({ "causal_scope_id": scope_id }),
         ));
-        let admission = runtime.try_admit_plugin(
+        // The lookup above can race a swap on the Host worker; admission
+        // re-checks the matched generation under the lifecycle lock.
+        let admission = match runtime.try_admit_package_event(
+            &delivery,
             PluginInvocationClass::Background,
             PluginInvocationRequest {
                 request_id: request_id.clone(),
@@ -1398,7 +1403,23 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 },
                 payload: BoundaryJson(delivery.payload_json.clone()),
             },
-        );
+        ) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                reservation.commit(crate::package_event_router::CausalOp::Release {
+                    scope_id,
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight,
+                });
+                runtime
+                    .event_plane_counters()
+                    .record_delivery_refusal(refusal);
+                let mut flight = event_flight(&delivery, None, request_id.0);
+                if !retire_event_holder(runtime, &mut flight) {
+                    queue_event_retirement(runtime, state, flight);
+                }
+                continue;
+            }
+        };
         match admission {
             PluginAdmissionResult::Queued { .. } => {
                 if runtime
