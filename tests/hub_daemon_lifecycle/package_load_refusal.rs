@@ -1,11 +1,17 @@
 /// A plugin package at `version` whose `<name>.version` tool reports that
 /// version, so a caller can tell which loaded version is serving.
 fn write_versioned_package(root: &Path, name: &str, version: &str) {
+    write_versioned_package_with(root, name, version, "");
+}
+
+/// A versioned package whose plugin runs `prelude` before it registers.
+fn write_versioned_package_with(root: &Path, name: &str, version: &str, prelude: &str) {
     fs::create_dir_all(root).expect("create versioned package root");
     fs::write(
         root.join("plugin.lua"),
         format!(
-            r#"return botster.register({{
+            r#"{prelude}
+return botster.register({{
   tools = {{{{
     name = "{name}.version",
     description = "Report the loaded package version.",
@@ -210,6 +216,107 @@ fn plugin_load_failure_refuses_reload_and_keeps_the_connection() {
     assert_load_refusal(&refused, "reload", &package_dir);
     assert_eq!(
         call_plugin_tool(&data_dir, "reload.error.version", serde_json::json!({}))["version"],
+        "1.0.0",
+        "the prior plugin version keeps serving"
+    );
+    assert_connection_serves(&mut connection);
+
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// A plugin version subscribing to an event nobody declares.
+const UNDECLARED_SUBSCRIPTION: &str =
+    "events.on('hub', 'botster_undeclared_event', function() return {} end)";
+
+/// Assert an event plane refusal: typed, never compensation, never success.
+fn assert_event_plane_refusal(refused: &botster_hub_client::DaemonResponse, operation: &str) {
+    assert_eq!(
+        refused.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "{refused:?}"
+    );
+    let error = refused.error.as_ref().expect("typed refusal");
+    assert_eq!(error.code, "rejected_undeclared", "{refused:?}");
+    assert_eq!(error.operation, operation, "{refused:?}");
+}
+
+/// Update an enabled package to a version the event plane rejects: the prior
+/// record and state are restored and the prior plugin version keeps serving.
+#[test]
+fn event_plane_rejection_refuses_an_update_and_keeps_the_old_version_serving() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("package-update-event-refusal");
+    let package_dir = unique_test_dir("daemon-update-event-refusal-package");
+    write_versioned_package(&package_dir, "update.event", "1.0.0");
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        UnixRouteClient::connect(&socket_endpoint(&data_dir)).expect("external connect");
+    let enabled = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        })
+        .expect("enable the loadable version");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision,
+        "{enabled:?}"
+    );
+
+    write_versioned_package_with(&package_dir, "update.event", "2.0.0", UNDECLARED_SUBSCRIPTION);
+    let refused = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        })
+        .expect("the refusal arrives on the same connection");
+    assert_event_plane_refusal(&refused, "enable");
+
+    let restored =
+        listed_package(&mut connection, "update.event").expect("the prior record is restored");
+    assert_eq!(restored.version, "1.0.0");
+    assert_eq!(restored.state, "enabled");
+    assert_eq!(
+        call_plugin_tool(&data_dir, "update.event.version", serde_json::json!({}))["version"],
+        "1.0.0",
+        "the prior plugin version keeps serving"
+    );
+    assert_connection_serves(&mut connection);
+
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// Reload a package to a version the event plane rejects: the reload is
+/// refused and the prior plugin version keeps serving.
+#[test]
+fn event_plane_rejection_refuses_reload_and_keeps_the_old_version_serving() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("package-reload-event-refusal");
+    let package_dir = unique_test_dir("daemon-reload-event-refusal-package");
+    write_versioned_package(&package_dir, "reload.event", "1.0.0");
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        UnixRouteClient::connect(&socket_endpoint(&data_dir)).expect("external connect");
+    let enabled = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        })
+        .expect("enable the loadable version");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision,
+        "{enabled:?}"
+    );
+
+    write_versioned_package_with(&package_dir, "reload.event", "1.0.0", UNDECLARED_SUBSCRIPTION);
+    let refused = connection
+        .request(&botster_hub_client::DaemonRequest::ReloadPackage {
+            package_name: "reload.event".to_string(),
+        })
+        .expect("the refusal arrives on the same connection");
+    assert_event_plane_refusal(&refused, "reload");
+    assert_eq!(
+        call_plugin_tool(&data_dir, "reload.event.version", serde_json::json!({}))["version"],
         "1.0.0",
         "the prior plugin version keeps serving"
     );
