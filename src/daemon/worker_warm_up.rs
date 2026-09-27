@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use crate::process_exit::PidExitWatch;
 
-/// Bound on one warm-up: a third of the daemon readiness budget (user
-/// decision, 2026-09-27), so the warm-up always leaves most of the budget to
-/// the rest of startup.
+/// Bound on the wait for the probe's exit after `spawn` returns: a third of
+/// the daemon readiness budget (user decision, 2026-09-27). `spawn` itself is
+/// not bounded; the log records it separately (`spawn_ms`). Measured cold
+/// execs paid their cost after `spawn` returned, inside this bounded wait.
 pub(crate) const WORKER_WARM_UP_DEADLINE: Duration =
     Duration::from_millis(crate::LOCAL_RUNTIME_DAEMON_READINESS_BUDGET.as_millis() as u64 / 3);
 
@@ -54,17 +55,25 @@ impl std::fmt::Display for WarmUpFailure {
     }
 }
 
-/// Exec `worker --probe` and wait for its exit event, bounded by `deadline`.
-pub(crate) fn warm_session_worker(worker: &Path, deadline: Duration) -> WarmUpOutcome {
-    let mut child = match Command::new(worker)
+/// Exec `worker --probe` and wait for its exit event, bounded by `deadline`
+/// from when `spawn` returns. Also returns the time spent inside `spawn`.
+pub(crate) fn warm_session_worker(worker: &Path, deadline: Duration) -> (WarmUpOutcome, Duration) {
+    let spawning = Instant::now();
+    let spawned = Command::new(worker)
         .arg("--probe")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-    {
+        .spawn();
+    let spawn_elapsed = spawning.elapsed();
+    let mut child = match spawned {
         Ok(child) => child,
-        Err(error) => return WarmUpOutcome::Failed(WarmUpFailure::Spawn(error)),
+        Err(error) => {
+            return (
+                WarmUpOutcome::Failed(WarmUpFailure::Spawn(error)),
+                spawn_elapsed,
+            );
+        }
     };
     // timer: deadline — bounds only a worker that never exits; the wait
     // itself ends on the child's exit event.
@@ -81,17 +90,28 @@ pub(crate) fn warm_session_worker(worker: &Path, deadline: Duration) -> WarmUpOu
             // Our own child, by its handle: kill it, then reap it.
             let _ = child.kill();
             let _ = child.wait();
-            return WarmUpOutcome::Failed(WarmUpFailure::DeadlineExpired);
+            return (
+                WarmUpOutcome::Failed(WarmUpFailure::DeadlineExpired),
+                spawn_elapsed,
+            );
         }
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return WarmUpOutcome::Failed(WarmUpFailure::Wait(error));
+            return (
+                WarmUpOutcome::Failed(WarmUpFailure::Wait(error)),
+                spawn_elapsed,
+            );
         }
     }
     let status = match child.wait() {
         Ok(status) => status,
-        Err(error) => return WarmUpOutcome::Failed(WarmUpFailure::Wait(error)),
+        Err(error) => {
+            return (
+                WarmUpOutcome::Failed(WarmUpFailure::Wait(error)),
+                spawn_elapsed,
+            );
+        }
     };
     let mut output = String::new();
     if let Some(stdout) = child.stdout.take() {
@@ -100,14 +120,18 @@ pub(crate) fn warm_session_worker(worker: &Path, deadline: Duration) -> WarmUpOu
             .read_to_string(&mut output);
     }
     if !status.success() {
-        return WarmUpOutcome::Failed(WarmUpFailure::Exit(status));
+        return (
+            WarmUpOutcome::Failed(WarmUpFailure::Exit(status)),
+            spawn_elapsed,
+        );
     }
-    match probe_identity(&output) {
+    let outcome = match probe_identity(&output) {
         Some(identity) => WarmUpOutcome::Ready {
             identity: identity.to_string(),
         },
         None => WarmUpOutcome::Failed(WarmUpFailure::UnexpectedOutput(output)),
-    }
+    };
+    (outcome, spawn_elapsed)
 }
 
 /// The probe prints exactly one line: `botster-session-worker <version> protocol <n>`.
@@ -130,15 +154,16 @@ fn probe_identity(output: &str) -> Option<&str> {
 /// Warm the worker, log the outcome, and report whether it failed.
 pub(crate) fn warm_up_and_log(worker: &Path) -> bool {
     let started = Instant::now();
-    let outcome = warm_session_worker(worker, WORKER_WARM_UP_DEADLINE);
+    let (outcome, spawn_elapsed) = warm_session_worker(worker, WORKER_WARM_UP_DEADLINE);
     let elapsed_ms = started.elapsed().as_millis();
+    let spawn_ms = spawn_elapsed.as_millis();
     match &outcome {
         WarmUpOutcome::Ready { identity } => crate::hub_log::hub_log!(
-            "worker_warm_up outcome=ready elapsed_ms={elapsed_ms} path={} identity={identity:?}",
+            "worker_warm_up outcome=ready elapsed_ms={elapsed_ms} spawn_ms={spawn_ms} path={} identity={identity:?}",
             worker.display()
         ),
         WarmUpOutcome::Failed(failure) => crate::hub_log::hub_log!(
-            "worker_warm_up outcome=failed elapsed_ms={elapsed_ms} path={} failure={failure}",
+            "worker_warm_up outcome=failed elapsed_ms={elapsed_ms} spawn_ms={spawn_ms} path={} failure={failure}",
             worker.display()
         ),
     }
@@ -181,7 +206,7 @@ mod tests {
             "ready",
             r#"[ "$1" = "--probe" ] || exit 9; echo "botster-session-worker 0.1.0 protocol 3""#,
         );
-        match warm_session_worker(&worker, WORKER_WARM_UP_DEADLINE) {
+        match warm_session_worker(&worker, WORKER_WARM_UP_DEADLINE).0 {
             WarmUpOutcome::Ready { identity } => {
                 assert_eq!(identity, "botster-session-worker 0.1.0 protocol 3");
             }
@@ -194,13 +219,13 @@ mod tests {
     fn a_failing_or_malformed_probe_is_a_typed_failure() {
         let (directory, exits) = fake_worker("exit", "echo 'unknown worker argument' >&2; exit 1");
         assert!(matches!(
-            warm_session_worker(&exits, WORKER_WARM_UP_DEADLINE),
+            warm_session_worker(&exits, WORKER_WARM_UP_DEADLINE).0,
             WarmUpOutcome::Failed(WarmUpFailure::Exit(status)) if status.code() == Some(1)
         ));
         std::fs::remove_dir_all(directory).unwrap();
         let (directory, wrong) = fake_worker("wrong", "echo 'botster-session-worker 0.1.0'");
         assert!(matches!(
-            warm_session_worker(&wrong, WORKER_WARM_UP_DEADLINE),
+            warm_session_worker(&wrong, WORKER_WARM_UP_DEADLINE).0,
             WarmUpOutcome::Failed(WarmUpFailure::UnexpectedOutput(_))
         ));
         std::fs::remove_dir_all(directory).unwrap();
@@ -208,7 +233,8 @@ mod tests {
             warm_session_worker(
                 Path::new("/nonexistent/botster-session-worker"),
                 WORKER_WARM_UP_DEADLINE
-            ),
+            )
+            .0,
             WarmUpOutcome::Failed(WarmUpFailure::Spawn(_))
         ));
     }
@@ -221,7 +247,7 @@ mod tests {
         let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(status.success());
         let started = Instant::now();
-        let outcome = warm_session_worker(&worker, Duration::from_millis(300));
+        let outcome = warm_session_worker(&worker, Duration::from_millis(300)).0;
         assert!(matches!(
             outcome,
             WarmUpOutcome::Failed(WarmUpFailure::DeadlineExpired)
