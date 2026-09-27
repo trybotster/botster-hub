@@ -449,9 +449,9 @@ pub enum DaemonTransportError {
     LocalWebrtc(crate::LocalWebrtcError),
     Runtime(crate::HubRuntimeError),
     Lifecycle(crate::HubLifecycleError),
-    /// A plugin failed to load before the runtime changed: whatever version of
-    /// the package was loaded before is still loaded and serving.
-    PluginLoadRefused {
+    /// A plugin load failed without replacing the running plugin: whatever
+    /// version of the package ran before still runs.
+    PluginNotSwapped {
         package_name: String,
         error: crate::HubLuaPluginLoadError,
     },
@@ -506,7 +506,10 @@ impl fmt::Display for DaemonTransportError {
             Self::LocalWebrtc(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
-            Self::PluginLoadRefused { error, .. } => write!(formatter, "{error}"),
+            Self::PluginNotSwapped {
+                package_name,
+                error,
+            } => write!(formatter, "{package_name}: {error}"),
             Self::PackageCompensation {
                 original,
                 rollbacks,

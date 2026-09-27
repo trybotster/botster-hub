@@ -387,6 +387,18 @@ pub struct EventPlaneCounters {
     last_ready_operation_wait_us: AtomicU64,
     max_ready_operation_wait_us: AtomicU64,
     stalled_write_timeouts: AtomicU64,
+    /// Package replacements whose commit failed after a successful preview
+    /// had already unloaded the previous generation. Hub-local until a
+    /// protocol revision exposes it.
+    replacements_stranded: AtomicU64,
+    /// Deliveries retired because the consumer generation they matched is no
+    /// longer installed, the plugin is unloaded, or the handler is absent.
+    /// Hub-local until a protocol revision exposes them.
+    deliveries_generation_unloaded: AtomicU64,
+    deliveries_package_unloaded: AtomicU64,
+    deliveries_handler_absent: AtomicU64,
+    stage_overlaps: AtomicU64,
+    events_stranded: AtomicU64,
     global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
@@ -433,6 +445,12 @@ impl EventPlaneCounters {
             last_ready_operation_wait_us: AtomicU64::new(0),
             max_ready_operation_wait_us: AtomicU64::new(0),
             stalled_write_timeouts: AtomicU64::new(0),
+            replacements_stranded: AtomicU64::new(0),
+            deliveries_generation_unloaded: AtomicU64::new(0),
+            deliveries_package_unloaded: AtomicU64::new(0),
+            deliveries_handler_absent: AtomicU64::new(0),
+            stage_overlaps: AtomicU64::new(0),
+            events_stranded: AtomicU64::new(0),
             global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
@@ -543,6 +561,59 @@ impl EventPlaneCounters {
 
     pub fn record_stalled_write_timeout(&self) {
         self.stalled_write_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replacement_stranded(&self) {
+        self.replacements_stranded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn replacements_stranded(&self) -> u64 {
+        self.replacements_stranded.load(Ordering::Relaxed)
+    }
+
+    /// A second package generation was staged while one was pending: an
+    /// invariant break, since package mutations are serialized.
+    pub(crate) fn record_stage_overlap(&self) {
+        self.stage_overlaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Read by tests until the C3 protocol revision exposes these counters.
+    #[cfg(test)]
+    pub(crate) fn stage_overlaps(&self) -> u64 {
+        self.stage_overlaps.load(Ordering::Relaxed)
+    }
+
+    /// Queued events of a quarantined package, retired by its unload.
+    pub(crate) fn record_events_stranded(&self, events: u64) {
+        self.events_stranded.fetch_add(events, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn events_stranded(&self) -> u64 {
+        self.events_stranded.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_delivery_refusal(&self, reason: crate::lifecycle::EventDeliveryRefusal) {
+        self.delivery_refusal_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_refusals(&self, reason: crate::lifecycle::EventDeliveryRefusal) -> u64 {
+        self.delivery_refusal_counter(reason)
+            .load(Ordering::Relaxed)
+    }
+
+    fn delivery_refusal_counter(
+        &self,
+        reason: crate::lifecycle::EventDeliveryRefusal,
+    ) -> &AtomicU64 {
+        use crate::lifecycle::EventDeliveryRefusal;
+        match reason {
+            EventDeliveryRefusal::GenerationUnloaded => &self.deliveries_generation_unloaded,
+            EventDeliveryRefusal::PackageUnloaded => &self.deliveries_package_unloaded,
+            EventDeliveryRefusal::HandlerAbsent => &self.deliveries_handler_absent,
+        }
     }
 
     /// Control-path insert. Event paths must not call this.

@@ -1928,6 +1928,13 @@ pub(crate) struct DaemonControlState {
     causal_wake_again: bool,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    /// A package event generation the document owner's failed effect staged
+    /// but never activated. Package mutations are serialized by the document
+    /// owner, so at most one exists; that attempt's runtime restore aborts it.
+    pub(crate) staged_package_generation: Option<(
+        crate::owner_identity::WaiterId,
+        crate::package_event_router::StagedGeneration,
+    )>,
     pub(crate) host_completion_drain_pending: bool,
     pub(crate) host_completion_drain_faulted: bool,
     pub(crate) host_capacity_wake_pending: bool,
@@ -2186,6 +2193,7 @@ impl Default for DaemonControlState {
             uncertain_publication: None,
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
+            staged_package_generation: None,
             host_completion_drain_pending: false,
             host_completion_drain_faulted: false,
             host_capacity_wake_pending: false,
