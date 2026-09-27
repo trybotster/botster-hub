@@ -581,6 +581,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("plugin_lifecycle_status", &[]),
             ("plugin_mcp_list_tools", &[]),
             (
+                "read_plugin_logs",
+                &[("package_name", "string"), ("after_seq?", "number")],
+            ),
+            (
                 "plugin_mcp_call_tool",
                 &[("name", "string"), ("arguments", "JsonValue")],
             ),
@@ -665,6 +669,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("plugin_tools", "JsonValue[]"),
             ("plugin_tool_result", "JsonValue"),
             ("plugin_surface?", "DaemonPluginSurface | null"),
+            ("plugin_logs?", "DaemonPluginLogs | null"),
             ("plugin_action_result?", "UiActionResult"),
             (
                 "local_webrtc_bootstrap?",
@@ -774,6 +779,28 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
+        "DaemonPluginLogs",
+        &[
+            ("package_name", "string"),
+            ("records", "DaemonPluginLogRecord[]"),
+            ("next_seq", "number"),
+            ("first_available_seq", "number"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonPluginLogRecord",
+        &[
+            ("seq", "number"),
+            ("at_ms", "number"),
+            ("level", "string"),
+            ("message", "string"),
+            ("fields?", "JsonValue"),
+            ("dropped_before", "number"),
+        ],
+    );
+    emit_interface(
+        &mut output,
         "DaemonPluginSurface",
         &[
             ("package_name", "string"),
@@ -843,6 +870,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "package_decision",
             "plugin_lifecycle",
             "plugin_mcp_tools",
+            "plugin_logs",
             "plugin_mcp_tool_result",
             "plugin_surface",
             "plugin_action_result",

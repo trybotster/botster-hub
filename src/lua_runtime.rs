@@ -696,6 +696,7 @@ struct LuaHostApi {
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
     memory: Arc<LuaMemoryAccount>,
+    logs: Arc<crate::plugin_logs::PluginLogBook>,
 }
 
 /// Validate the event name before the body without copying its Rust bytes.
@@ -855,6 +856,7 @@ fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> 
 #[derive(Clone)]
 pub struct LuaPluginHostApi {
     pub(crate) memory: Arc<LuaMemoryAccount>,
+    pub(crate) logs: Arc<crate::plugin_logs::PluginLogBook>,
     pub capabilities: SharedHubCapabilityRuntime,
     pub coordination: HubCoordinationBridge,
     pub entity_publish: HubEntityPublishBridge,
@@ -1202,6 +1204,7 @@ mod state_owner_tests {
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
+            logs: api.logs,
         };
         let entrypoint = directory.0.join("plugin.lua");
         std::fs::write(
@@ -1586,6 +1589,7 @@ impl LuaPluginRuntime {
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
+            logs: api.logs,
         };
         // Lua reports errors against this name. An `@` name is a file name,
         // so errors read `plugin.lua:3: ...`, relative to the package root.
@@ -2166,7 +2170,13 @@ fn install_botster_api(
 
     let botster = lua.create_table()?;
     botster.set("register", register)?;
-    basics::install(lua, &botster, Arc::clone(&host_api.memory))?;
+    basics::install(
+        lua,
+        &botster,
+        Arc::clone(&host_api.memory),
+        &plugin_key.0,
+        Arc::clone(&host_api.logs),
+    )?;
 
     let capabilities_table = lua.create_table()?;
     let timer_capabilities = host_api.capabilities.clone();
