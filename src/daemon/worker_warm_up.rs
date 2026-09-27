@@ -377,6 +377,24 @@ echo "botster-session-worker 0.1.0 protocol 3""#,
                     .success()
             );
         }
+        // A failed assertion before the release below must not leave the
+        // probe blocked on the FIFO forever (it outlives the test process).
+        struct ReleaseOnDrop(PathBuf);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Non-blocking: with no probe reading, the open fails (ENXIO)
+                // and there is nothing to release.
+                if let Ok(mut release) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.0)
+                {
+                    let _ = std::io::Write::write_all(&mut release, b"go\n");
+                }
+            }
+        }
+        let _release_on_drop = ReleaseOnDrop(directory.join("release"));
         let mut daemon = serve_with_worker(short_root("held"), &worker);
         // Opening the FIFO for reading blocks until the probe opens it: the
         // probe is running inside the warm-up.
