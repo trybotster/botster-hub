@@ -8079,6 +8079,101 @@ return botster.register({{ handlers = {{{{
         (daemon, state, wakes, root)
     }
 
+    /// A session-family snapshot reaches a plugin handler and each frame's
+    /// completion clears the consumer's in-flight slot, driven only by owner
+    /// wakes (the plugin completion notifier). With `install_notifier` false
+    /// nothing else wakes the owner, so the drive stops at its hang guard.
+    fn drive_session_family_snapshot(install_notifier: bool, hang_guard: Duration) {
+        let root = unique_package_control_dir("session-family-wake");
+        let package_dir = root.join("family-probe");
+        write_package_control_manifest(
+            &package_dir,
+            "family-probe",
+            serde_json::json!({
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+botster.events.on({ owner = "hub", name = "session_family" }, function(event)
+  return { ok = true }
+end)
+return botster.register({ handlers = {} })
+"#,
+        )
+        .unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "family-probe".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        let mut wakes = TestOwnerWakes::bind(&daemon, &state);
+        if install_notifier {
+            daemon
+                .runtime()
+                .unwrap()
+                .install_plugin_completion_notifier(
+                    state.plugin_result_budget.completion_notifier(),
+                );
+        }
+        drive_owner_until(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            hang_guard,
+            |_, state| {
+                state
+                    .maintenance
+                    .session_family
+                    .test_consumer_settled("family-probe")
+                    == Some(true)
+            },
+            |_, state| {
+                format!(
+                    "consumer={}",
+                    state
+                        .maintenance
+                        .session_family
+                        .test_consumer_debug("family-probe")
+                )
+            },
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_session_family_snapshot_completes_on_the_completion_wake_alone() {
+        drive_session_family_snapshot(true, TEST_HANG_GUARD);
+    }
+
+    #[test]
+    fn without_the_completion_notifier_the_session_family_drive_stops_at_its_guard() {
+        let stuck = std::panic::catch_unwind(|| {
+            drive_session_family_snapshot(false, Duration::from_secs(3))
+        });
+        let message = stuck
+            .expect_err("no completion notifier must leave the consumer unsettled")
+            .downcast::<String>()
+            .map(|message| *message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("owner wakes stopped") || message.contains("hang guard expired"),
+            "{message}"
+        );
+    }
+
     /// Delivers one `worktree_created` event and drives owner turns until its
     /// handler reaches a terminal outcome and every publication retires.
     /// Returns the event-plane counters at that point. Any terminal outcome
