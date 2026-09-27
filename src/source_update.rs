@@ -79,14 +79,7 @@ pub(crate) fn start_update_handoff(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|error| format!("start detached Hub updater: {error}"))?;
