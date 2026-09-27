@@ -4165,8 +4165,11 @@ mod tests {
     }
 
     /// A request parked behind the active entity model is re-polled when that
-    /// model faults, and fails with a typed error, through the owner's own
-    /// scheduling: no other progress is injected after the fault.
+    /// model is faulted, and fails with the typed cleanup refusal, through the
+    /// owner's own wake, sweep, and response path; no other progress is
+    /// injected after the fault. Scope: the blocker is begun but never
+    /// submitted, and the test calls fault_entity_model directly (as an owner
+    /// does on a failed completion); no Host job or failed completion runs.
     #[test]
     fn a_request_parked_behind_a_faulted_model_is_refused_through_the_owner() {
         let root = unique_package_control_dir("parked-behind-fault");
@@ -4195,7 +4198,7 @@ mod tests {
                 entity: serde_json::json!({"id": "item"}),
             },
         );
-        // The active model: its Host job is in flight until it fails below.
+        // The active model: begun, never submitted, faulted directly below.
         let blocker_identity = crate::host_executor::HostJobIdentity::first(
             crate::owner_identity::WaiterId(u64::MAX - 7),
         );
@@ -4245,7 +4248,7 @@ mod tests {
         }
         let waiter = *state.family_cleanup_waiters.keys().next().unwrap();
 
-        // The blocker's owner faults it after its Host job fails.
+        // Fault it directly, as its owner would on a failed completion.
         daemon
             .runtime()
             .unwrap()
@@ -4259,7 +4262,11 @@ mod tests {
             thread::yield_now();
         }
         let response = receive_test_control_reply(reply).expect("a typed response");
-        assert!(response.error.is_some(), "{response:?}");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("entity_family_cleanup_failed"),
+            "{response:?}"
+        );
         drop(blocker);
         drop(blocker_permit);
         daemon.stop();
