@@ -1309,6 +1309,11 @@ impl PackageEventRouter {
         self.inner.is_poisoned()
     }
 
+    /// [`Self::arm_lock`], with the signal the router's release raises.
+    pub(crate) fn arm_lock_parked(&self) -> crate::daemon::owner_signal::Parked {
+        self.inner.arm_parked()
+    }
+
     /// Arm an owner wait on the router lock before a retry after `ShedBusy`.
     pub(crate) fn arm_lock(&self) -> crate::daemon::owner_signal::Seen {
         self.inner.arm()

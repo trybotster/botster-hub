@@ -29,6 +29,8 @@ pub(crate) const READY_PLUGIN_COMPLETION: ReadyReasons = ReadyReasons::from_bits
 pub(crate) const READY_HOST_COMPLETION: ReadyReasons = ReadyReasons::from_bits(1 << 3);
 pub(crate) const READY_DEADLINE: ReadyReasons = ReadyReasons::from_bits(1 << 4);
 pub(crate) const READY_BACKGROUND: ReadyReasons = ReadyReasons::from_bits(1 << 5);
+/// A lock or queue that a parked request waited on was released.
+pub(crate) const READY_SIGNAL: ReadyReasons = ReadyReasons::from_bits(1 << 6);
 
 /// Outcome of one continuation poll.
 pub(crate) enum ControlPoll {
@@ -715,6 +717,7 @@ fn retire(
     state.deadlines.retire(entry.waiter_id);
     state.host_completions.remove(&entry.waiter_id);
     state.document_waiters.remove(&entry.waiter_id);
+    state.signal_request_waits.remove(&entry.waiter_id);
     state
         .blocked_session_type_roots
         .retain(|_, waiter_id| *waiter_id != entry.waiter_id);
@@ -822,6 +825,7 @@ pub(crate) fn poll_ready_request_item(
         state.plugin_controls.cancel_reply(waiter_id);
     }
     let has_completion = reasons.contains(READY_INITIAL)
+        || reasons.contains(READY_SIGNAL)
         || reasons.contains(READY_CORE_COMPLETION)
         || reasons.contains(READY_PLUGIN_COMPLETION)
         || reasons.contains(READY_HOST_COMPLETION);

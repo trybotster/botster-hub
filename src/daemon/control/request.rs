@@ -85,22 +85,6 @@ pub(crate) fn handle(
     }
     if matches!(
         request.as_ref(),
-        DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. }
-    ) {
-        let connection_id = grant_id
-            .clone()
-            .or_else(|| client_id.clone())
-            .unwrap_or_default();
-        let response = events::handle_client_event_request(
-            daemon,
-            state,
-            &connection_id,
-            request.as_ref().clone(),
-        );
-        return send_control_response(reply_tx, Ok(response), response_delivery_rx);
-    }
-    if matches!(
-        request.as_ref(),
         DaemonRequest::CheckHubUpdate
             | DaemonRequest::StartHubUpdate { .. }
             | DaemonRequest::GetHubUpdateExecution
@@ -163,7 +147,19 @@ pub(crate) fn handle(
     let must_finish = request_must_finish(&request);
     let completion = OwnerRequestCompletion::from_request(&request);
     state.current_waiter_id = Some(waiter_id);
-    let step = handle_control_request(daemon, state, observability, control_tx, request);
+    let step = if matches!(
+        request,
+        DaemonRequest::SubscribeEvents { .. } | DaemonRequest::UnsubscribeEvents { .. }
+    ) {
+        // Package-event requests are polled so that lock contention waits.
+        let connection_id = grant_id
+            .clone()
+            .or_else(|| client_id.clone())
+            .unwrap_or_default();
+        events::control_step(connection_id, request)
+    } else {
+        handle_control_request(daemon, state, observability, control_tx, request)
+    };
     state.current_waiter_id = None;
     let entry = PendingControlRequest {
         waiter_id,
