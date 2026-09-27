@@ -24,7 +24,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     line(&mut output, "");
     line(
         &mut output,
-        "// Host-control protocol 11 constants. See botster-hub-client/src/lib.rs.",
+        "// Host-control protocol 12 constants. See botster-hub-client/src/lib.rs.",
     );
     emit_const(&mut output, "PROTOCOL", &format!("\"{}\"", crate::PROTOCOL));
     emit_const(
@@ -1772,6 +1772,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("event_stage_overlaps?", "number"),
             ("events_stranded?", "number"),
             ("package_quarantines_not_durable?", "number"),
+            (
+                "retained_reservation_outstanding_staging_funding?",
+                "number",
+            ),
+            ("retained_reservation_outstanding_entity_work?", "number"),
         ],
     );
     emit_interface(

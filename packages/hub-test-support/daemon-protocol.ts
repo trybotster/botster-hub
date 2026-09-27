@@ -5,10 +5,10 @@ import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActio
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-// Host-control protocol 11 constants. See botster-hub-client/src/lib.rs.
+// Host-control protocol 12 constants. See botster-hub-client/src/lib.rs.
 export const PROTOCOL = "botster-hub-daemon-v1";
-export const PROTOCOL_VERSION = 11;
-export const CONFORMANCE_FIXTURE_REVISION = 51;
+export const PROTOCOL_VERSION = 12;
+export const CONFORMANCE_FIXTURE_REVISION = 52;
 export const MAX_REQUEST_ID_BYTES = 20;
 export const MAX_OUTSTANDING_REQUESTS = 32;
 export const MAX_CONTROL_REQUEST_BYTES = 1048576;
@@ -347,10 +347,11 @@ export interface DaemonPluginLogs {
 
 export interface DaemonPluginLogRecord {
   seq: number;
+  generation: number;
   at_ms: number;
   level: string;
   message: string;
-  fields?: JsonValue;
+  fields_json?: string;
   dropped_before: number;
 }
 
@@ -1098,6 +1099,8 @@ export interface DaemonObservabilityCounters {
   event_stage_overlaps?: number;
   events_stranded?: number;
   package_quarantines_not_durable?: number;
+  retained_reservation_outstanding_staging_funding?: number;
+  retained_reservation_outstanding_entity_work?: number;
 }
 
 export interface DaemonLatencyHistogram {
