@@ -344,7 +344,10 @@ pub(crate) fn daemon_plugin_logs(
         mut charge,
     } = page;
     if let Some(charge) = charge.as_mut() {
-        let levels: usize = records.iter().map(|record| record.level.as_str().len()).sum();
+        let levels: usize = records
+            .iter()
+            .map(|record| record.level.as_str().len())
+            .sum();
         let reply_records =
             records.len() * std::mem::size_of::<botster_hub_client::DaemonPluginLogRecord>();
         charge.grow(reply_records + levels).ok()?;
