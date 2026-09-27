@@ -7887,6 +7887,22 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// Assert a publish_seq action's response before waiting for its frame, so a
+/// refused publish fails here and names itself instead of timing out later.
+fn assert_publish_status(response: &botster_hub_client::DaemonResponse, expected: &str) {
+    assert_eq!(
+        response.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult,
+        "{response:?}"
+    );
+    let status = response
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .and_then(|payload| payload["status"].as_str());
+    assert_eq!(status, Some(expected), "{response:?}");
+}
+
 #[test]
 fn daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all_subscribers() {
     let _guard = daemon_test_guard();
@@ -7929,11 +7945,12 @@ fn daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all
     );
     // Behind first resync would still see seq=2 from live provider after gap publish
     // (publish updates rows). Fill N+1 and require ordered delivery.
-    let _ = mutation_action(
+    let fill = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "n1" }),
     );
+    assert_publish_status(&fill, "accepted");
     let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
         matches!(
             frame,
@@ -8000,13 +8017,15 @@ fn daemon_package_entity_publish_concurrent_out_of_order_preserves_family_order(
             serde_json::json!({ "seq": 2, "id": "b" }),
         )
     });
-    let _ = t1.join().expect("join t1");
-    let _ = t2.join().expect("join t2");
-    let _ = mutation_action(
+    // With the provider at 0, both concurrent publishes are ahead of it.
+    assert_publish_status(&t1.join().expect("join t1"), "pending_gap");
+    assert_publish_status(&t2.join().expect("join t2"), "pending_gap");
+    let fill = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "a" }),
     );
+    assert_publish_status(&fill, "accepted");
 
     let mut seen = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
