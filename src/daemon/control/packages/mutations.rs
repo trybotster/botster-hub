@@ -34,8 +34,9 @@ fn load_package_after_enable(
 }
 
 /// Classify a plugin load failure. Both load paths finish every fallible step
-/// before they replace the running plugin, and the plugin commit cannot fail,
-/// so each of these errors leaves the previous version running.
+/// (bundle, lifecycle preflight, event-plane stage) before they install the
+/// plugin, so those errors leave the previous version running. Activation
+/// follows the install, so its failures come after the swap.
 fn plugin_load_error(
     package_name: &str,
     error: crate::HubLuaPluginLoadError,
@@ -46,13 +47,15 @@ fn plugin_load_error(
         | Load::Lua(_)
         | Load::Lifecycle(_)
         | Load::EventPlane(_)
-        | Load::EventPlaneStranded(_) => DaemonTransportError::PluginNotSwapped {
+        | Load::EventPlaneStageOverlap
+        | Load::EventPlaneUnfunded { .. } => DaemonTransportError::PluginNotSwapped {
             package_name: package_name.to_string(),
             error,
         },
-        Load::EventPlaneCleanup | Load::EntityFamilyCleanup(_) => {
-            crate::HubDaemonError::from(error).into()
-        }
+        Load::EventPlaneStranded(_)
+        | Load::EventPlaneActivationFaulted
+        | Load::EventPlaneCleanup
+        | Load::EntityFamilyCleanup(_) => crate::HubDaemonError::from(error).into(),
     }
 }
 

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use super::{HubLuaPluginLoadError, PendingEventPlaneReplace};
 use crate::lifecycle::{HubLifecycleResult, HubPluginLifecycle, HubPluginRuntimeBundle};
 use crate::lua_runtime::{LuaPluginHostApi, LuaPluginRuntime, SharedHubCapabilityRuntime};
-use crate::package_event_router::{EventPlaneStatus, EventSubscription, PackageEventRouter};
+use crate::package_event_router::{
+    ActivationError, EventPlaneStatus, EventSubscription, PackageEventRouter, StageError,
+    StagedGeneration,
+};
 use crate::packages::PackageRegistry;
 use botster_core::{PluginCapabilityRuntime, PluginCleanupResult, PluginKey, RequestId};
 
@@ -21,6 +24,31 @@ pub(crate) struct HostPackageCleanup {
         Result<u64, EventPlaneStatus>,
         crate::package_event_router::EventOwnerWorkError,
     )>,
+    /// A generation staged but never activated, because the effect failed or
+    /// unwound between stage and activation. The attempt's restore aborts it.
+    pub(crate) staged: Option<StagedGeneration>,
+}
+
+/// Funding for staging one package event generation: a handle that keeps the
+/// attempt's prepared-byte reservation alive, and that reservation's size.
+/// The router holds the handle with the pending entry, so the charge lives
+/// exactly as long as the entry.
+pub(crate) struct StagingFunding {
+    pub(crate) retained: Box<dyn Send>,
+    pub(crate) reserved_bytes: usize,
+}
+
+impl StagingFunding {
+    /// Funding for a load outside any Host attempt: daemon startup, before the
+    /// owner loop serves, and direct test loads. The pending entry lives only
+    /// inside that one synchronous load, and the Host prepared-byte capacity
+    /// bounds it as it bounds every attempt.
+    pub(crate) fn outside_attempt() -> Self {
+        Self {
+            retained: Box::new(()),
+            reserved_bytes: crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+        }
+    }
 }
 
 pub(crate) struct HostPackageRuntime {
@@ -35,9 +63,24 @@ pub(crate) struct HostPackageRuntime {
         Result<u64, EventPlaneStatus>,
         crate::package_event_router::EventOwnerWorkError,
     )>,
+    staging_funding: Option<StagingFunding>,
+    /// Held here, outside the effect's `catch_unwind`, so an unwind between
+    /// stage and activation still hands it to the restore.
+    staged: Option<StagedGeneration>,
 }
 
 impl HostPackageRuntime {
+    /// Fund the next event generation this runtime stages.
+    pub(crate) fn fund_staging(&mut self, funding: StagingFunding) {
+        self.staging_funding = Some(funding);
+    }
+
+    /// Discard a generation a failed attempt staged but never activated.
+    /// Runs on a Host worker; the router lock is taken blocking.
+    pub(crate) fn abort_staged(&mut self, staged: StagedGeneration) {
+        self.package_event_router.abort_staged_generation(staged);
+    }
+
     pub(crate) fn new(plugin_lifecycle: HubPluginLifecycle, host_api: LuaPluginHostApi) -> Self {
         Self {
             plugin_lifecycle,
@@ -48,6 +91,8 @@ impl HostPackageRuntime {
             unloaded_families: Vec::new(),
             event_plane_unloads: VecDeque::new(),
             event_plane_faults: Vec::new(),
+            staging_funding: None,
+            staged: None,
         }
     }
 
@@ -59,6 +104,7 @@ impl HostPackageRuntime {
             unloaded_families: self.unloaded_families,
             event_plane_unloads: self.event_plane_unloads,
             event_plane_faults: self.event_plane_faults,
+            staged: self.staged,
         }
     }
 
@@ -103,19 +149,89 @@ impl HostPackageRuntime {
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
-        // Every fallible step runs before the plugin changes. A failed event
-        // plane commit restores its own admission state, so each error below
-        // leaves any previously loaded version serving.
-        let plugin = self
+        // Every fallible step runs before anything changes: prepare the
+        // plugin, then stage its event generation. The install cannot fail,
+        // and activation publishes the subscriptions only after it.
+        let mut plugin = self
             .plugin_lifecycle
             .prepare_package(registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)?;
-        self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
+        let staged_plane = self
+            .staged_package_event_plane(package_name, registry, &event_handlers)
             .map_err(HubLuaPluginLoadError::EventPlane)?;
+        let generation = self.stage_event_generation(package_name, staged_plane)?;
+        plugin.set_event_generation(generation);
         let (key, _) = self
             .plugin_lifecycle
             .commit_package(RequestId("hub-load-registration".into()), plugin);
+        self.activate_event_generation()?;
         Ok(key)
+    }
+
+    /// Stage this package's next event generation, funded by the attempt.
+    /// A refusal leaves the router unchanged.
+    fn stage_event_generation(
+        &mut self,
+        package_name: &str,
+        staged_plane: PendingEventPlaneReplace,
+    ) -> Result<u64, HubLuaPluginLoadError> {
+        let funding = self
+            .staging_funding
+            .take()
+            .unwrap_or_else(StagingFunding::outside_attempt);
+        let staged = self
+            .package_event_router
+            .stage_package_generation(
+                package_name,
+                staged_plane.contracts,
+                staged_plane.subscriptions,
+                funding.retained,
+                funding.reserved_bytes,
+            )
+            .map_err(|error| match error {
+                StageError::Rejected(status) => HubLuaPluginLoadError::EventPlane(status),
+                StageError::AlreadyStaged => HubLuaPluginLoadError::EventPlaneStageOverlap,
+                StageError::Unfunded { required, reserved } => {
+                    HubLuaPluginLoadError::EventPlaneUnfunded { required, reserved }
+                }
+            })?;
+        let generation = staged.generation();
+        self.staged = Some(staged);
+        Ok(generation)
+    }
+
+    /// Publish the staged generation after the plugin that serves it is
+    /// installed. Only an invariant break fails here, after the swap.
+    fn activate_event_generation(&mut self) -> Result<(), HubLuaPluginLoadError> {
+        let staged = self
+            .staged
+            .take()
+            .expect("activation follows a successful stage");
+        match self.package_event_router.activate_staged_generation(staged) {
+            Ok(_) => Ok(()),
+            Err(ActivationError::Faulted(staged)) => {
+                self.staged = Some(staged);
+                Err(HubLuaPluginLoadError::EventPlaneActivationFaulted)
+            }
+            Err(ActivationError::NotStaged) => {
+                Err(HubLuaPluginLoadError::EventPlaneActivationFaulted)
+            }
+            Err(ActivationError::Replace(error)) => match error.into_parts() {
+                (Err(status), cleanup) => {
+                    if let Some(cleanup) = cleanup {
+                        self.event_plane_faults.push((Err(status), cleanup));
+                    }
+                    Err(HubLuaPluginLoadError::EventPlaneStranded(status))
+                }
+                (Ok(generation), Some(cleanup)) => {
+                    // Committed; only the previous generation's cleanup
+                    // failed. One version serves; retain the cleanup fault.
+                    self.event_plane_faults.push((Ok(generation), cleanup));
+                    Ok(())
+                }
+                (Ok(_), None) => unreachable!("an activation error carries a failure"),
+            },
+        }
     }
 
     pub fn reload_lua_plugin_package(
@@ -138,44 +254,20 @@ impl HostPackageRuntime {
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
-        let staged = self
+        let staged_plane = self
             .staged_package_event_plane(package_name, registry, &event_handlers)
             .map_err(HubLuaPluginLoadError::EventPlane)?;
-        // Prepare the plugin before the event plane changes, so every
-        // rejection leaves the previous version serving.
-        let plugin = self
+        // Every fallible step runs before anything changes. The previous
+        // generation stays live until activation, which follows the install.
+        let mut plugin = self
             .plugin_lifecycle
             .prepare_package(registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)?;
-        if let Err(error) = self.package_event_router.try_replace_package_generation(
-            package_name,
-            staged.contracts,
-            staged.subscriptions,
-        ) {
-            let unloaded = error.unloaded();
-            let (result, cleanup) = error.into_parts();
-            match (result, cleanup) {
-                (Err(status), None) if !unloaded => {
-                    return Err(HubLuaPluginLoadError::EventPlane(status));
-                }
-                (Err(status), cleanup) => {
-                    // The previous generation is unloaded and the new one is
-                    // not committed; the previous plugin still runs.
-                    if let Some(cleanup) = cleanup {
-                        self.event_plane_faults.push((Err(status), cleanup));
-                    }
-                    return Err(HubLuaPluginLoadError::EventPlaneStranded(status));
-                }
-                (Ok(generation), Some(cleanup)) => {
-                    // The new generation is committed; only the previous
-                    // generation's cleanup failed. Finish the swap so one
-                    // version serves, and retain the cleanup fault.
-                    self.event_plane_faults.push((Ok(generation), cleanup));
-                }
-                (Ok(_), None) => unreachable!("a replacement error carries a failure"),
-            }
-        }
-        Ok(self.commit_reloaded_plugin(request_id, plugin))
+        let generation = self.stage_event_generation(package_name, staged_plane)?;
+        plugin.set_event_generation(generation);
+        let cleanup = self.commit_reloaded_plugin(request_id, plugin);
+        self.activate_event_generation()?;
+        Ok(cleanup)
     }
 
     /// Swap in a prepared plugin and release the previous one's capabilities.

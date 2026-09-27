@@ -585,7 +585,9 @@ pub enum StageError {
 /// Why activation failed: only a poisoned router lock or an invariant break.
 #[derive(Debug)]
 pub enum ActivationError {
-    Faulted,
+    /// The router lock is poisoned; the staged generation is returned so the
+    /// attempt's restore can still abort it.
+    Faulted(StagedGeneration),
     NotStaged,
     Replace(EventPlaneReplaceError),
 }
@@ -936,7 +938,9 @@ impl PackageEventRouter {
         &self,
         staged: StagedGeneration,
     ) -> Result<u64, ActivationError> {
-        let mut inner = self.inner.lock().map_err(|_| ActivationError::Faulted)?;
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(ActivationError::Faulted(staged));
+        };
         let Some(pending) = take_staged(&mut inner, &staged) else {
             return Err(ActivationError::NotStaged);
         };
@@ -1646,6 +1650,18 @@ impl PackageEventRouter {
 }
 
 impl RouterInner {
+    fn pending_plugin_reserve(&self, plugin_key: &str) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.plugin_reserve(plugin_key))
+    }
+
+    fn pending_event_reserve(&self, key: &(String, String)) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.event_reserve(key))
+    }
+
     fn global_bytes(&self) -> usize {
         self.global_in_flight_bytes
     }
@@ -2098,6 +2114,7 @@ fn preview_package_replacement(
                             .unwrap_or(0),
                     )
                     .expect("selected removals cannot exceed the plugin count")
+                    .saturating_add(inner.pending_plugin_reserve(&subscription.plugin_key))
             });
         let event_count = event_counts.entry(key.clone()).or_insert_with(|| {
             inner
@@ -2107,6 +2124,7 @@ fn preview_package_replacement(
                 .map_or(0, Vec::len)
                 .checked_sub(removed_events.get(&key).copied().unwrap_or(0))
                 .expect("selected removals cannot exceed the event count")
+                .saturating_add(inner.pending_event_reserve(&key))
         });
         let status = subscription_admission_status(
             &inner.policy,
@@ -2189,16 +2207,19 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
         .contracts
         .get(&key.0)
         .and_then(|events| events.get(&key.1));
+    // Capacity a staged generation reserved is not available to others.
     let plugin_count = inner
         .subscriptions_per_plugin
         .get(&subscription.plugin_key)
         .copied()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_add(inner.pending_plugin_reserve(&subscription.plugin_key));
     let event_count = inner
         .subscriptions
         .get(&key.0)
         .and_then(|events| events.get(&key.1))
-        .map_or(0, Vec::len);
+        .map_or(0, Vec::len)
+        .saturating_add(inner.pending_event_reserve(&key));
     let status = subscription_admission_status(
         &inner.policy,
         &subscription,

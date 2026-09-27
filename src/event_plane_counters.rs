@@ -397,6 +397,7 @@ pub struct EventPlaneCounters {
     deliveries_generation_unloaded: AtomicU64,
     deliveries_package_unloaded: AtomicU64,
     deliveries_handler_absent: AtomicU64,
+    stage_overlaps: AtomicU64,
     global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
@@ -447,6 +448,7 @@ impl EventPlaneCounters {
             deliveries_generation_unloaded: AtomicU64::new(0),
             deliveries_package_unloaded: AtomicU64::new(0),
             deliveries_handler_absent: AtomicU64::new(0),
+            stage_overlaps: AtomicU64::new(0),
             global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
@@ -565,6 +567,16 @@ impl EventPlaneCounters {
 
     pub(crate) fn replacements_stranded(&self) -> u64 {
         self.replacements_stranded.load(Ordering::Relaxed)
+    }
+
+    /// A second package generation was staged while one was pending: an
+    /// invariant break, since package mutations are serialized.
+    pub(crate) fn record_stage_overlap(&self) {
+        self.stage_overlaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stage_overlaps(&self) -> u64 {
+        self.stage_overlaps.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_delivery_refusal(&self, reason: crate::lifecycle::EventDeliveryRefusal) {

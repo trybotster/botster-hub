@@ -5923,6 +5923,15 @@ pub enum HubLuaPluginLoadError {
     /// event generation is unloaded, the new one is not committed, and the
     /// previous plugin still runs without its event subscriptions.
     EventPlaneStranded(EventPlaneStatus),
+    /// A second event generation was staged while one was pending; package
+    /// mutations are serialized, so this is an invariant break.
+    EventPlaneStageOverlap,
+    /// The staged generation's retained storage exceeds the attempt's
+    /// prepared-byte reservation. Nothing changed.
+    EventPlaneUnfunded { required: usize, reserved: usize },
+    /// Activation found the router lock poisoned, or its staged generation
+    /// gone, after the plugin was installed.
+    EventPlaneActivationFaulted,
     EventPlaneCleanup,
     EntityFamilyCleanup(PackageEntityCleanupError),
 }
@@ -5932,6 +5941,9 @@ impl HubLuaPluginLoadError {
         match self {
             Self::Package(_) | Self::Lua(_) | Self::Lifecycle(_) => true,
             Self::EventPlaneStranded(_)
+            | Self::EventPlaneStageOverlap
+            | Self::EventPlaneUnfunded { .. }
+            | Self::EventPlaneActivationFaulted
             | Self::EventPlaneCleanup
             | Self::EntityFamilyCleanup(_) => false,
             // List package failures explicitly. A new event-plane status must
@@ -5956,6 +5968,9 @@ impl HubLuaPluginLoadError {
             Self::Lifecycle(_) => "plugin_lifecycle_rejected",
             Self::EventPlane(status) => status.as_str(),
             Self::EventPlaneStranded(_) => "event_plane_replacement_stranded",
+            Self::EventPlaneStageOverlap => "event_plane_stage_overlap",
+            Self::EventPlaneUnfunded { .. } => "event_plane_stage_unfunded",
+            Self::EventPlaneActivationFaulted => "event_plane_activation_faulted",
             Self::EventPlaneCleanup => "event_plane_cleanup_failed",
             Self::EntityFamilyCleanup(PackageEntityCleanupError::GenerationExhausted) => {
                 "entity_family_generation_exhausted"
@@ -5981,6 +5996,16 @@ impl fmt::Display for HubLuaPluginLoadError {
                  previous plugin version still runs without event subscriptions",
                 status.as_str()
             ),
+            Self::EventPlaneStageOverlap => {
+                formatter.write_str("another package event generation is already staged")
+            }
+            Self::EventPlaneUnfunded { required, reserved } => write!(
+                formatter,
+                "staging the package event generation needs {required} bytes; the attempt reserved {reserved}"
+            ),
+            Self::EventPlaneActivationFaulted => formatter.write_str(
+                "the package event generation could not be activated after the plugin was installed",
+            ),
             Self::EventPlaneCleanup => {
                 formatter.write_str("event router cleanup requires recovery")
             }
@@ -6000,7 +6025,11 @@ impl Error for HubLuaPluginLoadError {
             Self::Package(_) => None,
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
-            Self::EventPlane(_) | Self::EventPlaneStranded(_) => None,
+            Self::EventPlane(_)
+            | Self::EventPlaneStranded(_)
+            | Self::EventPlaneStageOverlap
+            | Self::EventPlaneUnfunded { .. }
+            | Self::EventPlaneActivationFaulted => None,
             Self::EventPlaneCleanup | Self::EntityFamilyCleanup(_) => None,
         }
     }

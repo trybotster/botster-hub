@@ -173,7 +173,8 @@ pub(crate) fn value_build(
     }
 }
 
-#[cfg(test)]
+/// Heap bytes a JSON value retains, by capacity, with maps sized by the
+/// shared B-tree node model. `None` on overflow.
 pub(crate) fn retained_bytes(value: &serde_json::Value) -> Option<usize> {
     match value {
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
