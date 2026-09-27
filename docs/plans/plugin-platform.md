@@ -350,116 +350,142 @@ latency, not CPU. A handler that publishes 512 times does not fit the 1 s
 event deadline on a loaded host (evidence:
 `botster-evidence/core-pin-549b3f6-20260926/core-per-publication-20260926.md`).
 
-This is wrong for the platform. A publication therefore is NOT a host call
-(section 4.2): it does not suspend the handler and has no per-publication
-result round trip.
+This is wrong for the platform. The contract below replaces it. It uses only
+mechanisms that sections 4.2 and 5.1 already define.
 
-**What `entity_publish` does.** `botster.entity_publish(spec)` runs in the VM:
-1. It validates the frame locally: shape, the plugin's declared entity family,
-   and the size bound.
-2. It takes one unit of publication credit (see "Credit" below).
-3. It appends a `Publish` message to the plugin's ordered outbound stream,
-   the same stream that carries `HostCall`, `Log`, and `InvocationResult`
-   (section 4.1). On the process host this stream is the single IPC writer,
-   which keeps push order. On the thread host it is a per-plugin FIFO.
-4. It returns at once, without suspending:
-   - `{ ok = true, value = { seq = <n> } }`, where `seq` is the plugin's
-     local publication sequence;
-   - `invalid_request` or `capability_denied` for a local validation failure.
+**4.5.1 Transport and credit.** A publication is a host call of kind
+`publish`, with `max_result_bytes = 0`, that the Lua side does not wait on:
+- `botster.entity_publish(spec)` validates the frame locally (shape, the
+  plugin's declared entity family, size), then sends it with the ordinary
+  host-call send (section 4.2 step 1). The send debits one delivery-pool slot
+  and the request bytes against the plugin's own pool room (section 5.1).
+- The Lua call does not yield. It returns `{ ok = true, value = { seq = <n>
+  } }` at once, where `seq` is the plugin's local publication sequence. A
+  local validation failure returns `invalid_request` or `capability_denied`,
+  and nothing is sent.
+- The call's one terminal is `release_call`, made after the Hub applies or
+  discards the publication (section 5.1 item 5). No result is admitted, so
+  the publication never resumes the handler. Releasing the call returns the
+  slot to the plugin, through the pool's unit-returned credit.
+- Credit is therefore the plugin's own delivery pool (the approved 128 slots
+  / 512 KiB per plugin). One plugin's publications cannot consume a
+  sibling's credit. Publications share the pool with the same plugin's other
+  host calls, and no other plugin's.
+- The Hub-wide `PUBLICATION_CAPACITY` (256) no longer bounds platform
+  publications; each plugin's pool does (at most 8 x 128). This change of an
+  existing bound needs the user's confirmation (section 18, item 15).
+- On the process host all of this is existing Core mechanism: a non-waiting
+  `HostPort::call`, `DeliveryPool::release_call`, and the unit-returned
+  credit. No new frame type is needed.
 
-   When no credit is left, `entity_publish` suspends the handler once and
-   resumes it when credit returns. This is a backpressure wait, not a round
-   trip per publication. Outside a suspendable handler (for example during
-   load), it returns `backpressured` instead, and nothing is sent.
+**4.5.2 Order and the bounded consumer.** The Hub applies one plugin's
+publications in the order it accepts them, through the existing entity
+pipeline:
+- A plugin's first queued publication marks the plugin's apply slice ready
+  (a coalesced wake, as for any ready owner work). Later publications while
+  the slice is marked add no wake.
+- One activation of the slice submits one Host apply operation. That
+  operation applies queued publications in order until the queue is empty or
+  the owner turn budget ends.
+- Progress rule: every activation applies at least one publication. If
+  publications remain when the activation ends, the slice marks itself ready
+  again. A partial batch therefore always continues.
+- Apply completion: when the Host operation completes, its completion wakes
+  the owner through the existing Host completion path. The owner then:
+  1. calls `release_call` for each applied or discarded publication;
+  2. adds them to the per-chain applied counts;
+  3. re-evaluates the held answers of those chains (4.5.3).
 
-**Order and batching.** The Hub applies one plugin's publications in stream
-order through the existing entity pipeline. Different plugins do not wait for
-each other. The apply side coalesces:
-- The owner is woken once when a plugin's publication queue goes from empty
-  to non-empty (a coalesced wake bit, as for `Log`), not once per
-  publication.
-- One Host operation applies every publication queued at that moment, in
-  order.
+**4.5.3 Barrier on answers.** The Hub keeps two counts per chain, across the
+root invocation and every resume: publications sent and publications applied.
+- A success-carrying answer is held until the chain's applied count reaches
+  the sent count recorded when that answer arrived. The success-carrying
+  answers are a request-response chain's `Reply` and the final result of any
+  other chain. All earlier publications of the chain are covered, including
+  those sent by an earlier invocation before it suspended.
+- A held `Reply` keeps its reply credit and its charge until it is released.
+- The check is O(1) per chain. It runs at apply completion (4.5.2) and when
+  the answer arrives. There is no wait and no poll.
+- If a covered publication failed to apply, the held answer becomes
+  `{ ok = false, error = { kind = "failed", detail = { publication_seq,
+  reason } } }` when it is released.
+- Timeout and cancellation stay as in section 4.2: the waiter is answered at
+  once with `timed_out` or `cancelled`. Such an answer claims nothing about
+  the chain's publications. Publications already accepted still apply in
+  order. A later apply failure is counted and logged to the plugin's log ring
+  (section 7.1), and it answers no one.
 
-So owner-to-Host handoffs grow with the number of batches, not with N.
+**4.5.4 Credit wait.** When a publication send is refused for lack of pool
+room inside a suspendable handler, `entity_publish` suspends:
+- The invocation yields and publishes a `suspended` marker with the reason
+  `publish_credit`. The chain ledger keeps the coroutine as a credit wait. It
+  holds no call id and no pool slot.
+- Resume rule: the Hub resumes the chain when the plugin's queue of
+  unapplied publications becomes empty. That is an edge seen at apply
+  completion (4.5.2), not a count of single credits.
+- The resume is an `Invoke` admitted into the plugin's ordinary Background
+  capacity, the same capacity timers and stream events use (section 4.3). If
+  that admission is `Backpressured`, the resume record parks. It is retried
+  on the plugin's next completion, by the section 4.3 rule.
+- Cancelling the chain resumes it at once with `cancelled`. Unload or reload
+  retires the coroutine with `cancelled`, on the same path as a suspended
+  host call (section 4.2), and releases its ledger charge.
+- Outside a suspendable handler (for example during load), a refused send
+  returns `backpressured`, and nothing is sent.
 
-**Where apply errors go.** A publication can still fail when the Hub applies
-it (for example a stale sequence). The Hub does not report that error back to
-the Lua call, which has already returned. It records the first apply failure
-against the invocation that sent the publication (its `request_id`). The
-invocation's final result carries it (see "Barrier" below). Every apply
-failure is also counted, and logged to the plugin's log ring (section 7.1).
+**4.5.5 Bounds.** Let C be the pool room free for publications when the
+handler starts, with no other host call of that plugin in flight.
+- Under the resume rule (4.5.4), each resume finds C free, so the handler
+  sends C publications between credit waits.
+- A handler that publishes N times therefore waits for credit exactly
+  ceil(N / C) - 1 times, and 0 times when N <= C. This holds for any apply
+  schedule, because the resume waits for the queue to empty, not for single
+  credits.
+- With the plugin's other host calls in flight, C is smaller for that period.
+  The bound uses the smallest C seen.
+- Serial depth (producer-to-consumer cycles) is the number of credit waits
+  plus 1. Apply activations are budgeted work, not round trips. There are at
+  least ceil(N / C) of them, and the owner turn budget can split a batch into
+  more. The Hub counts them but asserts no constant bound on them.
 
-**Barrier: the handler's final result.** The Hub routes an invocation's final
-result (`done`, a handler error, or a timeout) only after it has applied every
-publication that the invocation sent before that result.
-- On the process host this needs no extra round trip: the publications come
-  before the `InvocationResult` in the same ordered stream.
-- On the thread host the Hub keeps, per invocation, the number of
-  publications sent and the number applied. It holds the completion in the
-  drain until the two are equal. This is an O(1) check at routing, with no
-  wait and no poll.
-- If any publication of the invocation failed to apply, the Hub turns a `done`
-  result into `{ ok = false, error = { kind = "failed",
-  detail = { publication_seq, reason } } }`. The Hub routes the handler's own
-  error or timeout unchanged; the publication failure is added to `detail`.
+**4.5.6 Barrier inside a handler.** `botster.entity_flush()` is one ordinary
+host call (section 4.2). The Hub answers it when the chain's applied count
+reaches the sent count recorded at the flush. It returns `{ ok = true, value
+= { applied = <n> } }`, or the first apply failure since the previous flush.
 
-**Barrier inside a handler.** `botster.entity_flush()` is one host call
-(section 4.2). It suspends once and resumes when every publication the plugin
-sent before it has been applied. It returns `{ ok = true, value = { applied
-= <n> } }`, or the first apply failure since the previous flush. A handler
-that needs to read back its own publications calls it once, not once per
-publication.
+**4.5.7 Cost.** A handler that publishes N times:
+- sends N non-waiting host calls;
+- suspends ceil(N / C) - 1 times for credit and once per `entity_flush`;
+- gets no per-publication result round trip.
 
-**Credit.** Publication credit bounds the unapplied publications of one
-plugin. A unit returns when the Hub applies the publication, or discards it.
-- Existing bounds stay: the global `PUBLICATION_CAPACITY` (256 retained
-  publications, `lua_runtime/entity_publish.rs`) and the entity publish bytes
-  counted in the callback account (section 5.0).
-- A per-plugin split of that capacity would be a new number. It is an open
-  decision for the user (section 18). Until then, every plugin draws from the
-  existing global bound.
-- With credit C, a handler that publishes N times suspends at most
-  ceil(N / C) times for credit, and 0 times when N <= C.
-
-**Cancellation.** Cancelling an invocation does not recall publications it
-already sent. The Hub still applies them in order, and then routes the
-`cancelled` result behind them.
-
-**Generation cleanup.** On unload or reload, the Hub discards the old
-generation's unapplied publications, counts them, and returns their credit.
-A stale-generation `Publish` that arrives later is dropped by the same
-generation check as a stale completion (section 4.2).
-
-**Cost.** A handler that publishes N times makes N `Publish` sends and 0
-per-publication round trips. It suspends only for credit (at most
-ceil(N / C) times) and once for each `entity_flush` it calls, plus its one
-final result. The apply side uses one owner wake and one Host operation per
-batch.
-
-**Deterministic test (slice 3 acceptance).** The test counts the whole path
-for one handler that publishes 512 times and then returns. Test-only counters
-record:
-- Lua suspensions and resumptions of the handler;
-- host calls and their result deliveries;
-- owner wakes and Host executor handoffs caused by the handler.
-
-The test holds the owner (it does not drive owner turns) until the handler
-parks, either suspended for credit or finished. Then it drives the owner.
-This makes the batch count exact and independent of timing.
-
-Assertions (C is the credit the test runs with):
-- 0 host calls;
-- exactly ceil(N / C) - 1 credit suspensions when N > C, and 0 when N <= C;
-- Host apply operations and owner wakes equal the number of batches,
-  ceil(N / C); for N = 1 and for N = C that is exactly 1;
-- `family_seq == 512`, and the final result is routed after the last
-  publication is applied.
-
-A second case publishes N <= C times, calls `entity_flush` once, and asserts
-exactly 1 suspension. Ablation: route each publication through a host call.
-The test then counts 512 host calls and 512 suspensions and fails at those
-assertions. The test measures no time.
+**4.5.8 Proofs (slice 3, both hosts).** Every test uses controlled gates:
+a test-only gate holds the apply slice, and the test releases it one step at
+a time. No test depends on scheduler timing.
+- Depth: N = 512 with pool room C.
+  - The test counts 512 publish sends, 0 publication results and ceil(512 /
+    C) - 1 credit waits.
+  - It also opens the gate in single-publication steps; the count of credit
+    waits is unchanged.
+  - Ablation: resume on every returned credit. The credit waits grow toward
+    N - C, and the assertion fails.
+- Reply barrier:
+  1. A request-response chain publishes in its root, suspends on a timer,
+     resumes, publishes again, and sends its `Reply`.
+  2. With the apply gate closed, the MCP caller is not answered, and the
+     reply credit stays charged.
+  3. Opening the gate answers the caller.
+  - Ablation: route the `Reply` without the barrier. The caller is answered
+    while the gate is closed.
+- Apply failure: a rejected publication turns the held `Reply` into
+  `failed` with `publication_seq`.
+- Cancellation and deadline: with the gate closed, cancelling the chain
+  answers `cancelled` at once. The publications apply when the gate opens,
+  and the apply failure counter is correct.
+- Credit wait lifecycle: cancel during a credit wait, and reload during a
+  credit wait. Both resume the coroutine with `cancelled`, and the accounting
+  returns to baseline.
+- Isolation: plugin A exhausts its pool with publications while plugin B
+  publishes. B never waits for credit.
 
 ## 5. Delivery, reservations, and accounting
 
@@ -533,7 +559,8 @@ Required proofs (slice 3):
    mirrors the pool's free room exactly. A host call debits one slot and its
    `max_result_bytes` before it is sent (section 4.2 step 1). If the room
    cannot fit the call, the call returns `backpressured` at once and does not
-   suspend. On the process host, a `HostCall` beyond its credit, or with an
+   suspend. The one exception is a publication inside a suspendable handler,
+   which waits for credit under the section 4.5.4 rule. On the process host, a `HostCall` beyond its credit, or with an
    unknown or duplicate `call_id`, is a protocol violation that kills the
    worker.
 4. **Guaranteed delivery.** Every outcome of an accepted call (success, Hub
@@ -1306,7 +1333,7 @@ setup.
 | 0 | Sandbox (section 14) | none | Host-file `dofile`/`loadfile` fail; bytecode `load` fails; `string.dump`, `print` absent; `collectgarbage("collect")` refused; a `pcall` spin fails at the budget; text `load` works. Per-guard control VM probes. |
 | 1 | Per-package grants (section 17 item 5); result convention for existing helpers; ABI doc rewrite | none | A package without `plugin_db` gets `capability_denied` while a granted sibling succeeds; the literal grant list is gone (ablation: restore it, the denial test fails). |
 | 2 | `log`, `json`, `clock`, `require` | log limits decision | `require` of a sibling module works; a symlinked or `..` module fails the load; log records reach `get_plugin_logs` with package and level; a flooding plugin drops records and reports the count without blocking. |
-| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; 8 plugins load and each uses its full completion share concurrently; one plugin with both request-response chains suspended does not delay a sibling's MCP call; its 3rd concurrent call is `backpressured`; a 9th plugin's load is refused with `quota_exceeded`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails); a handler that publishes 512 entities makes 0 host calls, suspends exactly ceil(512 / C) - 1 times for credit (0 when 512 <= C), and, with the owner held until the handler parks, its Host apply operations and owner wakes equal the batch count ceil(512 / C); its final result is routed after its last publication applies; with N <= C, one `entity_flush` is the only suspension (section 4.5; ablation: route each publication through a host call, 512 host calls are counted and the assertion fails). |
+| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; 8 plugins load and each uses its full completion share concurrently; one plugin with both request-response chains suspended does not delay a sibling's MCP call; its 3rd concurrent call is `backpressured`; a 9th plugin's load is refused with `quota_exceeded`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails); the publication proofs of section 4.5.8 (credit-wait depth, Reply barrier, apply failure, cancellation and deadline, credit-wait lifecycle, and sibling isolation), each with its ablation. |
 | 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; two watches on one collection each receive one notification for a burst of commits and one batch touching many documents; cancelling one watch leaves the other notified (ablation: remove folding, the second commit queues a second event); a collection projection delivers a delete from the commit diff to an entity subscriber; a collection projection serves a snapshot and a live change to an entity subscriber. |
 | 4b | Declarative views (section 12): schema, admission, projection, action routing; `surface_route` removed | none (user decision made); Web/TUI renderer work scheduled by the orchestrator | A manifest view over an undeclared family, an unknown field, or an unregistered action fails enable; an admitted view is projected to a daemon client; an action reaches the plugin handler with validated input and returns its result; a collection change reaches a client subscribed to the view's family; ablation: removing the field-allowlist check lets the invalid manifest enable. |
 | 5 | Sessions, messaging, caller identity (section 9) | cross-plugin control, message tools, caller auth decisions | A plugin cannot close a session it does not own without `:any`; post/receive round trip between two sessions; a forged caller is refused (option A). |
@@ -1482,6 +1509,8 @@ is replaced.
 
 Open (not yet decided by the user):
 
-15. Per-plugin publication credit (4.5): whether to split the existing global
-    `PUBLICATION_CAPACITY` (256) into per-plugin credit, and the split value.
-    Until the user decides, plugins draw from the global bound.
+15. Publication credit (4.5.1): platform publications draw on each plugin's
+    own delivery pool (the approved 128 slots / 512 KiB), which replaces the
+    Hub-wide `PUBLICATION_CAPACITY` (256) as their bound (at most 8 x 128 in
+    total). This changes an existing bound, so it needs the user's
+    confirmation before slice 3 lands.
