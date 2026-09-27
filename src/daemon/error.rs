@@ -159,6 +159,26 @@ pub(crate) fn bound_compensation_message(message: String, bound: usize) -> Strin
     message.chars().take(bound).collect()
 }
 
+/// A plugin load failure outside a package mutation's own typed reply.
+pub(crate) fn daemon_plugin_load_error(error: crate::HubLuaPluginLoadError) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    let message = error.to_string();
+    response.error = Some(DaemonOperatorError {
+        code: error.code().to_string(),
+        request_id: String::new(),
+        operation: "package_runtime".to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(
+            "package_runtime",
+            &message,
+        )],
+        message,
+    });
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
+    response
+}
+
 pub(crate) fn daemon_entrypoint_error(error: EntrypointSupervisorError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     response.error = Some(daemon_operator_error_from_entrypoint(error));

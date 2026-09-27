@@ -1584,7 +1584,22 @@ impl LuaPluginRuntime {
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
         };
-        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, memory)?;
+        // Lua reports errors against this name. An `@` name is a file name,
+        // so errors read `plugin.lua:3: ...`, relative to the package root.
+        let source_name = format!(
+            "@{}",
+            entrypoint
+                .strip_prefix(&prepared.package_root)
+                .unwrap_or_else(|_| Path::new(entrypoint.file_name().unwrap_or_default()))
+                .display()
+        );
+        let loaded = LoadedLuaPlugin::load(
+            plugin_key.clone(),
+            entrypoint,
+            &source_name,
+            host_api,
+            memory,
+        )?;
         let runtime = Arc::new(loaded.runtime);
         #[cfg(test)]
         lua_plugin_runtimes
@@ -1605,9 +1620,22 @@ impl LuaPluginRuntime {
         })
     }
 
+    /// Load under the entrypoint's own path as the Lua source name.
+    #[cfg(test)]
     fn new(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        host_api: LuaHostApi,
+        memory: Arc<LuaMemoryAccount>,
+    ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
+        let source_name = entrypoint.to_string_lossy().into_owned();
+        Self::new_named(plugin_key, entrypoint, &source_name, host_api, memory)
+    }
+
+    fn new_named(
+        plugin_key: PluginKey,
+        entrypoint: &Path,
+        source_name: &str,
         host_api: LuaHostApi,
         memory: Arc<LuaMemoryAccount>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
@@ -1647,7 +1675,7 @@ impl LuaPluginRuntime {
             let capacity_string = install_botster_api(lua, plugin_key.clone(), host_api)?;
             let value: Value = lua
                 .load(&source)
-                .set_name(entrypoint.to_string_lossy().as_ref())
+                .set_name(source_name)
                 .eval()
                 .map_err(LuaPluginRuntimeError::from)?;
             let registration = registration_from_value(lua, value)?;
@@ -1875,11 +1903,17 @@ impl LoadedLuaPlugin {
     fn load(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        source_name: &str,
         host_api: LuaHostApi,
         memory: Arc<LuaMemoryAccount>,
     ) -> Result<Self, LuaPluginRuntimeError> {
-        let (runtime, registration) =
-            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api, memory)?;
+        let (runtime, registration) = LuaPluginRuntime::new_named(
+            plugin_key.clone(),
+            entrypoint,
+            source_name,
+            host_api,
+            memory,
+        )?;
         let mut handlers = Vec::new();
         let mut event_handlers = Vec::new();
         let mut descriptors = Vec::new();

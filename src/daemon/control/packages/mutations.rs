@@ -25,9 +25,31 @@ fn load_package_after_enable(
     if prepared.selected_lua_entrypoint().is_some() {
         runtime
             .load_lua_plugin_package(registry, package_name)
-            .map_err(crate::HubDaemonError::from)?;
+            .map_err(|error| {
+                log_plugin_load_failure("enable", package_name, &prepared, &error);
+                crate::HubDaemonError::from(error)
+            })?;
     }
     Ok(())
+}
+
+/// Record a plugin load failure with its local context. Lua reports errors
+/// against the package-relative entrypoint, so the absolute path is kept here.
+fn log_plugin_load_failure(
+    operation: &str,
+    package_name: &str,
+    prepared: &crate::PreparedLocalPackage,
+    error: &crate::HubLuaPluginLoadError,
+) {
+    crate::hub_log::hub_log!(
+        "package_plugin_load_failed operation={operation} package={package_name} package_root={} entrypoint={} code={} error={error}",
+        prepared.package_root.display(),
+        prepared
+            .selected_entrypoint_path
+            .as_deref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
+        error.code(),
+    );
 }
 
 fn reload_package(
@@ -44,7 +66,10 @@ fn reload_package(
                 registry,
                 package_name,
             )
-            .map_err(crate::HubDaemonError::from)?;
+            .map_err(|error| {
+                log_plugin_load_failure("reload", package_name, &prepared, &error);
+                crate::HubDaemonError::from(error)
+            })?;
     }
     Ok(())
 }
