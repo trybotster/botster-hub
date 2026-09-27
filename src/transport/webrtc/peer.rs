@@ -119,6 +119,16 @@ pub(crate) struct PeerRemoveResult {
     pub attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 }
 impl LocalWebrtcTransport {
+    /// A transport whose client event plane raises the Hub owner's `signal`.
+    pub(crate) fn with_owner_signal(signal: Arc<crate::daemon::owner_signal::OwnerSignal>) -> Self {
+        Self {
+            event_plane: SharedEventPlane(Arc::new(
+                crate::subscription::package_events::ClientEventPlane::new(signal),
+            )),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn bind_entity_capacity_wake(&mut self, wake: EntitySubscriptionCapacityWake) {
         self.entity_capacity_wake = wake;
     }
