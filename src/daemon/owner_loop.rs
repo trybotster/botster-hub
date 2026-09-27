@@ -4164,6 +4164,108 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove client cleanup test directory");
     }
 
+    /// A request parked behind the active entity model is re-polled when that
+    /// model faults, and fails with a typed error, through the owner's own
+    /// scheduling: no other progress is injected after the fault.
+    #[test]
+    fn a_request_parked_behind_a_faulted_model_is_refused_through_the_owner() {
+        let root = unique_package_control_dir("parked-behind-fault");
+        let package_dir = root.join("parked.plugin");
+        write_package_control_manifest(&package_dir, "parked.plugin", serde_json::json!({}));
+        let mut daemon =
+            HubDaemon::start(package_control_config(root.join("data"))).expect("start daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "parked.plugin".into(),
+            },
+        )
+        .expect("enable");
+        daemon.runtime().unwrap().test_store_family_payload(
+            crate::package_entity_fanout::PackageEntityMutation::Upsert {
+                admission: None,
+                entity_type: "parked.plugin.item".into(),
+                snapshot_seq: 1,
+                id: "item".into(),
+                entity: serde_json::json!({"id": "item"}),
+            },
+        );
+        // The active model: its Host job is in flight until it fails below.
+        let blocker_identity = crate::host_executor::HostJobIdentity::first(
+            crate::owner_identity::WaiterId(u64::MAX - 7),
+        );
+        let blocker_permit = daemon
+            .runtime()
+            .unwrap()
+            .host_executor()
+            .try_reserve()
+            .expect("reserve the blocker");
+        let blocker = daemon
+            .runtime()
+            .unwrap()
+            .begin_entity_model(
+                blocker_identity,
+                crate::runtime::entity_model::Operation::TakeFanout { retained: None },
+                &blocker_permit,
+            )
+            .unwrap_or_else(|_| panic!("the model is free"));
+
+        let mut state = DaemonControlState::default();
+        let reply = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::DisablePackage {
+                package_name: "parked.plugin".into(),
+            },
+            "parked-client",
+            "parked-request",
+        );
+        // timer: deadline — bounds each owner-driven phase below.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let turn = |daemon: &mut HubDaemon, state: &mut DaemonControlState| {
+            publish_completion_wakes(daemon, state);
+            publish_maintenance_wakes(state);
+            if let Some(item) = state.owner_ready.pop_next() {
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                assert!(!dispatch_owner_ready_item(daemon, state, item, &mut budget));
+            }
+        };
+        while state.family_cleanup_waiters.is_empty() {
+            turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < deadline,
+                "the cleanup must park behind the active model"
+            );
+            thread::yield_now();
+        }
+        let waiter = *state.family_cleanup_waiters.keys().next().unwrap();
+
+        // The blocker's owner faults it after its Host job fails.
+        daemon
+            .runtime()
+            .unwrap()
+            .fault_entity_model(blocker_identity);
+        while state.pending_requests.contains_key(&waiter) {
+            turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < deadline,
+                "the fault must re-poll the parked cleanup"
+            );
+            thread::yield_now();
+        }
+        let response = receive_test_control_reply(reply).expect("a typed response");
+        assert!(response.error.is_some(), "{response:?}");
+        drop(blocker);
+        drop(blocker_permit);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn package_event_cleanup_reuses_its_slot_at_full_host_capacity() {
         for (disconnected, contended, stale) in [
