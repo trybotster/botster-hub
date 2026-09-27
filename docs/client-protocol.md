@@ -276,6 +276,26 @@ the pair. `FEATURE_ATTACH_OCCUPANCY` is advertised support. It is not in
 `DaemonCompatibilityRequirement::current()`. Unix connection EOF releases the
 generation still owned by that `client_id`. It does not `ShutdownSession` and
 does not emit `TerminalSubscriptionClosed` on the dead socket.
+
+`TerminalSubscriptionClosed.reason` names why a bound terminal subscription
+ended while its connection stayed up:
+- `host_adapter_closed` (`TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER`): Hub
+  closed the adapter.
+- `core_adapter_closed` (`TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER`): Core
+  closed the adapter. Hub reports it only while the session is running; a
+  session that exits delivers PROCESS_EXIT on the route instead.
+- `worker_lost` (`TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST`): the session's
+  worker died without an exit report, so the route got no PROCESS_EXIT. Hub
+  reports it whatever the registry state. The session entity then reports
+  `lifecycle: "failed"` with `failure_reason: "worker_lost"`.
+A client that does not know a reason still treats the event as a close.
+Detach and ShutdownSession never produce one of these events for the
+generation they end.
+
+Core refuses terminal input, resize and guarded writes from a client that has
+no active subscription on the session. Nothing reaches the session. The
+request fails with the operator error code `not_attached`, never an Ok that
+dropped the bytes.
 During steady state the daemon reads one shared Core lifecycle journal cursor;
 the filesystem-backed baseline counter advances only for initial seeding or an
 explicit journal resync.

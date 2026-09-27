@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use botster_hub_client::{
     DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
-    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
+    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER, TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST,
 };
 
 use crate::subscription::closed_events::ClosedEventLedger;
+use crate::transport::shared::close_reason::CloseReport;
 
 /// Bounded ready-channel capacity. Matches the Core wake channel.
 pub(crate) const CLOSE_WORK_QUEUE_CAPACITY: usize = 64;
@@ -30,12 +31,25 @@ pub(crate) struct RouteCloseState {
     pub retired: AtomicBool,
     pub reported: AtomicBool,
     pub host_closed: AtomicBool,
+    /// Core closed the route first because the session's worker was lost.
+    pub worker_lost: AtomicBool,
     pub key: RouteCloseKey,
     ledger: ClosedEventLedger,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl RouteCloseState {
+    fn record(&self, report: CloseReport) {
+        self.host_closed.store(report.host_closed, Ordering::SeqCst);
+        self.worker_lost.store(report.worker_lost, Ordering::SeqCst);
+    }
+
+    /// A lost worker ends the session without PROCESS_EXIT on this route, so
+    /// its close is reported whatever the registry state.
+    pub(crate) fn reports_without_registry(&self) -> bool {
+        self.worker_lost.load(Ordering::SeqCst)
+    }
+
     fn enqueue_closed_event(&self) {
         if self.ledger.generation_is_suppressed(
             &self.key.session_id,
@@ -48,7 +62,9 @@ impl RouteCloseState {
         if self.reported.swap(true, Ordering::SeqCst) {
             return;
         }
-        let reason = if self.host_closed.load(Ordering::SeqCst) {
+        let reason = if self.worker_lost.load(Ordering::SeqCst) {
+            TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST
+        } else if self.host_closed.load(Ordering::SeqCst) {
             TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
         } else {
             TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
@@ -72,14 +88,14 @@ pub(crate) struct CloseWorkHook {
 }
 
 impl CloseWorkHook {
-    pub(crate) fn notify_closed(&self, host_closed: bool) {
+    pub(crate) fn notify_closed(&self, report: CloseReport) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
         if state.retired.load(Ordering::Acquire) {
             return;
         }
-        state.host_closed.store(host_closed, Ordering::SeqCst);
+        state.record(report);
         if state
             .queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -99,11 +115,11 @@ impl CloseWorkHook {
     }
 
     #[cfg(test)]
-    fn notify_closed_through_overflow(&self, host_closed: bool) {
+    fn notify_closed_through_overflow(&self, report: CloseReport) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        state.host_closed.store(host_closed, Ordering::SeqCst);
+        state.record(report);
         state.queued.store(true, Ordering::Release);
         self.overflow.store(true, Ordering::Release);
     }
@@ -152,6 +168,7 @@ impl CloseWorkSource {
             retired: AtomicBool::new(false),
             reported: AtomicBool::new(false),
             host_closed: AtomicBool::new(false),
+            worker_lost: AtomicBool::new(false),
             key: key.clone(),
             ledger,
             wake,
@@ -308,8 +325,8 @@ mod tests {
             ClosedEventLedger::default(),
             Arc::clone(&wake),
         );
-        live.notify_closed(false);
-        retired.notify_closed(false);
+        live.notify_closed(CloseReport::default());
+        retired.notify_closed(CloseReport::default());
         source.retire("dead", "sub", 3);
         source.force_overflow_for_test();
         let batch = source.take_batch(8);
@@ -339,7 +356,7 @@ mod tests {
             })
             .collect();
         for hook in &hooks {
-            hook.notify_closed_through_overflow(false);
+            hook.notify_closed_through_overflow(CloseReport::default());
         }
 
         let first = source.take_batch(8);
@@ -370,7 +387,7 @@ mod tests {
         assert_eq!(source.live_count(), baseline + 1);
         source.retire("session", "sub", 7);
         assert_eq!(source.live_count(), baseline);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseReport::default());
         assert!(source.take_batch(8).is_empty());
     }
 
@@ -381,7 +398,7 @@ mod tests {
         let ledger = ClosedEventLedger::default();
         let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
         ledger.suppress_generation("session", "sub", 7);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseReport::default());
         let state = source.take_batch(1).pop().expect("queued close work");
         state.report_if_live(true);
         assert!(
@@ -398,7 +415,7 @@ mod tests {
         let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
         ledger.suppress_generation("session", "sub", 7);
         ledger.unsuppress_generation("session", "sub", 7);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseReport::default());
         let state = source.take_batch(1).pop().expect("queued close work");
         state.report_if_live(true);
         assert!(matches!(
@@ -410,5 +427,62 @@ mod tests {
                 ..
             }) if session_id == "session" && subscription_id == "sub"
         ));
+    }
+
+    #[test]
+    fn worker_lost_close_reports_without_the_registry_and_names_the_loss() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let ledger = ClosedEventLedger::default();
+        let lost = source.register(
+            "lost".into(),
+            "sub".into(),
+            4,
+            ledger.clone(),
+            Arc::clone(&wake),
+        );
+        let ended = source.register(
+            "ended".into(),
+            "sub".into(),
+            5,
+            ledger.clone(),
+            Arc::clone(&wake),
+        );
+        let detached = source.register(
+            "detached".into(),
+            "sub".into(),
+            6,
+            ledger.clone(),
+            Arc::clone(&wake),
+        );
+        ledger.suppress_generation("detached", "sub", 6);
+        let worker_lost = CloseReport {
+            host_closed: false,
+            worker_lost: true,
+        };
+        lost.notify_closed(worker_lost);
+        ended.notify_closed(CloseReport::default());
+        detached.notify_closed(worker_lost);
+        let batch = source.take_batch(8);
+        assert_eq!(batch.len(), 3);
+        for state in batch {
+            // The registry answers "not running" for every one of them.
+            let emit = state.reports_without_registry();
+            assert_eq!(emit, state.key.session_id != "ended", "{:?}", state.key);
+            state.report_if_live(emit);
+        }
+        match ledger.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id, reason, ..
+            }) => {
+                assert_eq!(session_id, "lost");
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST);
+            }
+            other => panic!("expected one worker_lost event, got {other:?}"),
+        }
+        assert!(
+            ledger.pop_pending_event().is_none(),
+            "an ended close stays silent and a suppressed generation stays silent"
+        );
     }
 }

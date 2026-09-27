@@ -1573,9 +1573,14 @@ fn run_loop(
         {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             for state in close_batch {
-                let lookup = core_daemon
-                    .session_registry_state(&botster_core::SessionId(state.key.session_id.clone()));
-                match session_close_event_decision(lookup) {
+                let decision = if state.reports_without_registry() {
+                    Some(true)
+                } else {
+                    session_close_event_decision(core_daemon.session_registry_state(
+                        &botster_core::SessionId(state.key.session_id.clone()),
+                    ))
+                };
+                match decision {
                     Some(emit) => {
                         let key = state.key.clone();
                         state.report_if_live(emit);

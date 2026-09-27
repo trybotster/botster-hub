@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PROTOCOL_CRATE: &str = "botster-terminal-protocol";
-const PROTOCOL_REV: &str = "549b3f62dabacf45cce4b4dfd19e1a6800bf8c7a";
+const PROTOCOL_REV: &str = "85b35077465509219d23a5a9d8740d062e51b068";
 const FIXTURE_FILES: &[&str] = &[
     "late-attach-history-ready-v2.ghostsnp",
     "late-attach-history-page-v2.ghostsnp",

@@ -66,6 +66,13 @@ impl UnixTerminalAdapterInner {
         self.slot.close();
     }
 
+    fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.slot.close_from_core(reason);
+    }
+
     fn pressure(&self) -> TerminalAdapterPressure {
         self.slot.pressure()
     }
@@ -164,8 +171,11 @@ impl TerminalAdapter for UnixTerminalAdapter {
         self.inner.try_write(frame)
     }
 
-    fn close(&mut self) {
-        self.inner.close();
+    fn close(
+        &mut self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.inner.close_from_core(reason);
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -284,7 +294,7 @@ impl UnixConnectionMux {
                 self.inner.closed_events.clone(),
                 Arc::new(move || wake.wake()),
             );
-            handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
+            handle.attach_close_hook(move |report| hook.notify_closed(report));
         }
         self.inner.wake.wake();
         true
@@ -554,7 +564,10 @@ impl UnixTerminalAdapterHandle {
         self.inner.is_flush_deferred()
     }
 
-    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+    pub(crate) fn attach_close_hook(
+        &self,
+        hook: impl Fn(crate::transport::shared::close_reason::CloseReport) + Send + Sync + 'static,
+    ) {
         self.inner.slot.attach_close_hook(hook);
     }
 
@@ -576,6 +589,12 @@ impl ClosedHandle for UnixTerminalAdapterHandle {
 
     fn host_closed(&self) -> bool {
         UnixTerminalAdapterHandle::host_closed(self)
+    }
+
+    fn core_close_reason(
+        &self,
+    ) -> Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason> {
+        self.inner.slot.core_close_reason()
     }
 }
 
@@ -686,7 +705,7 @@ mod tests {
     #[test]
     fn host_close_after_core_close_does_not_claim_host_reason() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
-        adapter.close();
+        adapter.close(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Detached);
         assert!(handle.is_closed());
         assert!(!handle.host_closed());
         handle.close_from_host();
@@ -818,5 +837,70 @@ mod tests {
                 "unix adapter must stay content-blind: found {forbidden}"
             );
         }
+    }
+    #[test]
+    fn worker_lost_close_is_reported_whatever_the_registry_state() {
+        let mux = UnixConnectionMux::new();
+        let (mut lost, lost_handle) = mux.create_adapter();
+        assert!(mux.register("lost".into(), "sub".into(), 5, lost_handle.clone()));
+        let (mut ended, ended_handle) = mux.create_adapter();
+        assert!(mux.register("ended".into(), "sub".into(), 6, ended_handle.clone()));
+        TerminalAdapter::close(
+            &mut lost,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed,
+        );
+        TerminalAdapter::close(
+            &mut ended,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::SessionEnded,
+        );
+        // The registry no longer calls either session live (Stale / Exited).
+        // Both closed routes are classified; only the lost worker's emits.
+        assert_eq!(mux.queue_closed_subscription_events(|_| false), 2);
+        match mux.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id,
+                subscription_id,
+                generation,
+                reason,
+            }) => {
+                assert_eq!(
+                    (session_id.as_str(), subscription_id.as_str(), generation),
+                    ("lost", "sub", 5)
+                );
+                assert_eq!(
+                    reason,
+                    botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST
+                );
+            }
+            other => panic!("expected the worker_lost close event, got {other:?}"),
+        }
+        assert!(
+            mux.pop_pending_event().is_none(),
+            "an ended session's close stays silent"
+        );
+    }
+
+    #[test]
+    fn only_the_first_close_carries_the_core_reason() {
+        let (mut core_first, core_first_handle) = UnixTerminalAdapter::pair();
+        TerminalAdapter::close(
+            &mut core_first,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
+        TerminalAdapter::close(
+            &mut core_first,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed,
+        );
+        assert_eq!(
+            ClosedHandle::core_close_reason(&core_first_handle),
+            Some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced)
+        );
+        let (mut host_first, host_first_handle) = UnixTerminalAdapter::pair();
+        host_first_handle.close_from_host();
+        TerminalAdapter::close(
+            &mut host_first,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed,
+        );
+        assert_eq!(ClosedHandle::core_close_reason(&host_first_handle), None);
     }
 }
