@@ -134,14 +134,7 @@ impl EntrypointSupervisor {
         }
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -905,14 +898,7 @@ mod tests {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         let child = command.spawn().expect("spawn controlled process group");
         let process = supervised_running_process(child, launch_result_path);
         let descendant_pid = wait_for_pid_file(descendant_pid_path);
@@ -1175,14 +1161,7 @@ mod tests {
             .args(["-c", "while :; do sleep 1; done"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         let child = command.spawn().expect("spawn controlled process group");
         let pid = child.id();
         let key = EntrypointKey {
@@ -1227,14 +1206,7 @@ mod tests {
             .args(["-c", "sleep 60 & wait"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         let child = command
             .spawn()
             .expect("spawn missing-publication process group");

@@ -308,14 +308,7 @@ impl CommandRunner for ProcessCommandRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         let mut child = command
             .spawn()
             .map_err(|error| format!("start {program}: {error}"))?;
@@ -379,14 +372,7 @@ impl CommandRunner for ProcessCommandRunner {
         for (name, value) in environment {
             command.env(name, value);
         }
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         let mut child = command
             .spawn()
             .map_err(|error| format!("start {program}: {error}"))?;
