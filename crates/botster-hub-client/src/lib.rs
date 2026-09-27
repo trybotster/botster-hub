@@ -3784,6 +3784,12 @@ pub enum DaemonQuarantine {
         /// False when the quarantine could not be persisted: it lasts only
         /// until the Hub restarts.
         durable: bool,
+        /// True while the package's runtime is still loaded. A loaded
+        /// quarantined package is inert: it receives no event and no
+        /// invocation. Resolve unloads it.
+        loaded: bool,
+        /// Zero when the Hub holds no record of the failure; the failure
+        /// texts are then empty.
         quarantined_at_ms: u64,
     },
 }
