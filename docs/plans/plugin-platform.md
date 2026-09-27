@@ -362,7 +362,8 @@ mechanisms that sections 4.2 and 5.1 already define.
 - The Lua call does not yield. It returns `{ ok = true, value = { seq = <n>
   } }` at once, where `seq` is the plugin's local publication sequence. A
   local validation failure returns `invalid_request` or `capability_denied`,
-  and nothing is sent.
+  and nothing is sent. A frame larger than the plugin's pool bytes is such a
+  failure (`invalid_request`), because it could never be sent.
 - The call's one terminal is `release_call`, made after the Hub applies or
   discards the publication (section 5.1 item 5). No result is admitted, so
   the publication never resumes the handler. Releasing the call returns the
@@ -435,6 +436,11 @@ room inside a suspendable handler, `entity_publish` suspends:
   apply completion (4.5.2). A waiter never depends on an apply edge alone.
   This covers the case where the publication queue is already empty and
   another host call holds the room.
+- The Hub also re-checks the new head whenever the waiter list changes
+  without a credit return: when the head is cancelled or retired, and when a
+  resumed chain's invocation ends (its next marker or final result arrives)
+  without it sending a publication. Credit left free by a waiter that left is
+  therefore never stranded.
 - **Resume.** At most the head waiter is resumed per check, in FIFO order.
   The resume does not reserve room. If another chain of the plugin takes the
   room first, the resumed send is refused again, and the chain registers
@@ -450,22 +456,28 @@ room inside a suspendable handler, `entity_publish` suspends:
 - Outside a suspendable handler (for example during load), a refused send
   returns `backpressured`, and nothing is sent.
 
-**4.5.5 Bounds.** A publication needs 1 slot plus its frame bytes. Let B be
-the largest publication frame the handler sends. The publication room R at a
-moment is min(free slots, floor(free bytes / B)). R can be 0.
-- Let R_min be the smallest room at any resume. Readiness (4.5.4) needs room
-  for at least one publication, so R_min >= 1. When R_min = 1 the bound
-  degenerates to N; this is the case while the plugin's other host calls hold
-  almost all of the pool.
-- Each resume starts with an empty publication queue and room R >= R_min, so
-  the handler sends at least R_min publications before it can wait again.
-- Upper bound, for any apply schedule: a handler that publishes N times waits
-  for credit at most ceil(N / R_min) times. If the room at the handler's
-  start is at least R_min, the bound is ceil(N / R_min) - 1.
+**4.5.5 Bounds.** A publication needs 1 slot plus its frame bytes. Local
+validation (4.5.1) refuses a frame larger than the plugin's pool bytes with
+`invalid_request`, so every accepted frame fits an empty pool. Let B be the
+largest publication frame the handler sends. With the whole pool free, the
+room is R_full = min(pool slots, floor(pool bytes / B)), and R_full >= 1.
+- **Scope of the bound: an uncontended producer.** One chain of the plugin
+  publishes, and no other host call of that plugin is in flight from its
+  first credit wait onward.
+- In that scope, readiness (4.5.4) needs an empty publication queue, and no
+  other call holds room, so every resume starts with the whole pool free and
+  sends at least R_full publications before it can wait again.
+- Upper bound, for any apply schedule: the handler waits for credit at most
+  ceil(N / R_full) times, and at most ceil(N / R_full) - 1 times if the pool
+  was whole when it started.
 - The count can be lower. Publications applied while the handler is still
-  sending return room early, so the handler may send more than R before its
-  first wait, or never wait. Exact counts are claimed only in tests that keep
+  sending return room early. Exact counts are claimed only in tests that keep
   the apply gate closed until the handler waits (4.5.8).
+- **Under contention** (several chains of the plugin publishing, or other
+  host calls of the plugin in flight), the resume reserves no room, and
+  another chain can take it first. The Hub guarantees only that no wake is
+  missed (4.5.4); it claims no count bound. Different plugins never contend,
+  because each has its own pool (4.5.1).
 - Serial depth (producer-to-consumer cycles) is the number of credit waits
   plus 1. Apply activations are budgeted work, not round trips. The owner
   turn budget can split a batch into more activations. The Hub counts
@@ -478,21 +490,22 @@ reaches the sent count recorded at the flush. It returns `{ ok = true, value
 
 **4.5.7 Cost.** A handler that publishes N times:
 - sends N non-waiting host calls;
-- suspends at most ceil(N / R_min) times for credit (4.5.5), and once per
-  `entity_flush`;
+- as an uncontended producer, suspends at most ceil(N / R_full) times for
+  credit (4.5.5), and once per `entity_flush`;
 - gets no per-publication result round trip.
 
 **4.5.8 Proofs (slice 3, both hosts).** Every test uses controlled gates:
 a test-only gate holds the apply slice, and the test releases it one step at
 a time. No test depends on scheduler timing.
-- Depth: N = 512 publications of equal size, starting with pool room R and
-  no other host call of the plugin in flight. The apply gate stays closed
-  until the handler waits, then opens.
+- Depth: an uncontended producer sends N = 512 publications of equal size,
+  starting with the whole pool free (room R_full). The apply gate stays
+  closed until the handler waits, then opens.
   - The test counts 512 publish sends, 0 publication results, and exactly
-    ceil(512 / R) - 1 credit waits.
+    ceil(512 / R_full) - 1 credit waits.
   - The same count holds when the test opens the gate one publication at a
     time after each wait, because readiness needs an empty queue.
-  - Ablation: resume on every returned credit. The waits grow toward N - R,
+  - Ablation: resume on every returned credit. The waits grow toward
+    N - R_full,
     and the assertion fails.
 - Queue already empty: the plugin's other host calls hold all of the pool.
   The publication waits with no publication queued. Releasing one of those
@@ -505,6 +518,12 @@ a time. No test depends on scheduler timing.
 - Multiple waiters: two chains of one plugin wait. Credit returns once for
   one publication. The first registered chain resumes, and the second waits
   until more credit returns.
+- Head leaves: two chains wait, and credit returns once for one
+  publication. The test cancels the first chain before its resumed send. The
+  second chain resumes and sends with no further credit return. Ablation:
+  skip the re-check when the head leaves. The second chain stays suspended.
+- Frame larger than the pool bytes: refused with `invalid_request`, and
+  nothing is sent.
 - Zero room at start: the handler's first publication waits, and the
   handler completes after credit returns.
 - Reply barrier:
@@ -1372,7 +1391,7 @@ setup.
 | 0 | Sandbox (section 14) | none | Host-file `dofile`/`loadfile` fail; bytecode `load` fails; `string.dump`, `print` absent; `collectgarbage("collect")` refused; a `pcall` spin fails at the budget; text `load` works. Per-guard control VM probes. |
 | 1 | Per-package grants (section 17 item 5); result convention for existing helpers; ABI doc rewrite | none | A package without `plugin_db` gets `capability_denied` while a granted sibling succeeds; the literal grant list is gone (ablation: restore it, the denial test fails). |
 | 2 | `log`, `json`, `clock`, `require` | log limits decision | `require` of a sibling module works; a symlinked or `..` module fails the load; log records reach `get_plugin_logs` with package and level; a flooding plugin drops records and reports the count without blocking. |
-| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; 8 plugins load and each uses its full completion share concurrently; one plugin with both request-response chains suspended does not delay a sibling's MCP call; its 3rd concurrent call is `backpressured`; a 9th plugin's load is refused with `quota_exceeded`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails); the publication proofs of section 4.5.8 (credit-wait depth with the gate closed, already-empty queue, registration race, multiple waiters, zero room, Reply barrier, apply failure, cancellation and deadline, credit-wait lifecycle, and sibling isolation), each with its ablation. |
+| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; 8 plugins load and each uses its full completion share concurrently; one plugin with both request-response chains suspended does not delay a sibling's MCP call; its 3rd concurrent call is `backpressured`; a 9th plugin's load is refused with `quota_exceeded`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails); the publication proofs of section 4.5.8 (credit-wait depth with the gate closed, already-empty queue, registration race, multiple waiters, head leaves, oversized frame, zero room, Reply barrier, apply failure, cancellation and deadline, credit-wait lifecycle, and sibling isolation), each with its ablation. |
 | 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; two watches on one collection each receive one notification for a burst of commits and one batch touching many documents; cancelling one watch leaves the other notified (ablation: remove folding, the second commit queues a second event); a collection projection delivers a delete from the commit diff to an entity subscriber; a collection projection serves a snapshot and a live change to an entity subscriber. |
 | 4b | Declarative views (section 12): schema, admission, projection, action routing; `surface_route` removed | none (user decision made); Web/TUI renderer work scheduled by the orchestrator | A manifest view over an undeclared family, an unknown field, or an unregistered action fails enable; an admitted view is projected to a daemon client; an action reaches the plugin handler with validated input and returns its result; a collection change reaches a client subscribed to the view's family; ablation: removing the field-allowlist check lets the invalid manifest enable. |
 | 5 | Sessions, messaging, caller identity (section 9) | cross-plugin control, message tools, caller auth decisions | A plugin cannot close a session it does not own without `:any`; post/receive round trip between two sessions; a forged caller is refused (option A). |
