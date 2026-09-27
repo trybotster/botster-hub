@@ -4,6 +4,9 @@ use botster_hub_client::{DaemonDiagnostic, DaemonOperatorError, DaemonRequest, D
 
 use crate::HubDaemon;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
+use crate::daemon::control::session_type_quarantine::{
+    PendingRepoQuarantine, QuarantineCause, REPO_SESSION_TYPE_QUARANTINED, UnknownOutcomeKind,
+};
 use crate::daemon::error::{DaemonTransportError, PackageRollbackFailure};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
@@ -374,6 +377,21 @@ pub(crate) fn handle(
             packages,
         })
     } else if is_session_type_prepare(&request) {
+        if let Some(root) = repo_session_type_root(&state_view, &request)
+            && state.repo_session_type_quarantine.contains(root)
+        {
+            #[cfg(test)]
+            state.repo_session_type_quarantine.note_refusal(
+                root,
+                crate::daemon::control::session_type_quarantine::QuarantineStage::Intake,
+            );
+            let error = quarantined_error();
+            return Some(ControlStep::ready(error_response(
+                &error.code,
+                "session_types",
+                &error.message,
+            )));
+        }
         if let Some(blocked_waiter) = blocked_session_type_waiter(state, &state_view, &request) {
             crate::daemon::control::pending::mark_owner_ready(
                 state,
@@ -437,6 +455,7 @@ pub(crate) fn handle(
                 family_work: None,
                 event_cleanup: None,
                 observes_session_type_catalog,
+                commit_obligation: None,
             },
         )),
         retire: None,
@@ -461,6 +480,31 @@ pub(crate) struct HostMutationContinuation {
     /// result of such a continuation conservatively counts as an external
     /// observation of it, even when that phase did not read the file.
     observes_session_type_catalog: bool,
+    /// Pre-effect evidence held from commit submission until the commit's
+    /// result arrives, so an uncertain or unknown outcome can be preserved.
+    commit_obligation: Option<CommitObligation>,
+}
+
+/// What the owner keeps while a submitted commit runs on the Host.
+enum CommitObligation {
+    /// A repository session-types file write, with its quarantine entry funded.
+    Repo(PendingRepoQuarantine),
+    /// A Hub-state document write.
+    Document {
+        base_revision: u64,
+        prior: Option<crate::shared_view::SharedView<crate::persistence::HubState>>,
+        candidate: crate::shared_view::SharedView<crate::persistence::HubState>,
+    },
+}
+
+/// A document commit whose Host job ended without a mutation result. The
+/// publication outcome is unknown; its pre-effect views are kept with the
+/// global Hub-state uncertainty obligation.
+pub(crate) struct UnknownDocumentOutcome {
+    _kind: UnknownOutcomeKind,
+    _base_revision: u64,
+    _prior: Option<crate::shared_view::SharedView<crate::persistence::HubState>>,
+    _candidate: crate::shared_view::SharedView<crate::persistence::HubState>,
 }
 
 impl HostMutationContinuation {
@@ -525,6 +569,7 @@ impl HostMutationContinuation {
             family_work,
             event_cleanup,
             observes_session_type_catalog,
+            commit_obligation,
         } = self;
         let waiter_id = *waiter_id;
         let must_finish = *must_finish;
@@ -541,6 +586,7 @@ impl HostMutationContinuation {
                     operation,
                 },
                 retained_prepare,
+                commit_obligation,
                 next_phase,
             );
         }
@@ -618,6 +664,17 @@ impl HostMutationContinuation {
                 if *observes_session_type_catalog {
                     crate::subscription::entity::note_session_type_catalog_observation(state);
                 }
+                // A commit whose Host job returned no mutation result has an
+                // unknown outcome: preserve it, then release admission.
+                if let Some(obligation) = commit_obligation.take() {
+                    let kind = match &result {
+                        HostResult::Failed { error, .. } => {
+                            UnknownOutcomeKind::from_host_code(&error.code)
+                        }
+                        _ => UnknownOutcomeKind::Other,
+                    };
+                    return finish_unknown_commit(state, waiter_id, permit, obligation, kind);
+                }
                 state.release_uncertain_reservation(waiter_id);
                 return finish_error(
                     permit,
@@ -635,11 +692,9 @@ impl HostMutationContinuation {
         if *observes_session_type_catalog {
             crate::subscription::entity::note_session_type_catalog_observation(state);
         }
-        if !matches!(
-            result,
-            HostMutationResult::PublishedUncertain { .. }
-                | HostMutationResult::ExternalEffectUncertain { .. }
-        ) {
+        // Any mutation result settles the submitted commit's obligation.
+        let obligation = commit_obligation.take();
+        if !matches!(result, HostMutationResult::PublishedUncertain { .. }) {
             state.release_uncertain_reservation(waiter_id);
         }
         if let Some(cleanup) = package_event_cleanup(&mut result) {
@@ -719,9 +774,19 @@ impl HostMutationContinuation {
                 drop(permit);
                 ControlPoll::Ready(Ok(error_response(code, "hub_state", message)))
             }
-            HostMutationResult::ExternalEffectUncertain { rollback, cause } => {
+            HostMutationResult::ExternalEffectUncertain { cause } => {
                 let (code, message) = cause.client_error();
-                state.retain_uncertain_external(waiter_id, rollback, cause);
+                let crate::host_mutations::ExternalEffectCause::RepoPublicationSyncUnconfirmed {
+                    cause: publication,
+                    ..
+                } = cause;
+                let Some(CommitObligation::Repo(pending)) = obligation else {
+                    unreachable!("a repository commit carries its funded quarantine entry");
+                };
+                // Scoped: only this repository root stops accepting writes.
+                state
+                    .repo_session_type_quarantine
+                    .install(pending, QuarantineCause::PublishedUncertain(publication));
                 release_document(state, waiter_id);
                 drop(permit);
                 ControlPoll::Ready(Ok(error_response(code, "repo_session_type", message)))
@@ -741,6 +806,7 @@ impl HostMutationContinuation {
                     operation,
                 },
                 retained_prepare,
+                commit_obligation,
                 next_phase,
             ),
             HostMutationResult::Committed(committed) => {
@@ -1131,6 +1197,7 @@ fn admit_or_park_commit(
     waiter_id: WaiterId,
     commit: ParkableCommit,
     retained: &mut Option<(PreparedMutation, HostWorkPermit)>,
+    obligation: &mut Option<CommitObligation>,
     next_phase: &mut u64,
 ) -> ControlPoll {
     let ParkableCommit {
@@ -1170,6 +1237,18 @@ fn admit_or_park_commit(
         daemon.state_view().0,
     ) {
         DocumentAdmission::Granted => {
+            let evidence = prepared.commit_evidence();
+            if let crate::host_mutations::CommitEvidence::RepoFile(repo) = &evidence
+                && state.repo_session_type_quarantine.contains(&repo.root)
+            {
+                #[cfg(test)]
+                state.repo_session_type_quarantine.note_refusal(
+                    &repo.root,
+                    crate::daemon::control::session_type_quarantine::QuarantineStage::CommitAdmission,
+                );
+                release_document(state, waiter_id);
+                return finish_error(permit, operation, quarantined_error());
+            }
             if !state.reserve_uncertain_publication(waiter_id) {
                 release_document(state, waiter_id);
                 return finish_error(
@@ -1183,6 +1262,41 @@ fn admit_or_park_commit(
                     },
                 );
             }
+            let held = match evidence {
+                crate::host_mutations::CommitEvidence::RepoFile(repo) => {
+                    // Fund the quarantine entry before the file effect.
+                    let budget = daemon.state_view().1.budget();
+                    match PendingRepoQuarantine::reserve(repo, &budget) {
+                        Ok(pending) => CommitObligation::Repo(pending),
+                        Err(error) => {
+                            state.release_uncertain_reservation(waiter_id);
+                            release_document(state, waiter_id);
+                            return finish_error(
+                                permit,
+                                operation,
+                                HostMutationError {
+                                    code: "recovery_capacity_exhausted".to_string(),
+                                    message: format!(
+                                        "the Hub-state budget cannot hold this write's recovery evidence: {} bytes requested, {} available",
+                                        error.requested, error.available
+                                    ),
+                                    event: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                crate::host_mutations::CommitEvidence::Document {
+                    base_revision,
+                    prior,
+                    candidate,
+                } => CommitObligation::Document {
+                    base_revision,
+                    prior,
+                    candidate,
+                },
+            };
+            *obligation = Some(held);
             let poll = submit_phase(
                 daemon,
                 state,
@@ -1192,6 +1306,8 @@ fn admit_or_park_commit(
                 next_phase,
             );
             if !matches!(poll, ControlPoll::Pending) {
+                // The commit never reached a Host worker, so there is no effect.
+                *obligation = None;
                 state.release_uncertain_reservation(waiter_id);
             }
             poll
@@ -1608,6 +1724,16 @@ fn blocked_session_type_waiter(
     hub_state: &crate::shared_view::SharedView<crate::persistence::HubState>,
     request: &DaemonRequest,
 ) -> Option<WaiterId> {
+    let root = repo_session_type_root(hub_state, request)?;
+    state.blocked_session_type_roots.get(root).copied()
+}
+
+/// The stored root of a repository session-type mutation's target. Target
+/// creation and update canonicalize it, so this reads no filesystem state.
+fn repo_session_type_root<'a>(
+    hub_state: &'a crate::persistence::HubState,
+    request: &DaemonRequest,
+) -> Option<&'a std::path::PathBuf> {
     let source = match request {
         DaemonRequest::CreateSessionType { source, .. }
         | DaemonRequest::UpdateSessionType { source, .. }
@@ -1617,12 +1743,64 @@ fn blocked_session_type_waiter(
     let botster_hub_client::DaemonSessionTypeMutationSource::Repo { target_id } = source else {
         return None;
     };
-    let root = hub_state
+    hub_state
         .spawn_targets
         .iter()
         .find(|target| target.target_id == *target_id)
-        .map(|target| &target.root)?;
-    state.blocked_session_type_roots.get(root).copied()
+        .map(|target| &target.root)
+}
+
+fn quarantined_error() -> HostMutationError {
+    HostMutationError {
+        code: REPO_SESSION_TYPE_QUARANTINED.to_string(),
+        message: "session types for this repository are quarantined after an uncertain write; resolve it or restart the Hub".to_string(),
+        event: None,
+    }
+}
+
+/// Preserve a submitted commit whose Host job returned no mutation result,
+/// then release document admission so later writers never deadlock.
+fn finish_unknown_commit(
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    permit: HostWorkPermit,
+    obligation: CommitObligation,
+    kind: UnknownOutcomeKind,
+) -> ControlPoll {
+    let (code, message) = match obligation {
+        CommitObligation::Repo(pending) => {
+            state.release_uncertain_reservation(waiter_id);
+            state
+                .repo_session_type_quarantine
+                .install(pending, QuarantineCause::UnknownOutcome(kind));
+            (
+                "repo_session_type_publication_uncertain",
+                "the repository session-type write ended without a result; its outcome is unknown",
+            )
+        }
+        CommitObligation::Document {
+            base_revision,
+            prior,
+            candidate,
+        } => {
+            state.retain_uncertain_unknown(
+                waiter_id,
+                UnknownDocumentOutcome {
+                    _kind: kind,
+                    _base_revision: base_revision,
+                    _prior: prior,
+                    _candidate: candidate,
+                },
+            );
+            (
+                "state_publication_uncertain",
+                "the state write ended without a result; its publication outcome is unknown",
+            )
+        }
+    };
+    release_document(state, waiter_id);
+    drop(permit);
+    ControlPoll::Ready(Ok(error_response(code, "hub_state", message)))
 }
 
 fn is_entrypoint_request(request: &DaemonRequest) -> bool {
@@ -1721,6 +1899,10 @@ mod tests {
     use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Parallel tests can read the same clock value; the counter keeps each
+    // test daemon's directory, and so its directory lock, distinct.
+    static NEXT_TEST_DAEMON: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn recovery_test_daemon() -> (HubDaemon, std::path::PathBuf) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1728,7 +1910,10 @@ mod tests {
             .as_nanos();
         let directory = std::path::PathBuf::from("target")
             .join("botster-hub-test-data")
-            .join(format!("package-restore-ownership-{unique}"));
+            .join(format!(
+                "package-restore-ownership-{unique}-{}",
+                NEXT_TEST_DAEMON.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
         let config = crate::HubStartupOptions {
             host: crate::HostIdentityOptions {
                 id: "package-restore-ownership".to_string(),
@@ -1831,6 +2016,7 @@ mod tests {
                 family_work: None,
                 event_cleanup: None,
                 observes_session_type_catalog: false,
+                commit_obligation: None,
             };
             let ControlPoll::ReadyHost(Ok(response), charge) =
                 continuation.poll(&mut daemon, &mut state)
@@ -1886,6 +2072,7 @@ mod tests {
             family_work: None,
             event_cleanup: None,
             observes_session_type_catalog: false,
+            commit_obligation: None,
         };
         assert!(matches!(
             continuation.poll(daemon, &mut state),
@@ -2085,6 +2272,7 @@ mod tests {
                 family_work: None,
                 event_cleanup: None,
                 observes_session_type_catalog: false,
+                commit_obligation: None,
             };
             assert!(!state.maintenance.wakes.take(delivery));
             let ControlPoll::ReadyHost(Ok(response), charge) =
@@ -2141,6 +2329,7 @@ mod tests {
             family_work: None,
             event_cleanup: None,
             observes_session_type_catalog: false,
+            commit_obligation: None,
         };
         let poll = continuation.poll(daemon, &mut state);
         assert!(matches!(
@@ -2155,31 +2344,6 @@ mod tests {
         assert_eq!(state.uncertain_publication_for_test(next_waiter), None);
         assert_eq!(state.document_owner, None);
         assert_eq!(state.document_waiters, [later_waiter].into_iter().collect());
-    }
-
-    #[test]
-    fn external_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
-        let (mut daemon, directory) = recovery_test_daemon();
-        let (_revision, prior) = daemon.state_view();
-        poll_uncertain_result(
-            &mut daemon,
-            HostMutationResult::ExternalEffectUncertain {
-                rollback: RollbackDescriptor::SessionType {
-                    previous: prior,
-                    repo_file: None,
-                },
-                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed {
-                    _error: SessionTypeError::new(
-                        "repo_session_type_sync_uncertain",
-                        "test uncertainty",
-                    ),
-                },
-            },
-            UncertainPublicationKind::External,
-            "repo_session_type_publication_uncertain",
-        );
-        daemon.stop();
-        std::fs::remove_dir_all(directory).expect("remove external uncertainty test directory");
     }
 
     #[test]
@@ -2381,5 +2545,432 @@ mod tests {
         wake_next_document_waiter(&mut state);
 
         assert!(state.document_waiters.is_empty());
+    }
+
+    // --- Scoped repository session-type quarantine and commit obligations ---
+
+    use crate::daemon::control::session_type_quarantine::QuarantineStage;
+    use crate::host_executor::HostCompletionPoll;
+    use crate::host_mutations::CommitPanicPoint;
+
+    const QUARANTINE_TARGET: &str = "quarantine-target";
+
+    /// A daemon with one enabled directory target whose canonical root exists.
+    fn quarantine_daemon() -> (HubDaemon, std::path::PathBuf, std::path::PathBuf) {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let root = directory.join("repo");
+        std::fs::create_dir_all(&root).expect("create repository root");
+        let root = root.canonicalize().expect("canonical repository root");
+        let view = {
+            let runtime = daemon.runtime().expect("runtime");
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: QUARANTINE_TARGET.into(),
+                label: QUARANTINE_TARGET.into(),
+                root: root.clone(),
+                enabled: true,
+                kind: "directory".into(),
+                base_ref: None,
+                metadata: Default::default(),
+            });
+            runtime.prepare_state(next).expect("target state fits")
+        };
+        daemon.publish_state(view);
+        (daemon, directory, root)
+    }
+
+    fn session_type_request(
+        id: &str,
+        source: botster_hub_client::DaemonSessionTypeMutationSource,
+    ) -> DaemonRequest {
+        DaemonRequest::CreateSessionType {
+            source,
+            definition: crate::client_api_dto::session::daemon_session_type_definition_from_client(
+                crate::PackageSessionType {
+                    id: id.to_string(),
+                    label: id.to_string(),
+                    description: None,
+                    icon: None,
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: Vec::new(),
+                    lifecycle: "durable".to_string(),
+                    execution: crate::PackageSessionTypeExecution::RelativeExecutable,
+                    command: "bin/agent".to_string(),
+                    args: Vec::new(),
+                    working_directory: crate::PackageSessionTypeWorkingDirectory::PackageRoot,
+                    environment: std::collections::BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                },
+            ),
+        }
+    }
+
+    fn repo_request(id: &str) -> DaemonRequest {
+        session_type_request(
+            id,
+            botster_hub_client::DaemonSessionTypeMutationSource::Repo {
+                target_id: QUARANTINE_TARGET.into(),
+            },
+        )
+    }
+
+    fn device_request(id: &str) -> DaemonRequest {
+        session_type_request(
+            id,
+            botster_hub_client::DaemonSessionTypeMutationSource::Device,
+        )
+    }
+
+    enum Begun {
+        Pending(WaiterId, Box<HostMutationContinuation>),
+        Ready(DaemonResponse),
+    }
+
+    fn begin(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        request: DaemonRequest,
+    ) -> Begun {
+        let waiter = daemon
+            .runtime()
+            .expect("runtime")
+            .next_waiter_id()
+            .expect("waiter id");
+        state.current_waiter_id = Some(waiter);
+        match handle(daemon, state, request).expect("host work handles session types") {
+            ControlStep::Pending(step) => {
+                let super::super::pending::ControlContinuation::HostMutation(continuation) =
+                    step.continuation
+                else {
+                    panic!("session-type work is a host mutation continuation");
+                };
+                Begun::Pending(waiter, continuation)
+            }
+            ControlStep::Ready(response) => Begun::Ready(response.expect("typed response")),
+        }
+    }
+
+    fn begin_pending(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        request: DaemonRequest,
+    ) -> (WaiterId, Box<HostMutationContinuation>) {
+        match begin(daemon, state, request) {
+            Begun::Pending(waiter, continuation) => (waiter, continuation),
+            Begun::Ready(response) => panic!("expected admitted work, got {response:?}"),
+        }
+    }
+
+    /// Route Host completions until `waiter` has one. The executor publishes
+    /// each completion exactly once; completions for other waiters are kept.
+    fn await_completion(daemon: &HubDaemon, state: &mut DaemonControlState, waiter: WaiterId) {
+        while !state.host_completions.contains_key(&waiter) {
+            match daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .poll_completion()
+            {
+                HostCompletionPoll::Ready(completion) => {
+                    // Catalog builds go to the catalog; this test's waiters,
+                    // which no pending request registry owns, stay retained.
+                    crate::subscription::entity::route_terminal_host_completion(state, completion)
+                        .expect("each completion is routed once");
+                }
+                HostCompletionPoll::Empty => std::thread::yield_now(),
+                HostCompletionPoll::Stopped => panic!("host executor stopped"),
+            }
+        }
+    }
+
+    /// Drive entity delivery, routing Host completions, until `found` accepts a
+    /// frame the subscriber received. The loop ends on that frame; the bound
+    /// only turns a lost delivery into a failure instead of a hang.
+    fn drive_until_frame(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        receiver: &std::sync::mpsc::Receiver<botster_hub_client::DaemonEntityFrame>,
+        what: &str,
+        found: impl Fn(&botster_hub_client::DaemonEntityFrame) -> bool,
+    ) -> botster_hub_client::DaemonEntityFrame {
+        let mut seen = Vec::new();
+        // timer: deadline — an iteration bound, not a wait; each turn either
+        // delivers, routes a completion, or yields once.
+        for _ in 0..2_000_000 {
+            // One owner turn routes Host completions, absorbs the catalog
+            // build, and runs subscriber delivery, as production does.
+            crate::daemon::owner_loop::drive_ready_test_turn(daemon, state);
+            crate::subscription::entity::drive_entity_subscriptions(daemon, state);
+            while let Ok(frame) = receiver.try_recv() {
+                if found(&frame) {
+                    return frame;
+                }
+                seen.push(frame);
+            }
+            std::thread::yield_now();
+        }
+        panic!("the subscriber never received {what}; frames seen: {seen:?}");
+    }
+
+    fn snapshot_ids(frame: &botster_hub_client::DaemonEntityFrame) -> Option<Vec<String>> {
+        let botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } = frame else {
+            return None;
+        };
+        Some(
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn live_session_type_subscriber_gets_the_file_after_an_uncertain_repo_write() {
+        let (mut daemon, directory, root) = quarantine_daemon();
+        let mut state = DaemonControlState::default();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+        let registered = crate::subscription::entity::register_builtin_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session_type".to_string(),
+            "types".to_string(),
+            crate::subscription::entity::EntityFrameSender::Blocking(sender),
+            None,
+        )
+        .expect("register the session-type subscription");
+        assert!(registered.error.is_none(), "{:?}", registered.error);
+        let baseline = drive_until_frame(
+            &mut daemon,
+            &mut state,
+            &receiver,
+            "a baseline snapshot",
+            |frame| snapshot_ids(frame).is_some(),
+        );
+        assert!(
+            !snapshot_ids(&baseline)
+                .expect("snapshot")
+                .contains(&"alpha".to_string())
+        );
+
+        let (waiter, mut work) = begin_pending(&mut daemon, &mut state, repo_request("alpha"));
+        await_completion(&daemon, &mut state, waiter);
+        crate::session_types::inject_next_repo_directory_sync_failure(&root);
+        let reply = settle(&mut daemon, &mut state, waiter, &mut work);
+        assert_eq!(
+            error_code(&reply),
+            Some("repo_session_type_publication_uncertain")
+        );
+        // The live subscriber receives a fresh catalog built from the current
+        // file, which holds the renamed but unconfirmed definition.
+        drive_until_frame(
+            &mut daemon,
+            &mut state,
+            &receiver,
+            "alpha after the write",
+            |frame| {
+                snapshot_ids(frame).is_some_and(|ids| ids.contains(&"alpha".to_string()))
+                    || matches!(
+                        frame,
+                        botster_hub_client::DaemonEntityFrame::Upsert { entity, .. }
+                            if entity.get("id").and_then(|id| id.as_str()) == Some("alpha")
+                    )
+            },
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove quarantine test directory");
+    }
+
+    /// Poll `continuation` to its reply, routing its own completions.
+    fn settle(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        waiter: WaiterId,
+        continuation: &mut HostMutationContinuation,
+    ) -> DaemonResponse {
+        loop {
+            match continuation.poll(daemon, state) {
+                ControlPoll::Pending => await_completion(daemon, state, waiter),
+                ControlPoll::Again => {}
+                other => return reply_of(other),
+            }
+        }
+    }
+
+    fn reply_of(poll: ControlPoll) -> DaemonResponse {
+        match poll {
+            ControlPoll::Ready(response) => response.expect("typed response"),
+            ControlPoll::ReadyHost(response, charge) => {
+                drop(charge);
+                response.expect("typed response")
+            }
+            _ => panic!("expected a reply"),
+        }
+    }
+
+    fn error_code(response: &DaemonResponse) -> Option<&str> {
+        response.error.as_ref().map(|error| error.code.as_str())
+    }
+
+    #[test]
+    fn uncertain_repo_write_quarantines_its_root_and_refuses_a_write_prepared_before_it() {
+        let (mut daemon, directory, root) = quarantine_daemon();
+        let mut state = DaemonControlState::default();
+        let (first, mut first_work) = begin_pending(&mut daemon, &mut state, repo_request("alpha"));
+        let (second, mut second_work) =
+            begin_pending(&mut daemon, &mut state, repo_request("beta"));
+        // Both writes are prepared before either commits.
+        await_completion(&daemon, &mut state, first);
+        await_completion(&daemon, &mut state, second);
+        crate::session_types::inject_next_repo_directory_sync_failure(&root);
+        assert!(matches!(
+            first_work.poll(&mut daemon, &mut state),
+            ControlPoll::Pending
+        ));
+        assert!(
+            matches!(
+                second_work.poll(&mut daemon, &mut state),
+                ControlPoll::Pending
+            ),
+            "the second write waits for document admission"
+        );
+        await_completion(&daemon, &mut state, first);
+        let first_reply = reply_of(first_work.poll(&mut daemon, &mut state));
+        assert_eq!(
+            error_code(&first_reply),
+            Some("repo_session_type_publication_uncertain")
+        );
+        assert_eq!(
+            state.repo_session_type_quarantine.cause_for(&root),
+            Some(QuarantineCause::PublishedUncertain(
+                crate::session_types::RepoPublicationCause::Injected
+            ))
+        );
+        assert_eq!(state.uncertain_publication_for_test(first), None);
+        assert_eq!(state.document_owner, None);
+
+        let second_reply = settle(&mut daemon, &mut state, second, &mut second_work);
+        assert_eq!(
+            error_code(&second_reply),
+            Some(REPO_SESSION_TYPE_QUARANTINED)
+        );
+        assert_eq!(
+            state.repo_session_type_quarantine.refusals_for(&root),
+            vec![QuarantineStage::CommitAdmission]
+        );
+
+        // A new write to the same root is refused at intake.
+        let Begun::Ready(third) = begin(&mut daemon, &mut state, repo_request("gamma")) else {
+            panic!("a quarantined root refuses at intake");
+        };
+        assert_eq!(error_code(&third), Some(REPO_SESSION_TYPE_QUARANTINED));
+        assert_eq!(
+            state.repo_session_type_quarantine.refusals_for(&root),
+            vec![QuarantineStage::CommitAdmission, QuarantineStage::Intake]
+        );
+
+        // Hub-state writes elsewhere continue: a device session type commits.
+        let (device, mut device_work) =
+            begin_pending(&mut daemon, &mut state, device_request("device-type"));
+        let device_reply = settle(&mut daemon, &mut state, device, &mut device_work);
+        assert_eq!(device_reply.error, None);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove quarantine test directory");
+    }
+
+    #[test]
+    fn repo_commit_panics_are_unknown_outcomes_that_quarantine_the_root() {
+        for point in [
+            CommitPanicPoint::BeforeEffect,
+            CommitPanicPoint::AfterEffect,
+        ] {
+            let (mut daemon, directory, root) = quarantine_daemon();
+            let mut state = DaemonControlState::default();
+            let (waiter, mut work) = begin_pending(&mut daemon, &mut state, repo_request("alpha"));
+            await_completion(&daemon, &mut state, waiter);
+            crate::host_mutations::inject_next_commit_panic(root.clone(), point);
+            let reply = settle(&mut daemon, &mut state, waiter, &mut work);
+            assert_eq!(
+                error_code(&reply),
+                Some("repo_session_type_publication_uncertain"),
+                "{point:?}"
+            );
+            assert_eq!(
+                state.repo_session_type_quarantine.cause_for(&root),
+                Some(QuarantineCause::UnknownOutcome(
+                    UnknownOutcomeKind::WorkerPanicked
+                )),
+                "{point:?}"
+            );
+            assert_eq!(state.document_owner, None, "{point:?}");
+            assert_eq!(
+                state.uncertain_publication_for_test(waiter),
+                None,
+                "{point:?}"
+            );
+            daemon.stop();
+            std::fs::remove_dir_all(directory).expect("remove quarantine test directory");
+        }
+    }
+
+    #[test]
+    fn document_commit_panic_keeps_the_global_obligation_and_releases_admission() {
+        let (mut daemon, directory, _root) = quarantine_daemon();
+        let mut state = DaemonControlState::default();
+        let (waiter, mut work) =
+            begin_pending(&mut daemon, &mut state, device_request("device-type"));
+        await_completion(&daemon, &mut state, waiter);
+        crate::host_mutations::inject_next_commit_panic(
+            directory.join("hub-state.json"),
+            CommitPanicPoint::BeforeEffect,
+        );
+        let reply = settle(&mut daemon, &mut state, waiter, &mut work);
+        assert_eq!(error_code(&reply), Some("state_publication_uncertain"));
+        assert_eq!(
+            state.uncertain_publication_for_test(waiter),
+            Some((UncertainPublicationKind::UnknownOutcome, false))
+        );
+        assert_eq!(state.document_owner, None, "admission is released");
+
+        // The global Hub-state stop holds: the next write is refused, not parked.
+        let (next, mut next_work) =
+            begin_pending(&mut daemon, &mut state, device_request("other-type"));
+        let next_reply = settle(&mut daemon, &mut state, next, &mut next_work);
+        assert_eq!(
+            error_code(&next_reply),
+            Some("state_publication_slot_occupied")
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove quarantine test directory");
+    }
+
+    #[test]
+    fn repo_failure_before_rename_neither_quarantines_nor_retains_its_charge() {
+        let (mut daemon, directory, root) = quarantine_daemon();
+        let mut state = DaemonControlState::default();
+        let budget = daemon.runtime().expect("runtime").shared_view_budget();
+        let (waiter, mut work) = begin_pending(&mut daemon, &mut state, repo_request("alpha"));
+        await_completion(&daemon, &mut state, waiter);
+        let used_before_commit = budget.used();
+        // A file where the .botster directory belongs fails before any rename.
+        std::fs::write(root.join(".botster"), b"not a directory").expect("block .botster");
+        let reply = settle(&mut daemon, &mut state, waiter, &mut work);
+        assert!(reply.error.is_some(), "the write fails before publication");
+        assert_ne!(
+            error_code(&reply),
+            Some("repo_session_type_publication_uncertain")
+        );
+        assert_eq!(state.repo_session_type_quarantine.cause_for(&root), None);
+        assert_eq!(
+            budget.used(),
+            used_before_commit,
+            "the entry reservation is released"
+        );
+        assert_eq!(state.document_owner, None);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove quarantine test directory");
     }
 }
