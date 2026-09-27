@@ -545,6 +545,83 @@ a time. No test depends on scheduler timing.
 - Isolation: plugin A exhausts its pool with publications while plugin B
   publishes. B never waits for credit.
 
+**4.5.9 Recorded inputs for the readiness and flow-control redesign
+(plugin Hub writer, 2026-09-27).** Slice 3 and the admission park-and-retry
+fix are paused for the redesign (user decision). These are the facts and
+decisions the paused work had established; the redesign may keep or replace
+them.
+
+1. Admission lock-busy (Core 19edeb1, on Core main):
+   - Core returns `PluginAdmissionResult::LockBusy { request_id, class }`
+     (serde status `lock_busy`) from `try_admit` only. When it returns, the
+     admission retry wake is armed or has already fired. The completion
+     notifier fires when a worker or the deadline waiter releases admission
+     state.
+   - A release on a host thread fires no wake, so the host must hold no
+     engine lock across its own admission attempts.
+   - A poisoned engine lock is `WorkerStopped` ("plugin worker engine lock is
+     poisoned"): terminal, never LockBusy.
+   - `Backpressured` now means only real saturation (class queue or
+     completion reservation).
+   - Hub pin: main is on Core 549b3f6, which has no LockBusy. 0058's roll goes
+     to 85b3507, which also has none.
+2. Hub admission sites and their current defects (full map:
+   `/private/tmp/plugin-platform/admission-lockbusy-sites-20260927.md`):
+   - control MCP calls (`daemon/control/plugins.rs`), package events and the
+     session family (`daemon_maintenance.rs`), and entity providers
+     (`plugin_entity.rs`) all end their admission `match` in `_ =>`. A new
+     variant compiles into the wrong arm. For package events, that arm
+     retires the holder: the event is dropped.
+   - Package events on `Backpressured`: requeue plus `wakes.mark_all()`. The
+     owner re-polls at once. This is a production retry loop, not a park
+     (orchestrator: a defect).
+   - Session family on any non-Queued result: `mark_gap` plus baseline
+     recovery. A transient contention costs a full recovery.
+   - Orchestrator decisions for the fix: park both LockBusy and Backpressured
+     on the completion wake (never a timer, never `mark_all`); exhaustive
+     matches, with no `_`; a test that counts owner turns while an admission
+     stays backpressured (the count stays bounded, and the test is red when
+     `mark_all` is restored); and a test seam that injects one LockBusy next
+     to `force_plugin_admit_backpressure`, asserting park, then admit on the
+     wake.
+3. Capability event notifier (slice 3 plan): Core's
+   `PluginCapabilityRuntime::set_event_notifier` (a callback after a runtime
+   queues an event; any thread; must not block) and `next_deadline` (the host
+   clamps its owner wait to it; a drain at or after the deadline cancels the
+   expired operation) are not wired in the Hub. The plan was: notifier to an
+   owner wake bit, the owner wait clamped to `next_deadline`, and
+   deterministic tests on the owner test driver.
+   OWNERSHIP (orchestrator, 2026-09-27): the readiness plan's step S4 installs
+   the notifier (to an owner signal) and `next_deadline` (in the owner
+   DeadlineIndex). The plugin platform owns the consumer, draining capability
+   events and resuming handlers (section 4.2), once S4 lands; until then it
+   stays paused.
+4. Completion-notifier contract (0058's triage of a lost `hub/session_family`
+   event on the 85b3507 roll): since Core 1c2e526, the notifier fires after
+   `InFlightGuard` drops and also for admission-state changes. If a completion
+   is published without an owner wake, the session-family consumer stays
+   `in_flight` and its later frames stay fenced. 0058 is building a
+   deterministic test on the owner test driver.
+5. Test driver (`daemon/owner_loop.rs`): `TestOwnerWakes::bind` binds the same
+   wake sources as the daemon loop. `drive_owner_until` runs turns only while
+   work is ready, otherwise blocks on a real wake with one hang-guard
+   deadline, and checks `done` before and after every turn. A missing wake
+   therefore fails at the hang guard. Proven pitfalls:
+   - `MaintenanceWakes::default` marks every slice;
+   - owner turns have a 2 ms wall-clock budget;
+   - a wake test must first prove the consumer is parked. The log mirror's
+     "records reach the Hub log" test passed with the wake removed, because
+     the append happened before the thread first waited. The fix is a
+     test-only parked flag, set under the lock before the Condvar wait.
+6. A readiness pattern that landing C uses (the plugin log mirror): the bounded
+   ring is the queue; one consumer keeps a cursor per producer; the producer
+   only notifies a Condvar; the consumer copies under a funded charge and does
+   I/O with no lock held; records evicted before consumption are counted, not
+   waited for. No new numbers, no polling.
+7. Readiness predicates: using the "work exists" predicate for a wake decision
+   either spins or parks. Four silent instances were found across four
+   subsystems. The package-event `mark_all` above is a fifth candidate.
+
 ## 5. Delivery, reservations, and accounting
 
 This section is the contract with the event-driven writer (Hub delivery
