@@ -3206,6 +3206,7 @@ mod tests {
                 control_tx.clone(),
                 message
             ));
+            drive_until_requests_answered(&mut daemon, &mut state);
             let response = read_response(&mut client, &mut reader, serial);
             assert!(
                 response.error.is_none(),
@@ -3238,6 +3239,7 @@ mod tests {
                 control_tx.clone(),
                 message
             ));
+            drive_until_requests_answered(&mut daemon, &mut state);
             assert!(read_response(&mut client, &mut reader, 3).error.is_none());
             let deadline = Instant::now() + Duration::from_secs(3);
             while !connection.test_cleanup_started() {
@@ -5711,6 +5713,22 @@ mod tests {
         match reader.read_frame(client).expect("read daemon hello ack") {
             DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => ack,
             other => panic!("expected hello ack, got {other:?}"),
+        }
+    }
+
+    /// Drive owner turns until no control request is pending. A package-event
+    /// request is answered through the owner's pending path, so a test that
+    /// reads its response must let the owner reach it.
+    fn drive_until_requests_answered(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+        // timer: deadline — the shared test hang guard; each turn is event-driven
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.pending_requests.is_empty() {
+            assert!(!drive_ready_test_turn(daemon, state));
+            assert!(
+                Instant::now() < deadline,
+                "the pending request must be answered"
+            );
+            thread::yield_now();
         }
     }
 
