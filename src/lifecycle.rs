@@ -181,17 +181,59 @@ impl HubPluginLifecycle {
         package_name: &str,
         bundle: HubPluginRuntimeBundle,
     ) -> HubLifecycleResult<PluginKey> {
+        let prepared = self.prepare_package(registry, package_name, bundle)?;
+        let (plugin_key, _) =
+            self.commit_package(RequestId("hub-load-registration".into()), prepared);
+        Ok(plugin_key)
+    }
+
+    /// Run every fallible check for loading `bundle` as `package_name`.
+    /// Nothing changes until the result is committed.
+    pub fn prepare_package(
+        &self,
+        registry: &PackageRegistry,
+        package_name: &str,
+        bundle: HubPluginRuntimeBundle,
+    ) -> HubLifecycleResult<PreparedPluginLoad> {
+        #[cfg(test)]
+        if take_injected_prepare_failure(package_name) {
+            return Err(HubLifecycleError::PackageNotEnabled {
+                package_name: package_name.to_string(),
+            });
+        }
         let record = enabled_record(registry, package_name)?;
         let plugin_key = plugin_key_for(record);
         let descriptors = bundle.descriptors.clone();
         let event_handlers = bundle.event_handlers.clone();
         let entity_providers = self.entity_providers.prepare(&plugin_key.0, &descriptors);
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
+        Ok(PreparedPluginLoad {
+            plugin_key,
+            descriptors,
+            event_handlers,
+            entity_providers,
+            registration,
+        })
+    }
 
+    /// Replace the package's running plugin with a prepared one. This cannot
+    /// fail, so a caller finishes its other fallible work before it commits.
+    pub fn commit_package(
+        &self,
+        request_id: RequestId,
+        prepared: PreparedPluginLoad,
+    ) -> (PluginKey, PluginCleanupResult) {
+        let PreparedPluginLoad {
+            plugin_key,
+            descriptors,
+            event_handlers,
+            entity_providers,
+            registration,
+        } = prepared;
         // Core must stop the previous worker before its registrations change.
         // The registration index remains unlocked while Core joins workers.
-        self.engine.unload_plugin(PluginUnloadSpec {
-            request_id: RequestId("hub-load-registration".into()),
+        let cleanup = self.engine.unload_plugin(PluginUnloadSpec {
+            request_id,
             plugin_key: plugin_key.clone(),
             cleanup: PluginCleanupScope::DescriptorsAndResources,
         });
@@ -214,7 +256,7 @@ impl HubPluginLifecycle {
             .expect("hub plugin lifecycle load failures lock")
             .remove(&plugin_key.0);
 
-        Ok(plugin_key)
+        (plugin_key, cleanup)
     }
 
     /// Invoke a plugin handler through core worker dispatch and capability checks.
@@ -264,36 +306,8 @@ impl HubPluginLifecycle {
         package_name: &str,
         bundle: HubPluginRuntimeBundle,
     ) -> HubLifecycleResult<PluginCleanupResult> {
-        let record = enabled_record(registry, package_name)?;
-        let plugin_key = plugin_key_for(record);
-        let descriptors = bundle.descriptors.clone();
-        let event_handlers = bundle.event_handlers.clone();
-        let entity_providers = self.entity_providers.prepare(&plugin_key.0, &descriptors);
-        let registration = registration_for(record, plugin_key.clone(), bundle)?;
-        let cleanup = self.engine.unload_plugin(PluginUnloadSpec {
-            request_id,
-            plugin_key: plugin_key.clone(),
-            cleanup: PluginCleanupScope::DescriptorsAndResources,
-        });
-        self.entity_providers.replace(entity_providers);
-        self.engine.load_plugin(registration);
-        self.loaded
-            .lock()
-            .expect("hub plugin lifecycle loaded set lock")
-            .insert(plugin_key.0.clone());
-        self.descriptors
-            .lock()
-            .expect("hub plugin lifecycle descriptors lock")
-            .insert(plugin_key.0.clone(), descriptors);
-        self.event_handlers
-            .lock()
-            .expect("hub plugin lifecycle event handlers lock")
-            .insert(plugin_key.0.clone(), event_handlers);
-        self.load_failures
-            .lock()
-            .expect("hub plugin lifecycle load failures lock")
-            .remove(&plugin_key.0);
-
+        let prepared = self.prepare_package(registry, package_name, bundle)?;
+        let (_, cleanup) = self.commit_package(request_id, prepared);
         Ok(cleanup)
     }
 
@@ -594,6 +608,45 @@ pub enum HubLifecycleError {
 
 /// Result alias for hub lifecycle operations that can fail before core load.
 pub type HubLifecycleResult<T> = Result<T, HubLifecycleError>;
+
+/// A plugin load that passed every fallible check. Only
+/// [`HubPluginLifecycle::prepare_package`] makes one, and committing it cannot
+/// fail, so no commit can skip the checks.
+#[must_use]
+pub struct PreparedPluginLoad {
+    plugin_key: PluginKey,
+    descriptors: Vec<PluginOwnedDescriptor>,
+    event_handlers: Vec<HubPluginEventHandler>,
+    entity_providers: entity_providers::PreparedEntityProviders,
+    registration: PluginWorkerRegistration,
+}
+
+impl PreparedPluginLoad {
+    #[must_use]
+    pub fn package_name(&self) -> &str {
+        &self.plugin_key.0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_PREPARE_FAILURES: std::cell::RefCell<BTreeSet<String>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+}
+
+/// Fail this thread's next lifecycle preflight for `package_name`. Its checks
+/// are otherwise unreachable once the registry has prepared an enabled package.
+#[cfg(test)]
+pub(crate) fn inject_next_prepare_failure(package_name: &str) {
+    INJECTED_PREPARE_FAILURES.with(|failures| {
+        failures.borrow_mut().insert(package_name.to_string());
+    });
+}
+
+#[cfg(test)]
+fn take_injected_prepare_failure(package_name: &str) -> bool {
+    INJECTED_PREPARE_FAILURES.with(|failures| failures.borrow_mut().remove(package_name))
+}
 
 fn enabled_record<'a>(
     registry: &'a PackageRegistry,

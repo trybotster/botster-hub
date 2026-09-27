@@ -33,28 +33,33 @@ fn load_package_after_enable(
     Ok(())
 }
 
-/// Classify a plugin load failure. Both load paths prepare the package and
-/// build the Lua bundle before they change the running plugin, so a failure
-/// there is a refusal that leaves the previous version loaded.
+/// Classify a plugin load failure. Both load paths finish every fallible step
+/// before they replace the running plugin, and the plugin commit cannot fail,
+/// so each of these errors leaves the previous version running.
 fn plugin_load_error(
     package_name: &str,
     error: crate::HubLuaPluginLoadError,
 ) -> DaemonTransportError {
+    use crate::HubLuaPluginLoadError as Load;
     match error {
-        crate::HubLuaPluginLoadError::Package(_) | crate::HubLuaPluginLoadError::Lua(_) => {
-            DaemonTransportError::PluginLoadRefused {
-                package_name: package_name.to_string(),
-                error,
-            }
+        Load::Package(_)
+        | Load::Lua(_)
+        | Load::Lifecycle(_)
+        | Load::EventPlane(_)
+        | Load::EventPlaneStranded(_) => DaemonTransportError::PluginNotSwapped {
+            package_name: package_name.to_string(),
+            error,
+        },
+        Load::EventPlaneCleanup | Load::EntityFamilyCleanup(_) => {
+            crate::HubDaemonError::from(error).into()
         }
-        error => crate::HubDaemonError::from(error).into(),
     }
 }
 
-/// The package whose plugin load was refused before the runtime changed.
-fn refused_package(original: &DaemonTransportError) -> Option<&str> {
+/// The package whose plugin load failed without replacing its running plugin.
+fn unswapped_package(original: &DaemonTransportError) -> Option<&str> {
     match original {
-        DaemonTransportError::PluginLoadRefused { package_name, .. } => Some(package_name),
+        DaemonTransportError::PluginNotSwapped { package_name, .. } => Some(package_name),
         _ => None,
     }
 }
@@ -215,9 +220,9 @@ pub(crate) fn apply_committed_runtime_effect(
 
 /// Restore runtime effects after the host restores durable package state.
 ///
-/// A package whose plugin load was refused is left alone: its runtime never
-/// changed, and its source on disk is the version that failed, so reloading
-/// it could only fail again or replace the version still serving.
+/// A package whose plugin load failed without a swap is left alone: its
+/// plugin never changed, and its source on disk is the version that failed,
+/// so reloading it could only fail again or replace the version still running.
 pub(crate) fn restore_runtime_after_failed_effect(
     runtime: &mut HostPackageRuntime,
     supervisor: &mut EntrypointSupervisor,
@@ -225,11 +230,11 @@ pub(crate) fn restore_runtime_after_failed_effect(
     effect: &PackageRuntimeEffect,
     original: &DaemonTransportError,
 ) -> Vec<PackageRollbackFailure> {
-    let refused = refused_package(original);
+    let unswapped = unswapped_package(original);
     let mut rollbacks = Vec::new();
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. } => {
-            if refused != Some(package_name.as_str()) {
+            if unswapped != Some(package_name.as_str()) {
                 let _ = runtime.unload_plugin_package(
                     request_id(&format!("daemon-disable-{package_name}")),
                     package_name,
@@ -248,7 +253,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
-                refused,
+                unswapped,
                 &mut rollbacks,
             );
         }
@@ -263,7 +268,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 running_entrypoints,
-                refused,
+                unswapped,
                 &mut rollbacks,
             );
         }
@@ -278,14 +283,14 @@ fn restore_registry_runtime(
     config: &HubConfig,
     previous: &PackageRegistry,
     running_entrypoints: &BTreeMap<String, Vec<String>>,
-    refused: Option<&str>,
+    unswapped: Option<&str>,
     rollbacks: &mut Vec<PackageRollbackFailure>,
 ) {
     for record in previous.packages() {
         let package_name = record.manifest.name.as_str();
-        // The refused load precedes this package's entrypoint restarts, so
+        // The failed load precedes this package's entrypoint restarts, so
         // neither its plugin nor its entrypoints changed.
-        if refused == Some(package_name) {
+        if unswapped == Some(package_name) {
             continue;
         }
         if record.state == PackageState::Enabled

@@ -103,18 +103,18 @@ impl HostPackageRuntime {
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
-        let key = self
-            .load_plugin_package(registry, package_name, bundle)
+        // Every fallible step runs before the plugin changes. A failed event
+        // plane commit restores its own admission state, so each error below
+        // leaves any previously loaded version serving.
+        let plugin = self
+            .plugin_lifecycle
+            .prepare_package(registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)?;
-        if let Err(status) =
-            self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
-        {
-            let _ = self.unload_plugin_package(
-                RequestId(format!("event-plane-rollback-{package_name}")),
-                package_name,
-            );
-            return Err(HubLuaPluginLoadError::EventPlane(status));
-        }
+        self.commit_loaded_package_event_plane(package_name, registry, &event_handlers)
+            .map_err(HubLuaPluginLoadError::EventPlane)?;
+        let (key, _) = self
+            .plugin_lifecycle
+            .commit_package(RequestId("hub-load-registration".into()), plugin);
         Ok(key)
     }
 
@@ -141,20 +141,59 @@ impl HostPackageRuntime {
         let staged = self
             .staged_package_event_plane(package_name, registry, &event_handlers)
             .map_err(HubLuaPluginLoadError::EventPlane)?;
+        // Prepare the plugin before the event plane changes, so every
+        // rejection leaves the previous version serving.
+        let plugin = self
+            .plugin_lifecycle
+            .prepare_package(registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)?;
         if let Err(error) = self.package_event_router.try_replace_package_generation(
             package_name,
             staged.contracts,
             staged.subscriptions,
         ) {
+            let unloaded = error.unloaded();
             let (result, cleanup) = error.into_parts();
-            if let Some(cleanup) = cleanup {
-                self.event_plane_faults.push((result, cleanup));
-                return Err(HubLuaPluginLoadError::EventPlaneCleanup);
+            match (result, cleanup) {
+                (Err(status), None) if !unloaded => {
+                    return Err(HubLuaPluginLoadError::EventPlane(status));
+                }
+                (Err(status), cleanup) => {
+                    // The previous generation is unloaded and the new one is
+                    // not committed; the previous plugin still runs.
+                    if let Some(cleanup) = cleanup {
+                        self.event_plane_faults.push((Err(status), cleanup));
+                    }
+                    return Err(HubLuaPluginLoadError::EventPlaneStranded(status));
+                }
+                (Ok(generation), Some(cleanup)) => {
+                    // The new generation is committed; only the previous
+                    // generation's cleanup failed. Finish the swap so one
+                    // version serves, and retain the cleanup fault.
+                    self.event_plane_faults.push((Ok(generation), cleanup));
+                }
+                (Ok(_), None) => unreachable!("a replacement error carries a failure"),
             }
-            result.map_err(HubLuaPluginLoadError::EventPlane)?;
         }
-        self.reload_plugin_package(request_id, registry, package_name, bundle)
-            .map_err(HubLuaPluginLoadError::Lifecycle)
+        Ok(self.commit_reloaded_plugin(request_id, plugin))
+    }
+
+    /// Swap in a prepared plugin and release the previous one's capabilities.
+    fn commit_reloaded_plugin(
+        &mut self,
+        request_id: RequestId,
+        plugin: crate::lifecycle::PreparedPluginLoad,
+    ) -> PluginCleanupResult {
+        let plugin_key = PluginKey(plugin.package_name().to_string());
+        let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
+        let (_, mut lifecycle_cleanup) = self.plugin_lifecycle.commit_package(request_id, plugin);
+        if let Some(cleanup) = capability_cleanup {
+            lifecycle_cleanup
+                .removed_resources
+                .extend(cleanup.removed_resources.clone());
+            self.last_capability_cleanup = Some(cleanup);
+        }
+        lifecycle_cleanup
     }
 
     fn staged_package_event_plane(
