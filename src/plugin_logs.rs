@@ -13,14 +13,22 @@
 //! Plugin workers append under a short lock; the daemon owner reads with
 //! `try_lock` and never waits.
 //!
-//! Every record carries the generation of the VM that wrote it, so a failed
-//! load removes exactly its own records, and records from different loads of
-//! one package stay distinguishable.
+//! The Hub log: the ring is also the Hub log's queue. One mirror thread keeps
+//! a cursor per plugin, copies one record at a time under a funded charge,
+//! and writes it with no lock held, so a slow or blocked sink never delays a
+//! plugin or a read. Records the ring evicts before the mirror reaches them
+//! are counted and reported with the next mirrored record.
+//!
+//! Every record carries the generation of the VM that wrote it. The ring is
+//! one chronological log across generations: a failed reload keeps its
+//! records, which explain the failure. A failed first load has no live
+//! generation, so its caller removes the whole entry.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Write as _;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 
@@ -115,6 +123,32 @@ pub(crate) enum ReadError {
     Capacity,
 }
 
+/// Where the mirror writes accepted records.
+pub(crate) trait HubLogSink: Send {
+    /// Write one record. `unmirrored_before` counts this plugin's records
+    /// that left the ring, or could not be funded, before the mirror
+    /// reached them.
+    fn write(&mut self, plugin: &str, record: &LogRecord, unmirrored_before: u64);
+}
+
+/// The Hub log is the daemon's standard error.
+struct StderrSink;
+
+impl HubLogSink for StderrSink {
+    fn write(&mut self, plugin: &str, record: &LogRecord, unmirrored_before: u64) {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "plugin_log package={plugin} generation={} seq={} level={} dropped_before={} unmirrored_before={unmirrored_before} message={:?} fields={}",
+            record.generation,
+            record.seq,
+            record.level.as_str(),
+            record.dropped_before,
+            record.message,
+            record.fields.as_deref().unwrap_or("null"),
+        );
+    }
+}
+
 struct PluginLog {
     records: VecDeque<LogRecord>,
     text_bytes: usize,
@@ -124,6 +158,10 @@ struct PluginLog {
     rate_dropped: u64,
     tokens_milli: u64,
     refilled_at_ms: u64,
+    /// The next sequence the Hub log mirror writes.
+    mirror_next: u64,
+    /// Records the mirror could not write since its last written record.
+    unmirrored: u64,
     charge: LuaCallbackCharge,
 }
 
@@ -134,22 +172,86 @@ impl PluginLog {
     }
 }
 
-pub(crate) struct PluginLogBook {
+struct BookState {
+    logs: BTreeMap<String, PluginLog>,
+    /// The plugin index the mirror serves next, so every plugin gets a turn.
+    mirror_turn: usize,
+    /// The mirror is inside its wait, so only a notify can wake it.
+    #[cfg(test)]
+    mirror_parked: bool,
+    closed: bool,
+}
+
+struct Shared {
     memory: Arc<LuaMemoryAccount>,
-    plugins: Mutex<BTreeMap<String, PluginLog>>,
+    state: Mutex<BookState>,
+    /// Appends and shutdown wake the mirror.
+    mirror_wake: Condvar,
+    /// The mirror announces each time it parks.
+    #[cfg(test)]
+    mirror_idle: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, BookState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One record copied out of the ring for the Hub log.
+struct MirrorLine {
+    plugin: String,
+    record: LogRecord,
+    unmirrored_before: u64,
+    /// Declared last: released after the copies above are freed.
+    _charge: LuaCallbackCharge,
+}
+
+pub(crate) struct PluginLogBook {
+    shared: Arc<Shared>,
 }
 
 impl PluginLogBook {
+    /// A book whose accepted records are mirrored to the Hub log.
     pub(crate) fn new(memory: Arc<LuaMemoryAccount>) -> Self {
+        Self::with_sink(memory, Box::new(StderrSink))
+    }
+
+    /// A book whose accepted records are mirrored to `sink`.
+    pub(crate) fn with_sink(memory: Arc<LuaMemoryAccount>, sink: Box<dyn HubLogSink>) -> Self {
+        let book = Self::unmirrored(memory);
+        let shared = Arc::clone(&book.shared);
+        if let Err(error) = std::thread::Builder::new()
+            .name("hub-plugin-log-mirror".to_string())
+            .spawn(move || run_mirror(&shared, sink))
+        {
+            eprintln!("plugin_log mirror unavailable: {error}; records stay in the plugin rings");
+        }
+        book
+    }
+
+    fn unmirrored(memory: Arc<LuaMemoryAccount>) -> Self {
         Self {
-            memory,
-            plugins: Mutex::new(BTreeMap::new()),
+            shared: Arc::new(Shared {
+                memory,
+                state: Mutex::new(BookState {
+                    logs: BTreeMap::new(),
+                    mirror_turn: 0,
+                    #[cfg(test)]
+                    mirror_parked: false,
+                    closed: false,
+                }),
+                mirror_wake: Condvar::new(),
+                #[cfg(test)]
+                mirror_idle: Condvar::new(),
+            }),
         }
     }
 
     /// Append one record for `plugin` written by VM `generation`. `now_ms`
     /// is monotonic (for the rate limit) and `wall_ms` is the record's Unix
-    /// time. An accepted record is also written to the Hub log.
+    /// time. An accepted record wakes the Hub log mirror; the append never
+    /// waits for it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append(
         &self,
@@ -165,17 +267,14 @@ impl PluginLogBook {
         if text > MAX_RECORD_BYTES {
             return AppendOutcome::TooLarge;
         }
-        let mut plugins = self
-            .plugins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !plugins.contains_key(plugin) {
+        let mut state = self.shared.lock();
+        if !state.logs.contains_key(plugin) {
             let Some(log) = self.new_log(plugin, now_ms) else {
                 return AppendOutcome::Capacity;
             };
-            plugins.insert(plugin.to_string(), log);
+            state.logs.insert(plugin.to_string(), log);
         }
-        let log = plugins.get_mut(plugin).expect("inserted above");
+        let log = state.logs.get_mut(plugin).expect("inserted above");
         let elapsed = now_ms.saturating_sub(log.refilled_at_ms);
         log.tokens_milli = log
             .tokens_milli
@@ -202,7 +301,7 @@ impl PluginLogBook {
         let seq = log.next_seq;
         log.next_seq += 1;
         log.text_bytes += text;
-        let record = LogRecord {
+        log.records.push_back(LogRecord {
             seq,
             generation,
             at_ms: wall_ms,
@@ -210,9 +309,9 @@ impl PluginLogBook {
             message: message.to_string(),
             fields: fields.map(str::to_string),
             dropped_before: std::mem::take(&mut log.rate_dropped),
-        };
-        write_hub_log(plugin, &record);
-        log.records.push_back(record);
+        });
+        drop(state);
+        self.shared.mirror_wake.notify_one();
         AppendOutcome::Accepted { seq }
     }
 
@@ -220,7 +319,11 @@ impl PluginLogBook {
     fn new_log(&self, plugin: &str, now_ms: u64) -> Option<PluginLog> {
         let fixed_bytes =
             size_of::<(String, PluginLog)>() + plugin.len() + RING_RECORDS * size_of::<LogRecord>();
-        let mut charge = self.memory.reserve_callback_total(fixed_bytes).ok()?;
+        let mut charge = self
+            .shared
+            .memory
+            .reserve_callback_total(fixed_bytes)
+            .ok()?;
         let records = VecDeque::with_capacity(RING_RECORDS);
         // `with_capacity` may round up; fund what it actually allocated.
         let extra = records
@@ -236,6 +339,8 @@ impl PluginLogBook {
             rate_dropped: 0,
             tokens_milli: BURST * MILLI,
             refilled_at_ms: now_ms,
+            mirror_next: 1,
+            unmirrored: 0,
             charge,
         })
     }
@@ -243,12 +348,12 @@ impl PluginLogBook {
     /// Copy the records after `after_seq` without ever waiting on a plugin.
     /// The copy is funded before it is made; the page carries that charge.
     pub(crate) fn read(&self, plugin: &str, after_seq: u64) -> Result<LogPage, ReadError> {
-        let plugins = match self.plugins.try_lock() {
-            Ok(plugins) => plugins,
+        let state = match self.shared.state.try_lock() {
+            Ok(state) => state,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return Err(ReadError::Busy),
         };
-        let Some(log) = plugins.get(plugin) else {
+        let Some(log) = state.logs.get(plugin) else {
             return Ok(LogPage {
                 records: Vec::new(),
                 next_seq: 1,
@@ -261,6 +366,7 @@ impl PluginLogBook {
         let bytes =
             count * size_of::<LogRecord>() + selected().map(LogRecord::text_bytes).sum::<usize>();
         let charge = self
+            .shared
             .memory
             .reserve_callback_total(bytes)
             .map_err(|_| ReadError::Capacity)?;
@@ -277,76 +383,203 @@ impl PluginLogBook {
         })
     }
 
-    /// Drop the records one VM generation wrote (a failed load or reload).
-    pub(crate) fn remove_generation(&self, plugin: &str, generation: u64) {
-        let mut plugins = self
-            .plugins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(log) = plugins.get_mut(plugin) else {
-            return;
-        };
-        // Retain in place: the ring keeps its funded allocation.
-        let text_bytes = &mut log.text_bytes;
-        log.records.retain(|record| {
-            if record.generation == generation {
-                *text_bytes -= record.text_bytes();
-                false
-            } else {
-                true
-            }
-        });
-        assert!(log.charge.shrink_to(log.fixed_bytes + log.text_bytes));
-    }
-
-    /// Drop a plugin's records and release their charge (package unload).
+    /// Drop a plugin's records and release their charge (package unload, or
+    /// a failed first load, which leaves no live generation to log for).
     pub(crate) fn remove(&self, plugin: &str) {
-        self.plugins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(plugin);
+        self.shared.lock().logs.remove(plugin);
+    }
+
+    /// Wait until the mirror has written every record it can reach and is
+    /// parked in its wait, holding no copy: from then on only an append or
+    /// shutdown can wake it. Only for a book with a mirror thread.
+    #[cfg(test)]
+    pub(crate) fn wait_until_mirrored(&self) {
+        // timer: deadline — a hang guard for a mirror that never catches up.
+        let deadline = std::time::Instant::now() + crate::daemon::owner_loop::TEST_HANG_GUARD;
+        let mut state = self.shared.lock();
+        while !state.mirror_parked
+            || state
+                .logs
+                .values()
+                .any(|log| log.mirror_next < log.next_seq)
+        {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("the Hub log mirror must catch up before the hang guard");
+            state = self
+                .shared
+                .mirror_idle
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
-/// The Hub log is the daemon's standard error.
-fn write_hub_log(plugin: &str, record: &LogRecord) {
-    #[cfg(test)]
-    HUB_LOG_LINES.with(|lines| lines.set(lines.get() + 1));
-    eprintln!(
-        "plugin_log package={plugin} generation={} seq={} level={} dropped_before={} message={:?} fields={}",
-        record.generation,
-        record.seq,
-        record.level.as_str(),
-        record.dropped_before,
-        record.message,
-        record.fields.as_deref().unwrap_or("null"),
-    );
+impl Drop for PluginLogBook {
+    /// The mirror finishes the records it can still reach, then exits.
+    fn drop(&mut self) {
+        self.shared.lock().closed = true;
+        self.shared.mirror_wake.notify_all();
+    }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Hub log lines this thread wrote.
-    pub(crate) static HUB_LOG_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// The mirror thread: write each accepted record once, in order per plugin,
+/// with no lock held while the sink runs. It waits only on the wake that
+/// appends and shutdown send.
+fn run_mirror(shared: &Shared, mut sink: Box<dyn HubLogSink>) {
+    let mut state = shared.lock();
+    loop {
+        let Some(line) = next_mirror_line(&shared.memory, &mut state) else {
+            if state.closed {
+                return;
+            }
+            #[cfg(test)]
+            {
+                state.mirror_parked = true;
+                shared.mirror_idle.notify_all();
+            }
+            state = shared
+                .mirror_wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                state.mirror_parked = false;
+            }
+            continue;
+        };
+        drop(state);
+        sink.write(&line.plugin, &line.record, line.unmirrored_before);
+        drop(line);
+        state = shared.lock();
+    }
+}
+
+/// Copy the next unwritten record, taking plugins in turn. Records the ring
+/// evicted, or that the account cannot fund a copy of, are skipped and
+/// counted.
+fn next_mirror_line(memory: &Arc<LuaMemoryAccount>, state: &mut BookState) -> Option<MirrorLine> {
+    let count = state.logs.len();
+    for offset in 0..count {
+        let index = (state.mirror_turn + offset) % count;
+        let (plugin, log) = state.logs.iter_mut().nth(index).expect("index is in range");
+        if log.mirror_next >= log.next_seq {
+            continue;
+        }
+        let at = log
+            .records
+            .partition_point(|record| record.seq < log.mirror_next);
+        let Some(record) = log.records.get(at) else {
+            log.unmirrored += log.next_seq - log.mirror_next;
+            log.mirror_next = log.next_seq;
+            continue;
+        };
+        let bytes = size_of::<MirrorLine>() + plugin.len() + record.text_bytes();
+        let Ok(charge) = memory.reserve_callback_total(bytes) else {
+            // The account is full now: count every pending record rather
+            // than leave some waiting for an append that may never come.
+            log.unmirrored += log.next_seq - log.mirror_next;
+            log.mirror_next = log.next_seq;
+            continue;
+        };
+        let skipped = record.seq - log.mirror_next;
+        log.mirror_next = record.seq + 1;
+        let line = MirrorLine {
+            plugin: plugin.clone(),
+            record: record.clone(),
+            unmirrored_before: std::mem::take(&mut log.unmirrored) + skipped,
+            _charge: charge,
+        };
+        state.mirror_turn = index + 1;
+        return Some(line);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::owner_loop::TEST_HANG_GUARD;
     use crate::lua_memory::LuaMemoryLimits;
+    use std::sync::mpsc;
 
-    fn book() -> (PluginLogBook, Arc<LuaMemoryAccount>) {
-        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+    fn memory() -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
             per_vm_bytes: 1024 * 1024,
             total_vm_bytes: 1024 * 1024,
             per_callback_bytes: 1024 * 1024,
             total_callback_bytes: 4 * 1024 * 1024,
         })
-        .unwrap();
-        (PluginLogBook::new(Arc::clone(&memory)), memory)
+        .unwrap()
+    }
+
+    /// A book without a mirror thread, for tests of the ring alone.
+    fn book() -> (PluginLogBook, Arc<LuaMemoryAccount>) {
+        let memory = memory();
+        (PluginLogBook::unmirrored(Arc::clone(&memory)), memory)
     }
 
     fn append(book: &PluginLogBook, message: &str, now_ms: u64) -> AppendOutcome {
         book.append("p", 7, LogLevel::Info, message, None, now_ms, 0)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SinkEvent {
+        Line {
+            plugin: String,
+            seq: u64,
+            unmirrored_before: u64,
+        },
+        /// The mirror thread returned and dropped its sink.
+        Closed,
+    }
+
+    /// Reports every write; with `release`, each write then blocks until the
+    /// test sends on, or drops, the release channel.
+    struct TestSink {
+        events: mpsc::Sender<SinkEvent>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+
+    impl HubLogSink for TestSink {
+        fn write(&mut self, plugin: &str, record: &LogRecord, unmirrored_before: u64) {
+            let _ = self.events.send(SinkEvent::Line {
+                plugin: plugin.to_string(),
+                seq: record.seq,
+                unmirrored_before,
+            });
+            if let Some(release) = &self.release {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    impl Drop for TestSink {
+        fn drop(&mut self) {
+            let _ = self.events.send(SinkEvent::Closed);
+        }
+    }
+
+    fn mirrored_book(
+        release: Option<mpsc::Receiver<()>>,
+    ) -> (PluginLogBook, mpsc::Receiver<SinkEvent>) {
+        let (events, received) = mpsc::channel();
+        let book = PluginLogBook::with_sink(memory(), Box::new(TestSink { events, release }));
+        (book, received)
+    }
+
+    fn next_event(events: &mpsc::Receiver<SinkEvent>, expected: &str) -> SinkEvent {
+        // timer: deadline — a hang guard for a mirror that never writes.
+        events.recv_timeout(TEST_HANG_GUARD).expect(expected)
+    }
+
+    fn line(plugin: &str, seq: u64, unmirrored_before: u64) -> SinkEvent {
+        SinkEvent::Line {
+            plugin: plugin.to_string(),
+            seq,
+            unmirrored_before,
+        }
     }
 
     #[test]
@@ -405,26 +638,128 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_generation_removes_only_its_own_records() {
-        let (book, memory) = book();
-        book.append("p", 1, LogLevel::Info, "live", None, 0, 0);
-        book.append("p", 2, LogLevel::Info, "failed-load", None, 0, 0);
-        let before = memory.usage().1;
-        book.remove_generation("p", 2);
+    fn records_from_every_generation_stay_in_one_chronological_ring() {
+        let (book, _memory) = book();
+        let mut now = 0;
+        for _ in 0..RING_RECORDS {
+            now += 10;
+            book.append("p", 1, LogLevel::Info, "live", None, now, 0);
+        }
+        for _ in 0..3 {
+            now += 10;
+            book.append("p", 2, LogLevel::Error, "candidate", None, now, 0);
+        }
         let page = book.read("p", 0).unwrap();
-        assert_eq!(page.records.len(), 1);
-        assert_eq!(page.records[0].message, "live");
-        drop(page);
-        assert_eq!(memory.usage().1, before - "failed-load".len());
-        book.remove("p");
+        assert_eq!(page.records.len(), RING_RECORDS);
+        assert_eq!(page.first_available_seq, 4, "the three oldest were evicted");
+        let (live, candidate): (Vec<_>, Vec<_>) = page
+            .records
+            .iter()
+            .partition(|record| record.generation == 1);
+        assert_eq!(live.len(), RING_RECORDS - 3);
+        assert_eq!(candidate.len(), 3);
+        assert!(candidate.iter().all(|record| record.message == "candidate"));
+        assert!(
+            page.records
+                .windows(2)
+                .all(|pair| pair[0].seq + 1 == pair[1].seq),
+            "one sequence across generations"
+        );
     }
 
     #[test]
     fn accepted_records_are_written_to_the_hub_log() {
-        let (book, _memory) = book();
-        let before = HUB_LOG_LINES.with(std::cell::Cell::get);
+        let (book, events) = mirrored_book(None);
+        // Parked first: only the append's wake can bring the record out.
+        book.wait_until_mirrored();
         append(&book, "mirrored", 0);
-        assert_eq!(HUB_LOG_LINES.with(std::cell::Cell::get), before + 1);
+        assert_eq!(
+            next_event(&events, "the accepted record reaches the Hub log"),
+            line("p", 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_blocked_hub_log_sink_never_delays_appends_or_reads() {
+        let (release, blocked) = mpsc::channel();
+        let (book, events) = mirrored_book(Some(blocked));
+        let book = Arc::new(book);
+        book.append("a", 1, LogLevel::Info, "first", None, 0, 0);
+        // The mirror is now inside the sink, blocked until release.
+        assert_eq!(
+            next_event(&events, "the mirror enters the sink"),
+            line("a", 1, 0)
+        );
+
+        let appends = RING_RECORDS as u64 + 10;
+        let writer = Arc::clone(&book);
+        let (done_tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            // 10 ms of refill per record keeps the rate limit out of the way.
+            for index in 1..=appends {
+                let outcome = writer.append("a", 1, LogLevel::Info, "more", None, index * 10, 0);
+                assert_eq!(outcome, AppendOutcome::Accepted { seq: index + 1 });
+            }
+            let other = writer.append("b", 1, LogLevel::Info, "other", None, 0, 0);
+            assert_eq!(other, AppendOutcome::Accepted { seq: 1 });
+            let page = writer.read("a", 0).expect("a read never waits on the sink");
+            let _ = done_tx.send(page.records.len());
+        });
+        // timer: deadline — a hang guard for appends stuck behind the sink.
+        let read = done
+            .recv_timeout(TEST_HANG_GUARD)
+            .expect("appends and reads must finish while the Hub log sink is blocked");
+        assert_eq!(read, RING_RECORDS);
+
+        drop(release);
+        let last = appends + 1;
+        let first_kept = last - RING_RECORDS as u64 + 1;
+        let mut a_lines = Vec::new();
+        let mut b_lines = Vec::new();
+        while a_lines.len() < RING_RECORDS || b_lines.is_empty() {
+            match next_event(&events, "the mirror catches up after release") {
+                SinkEvent::Line {
+                    plugin,
+                    seq,
+                    unmirrored_before,
+                } if plugin == "a" => a_lines.push((seq, unmirrored_before)),
+                SinkEvent::Line {
+                    seq,
+                    unmirrored_before,
+                    ..
+                } => b_lines.push((seq, unmirrored_before)),
+                SinkEvent::Closed => panic!("the mirror closed early"),
+            }
+        }
+        // Records 2 .. first_kept left the ring before the mirror reached
+        // them; the first kept record reports them.
+        assert_eq!(a_lines[0], (first_kept, first_kept - 2));
+        assert!(
+            a_lines[1..]
+                .iter()
+                .zip(first_kept + 1..)
+                .all(|(line, seq)| *line == (seq, 0))
+        );
+        assert_eq!(b_lines, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn dropping_the_book_wakes_and_stops_an_idle_mirror() {
+        let (book, events) = mirrored_book(None);
+        append(&book, "before shutdown", 0);
+        assert_eq!(
+            next_event(&events, "the record is mirrored"),
+            line("p", 1, 0)
+        );
+        book.wait_until_mirrored();
+        drop(book);
+        assert_eq!(
+            next_event(
+                &events,
+                "shutdown must wake the idle mirror, which then exits"
+            ),
+            SinkEvent::Closed
+        );
     }
 
     #[test]
@@ -482,7 +817,7 @@ mod tests {
     #[test]
     fn reads_never_wait_on_an_appending_plugin() {
         let (book, _memory) = book();
-        let _held = book.plugins.lock().unwrap();
+        let _held = book.shared.lock();
         assert!(matches!(book.read("p", 0), Err(ReadError::Busy)));
     }
 }

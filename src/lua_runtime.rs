@@ -874,8 +874,6 @@ pub struct LuaPluginHostApi {
 /// Real Lua runtime for one loaded plugin package.
 pub struct LuaPluginRuntime {
     plugin_key: PluginKey,
-    /// This VM's log generation (see `plugin_logs`).
-    log_generation: u64,
     lua: Mutex<LuaState>,
     instruction_budget: Arc<AtomicU64>,
     stopped: AtomicBool,
@@ -1417,7 +1415,6 @@ mod state_owner_tests {
         let state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
         Arc::new(LuaPluginRuntime {
             plugin_key: PluginKey("state-owner-test".into()),
-            log_generation: 0,
             lua: Mutex::new(state),
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),
@@ -1618,7 +1615,6 @@ impl LuaPluginRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(std::sync::Arc::downgrade(&runtime));
         Ok(HubPluginRuntimeBundle {
-            log_generation: Some(runtime.log_generation),
             runtime,
             handlers: loaded.handlers,
             event_handlers: loaded.event_handlers,
@@ -1652,8 +1648,10 @@ impl LuaPluginRuntime {
         )
     }
 
-    /// Load one VM under a new log generation. A failed load removes the
-    /// records its entrypoint wrote, so they never outlive the attempt.
+    /// Load one VM under a new log generation. A failed load's records stay
+    /// in the ring, tagged with that generation: they explain the failure.
+    /// The package runtime releases the whole entry when no generation of
+    /// the package is live.
     fn new_named(
         plugin_key: PluginKey,
         entrypoint: &Path,
@@ -1662,22 +1660,15 @@ impl LuaPluginRuntime {
         host_api: LuaHostApi,
         memory: Arc<LuaMemoryAccount>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
-        let log_generation = crate::plugin_logs::next_generation();
-        let logs = Arc::clone(&host_api.logs);
-        let plugin = plugin_key.0.clone();
-        let loaded = Self::load_generation(
-            log_generation,
+        Self::load_generation(
+            crate::plugin_logs::next_generation(),
             plugin_key,
             entrypoint,
             source_name,
             package_root,
             host_api,
             memory,
-        );
-        if loaded.is_err() {
-            logs.remove_generation(&plugin, log_generation);
-        }
-        loaded
+        )
     }
 
     fn load_generation(
@@ -1747,7 +1738,6 @@ impl LuaPluginRuntime {
         Ok((
             Self {
                 plugin_key,
-                log_generation,
                 lua: Mutex::new(state),
                 instruction_budget: budget,
                 stopped: AtomicBool::new(false),
@@ -4226,7 +4216,6 @@ mod completion_tests {
         let plugin_key = PluginKey("completion-test".to_string());
         let runtime = LuaPluginRuntime {
             plugin_key: plugin_key.clone(),
-            log_generation: 0,
             lua: Mutex::new(state),
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),

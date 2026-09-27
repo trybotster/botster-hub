@@ -240,9 +240,14 @@ bad input.
   200. Beyond the rate the call returns `backpressured` and the next accepted
   record reports the count in `dropped_before`. Operators read records with
   the `read_plugin_logs` daemon request (docs/client-protocol.md). Each record
-  carries its load's generation. Records are dropped when the package unloads,
-  and a failed load or reload drops the records it wrote. Accepted records are
-  also written to the Hub log (the daemon's standard error).
+  carries its load's generation. Records are dropped when the package unloads.
+  A failed reload keeps the records its entrypoint wrote, beside the serving
+  version's, because they explain the failure; they may evict older records like
+  any others. A failed load with no serving version drops the package's records.
+  Accepted records are also written to the Hub log (the daemon's standard
+  error) by a separate writer: a slow or blocked standard error never delays
+  the plugin, and records evicted before the writer reached them are reported
+  as `unmirrored_before` on the next line written.
 - `botster.clock.now()` returns Unix epoch milliseconds.
 - `botster.clock.monotonic()` returns milliseconds since the Hub process
   started; it never goes backward.

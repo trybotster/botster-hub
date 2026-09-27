@@ -290,20 +290,20 @@ impl HostPackageRuntime {
             Ok(bundle) => bundle,
             Err(error) => {
                 self.revoke_grants(package_name);
+                self.release_unloaded_logs(package_name);
                 return Err(HubLuaPluginLoadError::Lua(error));
             }
         };
         // Every fallible step runs before anything changes: prepare the
         // plugin, then stage its event generation. The install cannot fail,
         // and activation publishes the subscriptions only after it. Nothing
-        // is installed if a step fails, so the grants and the records the
-        // entrypoint logged go too.
-        let log_generation = bundle.log_generation;
+        // is installed if a step fails, so the grants go too, and so does
+        // the log entry unless a live generation still writes to it.
         let plugin = match self.prepare_new_load(registry, package_name, bundle) {
             Ok(plugin) => plugin,
             Err(error) => {
                 self.revoke_grants(package_name);
-                self.remove_log_generation(package_name, log_generation);
+                self.release_unloaded_logs(package_name);
                 return Err(error);
             }
         };
@@ -354,11 +354,12 @@ impl HostPackageRuntime {
         Ok(plugin)
     }
 
-    fn remove_log_generation(&self, package_name: &str, generation: Option<u64>) {
-        if let Some(generation) = generation {
-            self.host_api
-                .logs
-                .remove_generation(package_name, generation);
+    /// After a failed load, release the package's log entry unless a live
+    /// generation still needs it. The failed attempt's records otherwise stay
+    /// next to the live ones: they explain the failure.
+    fn release_unloaded_logs(&self, package_name: &str) {
+        if !self.plugin_lifecycle.is_loaded(package_name) {
+            self.host_api.logs.remove(package_name);
         }
     }
 
@@ -459,20 +460,25 @@ impl HostPackageRuntime {
         // The old generation stays loaded if this reload fails, so a failure
         // keeps the grants that the current admitted record defines.
         self.install_admitted_grants(registry, package_name);
-        let bundle = LuaPluginRuntime::load_prepared_bounded(
+        let bundle = match LuaPluginRuntime::load_prepared_bounded(
             &prepared,
             configuration,
             self.host_api.clone(),
-        )
-        .map_err(HubLuaPluginLoadError::Lua)?;
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.release_unloaded_logs(package_name);
+                return Err(HubLuaPluginLoadError::Lua(error));
+            }
+        };
         // Every fallible step runs before anything changes. The previous
         // generation stays live until activation, which follows the install.
-        // A refusal here removes only the records the candidate logged.
-        let log_generation = bundle.log_generation;
+        // A refusal here keeps the candidate's records next to the live
+        // generation's: they explain the failure.
         let plugin = match self.prepare_reload(registry, package_name, bundle) {
             Ok(plugin) => plugin,
             Err(error) => {
-                self.remove_log_generation(package_name, log_generation);
+                self.release_unloaded_logs(package_name);
                 return Err(error);
             }
         };
