@@ -232,7 +232,7 @@ fn plugin_load_failure_refuses_reload_and_keeps_the_connection() {
 
 /// A plugin version subscribing to an event nobody declares.
 const UNDECLARED_SUBSCRIPTION: &str =
-    "events.on('hub', 'botster_undeclared_event', function() return {} end)";
+    "botster.events.on({ owner = 'hub', name = 'botster_undeclared_event' }, function() return {} end)";
 
 /// Assert an event plane refusal: typed, never compensation, never success.
 fn assert_event_plane_refusal(refused: &botster_hub_client::DaemonResponse, operation: &str) {
