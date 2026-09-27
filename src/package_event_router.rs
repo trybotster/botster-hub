@@ -601,9 +601,10 @@ pub enum ActivationError {
 /// Send + Sync router. Owner and plugin callback APIs use `try_lock` only.
 /// Worker unloads and replacement finalization use [`EventOwnerWork::run`].
 pub struct PackageEventRouter {
-    inner: Mutex<RouterInner>,
+    inner: crate::daemon::owner_signal::SignalingMutex<RouterInner>,
     counters: Arc<EventPlaneCounters>,
-    delivery_wake: AtomicBool,
+    /// Raised whenever a consumer copy becomes ready for delivery.
+    owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     next_holder_key: AtomicU64,
     fail_next_age_reserve: AtomicBool,
     policy: PackageEventPlanePolicy,
@@ -614,6 +615,15 @@ pub struct PackageEventRouter {
 impl PackageEventRouter {
     #[must_use]
     pub fn new(policy: PackageEventPlanePolicy) -> Self {
+        Self::with_owner_signal(policy, Arc::default())
+    }
+
+    /// Build a router whose delivery wakes raise the Hub owner's `signal`.
+    #[must_use]
+    pub(crate) fn with_owner_signal(
+        policy: PackageEventPlanePolicy,
+        owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
+    ) -> Self {
         let mut hub_contracts = HashMap::new();
         let schema = worktree_lifecycle_schema();
         for name in WORKTREE_EVENT_NAMES {
@@ -654,45 +664,49 @@ impl PackageEventRouter {
         let mut producer_age_lists = HashMap::new();
         producer_age_lists.insert((HUB_EVENT_OWNER.to_string(), 0), hub_list);
         Self {
-            inner: Mutex::new(RouterInner {
-                policy,
-                contracts,
-                contract_name_counts,
-                subscriptions: HashMap::new(),
-                client_holders: HashMap::new(),
-                client_by_id: HashMap::new(),
-                subscriptions_per_plugin: HashMap::new(),
-                subscription_events_by_plugin: HashMap::new(),
-                producer,
-                consumers: HashMap::new(),
-                ready_consumers: BTreeSet::new(),
-                last_ready_consumer: None,
-                #[cfg(test)]
-                ready_key_visits: 0,
-                #[cfg(test)]
-                ready_key_clones: 0,
-                queued_by_producer: HashMap::new(),
-                retiring_by_cleanup: HashMap::new(),
-                #[cfg(test)]
-                cleanup_visits: CleanupVisits::default(),
-                #[cfg(test)]
-                preview_visits: PreviewVisits::default(),
-                #[cfg(test)]
-                snapshot_visits: SnapshotVisits::default(),
-                envelopes: HashMap::new(),
-                global_in_flight_bytes: 0,
-                admitted: HashMap::new(),
-                buckets: HashMap::new(),
-                next_envelope: 1,
-                next_pull: 1,
-                outstanding_pulls: HashSet::new(),
-                package_generation: HashMap::new(),
-                producer_age_lists,
-                pending: None,
-                stranded_owners: HashSet::new(),
-            }),
+            inner: crate::daemon::owner_signal::SignalingMutex::new(
+                RouterInner {
+                    policy,
+                    contracts,
+                    contract_name_counts,
+                    subscriptions: HashMap::new(),
+                    client_holders: HashMap::new(),
+                    client_by_id: HashMap::new(),
+                    subscriptions_per_plugin: HashMap::new(),
+                    subscription_events_by_plugin: HashMap::new(),
+                    producer,
+                    consumers: HashMap::new(),
+                    ready_consumers: BTreeSet::new(),
+                    last_ready_consumer: None,
+                    #[cfg(test)]
+                    ready_key_visits: 0,
+                    #[cfg(test)]
+                    ready_key_clones: 0,
+                    queued_by_producer: HashMap::new(),
+                    retiring_by_cleanup: HashMap::new(),
+                    #[cfg(test)]
+                    cleanup_visits: CleanupVisits::default(),
+                    #[cfg(test)]
+                    preview_visits: PreviewVisits::default(),
+                    #[cfg(test)]
+                    snapshot_visits: SnapshotVisits::default(),
+                    envelopes: HashMap::new(),
+                    global_in_flight_bytes: 0,
+                    admitted: HashMap::new(),
+                    buckets: HashMap::new(),
+                    next_envelope: 1,
+                    next_pull: 1,
+                    outstanding_pulls: HashSet::new(),
+                    package_generation: HashMap::new(),
+                    producer_age_lists,
+                    pending: None,
+                    stranded_owners: HashSet::new(),
+                },
+                Arc::clone(&owner_signal),
+                crate::daemon::owner_signal::SignalKey::EventRouter,
+            ),
             counters,
-            delivery_wake: AtomicBool::new(false),
+            owner_signal,
             next_holder_key: AtomicU64::new(1),
             fail_next_age_reserve: AtomicBool::new(false),
             policy,
@@ -1282,20 +1296,26 @@ impl PackageEventRouter {
             enqueue_consumer_copy(&mut inner, &self.counters, envelope_id, size, subscription);
         }
         drop(inner);
-        self.delivery_wake.store(true, Ordering::SeqCst);
+        self.raise_delivery();
         EventPlaneStatus::Accepted
     }
 
-    pub fn take_delivery_wake(&self) -> bool {
-        self.delivery_wake.swap(false, Ordering::SeqCst)
+    /// Read the delivery epoch before a pull; see [`OwnerSignal`].
+    ///
+    /// [`OwnerSignal`]: crate::daemon::owner_signal::OwnerSignal
+    pub(crate) fn delivery_seen(&self) -> crate::daemon::owner_signal::Seen {
+        self.owner_signal
+            .seen(crate::daemon::owner_signal::SignalKey::PackageEvents)
     }
 
-    pub fn peek_delivery_wake(&self) -> bool {
-        self.delivery_wake.load(Ordering::SeqCst)
+    /// Arm an owner wait on the router lock before a retry after `ShedBusy`.
+    pub(crate) fn arm_lock(&self) -> crate::daemon::owner_signal::Seen {
+        self.inner.arm()
     }
 
-    pub fn set_delivery_wake(&self) {
-        self.delivery_wake.store(true, Ordering::SeqCst);
+    fn raise_delivery(&self) {
+        self.owner_signal
+            .raise(crate::daemon::owner_signal::SignalKey::PackageEvents);
     }
 
     pub fn pull_ready_batch(
@@ -1430,7 +1450,8 @@ impl PackageEventRouter {
             }
         }
         if !ready.is_empty() || !inner.queued_by_producer.is_empty() {
-            self.delivery_wake.store(true, Ordering::SeqCst);
+            drop(inner);
+            self.raise_delivery();
         }
         Ok(ready)
     }
@@ -1530,7 +1551,8 @@ impl PackageEventRouter {
             inner.ready_consumers.insert(plugin_key.clone());
         }
         update_consumer_age(&mut inner, &plugin_key, &self.counters);
-        self.delivery_wake.store(true, Ordering::SeqCst);
+        drop(inner);
+        self.raise_delivery();
         Ok(())
     }
 
@@ -1767,8 +1789,8 @@ impl RouterInner {
 }
 
 fn lock_inner(
-    mutex: &Mutex<RouterInner>,
-) -> Result<std::sync::MutexGuard<'_, RouterInner>, EventPlaneStatus> {
+    mutex: &crate::daemon::owner_signal::SignalingMutex<RouterInner>,
+) -> Result<crate::daemon::owner_signal::SignalingGuard<'_, RouterInner>, EventPlaneStatus> {
     match mutex.try_lock() {
         Ok(guard) => Ok(guard),
         Err(TryLockError::WouldBlock) => Err(EventPlaneStatus::ShedBusy),
@@ -4696,14 +4718,17 @@ mod tests {
                 .queued_by_producer
                 .is_empty()
         );
-        router.take_delivery_wake();
+        let seen = router.delivery_seen();
         assert!(
             router
                 .pull_ready_batch(1, usize::MAX, Instant::now(), StdDuration::from_secs(1))
                 .expect("empty pull")
                 .is_empty()
         );
-        assert!(!router.take_delivery_wake());
+        assert!(
+            !router.owner_signal.moved(seen),
+            "an empty pull must not raise delivery"
+        );
     }
 
     #[test]

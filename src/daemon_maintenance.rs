@@ -511,6 +511,9 @@ impl SessionFamilyBridge {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceState {
     pub wakes: MaintenanceWakes,
+    /// Slices parked on a cross-thread signal. The owner marks a slice ready
+    /// when its key's epoch moves past the value it read before its attempt.
+    pub(crate) signal_waits: BTreeMap<MaintenanceSliceKind, crate::daemon::owner_signal::Seen>,
     pub projection: SessionProjection,
     pub observe_resume: Option<ObserveLifecycleCursor>,
     pub pending_changes: VecDeque<SessionLifecycleChange>,
@@ -627,6 +630,21 @@ impl MaintenanceState {
             return timeout_ms;
         }
         EVENT_INVOCATION_TIMEOUT_MS
+    }
+
+    /// Mark every slice whose signal moved since it parked, and unpark it.
+    pub(crate) fn mark_signaled_waits(
+        &mut self,
+        signal: &crate::daemon::owner_signal::OwnerSignal,
+    ) {
+        let wakes = &mut self.wakes;
+        self.signal_waits.retain(|kind, seen| {
+            let moved = signal.moved(*seen);
+            if moved {
+                wakes.mark(*kind);
+            }
+            !moved
+        });
     }
 
     pub(crate) fn note_causal_capacity_progress(&mut self) {
@@ -1371,29 +1389,61 @@ fn queue_event_retirement(
 
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     flush_pending_event_retirements(runtime, state);
+    // A parked slice stays parked until its epoch moves, even when another
+    // site marks every slice; readiness is the epoch, not the mark.
+    if let Some(seen) = state
+        .signal_waits
+        .get(&MaintenanceSliceKind::PackageEventDelivery)
+        && !runtime.owner_signal().moved(*seen)
+    {
+        return;
+    }
+    state
+        .signal_waits
+        .remove(&MaintenanceSliceKind::PackageEventDelivery);
+    // Causal capacity progress marks this slice again.
     if state.event_causal_blocked || state.event_causal_faulted {
         return;
     }
-    let woke = runtime.package_event_router().take_delivery_wake();
-    if runtime.package_event_router().peek_delivery_wake() {
-        state.wakes.mark_all();
-    }
-    if !woke {
-        return;
-    }
-    let batch = match runtime.package_event_router().pull_ready_batch(
-        EVENT_DELIVERY_MAX_ITEMS,
-        EVENT_DELIVERY_MAX_BYTES,
-        Instant::now(),
-        EVENT_DELIVERY_MAX_ELAPSED,
-    ) {
+    // Register before the pull: a copy that becomes ready after this read
+    // moves the epoch, so an empty pull below cannot strand it.
+    let seen = runtime.package_event_router().delivery_seen();
+    #[cfg(test)]
+    run_delivery_test_hook(DeliveryTestPoint::AfterSeen, runtime);
+    let router = runtime.package_event_router();
+    let pull = || {
+        router.pull_ready_batch(
+            EVENT_DELIVERY_MAX_ITEMS,
+            EVENT_DELIVERY_MAX_BYTES,
+            Instant::now(),
+            EVENT_DELIVERY_MAX_ELAPSED,
+        )
+    };
+    // A busy router lock is contention: arm on that lock and retry once. If the
+    // retry also fails, park until the holder's release raises the lock key.
+    let batch = match pull() {
         Ok(batch) => batch,
         Err(_) => {
-            runtime.package_event_router().set_delivery_wake();
-            state.wakes.mark_all();
-            return;
+            let lock_seen = router.arm_lock();
+            match pull() {
+                Ok(batch) => batch,
+                Err(_) => {
+                    state
+                        .signal_waits
+                        .insert(MaintenanceSliceKind::PackageEventDelivery, lock_seen);
+                    return;
+                }
+            }
         }
     };
+    if batch.is_empty() {
+        #[cfg(test)]
+        run_delivery_test_hook(DeliveryTestPoint::AfterEmptyPull, runtime);
+        state
+            .signal_waits
+            .insert(MaintenanceSliceKind::PackageEventDelivery, seen);
+        return;
+    }
     for delivery in batch {
         let request_id = package_event_request_id(&delivery);
         // Only the consumer generation the delivery matched may handle it.
@@ -1527,11 +1577,51 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             }
         }
     }
-    if runtime.package_event_router().peek_delivery_wake()
-        && !state.event_causal_blocked
-        && !state.event_causal_faulted
-    {
+    // The batch made progress, so the slice runs again; an empty pull parks it.
+    if !state.event_causal_blocked && !state.event_causal_faulted {
         state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryTestPoint {
+    AfterSeen,
+    AfterEmptyPull,
+}
+
+#[cfg(test)]
+type DeliveryTestHook = Box<dyn FnOnce(&HubRuntime)>;
+
+#[cfg(test)]
+thread_local! {
+    static DELIVERY_TEST_HOOK: std::cell::RefCell<Option<(DeliveryTestPoint, DeliveryTestHook)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once when this thread's next delivery slice reaches `point`.
+#[cfg(test)]
+pub(crate) fn set_delivery_test_hook(
+    point: DeliveryTestPoint,
+    hook: impl FnOnce(&HubRuntime) + 'static,
+) {
+    DELIVERY_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn run_delivery_test_hook(point: DeliveryTestPoint, runtime: &HubRuntime) {
+    let hook = DELIVERY_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.take() {
+            Some((at, hook)) if at == point => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    });
+    if let Some(hook) = hook {
+        hook(runtime);
     }
 }
 
@@ -3972,13 +4062,17 @@ return botster.register({})
             .expect("load event probe plugin");
         ingress_worktree_created(&runtime);
         let mut state = MaintenanceState::default();
-        let queue_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < queue_deadline && state.event_in_flight.len() < 2 {
+        // Each slice run either admits a batch or parks on the delivery signal.
+        while state.event_in_flight.len() < 2
+            && !state
+                .signal_waits
+                .contains_key(&MaintenanceSliceKind::PackageEventDelivery)
+        {
+            assert!(
+                !state.event_causal_blocked,
+                "causal capacity blocked: {state:?}"
+            );
             run_package_event_delivery_slice(&runtime, &mut state);
-            if state.event_in_flight.len() < 2 {
-                runtime.package_event_router().set_delivery_wake();
-                std::thread::sleep(Duration::from_millis(10));
-            }
         }
         assert_eq!(
             state.event_in_flight.len(),
@@ -4215,7 +4309,6 @@ return botster.register({})
             "requeued occupancy must remain until a later slice admits or expires the copy"
         );
         runtime.set_test_plugin_admit_backpressure(false);
-        runtime.package_event_router().set_delivery_wake();
         run_package_event_delivery_slice(&runtime, &mut state);
         let after = runtime.package_event_router().snapshot().expect("after");
         assert_eq!(
@@ -4223,6 +4316,115 @@ return botster.register({})
             "a later slice must consume the requeued holder rather than lose it"
         );
         let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// Park the delivery slice, then run `setup` and return whether the owner
+    /// would mark the slice again with no other wake.
+    fn delivery_marked_after(point: DeliveryTestPoint, name: &str) -> (bool, usize) {
+        let (registry, package_root) = install_event_probe_registry(name);
+        let (mut runtime, data_directory) = event_delivery_runtime(name);
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        set_delivery_test_hook(point, ingress_worktree_created);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let admitted = state.event_in_flight.len();
+        state.mark_signaled_waits(runtime.owner_signal());
+        let marked = state.wakes.take(MaintenanceSliceKind::PackageEventDelivery);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+        let _ = std::fs::remove_dir_all(package_root);
+        (marked, admitted)
+    }
+
+    #[test]
+    fn an_event_ready_after_the_delivery_read_is_pulled_by_the_same_slice() {
+        let (_, admitted) =
+            delivery_marked_after(DeliveryTestPoint::AfterSeen, "delivery-after-seen");
+        assert!(admitted > 0, "the pull after the read sees the new copies");
+    }
+
+    #[test]
+    fn an_event_ready_after_an_empty_pull_marks_the_parked_slice() {
+        let (marked, admitted) =
+            delivery_marked_after(DeliveryTestPoint::AfterEmptyPull, "delivery-after-empty");
+        assert_eq!(admitted, 0, "the pull ran before the event existed");
+        assert!(
+            marked,
+            "the ingress after the read moved the epoch, so the parked slice runs with no other wake"
+        );
+    }
+
+    #[test]
+    fn a_busy_router_parks_delivery_until_the_holder_releases_the_lock() {
+        let (runtime, data_directory) = event_delivery_runtime("delivery-router-busy");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        runtime.package_event_router().test_with_inner_held(|| {
+            run_package_event_delivery_slice(&runtime, &mut state);
+            state.mark_signaled_waits(runtime.owner_signal());
+            assert!(
+                !state.wakes.has_any(),
+                "contention must park, not re-mark the owner: {state:?}"
+            );
+        });
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
+            "the holder's release wakes the parked slice with no other wake"
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_blanket_mark_does_not_pull_for_a_parked_delivery_slice() {
+        let (runtime, data_directory) = event_delivery_runtime("delivery-blanket-mark");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let parked = state.signal_waits.clone();
+        assert!(parked.contains_key(&MaintenanceSliceKind::PackageEventDelivery));
+        runtime.package_event_router().test_with_inner_held(|| {
+            // A mark_all from an unrelated site runs the slice again while a
+            // holder has the router. It must not pull, and so must not arm.
+            run_package_event_delivery_slice(&runtime, &mut state);
+        });
+        assert_eq!(state.signal_waits, parked, "still parked on the same epoch");
+        state.wakes = MaintenanceWakes(0);
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            !state.wakes.has_any(),
+            "the holder's release wakes nothing that was not armed"
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_parked_delivery_slice_stays_parked_with_no_new_event() {
+        let (registry, package_root) = install_event_probe_registry("delivery-stays-parked");
+        let (mut runtime, data_directory) = event_delivery_runtime("delivery-stays-parked");
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(!state.wakes.has_any(), "no raise, no wake: {state:?}");
+        assert!(
+            state
+                .signal_waits
+                .contains_key(&MaintenanceSliceKind::PackageEventDelivery)
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+        let _ = std::fs::remove_dir_all(package_root);
     }
 
     fn install_lua_event_plugin(
