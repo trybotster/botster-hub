@@ -9,7 +9,7 @@ use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
 use botster_terminal_protocol::RoutedTerminalFrame;
 
 use super::close_reason::{CloseCause, CloseReport};
-use super::ingress::IngressBuffer;
+use super::ingress::{IngressBuffer, IngressStore};
 use super::wake::WakeSink;
 
 type CloseHook = Arc<dyn Fn(CloseReport) + Send + Sync>;
@@ -232,25 +232,30 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.ingress.try_read(self.is_closed())
     }
 
-    /// Validate the input header and buffer one complete frame.
-    ///
-    /// Returns `Err(())` when the header is malformed so the caller can close
-    /// the route.
-    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
+    /// Store one input frame without latching loss. `Full` hands the frame
+    /// back: the transport keeps it, stops reading, and waits for
+    /// [`Self::ingress_room`]. A malformed header closes the route.
+    pub(crate) fn try_push_ingress(&self, bytes: Vec<u8>) -> IngressStore {
         if self.is_closed() {
-            return Ok(());
+            return IngressStore::Closed;
         }
-        match self.ingress.push_complete(bytes, || self.is_closed()) {
-            Ok(true) => {
-                self.emit_writable();
-                Ok(())
-            }
-            Ok(false) => Ok(()),
-            Err(()) => {
-                self.close();
-                Err(())
-            }
+        let stored = self.ingress.try_store(bytes, || self.is_closed());
+        match &stored {
+            IngressStore::Stored => self.emit_writable(),
+            IngressStore::Malformed => self.close(),
+            IngressStore::Full(_) | IngressStore::Closed => {}
         }
+        stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ingress_full_observer(&self, observer: std::sync::mpsc::Sender<()>) {
+        self.ingress.set_full_observer(observer);
+    }
+
+    /// Resolves after Core removes an input frame or the route closes.
+    pub(crate) async fn ingress_room(&self) {
+        self.ingress.room().await;
     }
 
     #[cfg(test)]
