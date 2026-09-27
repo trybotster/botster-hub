@@ -94,6 +94,8 @@ pub(crate) mod resync;
 pub(crate) mod session_reservations;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
+#[cfg(test)]
+pub(crate) use session_spawn::await_remove_before_next_poll;
 pub(crate) use session_spawn::{SessionSpawnCleanupPoll, SessionTypeSpawnStart};
 #[allow(unused_imports)] // The owner continuation will use the conversion outcome.
 pub(crate) use session_spawn::{
@@ -3216,6 +3218,16 @@ impl HubRuntime {
         self.core_daemon.waiter_retirement(waiter_id)
     }
 
+    /// Test-only: the owner phases still registered for a waiter, which the
+    /// owner must collect; phases an operation collected itself are gone.
+    #[cfg(test)]
+    pub(crate) fn test_registered_owner_identities(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> Vec<crate::owner_identity::OwnerWorkIdentity> {
+        self.core_daemon.test_registered_owner_identities(waiter_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_core_waiter_probe(
         &self,
@@ -6263,6 +6275,21 @@ impl CoreOperationTracker {
         Self {
             stage: CoreOperationStage::Begin { ticket, completion },
             accepted_id: None,
+        }
+    }
+
+    /// Test-only: wait until every phase this tracker owns is published,
+    /// without collecting any.
+    #[cfg(test)]
+    pub(crate) fn test_wait_published(&self, deadline: Instant) -> bool {
+        match &self.stage {
+            CoreOperationStage::Begin { ticket, completion } => {
+                ticket.test_wait_published(deadline) && completion.test_wait_published(deadline)
+            }
+            CoreOperationStage::Pending { completion, .. } => {
+                completion.test_wait_published(deadline)
+            }
+            CoreOperationStage::Done => true,
         }
     }
 

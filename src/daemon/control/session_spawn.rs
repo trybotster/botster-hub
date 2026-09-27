@@ -860,6 +860,9 @@ mod owner_conversion_lifecycle_tests {
     #[derive(Clone, Copy)]
     enum Case {
         ExplicitAbandonment,
+        /// As ExplicitAbandonment, but Remove completes before its first
+        /// poll, so one poll advances through Remove into Release.
+        ExplicitAbandonmentRemoveReady,
         RegistrationRefusal,
         DroppedReceiver,
     }
@@ -943,18 +946,22 @@ mod owner_conversion_lifecycle_tests {
         wake: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
         waiter_id: WaiterId,
     ) {
-        let mut phase = 6;
         for _ in 0..12 {
             match operation.poll(daemon, state) {
                 ControlPoll::Again => {}
                 ControlPoll::Pending => {
-                    collect(
-                        daemon.runtime().expect("runtime remains live"),
-                        wake,
-                        waiter_id,
-                        &[phase, phase + 1],
-                    );
-                    phase += 2;
+                    // Collect exactly the phases the live operation still
+                    // awaits. A stage whose Core work finished before its
+                    // first poll was collected by the operation itself, so
+                    // a fixed per-stage phase counter would be wrong.
+                    let runtime = daemon.runtime().expect("runtime remains live");
+                    let awaited = runtime
+                        .test_registered_owner_identities(waiter_id)
+                        .into_iter()
+                        .map(|identity| identity.phase)
+                        .collect::<Vec<_>>();
+                    assert!(!awaited.is_empty(), "a Pending cleanup awaits a Core phase");
+                    collect(runtime, wake, waiter_id, &awaited);
                 }
                 ControlPoll::FinishedInternal => return,
                 _ => panic!("owner cleanup must not report success"),
@@ -1127,7 +1134,7 @@ mod owner_conversion_lifecycle_tests {
             .expect("the Core reservation exists");
 
         match case {
-            Case::ExplicitAbandonment => {
+            Case::ExplicitAbandonment | Case::ExplicitAbandonmentRemoveReady => {
                 assert!(matches!(
                     operation.poll(&mut daemon, &mut state),
                     ControlPoll::Pending
@@ -1207,6 +1214,9 @@ mod owner_conversion_lifecycle_tests {
                 ));
             }
         }
+        if matches!(case, Case::ExplicitAbandonmentRemoveReady) {
+            crate::runtime::await_remove_before_next_poll();
+        }
         if !matches!(case, Case::RegistrationRefusal) {
             finish_cleanup(
                 &mut operation,
@@ -1272,6 +1282,14 @@ mod owner_conversion_lifecycle_tests {
     #[test]
     fn explicit_conversion_abandonment_confirms_owner_cleanup() {
         run(Case::ExplicitAbandonment);
+    }
+
+    /// Remove completes before its first poll, so one cleanup poll collects
+    /// Remove itself and advances into Release: the test must collect only
+    /// what the operation still awaits.
+    #[test]
+    fn explicit_abandonment_confirms_cleanup_when_remove_finishes_first() {
+        run(Case::ExplicitAbandonmentRemoveReady);
     }
 
     #[test]
