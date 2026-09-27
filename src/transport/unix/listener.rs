@@ -202,6 +202,13 @@ async fn accept_connections_with_events(
                 match event {
                     Some(Err(error)) => {
                         eprintln!("botster-hub daemon socket watch error: {error}");
+                        #[cfg(test)]
+                        if let Some(errors) = socket_events
+                            .as_ref()
+                            .and_then(|events| events.watch_errors.as_ref())
+                        {
+                            errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     None => {
                         eprintln!("botster-hub daemon socket watch stopped");
@@ -241,6 +248,9 @@ struct SocketPathEvents {
     /// Test-only: every rebind attempt the accept loop makes, in order.
     #[cfg(test)]
     rebind_observer: Option<tokio_mpsc::UnboundedSender<RebindOutcome>>,
+    /// Test-only: watch errors the accept loop reported.
+    #[cfg(test)]
+    watch_errors: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// What wakes the accept loop when the socket's directory changes. The loop
@@ -281,7 +291,15 @@ impl SocketPathSource {
                     *self = Self::Stopped;
                     None
                 }
-                Err(error) => Some(Err(error.to_string())),
+                Err(error) => {
+                    // A watch whose reactor registration failed has lost its
+                    // descriptor: report it once, then stop the source so
+                    // the accept loop keeps accepting without it.
+                    if watch.failed() {
+                        *self = Self::Stopped;
+                    }
+                    Some(Err(error.to_string()))
+                }
             },
             #[cfg(not(target_os = "macos"))]
             Self::Notify { events, .. } => events
@@ -314,6 +332,8 @@ impl SocketPathEvents {
             missing_at_start,
             #[cfg(test)]
             rebind_observer: None,
+            #[cfg(test)]
+            watch_errors: None,
         })
     }
 
@@ -331,7 +351,26 @@ impl SocketPathEvents {
             path,
             missing_at_start: false,
             rebind_observer: None,
+            #[cfg(test)]
+            watch_errors: None,
         }
+    }
+
+    /// Test-only: make the platform watch's first reactor registration fail.
+    #[cfg(all(test, target_os = "macos"))]
+    fn fail_reactor_registration(mut self) -> Self {
+        let SocketPathSource::Kqueue(watch) = &mut self.source else {
+            panic!("the macOS source is a kqueue watch");
+        };
+        watch.fail_registration = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn count_watch_errors(mut self) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.watch_errors = Some(Arc::clone(&errors));
+        (self, errors)
     }
 
     #[cfg(test)]
@@ -387,6 +426,9 @@ enum DirectoryChange {
 #[cfg(target_os = "macos")]
 struct DirectoryVnodeWatch {
     queue: VnodeQueue,
+    /// Test-only: fail the first reactor registration.
+    #[cfg(test)]
+    fail_registration: bool,
     // Held open for the registration's lifetime; O_EVTONLY does not block
     // the volume from unmounting.
     _directory: std::os::fd::OwnedFd,
@@ -394,8 +436,10 @@ struct DirectoryVnodeWatch {
 
 #[cfg(target_os = "macos")]
 enum VnodeQueue {
-    Unregistered(Option<std::os::fd::OwnedFd>),
+    Unregistered(std::os::fd::OwnedFd),
     Registered(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>),
+    /// The reactor registration failed and consumed the descriptor.
+    Failed,
 }
 
 #[cfg(target_os = "macos")]
@@ -452,9 +496,16 @@ impl DirectoryVnodeWatch {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Self {
-            queue: VnodeQueue::Unregistered(Some(queue)),
+            queue: VnodeQueue::Unregistered(queue),
+            #[cfg(test)]
+            fail_registration: false,
             _directory: directory,
         })
+    }
+
+    /// Whether the watch lost its descriptor to a failed registration.
+    fn failed(&self) -> bool {
+        matches!(self.queue, VnodeQueue::Failed)
     }
 
     /// Wait for the kernel's next report on the directory. Must run inside a
@@ -462,17 +513,29 @@ impl DirectoryVnodeWatch {
     async fn changed(&mut self) -> std::io::Result<DirectoryChange> {
         use std::os::fd::AsRawFd;
 
-        if let VnodeQueue::Unregistered(queue) = &mut self.queue {
-            let queue = queue
-                .take()
-                .expect("an unregistered queue retains its descriptor");
+        if matches!(self.queue, VnodeQueue::Unregistered(_)) {
+            let VnodeQueue::Unregistered(queue) =
+                std::mem::replace(&mut self.queue, VnodeQueue::Failed)
+            else {
+                unreachable!("checked above");
+            };
+            #[cfg(test)]
+            if self.fail_registration {
+                drop(queue);
+                return Err(std::io::Error::other(
+                    "injected reactor registration failure",
+                ));
+            }
+            // On failure the state stays Failed: the descriptor is gone.
             self.queue = VnodeQueue::Registered(tokio::io::unix::AsyncFd::with_interest(
                 queue,
                 tokio::io::Interest::READABLE,
             )?);
         }
         let VnodeQueue::Registered(queue) = &self.queue else {
-            unreachable!("the queue was registered above");
+            return Err(std::io::Error::other(
+                "the socket directory watch failed to register",
+            ));
         };
         loop {
             let mut ready = queue.readable().await?;
@@ -978,6 +1041,31 @@ mod tests {
             .expect("degraded accept loop should not panic");
         cleanup_socket_path(&socket, owner);
         let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
+
+    /// The deferred reactor registration fails inside the accept loop: the
+    /// source reports the error once, stops, and the loop keeps accepting
+    /// and shuts down cleanly.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_reactor_registration_stops_the_watch_and_keeps_accepting() {
+        let socket = temp_socket_path("reactor-registration-failure");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(listener).expect("Tokio listener");
+        let (events, errors) = SocketPathEvents::new(&listener)
+            .expect("the kernel watch registers")
+            .fail_reactor_registration()
+            .count_watch_errors();
+
+        assert_degraded_watch_still_accepts(socket, owner, listener, Ok(events)).await;
+        assert_eq!(
+            errors.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the failed source reports once and stops, never spinning"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
