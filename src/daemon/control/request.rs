@@ -323,8 +323,10 @@ fn finish(
         }
         // A plugin load failure refuses this request; it never closes the
         // client connection.
-        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error))
-        | DaemonTransportError::PluginNotSwapped { error, .. } => {
+        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error)) => {
+            Ok(crate::daemon::error::daemon_plugin_load_error(&error))
+        }
+        DaemonTransportError::PluginNotSwapped { error, .. } => {
             Ok(crate::daemon::error::daemon_plugin_load_error(&error))
         }
         error => Err(error),

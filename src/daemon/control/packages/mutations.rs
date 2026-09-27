@@ -50,7 +50,7 @@ fn plugin_load_error(
         | Load::EventPlaneStageOverlap
         | Load::EventPlaneUnfunded { .. } => DaemonTransportError::PluginNotSwapped {
             package_name: package_name.to_string(),
-            error,
+            error: Box::new(error),
         },
         Load::EventPlaneStranded(_)
         | Load::EventPlaneActivationFaulted
