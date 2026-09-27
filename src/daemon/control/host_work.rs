@@ -959,7 +959,13 @@ impl HostMutationContinuation {
                     .apply_host_package_cleanup(cleanup);
                 release_document(state, waiter_id);
                 if rollbacks.is_empty() {
-                    finish_transport_error(permit, original)
+                    // The durable state and runtime are restored. A plugin
+                    // load failure is this request's typed refusal, never a
+                    // reason to close the client connection.
+                    match package_load_refusal(&original) {
+                        Some(error) => finish_error(permit, operation, error),
+                        None => finish_transport_error(permit, original),
+                    }
                 } else {
                     state.host_recovery.insert(
                         waiter_id,
@@ -1572,6 +1578,25 @@ fn finish_error(
             let charge = permit.into_prepared_charge(0);
             ControlPoll::ReadyHost(Ok(host_error_response(operation, without_event)), charge)
         }
+    }
+}
+
+/// The typed refusal for a package runtime effect that failed to load its
+/// plugin, or to find the socket binding its entrypoint restart needs.
+fn package_load_refusal(error: &DaemonTransportError) -> Option<HostMutationError> {
+    match error {
+        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error))
+        | DaemonTransportError::PluginLoadRefused { error, .. } => Some(HostMutationError {
+            code: error.code().to_string(),
+            message: error.to_string(),
+            event: None,
+        }),
+        DaemonTransportError::MissingSocketBinding => Some(HostMutationError {
+            code: "socket_binding_missing".to_string(),
+            message: "the entrypoint restart has no socket binding".to_string(),
+            event: None,
+        }),
+        _ => None,
     }
 }
 
