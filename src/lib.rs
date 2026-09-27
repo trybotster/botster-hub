@@ -82,6 +82,7 @@ pub(crate) mod package_event_schema;
 pub mod packages;
 pub mod persistence;
 pub(crate) mod plugin_entity;
+pub(crate) mod plugin_logs;
 pub(crate) mod plugin_response;
 pub mod process_exit;
 pub mod profile;
