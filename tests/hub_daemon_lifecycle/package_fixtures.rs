@@ -1178,7 +1178,7 @@ local function create(arguments)
   local target_id = arguments.target_id
   local target_validation = nil
   if type(target_id) == "string" and target_id ~= "" then
-    target_validation = botster.capabilities.spawn_targets.validate({ target_id = target_id })
+    target_validation = botster.capabilities.spawn_targets.validate({ target_id = target_id }).value
     if not target_validation.ok then
       return { ok = false, status = target_validation.status, target_id = target_id }
     end
@@ -1204,7 +1204,7 @@ local function use_workspace(arguments)
   local record = botster.capabilities.plugin_db.get({ key = "workspace/" .. id })
   local workspace = record.record.payload
   if type(arguments.target_id) == "string" and arguments.target_id ~= "" then
-    local validation = botster.capabilities.spawn_targets.validate({ target_id = arguments.target_id })
+    local validation = botster.capabilities.spawn_targets.validate({ target_id = arguments.target_id }).value
     if not validation.ok then
       return { ok = false, status = validation.status, target_id = arguments.target_id }
     end
@@ -1224,7 +1224,7 @@ local function validate_target(arguments)
   if type(target_id) ~= "string" or target_id == "" then
     return { ok = false, status = "missing_argument" }
   end
-  return botster.capabilities.spawn_targets.validate({ target_id = target_id })
+  return botster.capabilities.spawn_targets.validate({ target_id = target_id }).value
 end
 
 local function render_workspaces(_arguments)
