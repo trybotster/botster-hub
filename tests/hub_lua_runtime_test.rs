@@ -3657,7 +3657,8 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
             }
         ]))
     );
-    hub.begin_package_entity_provider_snapshot("lease-probe.item", snapshot_seq);
+    hub.begin_package_entity_provider_snapshot("lease-probe.item", snapshot_seq)
+        .expect("the test model is not poisoned");
     assert!(matches!(
         hub.step_package_entity_provider_snapshot("lease-probe.item"),
         botster_hub::runtime::PackageEntitySnapshotStep::Pending

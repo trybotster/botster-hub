@@ -1248,7 +1248,8 @@ impl HubRuntime {
         };
         let mut cursor = resync::Cursor::default();
         let mut operation = None;
-        self.with_direct_entity_model(|model| {
+        // A poisoned model runs nothing; the reservation returns its slot.
+        let _ = self.with_direct_entity_model(|model| {
             model.step_resync(resync::Action::Release, &mut cursor, &mut operation)
         });
         if let Some(operation) = operation {
@@ -2869,9 +2870,25 @@ impl HubRuntime {
         publication_token: u64,
         reservation: &mut Option<CausalReservation>,
     ) -> Result<AdmittedEntityPublish, (String, PackageEntityMutation)> {
-        let transition = self.with_direct_entity_model(|model| {
-            model.admit(registration, mutation, scope_id, publication_token)
-        })?;
+        let mut mutation = Some(mutation);
+        let transition = match self.with_direct_entity_model(|model| {
+            model.admit(
+                registration,
+                mutation.take().expect("the publish retains its mutation"),
+                scope_id,
+                publication_token,
+            )
+        }) {
+            Ok(transition) => transition?,
+            Err(entity_model::EntityModelPoisoned) => {
+                return Err((
+                    entity_model::ENTITY_MODEL_POISONED_MESSAGE.to_string(),
+                    mutation
+                        .take()
+                        .expect("a poisoned model never takes the mutation"),
+                ));
+            }
+        };
         if let Some(op) = transition.causal {
             reservation
                 .take()
@@ -2896,7 +2913,12 @@ impl HubRuntime {
             };
             let (mutation, finish) = item.into_parts();
             if let Some(lease) = finish.lease.as_ref() {
-                reservation.commit(self.prepare_finish_op(lease, finish.scheduled_resync));
+                let Some(op) = self.prepare_finish_op(lease, finish.scheduled_resync) else {
+                    // The model is poisoned: hand back what was taken, stop.
+                    mutations.push(mutation);
+                    break;
+                };
+                reservation.commit(op);
             }
             mutations.push(mutation);
         }
@@ -2912,6 +2934,8 @@ impl HubRuntime {
     #[must_use]
     pub fn take_one_package_entity_fanout(&self) -> Option<TakenPackageEntityMutation> {
         self.with_direct_entity_model(|model| model.fanout.pop_first())
+            .ok()
+            .flatten()
             .map(|item| TakenPackageEntityMutation {
                 mutation: item.mutation,
                 finish: PackageEntityFanoutFinish {
@@ -2952,18 +2976,26 @@ impl HubRuntime {
             Ok(reservation) => reservation,
             Err(status) => return status,
         };
-        let op = self.prepare_finish_op(lease, finish.scheduled_resync);
+        let Some(op) = self.prepare_finish_op(lease, finish.scheduled_resync) else {
+            return CausalTransitionStatus::Fault;
+        };
         reservation.commit(op);
         CausalTransitionStatus::Applied
     }
 
-    fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
-        let (op, changed) =
-            self.with_direct_entity_model(|model| model.finish(lease, scheduled_resync));
+    /// `None` when the model is poisoned.
+    fn prepare_finish_op(
+        &self,
+        lease: &EntityMutationLease,
+        scheduled_resync: bool,
+    ) -> Option<CausalOp> {
+        let (op, changed) = self
+            .with_direct_entity_model(|model| model.finish(lease, scheduled_resync))
+            .ok()?;
         if changed {
             self.note_package_entity_resync_changed();
         }
-        op
+        Some(op)
     }
 
     /// Read scalar family progress without copying pending payloads.
@@ -2985,7 +3017,7 @@ impl HubRuntime {
         &self,
         entity_type: &str,
         snapshot_seq: u64,
-    ) -> PackageEntityFamilyProgress {
+    ) -> Result<PackageEntityFamilyProgress, entity_model::EntityModelPoisoned> {
         self.note_package_entity_resync_changed();
         self.with_direct_entity_model(|model| model.begin_snapshot(entity_type, snapshot_seq))
     }
@@ -3001,8 +3033,11 @@ impl HubRuntime {
             Err(CausalTransitionStatus::Waiting) => return PackageEntitySnapshotStep::Waiting,
             Err(_) => return PackageEntitySnapshotStep::Fault,
         };
-        let (generation, step) =
-            self.with_direct_entity_model(|model| model.step_snapshot(entity_type));
+        let Ok((generation, step)) =
+            self.with_direct_entity_model(|model| model.step_snapshot(entity_type))
+        else {
+            return PackageEntitySnapshotStep::Fault;
+        };
         match step {
             PackageEntityFamilyStep::Discarded { mutation, lease } => {
                 PackageEntitySnapshotStep::Discarded(TakenPackageEntityMutation {
@@ -3046,14 +3081,14 @@ impl HubRuntime {
     /// or a new publish admission restarts a need cycle after degradation.
     pub fn mark_package_entity_resync_needed(&self, entity_type: &str) {
         self.note_package_entity_resync_changed();
-        self.with_direct_entity_model(|model| model.mark_resync(entity_type));
+        let _ = self.with_direct_entity_model(|model| model.mark_resync(entity_type));
     }
 
     /// Explicitly re-arm resync after a new catching-up subscription (or other
     /// progress event that must clear degradation).
     pub fn rearm_package_entity_resync(&self, entity_type: &str) {
         self.note_package_entity_resync_changed();
-        self.with_direct_entity_model(|model| model.rearm_resync(entity_type));
+        let _ = self.with_direct_entity_model(|model| model.rearm_resync(entity_type));
     }
 
     /// Retain a resync change until the owner records the scheduling work.
@@ -3076,8 +3111,9 @@ impl HubRuntime {
 
     /// Record a resync attempt; returns whether the family entered degraded.
     pub fn record_package_entity_resync_attempt(&self, entity_type: &str) -> bool {
-        let degraded =
-            self.with_direct_entity_model(|model| model.record_resync_attempt(entity_type));
+        let degraded = self
+            .with_direct_entity_model(|model| model.record_resync_attempt(entity_type))
+            .unwrap_or(false);
         if degraded {
             self.release_one_degraded_package_entity_resync_lease(entity_type);
         }
@@ -3092,9 +3128,9 @@ impl HubRuntime {
         let Ok(reservation) = self.reserve_causal_transition() else {
             return false;
         };
-        let op =
-            self.with_direct_entity_model(|model| model.take_resync_release(entity_type, true));
-        let Some(op) = op else {
+        let Ok(Some(op)) =
+            self.with_direct_entity_model(|model| model.take_resync_release(entity_type, true))
+        else {
             return false;
         };
         reservation.commit(op);
@@ -9781,7 +9817,9 @@ pub(crate) mod tests {
             assert_index();
             runtime.rearm_package_entity_resync(family);
             assert_index();
-            runtime.begin_package_entity_provider_snapshot(family, 1);
+            runtime
+                .begin_package_entity_provider_snapshot(family, 1)
+                .expect("the test model is not poisoned");
             assert_index();
         }
         runtime.step_package_entity_provider_snapshot("producer.a");

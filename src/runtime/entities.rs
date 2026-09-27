@@ -88,6 +88,9 @@ impl PackageEntities {
         };
         let advanced = family.has_next_pending();
         if advanced {
+            // An identifier space, not a load bound: the fanout sequence is a
+            // monotonic u64 (PackageEntityFanout::has_sequence_capacity), so
+            // exhausting it is restart-class, never backpressure.
             if !self.fanout.has_sequence_capacity() {
                 return (super::PublicationAdvance::Fault, None);
             }
