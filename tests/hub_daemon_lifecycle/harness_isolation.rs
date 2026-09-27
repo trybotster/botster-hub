@@ -353,9 +353,16 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
     let _lock = daemon_test_guard();
     // Scoped: the taint is cleared on every exit path, so a failed assertion
     // here cannot cascade into every later daemon test in the process.
-    let _taint = ScopedHarnessTaint::inject("injected prove-absence failure");
+    let taint = ScopedHarnessTaint::inject("injected prove-absence failure");
     let data_dir = unique_short_test_dir("tnt");
     fs::create_dir_all(&data_dir).expect("create data dir");
+    let data_dir_token = data_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("data dir name")
+        .to_string();
+    // Attributed to this data dir: a host-wide worker count also counts
+    // workers that other sessions on the machine start meanwhile.
     let data_dir_workers = || {
         session_worker_process_identities()
             .expect("session worker census")
@@ -363,10 +370,6 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
             .filter(|worker| worker_belongs_to_data_dir(worker, &data_dir))
             .collect::<Vec<_>>()
     };
-    assert!(
-        data_dir_workers().is_empty(),
-        "positive control: a fresh data dir has no workers"
-    );
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = start_cli_daemon(&data_dir);
     }));
@@ -375,16 +378,48 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
         !daemon_socket_path(&data_dir).exists(),
         "tainted start must not create a daemon socket"
     );
-    // Attributed to this data dir: a host-wide worker count also counts
-    // workers that other sessions on the machine start meanwhile.
     let workers = data_dir_workers();
     assert!(workers.is_empty(), "tainted start must not spawn workers: {workers:?}");
-    let data_dir_token = data_dir.file_name().and_then(|name| name.to_str()).expect("data dir name");
-    assert_eq!(
-        test_owned_process_rows(&[data_dir_token.to_string()]),
-        Vec::new(),
-        "tainted start must not start any process for its data dir"
+    let processes =
+        test_owned_process_rows(std::slice::from_ref(&data_dir_token)).expect("process census");
+    assert!(
+        processes.is_empty(),
+        "tainted start must not start any process for its data dir: {processes:?}"
     );
+
+    // Positive control: once the taint is cleared, the same data dir starts a
+    // real daemon and a worker-backed session, and both census predicates
+    // used above observe them.
+    drop(taint);
+    let daemon = start_cli_daemon(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir));
+    let spawn = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "taint-positive-control".to_string(),
+            command: "sh -c 'sleep 30'".to_string(),
+        },
+    )
+    .expect("spawn worker-backed session");
+    assert_eq!(
+        spawn.kind,
+        botster_hub_client::DaemonResponseKind::Spawned,
+        "spawn worker-backed session: {}",
+        typed_operator_error_body(&spawn)
+    );
+    wait_for_registry_worker(&data_dir);
+    let workers = data_dir_workers();
+    assert!(
+        !workers.is_empty(),
+        "positive control: the data-dir worker predicate must observe a real worker"
+    );
+    let processes =
+        test_owned_process_rows(std::slice::from_ref(&data_dir_token)).expect("process census");
+    assert!(
+        !processes.is_empty(),
+        "positive control: the data-dir process census must observe the real daemon"
+    );
+    daemon.shutdown();
 }
 
 #[test]
@@ -1178,4 +1213,120 @@ fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
     );
     assert_orphan_gone(pid);
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
+}
+
+/// Starts an orphan group leader whose command line names `dir`, with a
+/// child that ignores SIGTERM and whose own command line does not name `dir`.
+/// Returns (leader pid, child pid).
+fn spawn_orphan_group_with_resistant_child(dir: &Path) -> (u32, u32) {
+    const LEADER: &str = concat!(
+        "setpgrp(0, 0); my $c = fork(); ",
+        "if ($c == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "$SIG{TERM} = 'IGNORE'; exec('sleep', '300'); } ",
+        "print \"$$ $c\\n\"; close(STDOUT); close(STDERR); sleep 300;"
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("perl -e \"$0\" \"$1\" </dev/null &")
+        .arg(LEADER)
+        .arg(dir)
+        .output()
+        .expect("spawn orphan group fixture");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut pids = text.split_whitespace().map(|pid| pid.parse().expect("fixture pid"));
+    let leader = pids.next().expect("leader pid");
+    let child = pids.next().expect("child pid");
+    (leader, child)
+}
+
+#[test]
+fn daemon_test_guard_kills_a_sigterm_resistant_descendant_of_a_test_owned_orphan() {
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let result = thread::spawn(move || {
+        let _guard = daemon_test_guard();
+        let dir = unique_short_test_dir("sweep-resist");
+        let (leader, child) = spawn_orphan_group_with_resistant_child(&dir);
+        pid_tx.send((leader, child)).expect("send fixture pids");
+        let child_snapshot = process_snapshot(child).expect("positive control: child is live");
+        assert_eq!(child_snapshot.pgid, leader, "positive control: child is in the leader's group");
+        assert!(
+            !child_snapshot.command.contains(dir.to_string_lossy().as_ref()),
+            "positive control: the child's command line does not name the test dir"
+        );
+    })
+    .join();
+    let (leader, child) = pid_rx.recv().expect("fixture pids");
+    let message = result
+        .expect_err("a leaked group must fail an otherwise passing test")
+        .downcast::<String>()
+        .map(|text| *text)
+        .unwrap_or_default();
+    assert!(
+        message.contains("test-owned processes outlived the test")
+            && !message.contains("survived SIGKILL"),
+        "the sweep must report the leak and stop the whole group: {message}"
+    );
+    assert_orphan_gone(leader);
+    assert_orphan_gone(child);
+    assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
+}
+
+struct SweepOnDrop;
+
+impl Drop for SweepOnDrop {
+    fn drop(&mut self) {
+        sweep_test_owned_processes();
+    }
+}
+
+#[test]
+fn test_owned_sweep_census_failure_fails_and_taints_without_replacing_a_panic() {
+    // Hold the guard so no sibling test observes the taint this proof records.
+    let _lock = daemon_test_guard();
+    for (program, expected) in [
+        ("/nonexistent/botster-census", "did not run"),
+        ("/usr/bin/false", "exited with"),
+    ] {
+        let passing = thread::spawn(move || {
+            set_test_owned_census_program(program);
+            register_test_owned_dir(Path::new("/tmp/bh-census-error-passing"));
+            sweep_test_owned_processes();
+        })
+        .join();
+        let message = passing
+            .expect_err("a failed census must fail a passing test")
+            .downcast::<String>()
+            .map(|text| *text)
+            .unwrap_or_default();
+        assert!(message.contains(expected), "{program}: {message}");
+        assert!(
+            harness_taint().is_some_and(|evidence| evidence.contains(expected)),
+            "{program}: a failed census must taint the harness: {:?}",
+            harness_taint()
+        );
+        reset_harness_taint_after_proof();
+
+        let unwinding = thread::spawn(move || {
+            set_test_owned_census_program(program);
+            register_test_owned_dir(Path::new("/tmp/bh-census-error-unwinding"));
+            let _sweep = SweepOnDrop;
+            panic!("original test failure");
+        })
+        .join();
+        let message = unwinding
+            .expect_err("the original failure must still fail the test")
+            .downcast::<&str>()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            message, "original test failure",
+            "{program}: the census failure must not replace the original panic"
+        );
+        assert!(
+            harness_taint().is_some_and(|evidence| evidence.contains(expected)),
+            "{program}: a failed census while unwinding must taint the harness: {:?}",
+            harness_taint()
+        );
+        reset_harness_taint_after_proof();
+    }
 }
