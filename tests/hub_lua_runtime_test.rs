@@ -1131,7 +1131,7 @@ fn install_event_probe_registry(name: &str) -> PackageRegistry {
     fs::write(
         root.join("plugin.lua"),
         r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
@@ -1139,14 +1139,14 @@ events.on("hub", "worktree_created", function(event)
   }
 end)
 
-events.on("hub", "worktree_deleted", function(event)
+botster.events.on({ owner = "hub", name = "worktree_deleted" }, function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
   }
 end)
 
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     received = event.event,
     observer = "second",
@@ -1686,13 +1686,27 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
         })
         .expect("call spawn target reader tool");
 
-    assert_eq!(result["targets"].as_array().expect("target list").len(), 2);
-    assert_eq!(result["validation"]["ok"], true);
-    assert_eq!(result["validation"]["status"], "ok");
-    assert_eq!(result["disabled"]["ok"], false);
-    assert_eq!(result["disabled"]["status"], "disabled");
-    assert_eq!(result["missing"]["ok"], false);
-    assert_eq!(result["missing"]["status"], "not_found");
+    assert_eq!(result["targets"]["ok"], true);
+    assert_eq!(
+        result["targets"]["value"]
+            .as_array()
+            .expect("target list")
+            .len(),
+        2
+    );
+    // Validation always answers; its value says whether the target is usable.
+    for (field, usable, status) in [
+        ("validation", true, "ok"),
+        ("disabled", false, "disabled"),
+        ("missing", false, "not_found"),
+    ] {
+        assert_eq!(result[field]["ok"], true, "{field}: {result}");
+        assert_eq!(result[field]["value"]["ok"], usable, "{field}: {result}");
+        assert_eq!(
+            result[field]["value"]["status"], status,
+            "{field}: {result}"
+        );
+    }
     assert_eq!(result["mutation_methods"]["create"], false);
     assert_eq!(result["mutation_methods"]["update"], false);
     assert_eq!(result["mutation_methods"]["delete"], false);
@@ -1739,16 +1753,20 @@ fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
         })
         .expect("call worktree reader tool");
 
+    assert_eq!(result["worktrees"]["ok"], true);
     assert_eq!(
-        result["worktrees"].as_array().expect("worktree list").len(),
+        result["worktrees"]["value"]
+            .as_array()
+            .expect("worktree list")
+            .len(),
         1
     );
-    assert_eq!(result["worktrees"][0]["status"], "present");
+    assert_eq!(result["worktrees"]["value"][0]["status"], "present");
     assert_eq!(result["shown"]["ok"], true);
-    assert_eq!(result["shown"]["status"], "present");
-    assert_eq!(result["shown"]["worktree"]["worktree_id"], "wt_lua_plain");
+    assert_eq!(result["shown"]["value"]["status"], "present");
+    assert_eq!(result["shown"]["value"]["worktree_id"], "wt_lua_plain");
     assert_eq!(result["missing"]["ok"], false);
-    assert_eq!(result["missing"]["status"], "not_found");
+    assert_eq!(result["missing"]["error"]["kind"], "not_found");
     assert_eq!(result["mutation_methods"]["create"], false);
     assert_eq!(result["mutation_methods"]["update"], false);
     assert_eq!(result["mutation_methods"]["delete"], false);
@@ -1799,11 +1817,14 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         .expect("call worktree reader tool after state refresh");
 
     assert_eq!(
-        result["worktrees"].as_array().expect("worktree list").len(),
+        result["worktrees"]["value"]
+            .as_array()
+            .expect("worktree list")
+            .len(),
         1
     );
     assert_eq!(result["shown"]["ok"], true);
-    assert_eq!(result["shown"]["worktree"]["worktree_id"], "wt_lua_late");
+    assert_eq!(result["shown"]["value"]["worktree_id"], "wt_lua_late");
 }
 
 #[test]
@@ -3342,8 +3363,8 @@ return botster.register({
       descriptor_id = "lease-probe.item",
       descriptor = { entity_type = "lease-probe.item", id_field = "id" },
       call = function()
-        local emitted = events.emit("unused", { ok = true })
-        provider_status = emitted.status
+        local emitted = botster.events.emit({ name = "unused", payload = { ok = true } })
+        provider_status = emitted.ok and emitted.value.status or emitted.error.detail.status
         return {
           type = "entity_snapshot",
           entity_type = "lease-probe.item",
@@ -3402,11 +3423,78 @@ fn lease_probe_manifest() -> serde_json::Value {
 }
 
 #[test]
+fn events_helpers_map_rejections_to_typed_results() {
+    let registry = install_named_lua_package(
+        "event-results",
+        r#"
+return botster.register({ handlers = {{
+  id = "probe",
+  kind = "command",
+  call = function()
+    return {
+      undeclared = botster.events.emit({ name = "never_declared", payload = {} }),
+      malformed_emit = botster.events.emit("never_declared"),
+      malformed_on = botster.events.on("hub", function() end),
+    }
+  end,
+}}})
+"#,
+        serde_json::json!({
+            "name": "event-results.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }),
+    );
+    let mut hub = explicit_runtime("event-results");
+    hub.load_lua_plugin_package(&registry, "event-results.plugin")
+        .expect("load event results plugin");
+    let outcome = hub.invoke_plugin(invocation(
+        PluginHandlerRef {
+            plugin_key: PluginKey("event-results.plugin".to_string()),
+            kind: PluginHandlerKind::Command,
+            handler_id: "probe".to_string(),
+        },
+        serde_json::json!({}),
+    ));
+    let PluginInvocationResult::Completed(PluginInvocationSuccess {
+        payload: Some(payload),
+        ..
+    }) = outcome.result
+    else {
+        panic!("event results probe should complete: {:?}", outcome.result);
+    };
+    let results = payload.0;
+    assert_eq!(
+        results["undeclared"],
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "kind": "capability_denied",
+                "message": "event rejected_undeclared",
+                "retryable": false,
+                "detail": { "status": "rejected_undeclared" },
+            },
+        })
+    );
+    for malformed in ["malformed_emit", "malformed_on"] {
+        assert_eq!(results[malformed]["ok"], false, "{malformed}: {results}");
+        assert_eq!(results[malformed]["error"]["kind"], "invalid_request");
+        assert_eq!(
+            results[malformed]["error"]["detail"]["status"],
+            "rejected_invalid"
+        );
+    }
+}
+
+#[test]
 fn failed_lua_load_does_not_leave_router_subscriptions() {
     let registry = install_named_lua_package(
         "failed-load-subs",
         r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return { received = event.event }
 end)
 error("deliberate load failure after events.on")
@@ -3462,7 +3550,7 @@ fn held_router_load_fails_without_partial_contracts_or_subscriptions() {
     let registry = install_named_lua_package(
         "held-router-load",
         r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return { received = event.event }
 end)
 return botster.register({})
@@ -3511,7 +3599,7 @@ fn held_router_reload_keeps_one_generation_until_owner_apply() {
     let registry = install_named_lua_package(
         "held-router-reload",
         r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return { received = event.event }
 end)
 return botster.register({})

@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use mlua::{Function, Lua, Table};
+use mlua::{Function, Lua};
 
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 

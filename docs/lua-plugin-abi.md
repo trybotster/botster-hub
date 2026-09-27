@@ -163,30 +163,37 @@ backward (`snapshot_seq < sub.last_applied_seq` is not delivered to that sub).
 
 ## Rust-Emitted Events
 
-Plugins subscribe to hub-emitted lifecycle events with the injected `events`
-global:
+Plugins subscribe to events and emit their own with `botster.events` (there
+is no `events` global):
 
 ```lua
-events.on("hub", "worktree_created", function(event)
+local subscribed = botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     worktree_id = event.worktree_id,
     target_id = event.target_id,
   }
 end)
+-- subscribed.ok, or subscribed.error.kind = "invalid_request"
+-- with error.detail.status = "rejected_invalid" | "rejected_wildcard"
 
-local result = events.emit("sample.ready", { ok = true })
--- result.status is accepted, rejected_*, or shed_*
+local emitted = botster.events.emit({ name = "sample.ready", payload = { ok = true } })
+-- emitted.ok and emitted.value.status == "accepted", or emitted.error.kind with
+-- the exact event-plane status in emitted.error.detail.status
 
 return botster.register({})
 ```
 
-`events.on(owner, name, fn)` is the only subscription form. The old
-single-name form is a typed reject. Packages emit only their own declared
-events through `events.emit(name, payload)`. Emit is one non-blocking
-router ingress; it does not wait for handlers.
+`botster.events.on({ owner, name }, fn)` is the only subscription form.
+Packages emit only their own declared events through
+`botster.events.emit({ name, payload })`. Emit is one non-blocking router
+ingress; it does not wait for handlers. Both return the platform result shape.
+Refusal statuses map to error kinds: `rejected_undeclared`,
+`rejected_foreign`, and `rejected_audience` to `capability_denied`;
+`rejected_over_rate`, `shed_full`, and `shed_busy` to `backpressured`; every
+other rejection to `invalid_request`.
 
 Authorized plugins consume the Hub-owned `/session` family through
-`events.on("hub", "session_family", ...)`. Hub admits those frames as Background
+`botster.events.on({ owner = "hub", name = "session_family" }, ...)`. Hub admits those frames as Background
 work: `snapshot_begin`, bounded `snapshot_chunk`, `snapshot_end` at one
 snapshot sequence, then live deltas. At most one session-family frame is
 in flight per plugin. Admission, completion, or handler failure marks a
@@ -303,9 +310,10 @@ The initial capability helper is:
   both. Capability or namespace denial raises a Lua runtime error instead
   of returning this failure table; callers that must survive a missing or
   revoked grant should invoke `plugin_db.batch` with `pcall`.
-- `botster.capabilities.config.get()`: returns the loaded plugin's own
-  sanitized effective package configuration as `{ values = {...},
-  missing_required = {...}, diagnostics = {...} }`. Values use the package
+- `botster.capabilities.config.get()`: returns `{ ok = true, value = {
+  values = {...}, missing_required = {...}, diagnostics = {...} } }`, the
+  loaded plugin's own sanitized effective package configuration. Any argument
+  other than none or an empty table returns `invalid_request`. Values use the package
   daemon DTO shape, including manifest defaults and operator-set non-secret
   values. Secret values are absent when unset and redacted when set.
 - `botster.capabilities.session_types.list({ target_id = "..." })` returns
@@ -330,23 +338,23 @@ The initial capability helper is:
   session_type_id, context_id, context_keys }`. Those fields are produced by the
   materialized session type and Core spawn outcome. Policy and runtime failures
   raise Lua runtime errors rather than returning placeholder diagnostics fields.
-- `botster.capabilities.spawn_targets.list()`: returns sanitized hub-owned spawn
-  target rows visible to plugins. Plugins receive ids, labels, enabled state,
+- `botster.capabilities.spawn_targets.list()`: returns `{ ok = true, value =
+  rows }`, the sanitized hub-owned spawn target rows visible to plugins. Plugins receive ids, labels, enabled state,
   kind, root, and sanitized metadata, but they do not own or mutate the
   registry.
 - `botster.capabilities.spawn_targets.validate({ target_id = "..." })`: returns
-  `{ target_id = "...", ok = boolean, status = "ok"|"disabled"|"not_found" }`.
-  Disabled targets exist but are unavailable for plugin references, so
-  validation returns `ok = false` with `status = "disabled"`.
-- `botster.capabilities.worktrees.list()`: returns deterministic sanitized
-  hub-owned worktree rows with reconciled `status` values. Worktree rows include
+  `{ ok = true, value = { target_id = "...", ok = boolean, status =
+  "ok"|"disabled"|"not_found" } }`. Validation always answers; its value says
+  whether the target is usable. Disabled targets exist but are unavailable for
+  plugin references, so their value has `ok = false` and `status = "disabled"`.
+  A missing `target_id` returns `invalid_request`.
+- `botster.capabilities.worktrees.list()`: returns `{ ok = true, value = rows
+  }`, the deterministic sanitized hub-owned worktree rows with reconciled `status` values. Worktree rows include
   `worktree_id`, `target_id`, label, path, status, optional git metadata, and
   sanitized metadata.
 - `botster.capabilities.worktrees.show({ worktree_id = "..." })`: returns
-  `{ ok = true, status = "...", worktree = {...} }` for an existing worktree.
-  Missing ids return `{ ok = false, status = "not_found", worktree_id = "...",
-  message = "..." }` so plugins can produce diagnostics without wrapping normal
-  absence in `pcall`.
+  `{ ok = true, value = worktree }` for an existing worktree, and
+  `{ ok = false, error = { kind = "not_found", ... } }` for a missing id.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
 cannot select another plugin's namespace.
