@@ -995,8 +995,9 @@ pub(crate) struct HostMutationError {
     pub(crate) code: String,
     pub(crate) message: String,
     /// A client-visible event that reports this failure, such as
-    /// `worktree_delete_failed`.
-    pub(crate) event: Option<DaemonEvent>,
+    /// `worktree_delete_failed`. Boxed: carried inline it enlarges every
+    /// `Result<_, HostMutationError>`.
+    pub(crate) event: Option<Box<DaemonEvent>>,
 }
 
 #[derive(Debug)]
@@ -3023,7 +3024,9 @@ fn worktree_failure(
         &error,
     );
     HostMutationError {
-        event: Some(DaemonEvent::WorktreeLifecycle { event: lifecycle }),
+        event: Some(Box::new(DaemonEvent::WorktreeLifecycle {
+            event: lifecycle,
+        })),
         ..HostMutationError::new(error.kind, error.message)
     }
 }

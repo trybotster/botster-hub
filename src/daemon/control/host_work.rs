@@ -1383,7 +1383,11 @@ impl HostMutationContinuation {
                 if state.document_owner == Some(waiter_id) {
                     release_document(state, waiter_id);
                 }
-                ingest_worktree_lifecycle_events(daemon, state, error.event.as_slice());
+                ingest_worktree_lifecycle_events(
+                    daemon,
+                    state,
+                    error.event.as_deref().map_or(&[], std::slice::from_ref),
+                );
                 finish_error(permit, operation, error)
             }
         }
@@ -2286,7 +2290,7 @@ fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -
 
 fn host_error_response(operation: &str, error: HostMutationError) -> DaemonResponse {
     let mut response = error_response(&error.code, operation, &error.message);
-    response.events.extend(error.event);
+    response.events.extend(error.event.map(|event| *event));
     response
 }
 
