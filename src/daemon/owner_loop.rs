@@ -1846,8 +1846,10 @@ pub(crate) struct UncertainPublicationCell {
 
 enum UncertainPublicationPayload {
     State(crate::persistence::HubStateUncertainWrite),
-    External {
-        _cause: crate::host_mutations::ExternalEffectCause,
+    /// A document commit whose Host job ended without a mutation result: the
+    /// publication outcome is unknown, so its pre-effect views are kept.
+    UnknownOutcome {
+        _outcome: crate::daemon::control::host_work::UnknownDocumentOutcome,
     },
 }
 
@@ -1855,7 +1857,7 @@ enum UncertainPublicationPayload {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UncertainPublicationKind {
     State,
-    External,
+    UnknownOutcome,
 }
 
 pub(crate) enum UncertainPublicationCleanup {
@@ -1931,6 +1933,10 @@ pub(crate) struct DaemonControlState {
     pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
         BTreeMap<std::path::PathBuf, crate::owner_identity::WaiterId>,
+    /// Repository roots quarantined after an uncertain or unknown write.
+    /// Unlike `blocked_session_type_roots`, entries outlive their writer.
+    pub(crate) repo_session_type_quarantine:
+        crate::daemon::control::session_type_quarantine::RepoSessionTypeQuarantines,
     /// Correlation for non-blocking plugin request-response work.
     pub(crate) plugin_controls: crate::daemon::control::plugins::PluginControlState,
     /// Correlation and retained replies for asynchronous entity providers.
@@ -2022,12 +2028,13 @@ impl DaemonControlState {
         cell.cleanup = cleanup;
     }
 
-    /// Retain an unresolved external effect in the cell claimed before Host commit.
-    pub(crate) fn retain_uncertain_external(
+    /// Retain a document commit whose outcome is unknown in the cell claimed
+    /// before Host commit. Hub-state writes stay refused, as for any uncertain
+    /// publication.
+    pub(crate) fn retain_uncertain_unknown(
         &mut self,
         waiter_id: crate::owner_identity::WaiterId,
-        rollback: crate::host_mutations::RollbackDescriptor,
-        cause: crate::host_mutations::ExternalEffectCause,
+        outcome: crate::daemon::control::host_work::UnknownDocumentOutcome,
     ) {
         let cell = self
             .uncertain_publication
@@ -2041,8 +2048,7 @@ impl DaemonControlState {
             cell.write.is_none(),
             "publication cell cannot be overwritten"
         );
-        cell.write = Some(UncertainPublicationPayload::External { _cause: cause });
-        cell.rollback = Some(rollback);
+        cell.write = Some(UncertainPublicationPayload::UnknownOutcome { _outcome: outcome });
     }
 
     /// Read the exact waiter's retained kind and rollback presence in tests.
@@ -2057,7 +2063,9 @@ impl DaemonControlState {
         }
         let kind = match cell.write.as_ref()? {
             UncertainPublicationPayload::State(_) => UncertainPublicationKind::State,
-            UncertainPublicationPayload::External { .. } => UncertainPublicationKind::External,
+            UncertainPublicationPayload::UnknownOutcome { .. } => {
+                UncertainPublicationKind::UnknownOutcome
+            }
         };
         Some((kind, cell.rollback.is_some()))
     }
@@ -2182,6 +2190,7 @@ impl Default for DaemonControlState {
             host_completion_drain_faulted: false,
             host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
+            repo_session_type_quarantine: Default::default(),
             plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
             plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),
             package_entity_resync_scan:

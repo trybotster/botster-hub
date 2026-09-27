@@ -55,7 +55,7 @@ use crate::persistence::{
 };
 use crate::runtime::package_effect::{HostPackageCleanup, HostPackageRuntime};
 use crate::session_types::{
-    PackageSessionType, RepoSessionTypeFileCommit, RepoSessionTypeFileSnapshot, SessionTypeError,
+    RepoPublicationCause, RepoSessionTypeFileCommit, RepoSessionTypeFileSnapshot, SessionTypeError,
     SessionTypeMutation, SessionTypeMutationSource, commit_repo_session_type_bytes,
     encode_repo_session_type_bytes, list_session_types_with_staged_repo,
     restore_repo_session_type_file, snapshot_repo_session_type_file,
@@ -331,8 +331,8 @@ pub(crate) enum HostMutationResult {
         reply: HostReply,
     },
     /// The repository file was renamed, but its durable result is unconfirmed.
+    /// The owner quarantines the root with the evidence it kept at admission.
     ExternalEffectUncertain {
-        rollback: RollbackDescriptor,
         cause: ExternalEffectCause,
     },
     Recovered(RecoveryOutcome),
@@ -647,9 +647,65 @@ pub(crate) enum PreparedSessionTypeChange {
     Document(PreparedStateChange),
     RepoFile {
         root: PathBuf,
-        definitions: Vec<PackageSessionType>,
+        bytes: Vec<u8>,
         reply: HostReply,
+        evidence: RepoWriteEvidence,
     },
+}
+
+/// The operation a repository session-types write performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionTypeOperation {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Pre-effect identity of one repository session-types write. The owner keeps
+/// a copy while the Host commits, so an uncertain or unknown outcome can be
+/// recorded without reading the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoWriteEvidence {
+    /// Canonical repository root, resolved by the Host at prepare.
+    pub(crate) root: PathBuf,
+    pub(crate) target_path: PathBuf,
+    pub(crate) session_type_id: String,
+    pub(crate) operation: SessionTypeOperation,
+    /// SHA-256 of the file before the write, or `None` when it was missing.
+    pub(crate) prior_sha256: Option<[u8; 32]>,
+    pub(crate) candidate_sha256: [u8; 32],
+}
+
+/// What the owner keeps from a prepared commit before the Host runs it.
+pub(crate) enum CommitEvidence {
+    RepoFile(RepoWriteEvidence),
+    Document {
+        base_revision: u64,
+        prior: Option<SharedView<HubState>>,
+        candidate: SharedView<HubState>,
+    },
+}
+
+impl PreparedMutation {
+    /// Copy the pre-effect evidence the owner keeps while the Host commits.
+    /// Document views are shared, so this retains no new allocation.
+    pub(crate) fn commit_evidence(&self) -> CommitEvidence {
+        let write = match &self.change {
+            PreparedChange::SessionType(PreparedSessionTypeChange::RepoFile {
+                evidence, ..
+            }) => return CommitEvidence::RepoFile(evidence.clone()),
+            PreparedChange::SessionType(PreparedSessionTypeChange::Document(change))
+            | PreparedChange::PackageConfiguration(change)
+            | PreparedChange::SpawnTarget(change)
+            | PreparedChange::RegisteredWorktree(change) => &change.write,
+        };
+        let (prior, candidate) = write.views();
+        CommitEvidence::Document {
+            base_revision: self.base_revision,
+            prior,
+            candidate,
+        }
+    }
 }
 
 /// Exact repository file state retained for session-type compensation.
@@ -727,7 +783,10 @@ pub(crate) struct HostMutationError {
 
 #[derive(Debug)]
 pub(crate) enum ExternalEffectCause {
-    RepoPublicationSyncUnconfirmed { _error: SessionTypeError },
+    RepoPublicationSyncUnconfirmed {
+        cause: RepoPublicationCause,
+        _error: SessionTypeError,
+    },
 }
 
 impl ExternalEffectCause {
@@ -1948,6 +2007,15 @@ fn prepare_session_type(
             ));
         }
     };
+    let (session_type_id, operation) = match &mutation {
+        SessionTypeMutation::Create(definition) => {
+            (definition.id.clone(), SessionTypeOperation::Create)
+        }
+        SessionTypeMutation::Update(definition) => {
+            (definition.id.clone(), SessionTypeOperation::Update)
+        }
+        SessionTypeMutation::Delete { id } => (id.clone(), SessionTypeOperation::Delete),
+    };
     let prepared = crate::session_types::prepare_session_type_mutation(
         &config,
         &state,
@@ -2007,10 +2075,24 @@ fn prepare_session_type(
         ));
     }
     let change = if let Some((root, definitions)) = repo_write {
+        let bytes = encode_repo_session_type_bytes(&definitions).map_err(session_type_error)?;
+        let prior_sha256 = match repo_file.as_ref().map(|rollback| &rollback.prior) {
+            Some(RepoSessionTypeFileSnapshot::Present(prior)) => Some(sha256(prior)),
+            Some(RepoSessionTypeFileSnapshot::Missing) | None => None,
+        };
+        let evidence = RepoWriteEvidence {
+            target_path: root.join(".botster/session-types.json"),
+            root: root.clone(),
+            session_type_id,
+            operation,
+            prior_sha256,
+            candidate_sha256: sha256(&bytes),
+        };
         PreparedSessionTypeChange::RepoFile {
             root,
-            definitions,
+            bytes,
             reply,
+            evidence,
         }
     } else {
         let store = FileHubStateStore::for_data_directory(data_directory);
@@ -2198,6 +2280,8 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
         packages,
         package_effect,
     } = into_state_change(change);
+    #[cfg(test)]
+    fire_commit_panic(store.path(), CommitPanicPoint::BeforeEffect);
     match store.commit_shared(write, base_revision) {
         Ok(FileCommitOutcome::Synced {
             state: view,
@@ -2227,7 +2311,7 @@ fn execute_session_type_commit(
     change: PreparedSessionTypeChange,
     rollback: RollbackDescriptor,
 ) -> HostMutationResult {
-    let (root, definitions, reply) = match change {
+    let (root, repo_bytes, reply) = match change {
         PreparedSessionTypeChange::Document(PreparedStateChange {
             store,
             write,
@@ -2237,6 +2321,8 @@ fn execute_session_type_commit(
         }) => {
             debug_assert!(packages.is_none());
             debug_assert!(package_effect.is_none());
+            #[cfg(test)]
+            fire_commit_panic(store.path(), CommitPanicPoint::BeforeEffect);
             return finish_session_type_state_commit(
                 store.commit_shared(write, committed_revision - 1),
                 rollback,
@@ -2244,10 +2330,8 @@ fn execute_session_type_commit(
             );
         }
         PreparedSessionTypeChange::RepoFile {
-            root,
-            definitions,
-            reply,
-        } => (root, definitions, reply),
+            root, bytes, reply, ..
+        } => (root, bytes, reply),
     };
     let RollbackDescriptor::SessionType {
         repo_file: Some(repo_prior),
@@ -2275,18 +2359,21 @@ fn execute_session_type_commit(
             "repository file changed after preparation",
         ));
     }
-    let repo_bytes = match encode_repo_session_type_bytes(&definitions) {
-        Ok(bytes) => bytes,
-        Err(error) => return HostMutationResult::Failed(session_type_error(error)),
-    };
     // The repository file is the whole effect: one atomic write, no journal
     // intent and no Hub-state document write.
-    match commit_repo_session_type_bytes(&root, &repo_bytes) {
+    #[cfg(test)]
+    fire_commit_panic(&root, CommitPanicPoint::BeforeEffect);
+    let committed = commit_repo_session_type_bytes(&root, &repo_bytes);
+    #[cfg(test)]
+    fire_commit_panic(&root, CommitPanicPoint::AfterEffect);
+    match committed {
         Ok(RepoSessionTypeFileCommit::Synced) => HostMutationResult::RepoFileCommitted { reply },
-        Ok(RepoSessionTypeFileCommit::PublishedUncertain(error)) => {
+        Ok(RepoSessionTypeFileCommit::PublishedUncertain { cause, error }) => {
             HostMutationResult::ExternalEffectUncertain {
-                rollback,
-                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed { _error: error },
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed {
+                    cause,
+                    _error: error,
+                },
             }
         }
         // Before the rename nothing was published.
@@ -2324,6 +2411,54 @@ fn finish_session_type_state_commit(
             failure: file_commit_error(error),
         })),
     }
+}
+
+/// Where a test-injected commit panic fires, relative to the file effect.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitPanicPoint {
+    BeforeEffect,
+    AfterEffect,
+}
+
+#[cfg(test)]
+fn commit_panics() -> &'static std::sync::Mutex<BTreeMap<PathBuf, CommitPanicPoint>> {
+    static PANICS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, CommitPanicPoint>>> =
+        std::sync::OnceLock::new();
+    PANICS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Panic the next commit keyed by `key` (a repository root, or a state
+/// document path) at `point`, inside the Host worker.
+#[cfg(test)]
+pub(crate) fn inject_next_commit_panic(key: impl Into<PathBuf>, point: CommitPanicPoint) {
+    commit_panics()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.into(), point);
+}
+
+#[cfg(test)]
+fn fire_commit_panic(key: &std::path::Path, point: CommitPanicPoint) {
+    let armed = {
+        let mut panics = commit_panics()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if panics.get(key) == Some(&point) {
+            panics.remove(key);
+            true
+        } else {
+            false
+        }
+    };
+    if armed {
+        panic!("test-injected commit panic at {point:?}");
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 fn file_commit_error(error: FileCommitError) -> HostMutationError {
@@ -2672,6 +2807,7 @@ impl io::Write for CountingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_types::PackageSessionType;
 
     fn execute(command: HostMutationCommand) -> HostMutationResult {
         super::execute(command, Some(&mut EntrypointSupervisor::default()))
@@ -3518,19 +3654,29 @@ mod tests {
             panic!("session-type preparation must succeed");
         };
         crate::session_types::inject_next_repo_directory_sync_failure(&root);
+        let CommitEvidence::RepoFile(evidence) = prepared.commit_evidence() else {
+            panic!("a repository prepare carries repository evidence");
+        };
+        assert_eq!(evidence.prior_sha256, None, "the prior file was missing");
+        assert_eq!(evidence.session_type_id, "review");
+        assert_eq!(evidence.operation, SessionTypeOperation::Create);
         let HostMutationResult::ExternalEffectUncertain {
-            rollback:
-                RollbackDescriptor::SessionType {
-                    repo_file: Some(prior),
-                    ..
+            cause:
+                ExternalEffectCause::RepoPublicationSyncUnconfirmed {
+                    cause,
+                    _error: error,
                 },
-            cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed { _error: error },
         } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
             panic!("repo rename with failed directory sync must retain uncertainty");
         };
         assert_eq!(error.kind, "repo_session_type_sync_uncertain");
-        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        assert_eq!(cause, RepoPublicationCause::Injected);
+        assert_eq!(
+            sha256(&fs::read(&repo_file).expect("read renamed repo file")),
+            evidence.candidate_sha256,
+            "the evidence names the bytes that were renamed into place"
+        );
         assert!(repo_file.is_file());
         assert_eq!(
             fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
