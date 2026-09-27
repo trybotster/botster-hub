@@ -115,10 +115,27 @@ pub(crate) struct HostPackageRuntime {
     /// Held here, outside the effect's `catch_unwind`, so an unwind between
     /// stage and activation still hands it to the restore.
     staged: Option<StagedGeneration>,
+    /// A generation an earlier attempt staged whose quarantine phase never
+    /// ran. Its router entry blocks every stage, so this runtime aborts it
+    /// before it stages anything.
+    retained: Option<StagedGeneration>,
 }
 
 impl HostPackageRuntime {
     /// Fund the next event generation this runtime stages.
+    /// Take ownership of a retained staged generation to settle first.
+    pub(crate) fn settle_before_staging(&mut self, staged: StagedGeneration) {
+        self.retained = Some(staged);
+    }
+
+    /// Abort a retained staged generation. Host workers only: the router
+    /// lock is taken blocking.
+    pub(crate) fn settle_retained(&mut self) {
+        if let Some(staged) = self.retained.take() {
+            self.abort_staged(staged);
+        }
+    }
+
     pub(crate) fn fund_staging(&mut self, funding: StagingFunding) {
         self.staging_funding = Some(funding);
     }
@@ -159,6 +176,7 @@ impl HostPackageRuntime {
             event_plane_faults: Vec::new(),
             staging_funding: None,
             staged: None,
+            retained: None,
             stranded,
         }
     }
