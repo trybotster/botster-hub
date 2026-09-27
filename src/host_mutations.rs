@@ -711,12 +711,14 @@ fn finalize_package_reply(
     let HostPackageFinalize { mut reply } = finalize;
     let entrypoint_processes = entrypoints.snapshots();
     apply_daemon_entrypoint_processes(&mut reply.response, entrypoint_processes);
-    HostReply::try_new(reply.response)
+    HostReply::try_new(*reply.response)
 }
 
 /// A response and its checked logical encoded-byte count.
 pub(crate) struct HostReply {
-    pub(crate) response: DaemonResponse,
+    /// Boxed: DaemonResponse is about 6 KB, and a reply travels inside Host
+    /// commands, results, and prepared mutations.
+    pub(crate) response: Box<DaemonResponse>,
     pub(crate) logical_bytes: usize,
 }
 
@@ -730,7 +732,7 @@ impl HostReply {
             ));
         }
         Ok(Self {
-            response,
+            response: Box::new(response),
             logical_bytes,
         })
     }
