@@ -125,7 +125,11 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 50.
+- conformance fixture revision 51.
+
+Conformance fixture revision 51 changes the plugin contract matrix fixture: it
+reads the result shape of `botster.capabilities.config.get()`
+(`{ ok, value }`). Protocol version stays 11.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
