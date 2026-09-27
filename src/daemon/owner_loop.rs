@@ -1035,6 +1035,99 @@ pub(crate) fn drive_ready_test_turn(
     false
 }
 
+/// The one shared test hang guard. Only a stuck owner reaches it: tests wait
+/// for owner wakes and assert outcomes, never elapsed time.
+#[cfg(test)]
+pub(crate) const TEST_HANG_GUARD: Duration = Duration::from_secs(60);
+
+/// A test-owned owner wake channel. It is bound to the same wake sources the
+/// daemon loop binds, so a test blocks where the daemon owner would.
+#[cfg(test)]
+pub(crate) struct TestOwnerWakes {
+    receiver: tokio_mpsc::Receiver<ControlMessage>,
+    blocking: tokio::runtime::Runtime,
+}
+
+#[cfg(test)]
+impl TestOwnerWakes {
+    pub(crate) fn bind(daemon: &HubDaemon, state: &DaemonControlState) -> Self {
+        let (sender, receiver) = tokio_mpsc::channel(64);
+        if let Some(runtime) = daemon.runtime() {
+            runtime.bind_data_plane_owner_wake(sender.clone());
+            runtime.bind_host_owner_wake(sender.clone());
+            runtime.bind_managed_spawn_owner_wake(sender.clone());
+        }
+        state.plugin_result_budget.bind_owner_wake(sender);
+        Self {
+            receiver,
+            blocking: tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test owner wake runtime"),
+        }
+    }
+
+    /// Block until the next owner wake. Returns false at `deadline`.
+    pub(crate) fn wait(&mut self, deadline: Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let receiver = &mut self.receiver;
+        // timer: deadline — the shared test hang guard; normal progress
+        // arrives as an owner wake before it.
+        // The timer must be created inside the runtime's context.
+        match self
+            .blocking
+            .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await })
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => panic!("the owner wake channel closed"),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Drive the owner as the daemon loop does until `done` holds: run turns
+/// while owner work is ready, and otherwise block until the next owner wake.
+/// `done` is checked before and after every turn, so a condition that
+/// already holds, or that a turn left holding, is seen before the owner
+/// advances again.
+/// `hang_guard` is checked on every iteration, so ready work that re-arms
+/// forever cannot bypass it. `describe` reports the state if it expires.
+#[cfg(test)]
+pub(crate) fn drive_owner_until(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    wakes: &mut TestOwnerWakes,
+    hang_guard: Duration,
+    mut done: impl FnMut(&HubDaemon, &mut DaemonControlState) -> bool,
+    describe: impl Fn(&HubDaemon, &DaemonControlState) -> String,
+) {
+    let deadline = Instant::now() + hang_guard;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the hang guard expired before the condition held: {}",
+            describe(daemon, state)
+        );
+        if done(daemon, state) {
+            return;
+        }
+        assert!(!drive_ready_test_turn(daemon, state));
+        if done(daemon, state) {
+            return;
+        }
+        publish_completion_wakes(daemon, state);
+        publish_maintenance_wakes(state);
+        if !state.owner_ready.is_empty() {
+            continue;
+        }
+        assert!(
+            wakes.wait(deadline),
+            "owner wakes stopped before the condition held: {}",
+            describe(daemon, state)
+        );
+    }
+}
+
 fn run_control_ingress_item(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -7921,10 +8014,13 @@ return botster.register({ handlers = {{
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn lifetime_budget_allows_a_live_event_to_complete_512_publications() {
-        use crate::package_event_router::{EventPlaneStatus, HUB_EVENT_OWNER};
-        let root = unique_package_control_dir("lifetime-live-event");
+    /// Starts a daemon whose `resync-probe` plugin performs `publications`
+    /// entity publications inside one `worktree_created` event handler.
+    fn start_publishing_event_daemon(
+        name: &str,
+        publications: usize,
+    ) -> (HubDaemon, DaemonControlState, TestOwnerWakes, PathBuf) {
+        let root = unique_package_control_dir(name);
         let package_dir = root.join("resync-probe");
         write_package_control_manifest(
             &package_dir,
@@ -7936,23 +8032,25 @@ return botster.register({ handlers = {{
         );
         std::fs::write(
             package_dir.join("plugin.lua"),
-            r#"
+            format!(
+                r#"
 events.on("hub", "worktree_created", function()
-  for seq = 1, 512 do
-    local result = botster.entity_publish({
+  for seq = 1, {publications} do
+    local result = botster.entity_publish({{
       type = "entity_remove", entity_type = "resync-probe.item", snapshot_seq = seq, id = "item"
-    })
+    }})
     assert(result.ok)
   end
 end)
-return botster.register({ handlers = {{
+return botster.register({{ handlers = {{{{
   id = "items", kind = "entity_provider", descriptor_id = "resync-probe.item",
-  descriptor = { entity_type = "resync-probe.item", id_field = "id" },
-  call = function() return {
-    type = "entity_snapshot", entity_type = "resync-probe.item", snapshot_seq = 0, items = {}
-  } end,
-}} })
-"#,
+  descriptor = {{ entity_type = "resync-probe.item", id_field = "id" }},
+  call = function() return {{
+    type = "entity_snapshot", entity_type = "resync-probe.item", snapshot_seq = 0, items = {{}}
+  }} end,
+}}}} }})
+"#
+            ),
         )
         .unwrap();
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
@@ -7968,59 +8066,240 @@ return botster.register({ handlers = {{
             },
         )
         .unwrap();
-        let mut state = DaemonControlState::default();
+        let state = DaemonControlState::default();
+        let wakes = TestOwnerWakes::bind(&daemon, &state);
         daemon
             .runtime()
             .unwrap()
             .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
-        let count = 1;
-        for expected in 1..=count {
-            assert_eq!(
-                daemon
-                    .runtime()
-                    .unwrap()
-                    .package_event_router()
-                    .try_ingress(
-                        HUB_EVENT_OWNER,
-                        "worktree_created",
-                        &serde_json::json!({"event": "worktree_created"}),
-                        Instant::now()
-                    ),
-                EventPlaneStatus::Accepted
-            );
-            state
-                .maintenance
-                .wakes
-                .mark(MaintenanceSliceKind::PackageEventDelivery);
-            let deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                drive_ready_test_turn(&mut daemon, &mut state);
+        (daemon, state, wakes, root)
+    }
+
+    /// Delivers one `worktree_created` event and drives owner turns until its
+    /// handler reaches a terminal outcome and every publication retires.
+    /// Returns the event-plane counters at that point. Any terminal outcome
+    /// ends the loop, so a failed or timed-out handler is reported at once.
+    fn drive_one_publishing_event(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        wakes: &mut TestOwnerWakes,
+        hang_guard: Duration,
+    ) -> botster_hub_client::DaemonObservabilityCounters {
+        use crate::package_event_router::{EventPlaneStatus, HUB_EVENT_OWNER};
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .package_event_router()
+                .try_ingress(
+                    HUB_EVENT_OWNER,
+                    "worktree_created",
+                    &serde_json::json!({"event": "worktree_created"}),
+                    Instant::now()
+                ),
+            EventPlaneStatus::Accepted
+        );
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::PackageEventDelivery);
+        drive_owner_until(
+            daemon,
+            state,
+            wakes,
+            hang_guard,
+            |daemon, state| {
                 let runtime = daemon.runtime().unwrap();
-                if runtime
-                    .event_plane_counters()
-                    .snapshot()
-                    .event_handler_completed_ok
-                    == expected as u64
+                handler_terminal_count(&runtime.event_plane_counters().snapshot()) == 1
                     && runtime.causal_operation_count() == 0
                     && !runtime.entity_publish_retirement_pending()
                     && state.maintenance.event_in_flight.is_empty()
                     && state.maintenance.pending_retirements.is_empty()
                     && state.budget.outstanding() == 0
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "event and publication work must retire"
+            },
+            |daemon, state| {
+                let runtime = daemon.runtime().unwrap();
+                format!(
+                    "causal_operations={} publish_retirement_pending={} event_in_flight={} \
+                     pending_retirements={} budget_outstanding={} counters={:?}",
+                    runtime.causal_operation_count(),
+                    runtime.entity_publish_retirement_pending(),
+                    state.maintenance.event_in_flight.len(),
+                    state.maintenance.pending_retirements.len(),
+                    state.budget.outstanding(),
+                    runtime.event_plane_counters().snapshot(),
+                )
+            },
+        );
+        daemon.runtime().unwrap().event_plane_counters().snapshot()
+    }
+
+    fn handler_terminal_count(counters: &botster_hub_client::DaemonObservabilityCounters) -> u64 {
+        counters.event_handler_completed_ok
+            + counters.event_handler_failed
+            + counters.event_handler_timed_out
+            + counters.event_handler_cancelled
+            + counters.event_handler_backpressured
+            + counters.event_handler_worker_stopped
+    }
+
+    #[test]
+    fn the_owner_test_driver_does_not_advance_past_a_condition_that_already_holds() {
+        let root = unique_package_control_dir("driver-already-satisfied");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let mut wakes = TestOwnerWakes::bind(&daemon, &state);
+        // The default state marks every slice; clear one, then mark it so a
+        // driven turn would consume it.
+        state
+            .maintenance
+            .wakes
+            .take(MaintenanceSliceKind::PackageEventDelivery);
+        assert!(
+            !state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::PackageEventDelivery)
+        );
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::PackageEventDelivery);
+        drive_owner_until(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            TEST_HANG_GUARD,
+            |_, _| true,
+            |_, _| "already satisfied".into(),
+        );
+        assert!(
+            state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::PackageEventDelivery),
+            "no owner turn ran, so the marked work is still pending"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_owner_test_driver_stops_at_its_hang_guard_while_work_stays_ready() {
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let root = unique_package_control_dir("driver-hang-guard");
+        let data = root.join("data");
+        thread::spawn(move || {
+            let mut daemon = HubDaemon::start(package_control_config(data)).unwrap();
+            let mut state = DaemonControlState::default();
+            let mut wakes = TestOwnerWakes::bind(&daemon, &state);
+            let expired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // The condition never holds, and every check re-arms owner
+                // work, so the driver never waits on a wake.
+                drive_owner_until(
+                    &mut daemon,
+                    &mut state,
+                    &mut wakes,
+                    Duration::from_millis(50),
+                    |_, state| {
+                        state
+                            .maintenance
+                            .wakes
+                            .mark(MaintenanceSliceKind::PackageEventDelivery);
+                        false
+                    },
+                    |_, _| "perpetually ready work".into(),
                 );
-                std::thread::yield_now();
-            }
-            let runtime = daemon.runtime().unwrap();
-            assert_eq!(runtime.test_resync_lease_count("resync-probe.item"), 0);
-            assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
-        }
+            }))
+            .is_err();
+            daemon.stop();
+            let _ = outcome_tx.send(expired);
+        });
+        // timer: deadline — the shared test hang guard bounds a driver that
+        // does not enforce its own; the driver's result is the event.
+        let expired = outcome_rx
+            .recv_timeout(TEST_HANG_GUARD)
+            .expect("the driver must stop at its own hang guard");
+        assert!(expired, "the driver must fail when its hang guard expires");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// (completed_ok, failed, timed_out, cancelled, backpressured, worker_stopped)
+    fn handler_outcomes(
+        counters: &botster_hub_client::DaemonObservabilityCounters,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            counters.event_handler_completed_ok,
+            counters.event_handler_failed,
+            counters.event_handler_timed_out,
+            counters.event_handler_cancelled,
+            counters.event_handler_backpressured,
+            counters.event_handler_worker_stopped,
+        )
+    }
+
+    #[test]
+    fn lifetime_budget_allows_a_live_event_to_complete_512_publications() {
+        let (mut daemon, mut state, mut wakes, root) =
+            start_publishing_event_daemon("lifetime-live-event", 512);
+        let counters = drive_one_publishing_event(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            Duration::from_secs(15),
+        );
+        assert_eq!(
+            handler_outcomes(&counters),
+            (1, 0, 0, 0, 0, 0),
+            "{counters:?}"
+        );
         let runtime = daemon.runtime().unwrap();
+        assert_eq!(runtime.test_resync_lease_count("resync-probe.item"), 0);
+        assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
         assert_eq!(runtime.test_family_seq("resync-probe.item"), 512);
+        assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_publication_fails_the_publishing_handler_at_once() {
+        let (mut daemon, mut state, mut wakes, root) =
+            start_publishing_event_daemon("rejected-live-event", 512);
+        daemon
+            .runtime()
+            .unwrap()
+            .entity_publish_bridge()
+            .reject_next_publish();
+        let counters =
+            drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
+        assert_eq!(
+            handler_outcomes(&counters),
+            (0, 1, 0, 0, 0, 0),
+            "{counters:?}"
+        );
+        let runtime = daemon.runtime().unwrap();
+        assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
+        assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_expired_publishing_handler_reports_a_timeout() {
+        let (mut daemon, mut state, mut wakes, root) =
+            start_publishing_event_daemon("expired-live-event", 512);
+        // A zero deadline is already expired when Core admits the invocation.
+        state.maintenance.test_event_invocation_timeout_ms = Some(0);
+        let counters =
+            drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
+        assert_eq!(
+            handler_outcomes(&counters),
+            (0, 0, 1, 0, 0, 0),
+            "{counters:?}"
+        );
+        let runtime = daemon.runtime().unwrap();
+        assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
         assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
