@@ -690,6 +690,13 @@ pub(crate) fn test_owned_process_rows(tokens: &[String]) -> Result<Vec<TestOwned
         .collect())
 }
 
+/// Processes that name a test-owned directory, plus all their descendants.
+/// A session worker's own command line does not name the data directory, so
+/// descent from the daemon that does is what attributes it.
+pub(crate) fn test_owned_process_tree(tokens: &[String]) -> Result<Vec<TestOwnedProcess>, String> {
+    TestOwnedIdentities::new(tokens.to_vec()).census()
+}
+
 /// The identities the sweep owns once it has found a leak: the matched PIDs,
 /// every descendant of them, and every process group they started (never the
 /// harness's own group). Ownership is retained, not rediscovered from argv, so

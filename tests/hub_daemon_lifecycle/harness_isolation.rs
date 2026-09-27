@@ -361,13 +361,21 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
         .and_then(|name| name.to_str())
         .expect("data dir name")
         .to_string();
-    // Attributed to this data dir: a host-wide worker count also counts
-    // workers that other sessions on the machine start meanwhile.
-    let data_dir_workers = || {
-        session_worker_process_identities()
-            .expect("session worker census")
-            .into_iter()
-            .filter(|worker| worker_belongs_to_data_dir(worker, &data_dir))
+    // Attributed to this data dir by descent: a host-wide worker count also
+    // counts workers that other sessions on the machine start meanwhile, and a
+    // worker's own command line does not name the data dir.
+    let data_dir_tree =
+        || test_owned_process_tree(std::slice::from_ref(&data_dir_token)).expect("process census");
+    let workers_in = |tree: &[TestOwnedProcess]| {
+        tree.iter()
+            .filter(|row| {
+                row.command
+                    .split_whitespace()
+                    .next()
+                    .and_then(|program| Path::new(program).file_name())
+                    .is_some_and(|name| name == "botster-session-worker")
+            })
+            .cloned()
             .collect::<Vec<_>>()
     };
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -378,13 +386,12 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
         !daemon_socket_path(&data_dir).exists(),
         "tainted start must not create a daemon socket"
     );
-    let workers = data_dir_workers();
+    let tree = data_dir_tree();
+    let workers = workers_in(&tree);
     assert!(workers.is_empty(), "tainted start must not spawn workers: {workers:?}");
-    let processes =
-        test_owned_process_rows(std::slice::from_ref(&data_dir_token)).expect("process census");
     assert!(
-        processes.is_empty(),
-        "tainted start must not start any process for its data dir: {processes:?}"
+        tree.is_empty(),
+        "tainted start must not start any process for its data dir: {tree:?}"
     );
 
     // Positive control: once the taint is cleared, the same data dir starts a
@@ -408,16 +415,14 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
         typed_operator_error_body(&spawn)
     );
     wait_for_registry_worker(&data_dir);
-    let workers = data_dir_workers();
+    let tree = data_dir_tree();
     assert!(
-        !workers.is_empty(),
-        "positive control: the data-dir worker predicate must observe a real worker"
+        !workers_in(&tree).is_empty(),
+        "positive control: the data-dir worker predicate must observe a real worker: {tree:?}"
     );
-    let processes =
-        test_owned_process_rows(std::slice::from_ref(&data_dir_token)).expect("process census");
     assert!(
-        !processes.is_empty(),
-        "positive control: the data-dir process census must observe the real daemon"
+        tree.iter().any(|row| row.command.contains(data_dir_token.as_str())),
+        "positive control: the data-dir process census must observe the real daemon: {tree:?}"
     );
     daemon.shutdown();
 }
