@@ -53,10 +53,9 @@ fn plugin_load_error(
 
 /// The package whose plugin load was refused before the runtime changed.
 fn refused_package(original: &DaemonTransportError) -> Option<&str> {
-    match original {
-        DaemonTransportError::PluginLoadRefused { package_name, .. } => Some(package_name),
-        _ => None,
-    }
+    // ABLATION (red arm, never merged): the restore never skips a package.
+    let _ = original;
+    None
 }
 
 /// Record a plugin load failure with its local context. Lua reports errors
