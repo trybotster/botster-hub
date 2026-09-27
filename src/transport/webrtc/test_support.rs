@@ -1667,6 +1667,25 @@ impl PeerHarness {
             }) => *peer_generation,
             None => panic!("WebRTC admission must be live"),
         };
+        self.wait_until_reservation_lookup(
+            label,
+            peer_generation,
+            crate::admission::reservations::now_seconds,
+            crate::admission::reservations::ReservationLookup::Bound,
+        );
+    }
+
+    /// Serve owner messages until the owner's reservation table reports
+    /// `expected` for `label`. The peer can observe a channel close before the
+    /// owner has processed its own close message, so tests that assert owner
+    /// state after a close wait here for the owner's side.
+    pub(crate) fn wait_until_reservation_lookup(
+        &mut self,
+        label: &str,
+        peer_generation: u64,
+        now: impl Fn() -> u64,
+        expected: crate::admission::reservations::ReservationLookup,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self
@@ -1674,17 +1693,13 @@ impl PeerHarness {
                 .pending_runtime
                 .admission
                 .reservations
-                .lookup_label(
-                    label,
-                    peer_generation,
-                    crate::admission::reservations::now_seconds(),
-                )
-                == crate::admission::reservations::ReservationLookup::Bound
+                .lookup_label(label, peer_generation, now())
+                == expected
             {
                 return;
             }
             if Instant::now() >= deadline {
-                panic!("timed out waiting for reserved subscription bind");
+                panic!("timed out waiting for reservation {label} to become {expected:?}");
             }
             match self.try_receive_owner_message() {
                 Ok(message) => {
@@ -1700,7 +1715,7 @@ impl PeerHarness {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("control channel closed while waiting for reservation bind");
+                    panic!("control channel closed while waiting for reservation {label}");
                 }
             }
         }
