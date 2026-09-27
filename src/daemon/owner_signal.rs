@@ -14,7 +14,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use tokio::sync::Notify;
 
@@ -105,24 +105,35 @@ impl<T> SignalingMutex<T> {
         }
     }
 
-    pub(crate) fn lock(&self) -> LockResult<SignalingGuard<'_, T>> {
-        match self.mutex.lock() {
-            Ok(guard) => Ok(self.wrap(guard)),
-            Err(poisoned) => Err(PoisonError::new(self.wrap(poisoned.into_inner()))),
-        }
+    /// Block for the lock. A poisoned lock is a fault: its guard is released
+    /// without a raise, so a failed attempt never wakes its own armed waiter.
+    pub(crate) fn lock(&self) -> Result<SignalingGuard<'_, T>, LockPoisoned> {
+        self.mutex
+            .lock()
+            .map(|guard| self.wrap(guard))
+            .map_err(|_| LockPoisoned)
     }
 
-    pub(crate) fn try_lock(&self) -> TryLockResult<SignalingGuard<'_, T>> {
+    /// Block for the lock and take it even if poisoned. Only for holders that
+    /// deliberately repair or discard state after a panic; the release raises
+    /// as any holder's does.
+    pub(crate) fn lock_or_recover(&self) -> SignalingGuard<'_, T> {
+        self.wrap(
+            self.mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Try the lock once. Only [`TryLock::WouldBlock`] is contention.
+    pub(crate) fn try_lock(&self) -> Result<SignalingGuard<'_, T>, TryLock> {
         match self.mutex.try_lock() {
             Ok(guard) => Ok(self.wrap(guard)),
-            Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
-            Err(TryLockError::Poisoned(poisoned)) => Err(TryLockError::Poisoned(PoisonError::new(
-                self.wrap(poisoned.into_inner()),
-            ))),
+            Err(TryLockError::WouldBlock) => Err(TryLock::WouldBlock),
+            Err(TryLockError::Poisoned(_)) => Err(TryLock::Poisoned),
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn is_poisoned(&self) -> bool {
         self.mutex.is_poisoned()
     }
@@ -140,6 +151,19 @@ impl<T> SignalingMutex<T> {
             owner: self,
         }
     }
+}
+
+/// A poisoned [`SignalingMutex`]: a fault, never a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockPoisoned;
+
+/// Why [`SignalingMutex::try_lock`] did not lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TryLock {
+    /// Another holder has it: contention, which a caller may arm on.
+    WouldBlock,
+    /// A holder panicked: a fault, which a caller must not wait on.
+    Poisoned,
 }
 
 /// A [`SignalingMutex`] guard. Dropping it unlocks, then raises if armed.
@@ -203,9 +227,9 @@ mod tests {
         assert!(!signal.moved(before), "an unarmed release raises nothing");
 
         let held = mutex.try_lock().expect("free lock");
-        assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(matches!(mutex.try_lock(), Err(TryLock::WouldBlock)));
         let seen = mutex.arm();
-        assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(matches!(mutex.try_lock(), Err(TryLock::WouldBlock)));
         assert!(
             !signal.moved(seen),
             "the failed retry itself raises nothing"
@@ -219,6 +243,43 @@ mod tests {
             mutex.try_lock().is_ok(),
             "the lock is free when the key moves"
         );
+    }
+
+    #[test]
+    fn a_failed_attempt_on_a_poisoned_lock_never_raises_its_armed_key() {
+        let signal = Arc::new(OwnerSignal::default());
+        let mutex = SignalingMutex::new(0_u8, Arc::clone(&signal), SignalKey::EventRouter);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.try_lock().expect("free lock");
+            panic!("poison the lock");
+        }));
+        let seen = mutex.arm();
+        for _ in 0..3 {
+            assert_eq!(mutex.try_lock().err(), Some(TryLock::Poisoned));
+            assert_eq!(mutex.lock().err(), Some(LockPoisoned));
+        }
+        assert!(
+            !signal.moved(seen),
+            "attempts on a poisoned lock must not wake their own armed waiter"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_panics_while_a_waiter_is_armed_wakes_it_into_the_fault() {
+        let signal = Arc::new(OwnerSignal::default());
+        let mutex = SignalingMutex::new(0_u8, Arc::clone(&signal), SignalKey::EventRouter);
+        let mut seen = None;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.try_lock().expect("free lock");
+            seen = Some(mutex.arm());
+            panic!("poison the lock while armed");
+        }));
+        let seen = seen.expect("armed while held");
+        assert!(
+            signal.moved(seen),
+            "the unwinding holder wakes the armed waiter"
+        );
+        assert_eq!(mutex.try_lock().err(), Some(TryLock::Poisoned));
     }
 
     #[test]
