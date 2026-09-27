@@ -321,6 +321,7 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "EnablePackage",
             "DisablePackage",
             "RemovePackage",
+            "ResolveQuarantine",
             "StartPackageEntrypoint",
             "StopPackageEntrypoint",
             "RestartPackageEntrypoint",
