@@ -1314,10 +1314,11 @@ mod tests {
         let document = config.data_directory.join(HUB_STATE_FILE_NAME);
         let alias = config.data_directory.with_extension("alias.json");
         std::fs::hard_link(&document, &alias).unwrap();
-        assert!(matches!(
-            store.load_retained(&config),
-            Err(HubStateStoreError::InvalidTemporaryFile)
-        ));
+        let result = store.load_retained(&config).map(|_| ());
+        assert!(
+            matches!(result, Err(HubStateStoreError::InvalidTemporaryFile)),
+            "{result:?}"
+        );
         std::fs::remove_file(&alias).unwrap();
         assert!(store.load_retained(&config).is_ok());
     }
@@ -1577,12 +1578,16 @@ mod tests {
             &serde_json::to_vec_pretty(&value).expect("serialize v2 state"),
         );
 
-        assert!(matches!(
-            load_file_state(&store, &config),
-            Err(HubStateStoreError::State(
-                HubStateError::UnsupportedVersion(2)
-            ))
-        ));
+        let result = load_file_state(&store, &config).map(|_| ());
+        assert!(
+            matches!(
+                result,
+                Err(HubStateStoreError::State(
+                    HubStateError::UnsupportedVersion(2)
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1610,12 +1615,16 @@ mod tests {
             &serde_json::to_vec_pretty(&value).expect("serialize v1 state"),
         );
 
-        assert!(matches!(
-            load_file_state(&store, &config),
-            Err(HubStateStoreError::State(
-                HubStateError::UnsupportedVersion(1)
-            ))
-        ));
+        let result = load_file_state(&store, &config).map(|_| ());
+        assert!(
+            matches!(
+                result,
+                Err(HubStateStoreError::State(
+                    HubStateError::UnsupportedVersion(1)
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -2001,7 +2010,7 @@ mod tests {
 
         let error = load_file_state(&store, &config).expect_err("corrupt state should fail");
 
-        assert!(matches!(error, HubStateStoreError::Corrupt(_)));
+        assert!(matches!(error, HubStateStoreError::Corrupt(_)), "{error:?}");
     }
 
     #[test]

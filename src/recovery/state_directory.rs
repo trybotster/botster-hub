@@ -350,8 +350,15 @@ impl StateDirectoryOwnership {
     }
 }
 
-// File closes only after the last clone drops. No explicit unlock, unlink,
-// filesystem synchronization, or wait runs in a custom destructor.
+// The lock is released explicitly when the last clone drops. A flock belongs
+// to the open file description, and a child forked by another thread holds a
+// copy of that description until it execs; closing our descriptor alone would
+// leave the lock held by that copy. No unlink, synchronization, or wait runs.
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -377,6 +384,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_released_owner_does_not_block_while_a_descriptor_copy_survives() {
+        let fixture = Fixture::new();
+        let owner = StateDirectoryOwnership::acquire(&fixture.0).expect("owner");
+        // The same open file description a forked child inherits.
+        let inherited = owner
+            .0
+            .file
+            .try_clone()
+            .expect("copy of the locked description");
+        drop(owner);
+        let reopened = StateDirectoryOwnership::acquire(&fixture.0);
+        drop(inherited);
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
     }
 
     #[test]
