@@ -515,6 +515,10 @@ pub struct MaintenanceState {
     pub event_causal_faulted: bool,
     /// Core reported a lifecycle-journal advance since the last consumer read it.
     pub journal_wake_pending: bool,
+    /// Test-only replacement for `EVENT_INVOCATION_TIMEOUT_MS`, so a test can
+    /// prove an outcome property without racing the production deadline.
+    #[cfg(test)]
+    pub(crate) test_event_invocation_timeout_ms: Option<u64>,
 }
 
 /// Core lifecycle reads the maintenance slices have in flight.
@@ -579,6 +583,14 @@ fn event_flight(
 }
 
 impl MaintenanceState {
+    fn event_invocation_timeout_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(timeout_ms) = self.test_event_invocation_timeout_ms {
+            return timeout_ms;
+        }
+        EVENT_INVOCATION_TIMEOUT_MS
+    }
+
     pub(crate) fn note_causal_capacity_progress(&mut self) {
         if self.event_causal_blocked && !self.event_causal_faulted {
             self.event_causal_blocked = false;
@@ -1205,7 +1217,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         PluginInvocationRequest {
             request_id: request_id.clone(),
             handler,
-            timeout_ms: EVENT_INVOCATION_TIMEOUT_MS,
+            timeout_ms: state.event_invocation_timeout_ms(),
             context: PluginInvocationContext {
                 client_id: None,
                 session_id: None,
@@ -1387,7 +1399,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             PluginInvocationRequest {
                 request_id: request_id.clone(),
                 handler: handler.handler,
-                timeout_ms: EVENT_INVOCATION_TIMEOUT_MS,
+                timeout_ms: state.event_invocation_timeout_ms(),
                 context: PluginInvocationContext {
                     client_id: None,
                     session_id: None,
