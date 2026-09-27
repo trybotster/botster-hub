@@ -98,8 +98,11 @@ pub(crate) fn daemon_snapshot_stream_forbidden_error(
     response
 }
 
+/// Characters kept of each compensation message a client or Status sees.
+pub(crate) const COMPENSATION_MESSAGE_BOUND: usize = 512;
+
 pub(crate) fn daemon_package_compensation_error(error: DaemonTransportError) -> DaemonResponse {
-    const MESSAGE_BOUND: usize = 512;
+    const MESSAGE_BOUND: usize = COMPENSATION_MESSAGE_BOUND;
     let DaemonTransportError::PackageCompensation {
         original,
         rollbacks,

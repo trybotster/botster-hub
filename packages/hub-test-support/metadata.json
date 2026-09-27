@@ -2,7 +2,7 @@
   "package_name": "@trybotster/hub-test-support",
   "package_version": "0.1.46",
   "protocol": "botster-hub-daemon-v1",
-  "protocol_version": 10,
+  "protocol_version": 11,
   "conformance_fixture_revision": 50,
   "ui_contract": {
     "conformance_fixture_export": "@trybotster/ui-contract/conformance-fixtures",
@@ -13,12 +13,12 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "094727a1d913e1d4882a6b0619aa67601a8d3872003a6ef0c521c77fe6230a10"
+    "sha256": "50db8080e14a562d69f42eb7403d756db7b3c4b79a291f90b26ecdcd8a22e00d"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
     "source_artifact_path": "botster_hub_test_support::first_party_client_support_matrix()",
-    "sha256": "b3202abb2f3677d3cb8e7b3081b1b9adb220a68a8e2db0126aa1bf2e45b6a99c"
+    "sha256": "a3516cc4db4c72b3096caa01765930c7d2228f5ec9420f4af9f7d6575e56083f"
   },
   "session_lifecycle_subscription_conformance_fixture": {
     "artifact_path": "session-lifecycle-subscription-conformance-fixture.json",

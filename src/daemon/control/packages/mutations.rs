@@ -180,6 +180,18 @@ pub(crate) fn apply_committed_runtime_effect(
             runtime.record_event_plane_unload(package_name);
             Ok(())
         }
+        // The package is already unloaded; unload again in case an explicit
+        // load raced the quarantine, then clear the marker.
+        PackageRuntimeEffect::Resolve { package_name } => {
+            supervisor.stop_package(package_name);
+            let _ = runtime.unload_plugin_package(
+                request_id(&format!("daemon-resolve-{package_name}")),
+                package_name,
+            );
+            runtime.record_event_plane_unload(package_name);
+            runtime.clear_stranded(package_name);
+            Ok(())
+        }
         PackageRuntimeEffect::Reload {
             package_name,
             reload_plugin,
@@ -307,7 +319,9 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 &mut rollbacks,
             );
         }
-        PackageRuntimeEffect::Disable { .. } | PackageRuntimeEffect::Remove { .. } => {}
+        PackageRuntimeEffect::Disable { .. }
+        | PackageRuntimeEffect::Remove { .. }
+        | PackageRuntimeEffect::Resolve { .. } => {}
     }
     rollbacks
 }

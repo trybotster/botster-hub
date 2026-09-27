@@ -33,7 +33,8 @@ use crate::shared_view::{SharedView, SharedViewBudget, SharedViewCharge};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
-const HUB_STATE_SCHEMA_VERSION: u16 = 4;
+/// Version 5 adds the durable package quarantine.
+const HUB_STATE_SCHEMA_VERSION: u16 = 5;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
 
 /// Persistence buckets the host profile must govern.
@@ -50,7 +51,8 @@ pub enum PersistenceBucket {
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
-    /// Version of this JSON schema. Version 4 adds recovery ownership.
+    /// Version of this JSON schema. Version 4 adds recovery ownership; version 5
+    /// adds the durable package quarantine.
     pub schema_version: u16,
     /// Host identity metadata resolved from hub config.
     pub host: HostIdentity,
@@ -679,13 +681,19 @@ impl FileHubStateStore {
         let mut prepared = prepared;
         prepared.evidence.committed_revision = revision;
         #[cfg(test)]
-        let result = if save_failure_is_due(&self.path) {
+        let scripted = scripted_commit_is_due(&self.path);
+        #[cfg(test)]
+        let result = if scripted == Some(InjectedCommit::FailBeforeRename)
+            || (scripted.is_none() && save_failure_is_due(&self.path))
+        {
             prepared
                 .evidence
                 .authority
                 .directory
                 .write_document_with_pre_rename_failure_for_test(&prepared.bytes)
-        } else if sync_failure_is_due(&self.path) {
+        } else if scripted == Some(InjectedCommit::SyncFailure)
+            || (scripted.is_none() && sync_failure_is_due(&self.path))
+        {
             prepared
                 .evidence
                 .authority
@@ -728,6 +736,19 @@ impl FileHubStateStore {
         }
     }
 
+    /// Script the outcomes of the next commits, in order. While a script
+    /// remains, it replaces the other save and sync injections.
+    #[cfg(test)]
+    pub(crate) fn script_commits(data_directory: impl AsRef<Path>, outcomes: &[InjectedCommit]) {
+        scripted_commits()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                data_directory.as_ref().join(HUB_STATE_FILE_NAME),
+                outcomes.iter().copied().collect(),
+            );
+    }
+
     /// Fail the next `save` after writing the temporary file, before rename.
     #[cfg(test)]
     pub fn inject_next_save_failure(data_directory: impl AsRef<Path>) {
@@ -765,6 +786,39 @@ fn save_failures() -> &'static Mutex<std::collections::BTreeMap<PathBuf, u32>> {
 fn sync_failures() -> &'static Mutex<std::collections::BTreeSet<PathBuf>> {
     static FAILURES: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> = OnceLock::new();
     FAILURES.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// One scripted commit outcome.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectedCommit {
+    Succeed,
+    /// Fail after writing the temporary file, before rename.
+    FailBeforeRename,
+    /// Rename, then fail the directory sync: the publication is uncertain.
+    SyncFailure,
+}
+
+#[cfg(test)]
+fn scripted_commits()
+-> &'static Mutex<std::collections::BTreeMap<PathBuf, std::collections::VecDeque<InjectedCommit>>> {
+    static SCRIPTS: OnceLock<
+        Mutex<std::collections::BTreeMap<PathBuf, std::collections::VecDeque<InjectedCommit>>>,
+    > = OnceLock::new();
+    SCRIPTS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn scripted_commit_is_due(path: &Path) -> Option<InjectedCommit> {
+    let mut scripts = scripted_commits()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let script = scripts.get_mut(path)?;
+    let outcome = script.pop_front();
+    if script.is_empty() {
+        scripts.remove(path);
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -891,12 +945,14 @@ struct HubStateVersion<'a> {
 fn decode_hub_state(bytes: &[u8]) -> HubStateStoreResult<HubState> {
     let version: HubStateVersion<'_> =
         serde_json::from_slice(bytes).map_err(HubStateStoreError::Corrupt)?;
-    if !matches!(version.schema_version, 3 | HUB_STATE_SCHEMA_VERSION) {
+    if !matches!(version.schema_version, 3 | 4 | HUB_STATE_SCHEMA_VERSION) {
         return Err(HubStateStoreError::State(
             HubStateError::UnsupportedVersion(version.schema_version),
         ));
     }
-    if version.schema_version == HUB_STATE_SCHEMA_VERSION && version.recovery.is_none() {
+    // Version 4 differs from 5 only by the optional package quarantine.
+    if matches!(version.schema_version, 4 | HUB_STATE_SCHEMA_VERSION) && version.recovery.is_none()
+    {
         return Err(HubStateStoreError::State(
             HubStateError::InvalidRecoveryState,
         ));
@@ -908,6 +964,9 @@ fn decode_hub_state(bytes: &[u8]) -> HubStateStoreResult<HubState> {
                 HubStateError::InvalidRecoveryState,
             ));
         }
+        state.schema_version = HUB_STATE_SCHEMA_VERSION;
+    }
+    if state.schema_version == 4 {
         state.schema_version = HUB_STATE_SCHEMA_VERSION;
     }
     state

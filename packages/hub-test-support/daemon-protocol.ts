@@ -7,7 +7,7 @@ export type JsonObject = { [key: string]: JsonValue };
 
 // Host-control protocol 10 constants. See botster-hub-client/src/lib.rs.
 export const PROTOCOL = "botster-hub-daemon-v1";
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 export const CONFORMANCE_FIXTURE_REVISION = 50;
 export const MAX_REQUEST_ID_BYTES = 20;
 export const MAX_OUTSTANDING_REQUESTS = 32;
@@ -204,6 +204,7 @@ export type DaemonRequest =
   | { type: "enable_package"; package_name: string }
   | { type: "disable_package"; package_name: string }
   | { type: "remove_package"; package_name: string }
+  | { type: "resolve_quarantine"; target: DaemonQuarantineTarget }
   | { type: "start_package_entrypoint"; package_name: string; entrypoint_id: string; environment_overrides?: Record<string, string> }
   | { type: "issue_local_webrtc_bootstrap"; package_name: string; entrypoint_id: string; origin: string }
   | { type: "stop_package_entrypoint"; package_name: string; entrypoint_id: string }
@@ -392,6 +393,7 @@ export type DaemonResponseKind =
   | "package_install_plan"
   | "package_update_status"
   | "package_decision"
+  | "quarantine_resolved"
   | "plugin_lifecycle"
   | "plugin_mcp_tools"
   | "plugin_mcp_tool_result"
@@ -936,6 +938,7 @@ export interface DaemonStatus {
   live_attach_occupancy?: DaemonAttachOccupancy[];
   observability?: DaemonObservabilityCounters;
   retention?: DaemonRetentionAccounting | null;
+  quarantines?: DaemonQuarantine[];
   local_webrtc_terminal_records?: DaemonLocalWebrtcTerminalRecord[];
   diagnostics?: DaemonDiagnostic[];
 }
@@ -948,6 +951,14 @@ export interface DaemonRetentionAccounting {
   sessions: number;
   evictions: number;
 }
+
+export type DaemonQuarantine =
+  | { kind: "repository_session_types"; root: string; cause: string; detail: string; quarantined_at_ms: number }
+  | { kind: "package"; package_name: string; original: string; compensation: string; durable: boolean; quarantined_at_ms: number };
+
+export type DaemonQuarantineTarget =
+  | { kind: "package"; package_name: string }
+  | { kind: "repository_session_types"; root: string };
 
 export interface DaemonAttachOccupancy {
   session_id: string;
@@ -1061,6 +1072,13 @@ export interface DaemonObservabilityCounters {
   stalled_write_timeouts: number;
   queue_ages?: DaemonQueueAgeObservation[];
   global_in_flight_bytes?: number;
+  event_replacements_stranded?: number;
+  event_deliveries_generation_unloaded?: number;
+  event_deliveries_package_unloaded?: number;
+  event_deliveries_handler_absent?: number;
+  event_stage_overlaps?: number;
+  events_stranded?: number;
+  package_quarantines_not_durable?: number;
 }
 
 export interface DaemonLatencyHistogram {

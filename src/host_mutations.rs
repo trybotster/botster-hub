@@ -12,8 +12,8 @@ use botster_core::{
 use botster_hub_client::{
     DaemonAvailablePackage, DaemonCapability, DaemonEvent, DaemonPackageCompatibility,
     DaemonPackageDiagnostic, DaemonPackageInstallEffect, DaemonPackageInstallPlan,
-    DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResolvedAppLaunch,
-    DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
+    DaemonPackagePin, DaemonPackageUpdateStatus, DaemonQuarantineTarget, DaemonRequest,
+    DaemonResolvedAppLaunch, DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
 };
 
 use crate::client_api::HubClientPackage;
@@ -47,7 +47,8 @@ use crate::daemon_projection::{
 use crate::entrypoint_supervisor::{EntrypointProcessSnapshot, EntrypointSupervisor};
 use crate::host_executor::HOST_PREPARED_BYTE_CAPACITY;
 use crate::packages::{
-    PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
+    PackageAction, PackageAdmissionReason, PackageDecision, PackageQuarantine,
+    PackageRegistryError, PackageState,
 };
 use crate::persistence::{
     FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
@@ -124,6 +125,9 @@ pub(crate) fn execute(
             Ok(HostMutationResult::Recovered(execute_recovery(recover)))
         }
         HostMutationCommand::RestorePackage(restore) => return execute_package_restore(restore),
+        HostMutationCommand::RecordPackageQuarantine(record) => {
+            return execute_package_quarantine_record(record);
+        }
     };
     result.unwrap_or_else(HostMutationResult::Failed)
 }
@@ -142,6 +146,7 @@ pub(crate) enum HostMutationCommand {
     Commit(HostCommit),
     Recover(HostRecover),
     RestorePackage(HostPackageRestore),
+    RecordPackageQuarantine(HostPackageQuarantineRecord),
 }
 
 impl HostMutationCommand {
@@ -177,6 +182,7 @@ impl std::fmt::Debug for HostMutationCommand {
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
             Self::RestorePackage(_) => "RestorePackage",
+            Self::RecordPackageQuarantine(_) => "RecordPackageQuarantine",
         };
         formatter.write_str(name)
     }
@@ -306,13 +312,41 @@ pub(crate) struct HostPackageRuntimeRestore {
     pub(crate) quarantine: Option<crate::daemon::error::PackageRollbackFailure>,
 }
 
+/// Persist the quarantine of a failed compensation's packages. The write is
+/// best effort: its failure leaves the quarantine in memory only.
+pub(crate) struct HostPackageQuarantineRecord {
+    pub(crate) base_revision: u64,
+    pub(crate) authority: Arc<HubStateAuthority>,
+    pub(crate) state: SharedView<HubState>,
+    pub(crate) packages: SharedView<PackageRegistry>,
+    pub(crate) data_directory: PathBuf,
+    pub(crate) quarantine: PackageQuarantine,
+    /// Carried through to the result: the owner retains the recovery and
+    /// answers the client with this compensation failure.
+    pub(crate) effect: PackageRuntimeEffect,
+    pub(crate) original: DaemonTransportError,
+    pub(crate) rollbacks: Vec<crate::daemon::error::PackageRollbackFailure>,
+}
+
+/// The outcome of a best-effort durable package quarantine write.
+pub(crate) enum PackageQuarantineWrite {
+    Synced {
+        state: SharedView<HubState>,
+        packages: SharedView<PackageRegistry>,
+    },
+    /// Nothing was published: the quarantine lasts until the Hub restarts.
+    NotDurable(String),
+    /// The write was renamed, but its durable result is unconfirmed.
+    Uncertain(HubStateUncertainWrite),
+}
+
 /// One typed host result.
 pub(crate) enum HostMutationResult {
     PackageEffectApplied {
         reply: Result<HostReply, HostMutationError>,
         cleanup: HostPackageCleanup,
-        /// The package an explicit enable or reload loaded; it resolves any
-        /// package recovery that covers it.
+        /// The package an explicit enable, reload, or quarantine resolve
+        /// settled; it resolves any package recovery that covers it.
         loaded: Option<String>,
     },
     PackageEffectFailed {
@@ -349,6 +383,12 @@ pub(crate) enum HostMutationResult {
     Recovered(RecoveryOutcome),
     PackageRestored(RestoredPackageView),
     PackageRestoreFailed(crate::HubStateStoreError),
+    PackageQuarantineRecorded {
+        write: PackageQuarantineWrite,
+        effect: PackageRuntimeEffect,
+        original: DaemonTransportError,
+        rollbacks: Vec<crate::daemon::error::PackageRollbackFailure>,
+    },
     Failed(HostMutationError),
 }
 
@@ -389,6 +429,9 @@ impl std::fmt::Debug for HostMutationResult {
                 .debug_tuple("PackageRestoreFailed")
                 .field(error)
                 .finish(),
+            Self::PackageQuarantineRecorded { .. } => {
+                formatter.write_str("PackageQuarantineRecorded(..)")
+            }
             Self::Failed(error) => formatter.debug_tuple("Failed").field(error).finish(),
         }
     }
@@ -433,7 +476,8 @@ fn execute_package_effect(
             });
             let loaded = match &effect {
                 PackageRuntimeEffect::Enable { package_name, .. }
-                | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name.clone()),
+                | PackageRuntimeEffect::Reload { package_name, .. }
+                | PackageRuntimeEffect::Resolve { package_name } => Some(package_name.clone()),
                 _ => None,
             };
             HostMutationResult::PackageEffectApplied {
@@ -554,6 +598,109 @@ fn execute_package_restore(restore: HostPackageRestore) -> HostMutationResult {
     }
 }
 
+fn execute_package_quarantine_record(record: HostPackageQuarantineRecord) -> HostMutationResult {
+    let HostPackageQuarantineRecord {
+        base_revision,
+        authority,
+        state,
+        packages,
+        data_directory,
+        quarantine,
+        effect,
+        original,
+        rollbacks,
+    } = record;
+    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_package_quarantine(
+            base_revision,
+            &authority,
+            state,
+            &packages,
+            data_directory,
+            &effect.package_names(),
+            &quarantine,
+        )
+    }))
+    .unwrap_or_else(|_| {
+        PackageQuarantineWrite::NotDurable("the quarantine write panicked".to_string())
+    });
+    HostMutationResult::PackageQuarantineRecorded {
+        write,
+        effect,
+        original,
+        rollbacks,
+    }
+}
+
+fn write_package_quarantine(
+    base_revision: u64,
+    authority: &Arc<HubStateAuthority>,
+    state: SharedView<HubState>,
+    packages: &PackageRegistry,
+    data_directory: PathBuf,
+    package_names: &[&str],
+    quarantine: &PackageQuarantine,
+) -> PackageQuarantineWrite {
+    let mut candidate_packages = packages.clone();
+    let mut installed = false;
+    for package_name in package_names {
+        installed |= candidate_packages.set_quarantine(package_name, Some(quarantine.clone()));
+    }
+    if !installed {
+        return PackageQuarantineWrite::NotDurable(
+            "no quarantined package is installed".to_string(),
+        );
+    }
+    let mut candidate_state = (*state).clone();
+    candidate_state.package_registry = candidate_packages.snapshot();
+    let package_bytes = match encoded_len(
+        &candidate_state.package_registry,
+        "host_quarantine_package_registry_encode_failed",
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => return PackageQuarantineWrite::NotDurable(error.message),
+    };
+    let budget = state.budget();
+    let packages = match SharedView::try_new(&budget, candidate_packages, package_bytes) {
+        Ok(view) => view,
+        Err(error) => {
+            return PackageQuarantineWrite::NotDurable(format!(
+                "package registry needs {} logical bytes but only {} remain",
+                error.requested, error.available
+            ));
+        }
+    };
+    let store = FileHubStateStore::for_data_directory(data_directory);
+    let write = match store.prepare_shared(
+        authority,
+        base_revision,
+        Some(state),
+        candidate_state,
+        &budget,
+    ) {
+        Ok(write) => write,
+        Err(error) => return PackageQuarantineWrite::NotDurable(error.to_string()),
+    };
+    match store.commit_shared(write, base_revision) {
+        Ok(FileCommitOutcome::Synced { state, .. }) => {
+            PackageQuarantineWrite::Synced { state, packages }
+        }
+        Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+            PackageQuarantineWrite::Uncertain(write)
+        }
+        Err(FileCommitError::Preparation(error))
+        | Err(FileCommitError::BeforePublication { error, .. }) => {
+            PackageQuarantineWrite::NotDurable(error.to_string())
+        }
+        Err(FileCommitError::Stale(_)) => {
+            PackageQuarantineWrite::NotDurable(crate::HubStateStoreError::StaleRevision.to_string())
+        }
+        Err(FileCommitError::RevisionExhausted(_)) => PackageQuarantineWrite::NotDurable(
+            crate::HubStateStoreError::RevisionExhausted.to_string(),
+        ),
+    }
+}
+
 fn finalize_package_reply(
     finalize: HostPackageFinalize,
     entrypoints: &mut EntrypointSupervisor,
@@ -631,6 +778,11 @@ pub(crate) enum PackageRuntimeEffect {
     Remove {
         package_name: String,
     },
+    /// An operator resolved the package's quarantine: it stays unloaded and
+    /// is no longer stranded.
+    Resolve {
+        package_name: String,
+    },
     Reload {
         package_name: String,
         reload_plugin: bool,
@@ -653,6 +805,7 @@ impl PackageRuntimeEffect {
             Self::Enable { package_name, .. }
             | Self::Disable { package_name }
             | Self::Remove { package_name }
+            | Self::Resolve { package_name }
             | Self::Reload { package_name, .. } => vec![package_name.as_str()],
             Self::Refresh { packages, .. } => packages
                 .iter()
@@ -684,7 +837,7 @@ impl PackageRuntimeEffect {
                 previous_packages,
                 ..
             } => (previous_state.clone(), previous_packages.clone()),
-            Self::Disable { .. } | Self::Remove { .. } => return None,
+            Self::Disable { .. } | Self::Remove { .. } | Self::Resolve { .. } => return None,
         };
         Some(HostPackageRestore {
             base_revision,
@@ -1720,6 +1873,9 @@ fn prepare_package(
                 .refreshed_local_package(&package_name, "daemon socket reload local package")
                 .map_err(package_error)?;
             candidate_packages = candidate;
+            // An explicit reload resolves a quarantine; a failed reload
+            // restores the previous state, quarantine included.
+            candidate_packages.set_quarantine(&package_name, None);
             let reload_plugin = decision.state == PackageState::Enabled;
             let response =
                 package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
@@ -1792,6 +1948,8 @@ fn prepare_package(
             let decision = candidate_packages
                 .enable(&package_name, "daemon socket enable package")
                 .map_err(package_error)?;
+            // An explicit enable resolves a quarantine, as a reload does.
+            candidate_packages.set_quarantine(&package_name, None);
             let response =
                 package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
             (
@@ -1812,6 +1970,28 @@ fn prepare_package(
             (
                 response,
                 Some(PackageRuntimeEffect::Disable { package_name }),
+            )
+        }
+        DaemonRequest::ResolveQuarantine {
+            target: DaemonQuarantineTarget::Package { package_name },
+        } => {
+            // The owner admitted the target: it is durably quarantined,
+            // stranded, or covered by a recovery record. Resolve to
+            // Disabled: nothing loads the package until the operator enables
+            // it. A package that is no longer installed has no durable record
+            // to change.
+            if candidate_packages.package(&package_name).is_some() {
+                candidate_packages
+                    .disable(&package_name, "daemon socket resolve package quarantine")
+                    .map_err(package_error)?;
+                candidate_packages.set_quarantine(&package_name, None);
+            }
+            let mut response =
+                package_list_reply(&candidate_packages, entrypoint_processes.clone());
+            response.kind = DaemonResponseKind::QuarantineResolved;
+            (
+                response,
+                Some(PackageRuntimeEffect::Resolve { package_name }),
             )
         }
         DaemonRequest::RemovePackage { package_name } => {
@@ -2318,7 +2498,8 @@ fn package_effect_bytes(effect: &PackageRuntimeEffect) -> Result<usize, HostMuta
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. }
         | PackageRuntimeEffect::Disable { package_name }
-        | PackageRuntimeEffect::Remove { package_name } => {
+        | PackageRuntimeEffect::Remove { package_name }
+        | PackageRuntimeEffect::Resolve { package_name } => {
             checked_total(&[initial, package_name.len()])
         }
         PackageRuntimeEffect::Reload {

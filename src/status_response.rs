@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use botster_hub_client::{
     DaemonAttachOccupancy, DaemonDiagnostic, DaemonLifecycleCounters,
-    DaemonLocalWebrtcTerminalRecord, DaemonOperatorError, DaemonResponse, DaemonResponseKind,
-    DaemonRetentionAccounting, MAX_CONTROL_RESPONSE_BYTES,
+    DaemonLocalWebrtcTerminalRecord, DaemonOperatorError, DaemonQuarantine, DaemonResponse,
+    DaemonResponseKind, DaemonRetentionAccounting, MAX_CONTROL_RESPONSE_BYTES,
 };
 use serde::Serialize;
 
@@ -41,6 +41,7 @@ pub(crate) struct StatusResponseSeed {
     pub(crate) retention: Option<DaemonRetentionAccounting>,
     pub(crate) occupancy: Vec<DaemonAttachOccupancy>,
     pub(crate) terminal_records: Vec<DaemonLocalWebrtcTerminalRecord>,
+    pub(crate) quarantines: Vec<DaemonQuarantine>,
 }
 
 /// The reservation remains after inventory in field destruction order.
@@ -152,6 +153,9 @@ impl StatusResponseInput {
                     seed.terminal_records
                         .len()
                         .checked_mul(size_of::<DaemonLocalWebrtcTerminalRecord>())?,
+                    seed.quarantines
+                        .len()
+                        .checked_mul(size_of::<DaemonQuarantine>())?,
                 ],
             )?;
             for row in &seed.egress {
@@ -170,6 +174,9 @@ impl StatusResponseInput {
             }
             for row in &seed.terminal_records {
                 // Encoded length conservatively includes every owned string.
+                bytes = checked_live_bytes(limit, [bytes, encoded_len(row, limit).ok()?])?;
+            }
+            for row in &seed.quarantines {
                 bytes = checked_live_bytes(limit, [bytes, encoded_len(row, limit).ok()?])?;
             }
         }
@@ -352,6 +359,7 @@ fn try_prepare(
     );
     status.live_attach_occupancy = seed.occupancy;
     status.local_webrtc_terminal_records = seed.terminal_records;
+    status.quarantines = seed.quarantines;
     response.status = Some(status);
     response.diagnostics = Vec::with_capacity(seed.egress.len() + 1);
     response
@@ -423,6 +431,7 @@ pub(crate) fn test_input(shutdown: bool) -> StatusResponseInput {
             retention: None,
             occupancy: Vec::new(),
             terminal_records: Vec::new(),
+            quarantines: Vec::new(),
         }),
         core: None,
         request_id: "41".to_string(),

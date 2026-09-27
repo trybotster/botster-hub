@@ -423,6 +423,7 @@ fn capture_seed(
         retention: None,
         occupancy: Vec::new(),
         terminal_records: Vec::new(),
+        quarantines: Vec::new(),
     });
     input
 }
@@ -453,8 +454,29 @@ fn capture_current_sources(
         remaining,
     )?;
     let terminal_bound = daemon.local_webrtc().terminal_records_bytes(remaining)?;
-    // Both construction bounds overlap the retained seed and returned Core inventory.
-    checked_live_bytes(limit, [live, occupancy_bound, terminal_bound])?;
+    let registry = daemon.package_registry_view();
+    let (package_rows, package_bytes) =
+        crate::daemon::control::host_work::package_quarantine_rows_bytes(
+            state, &registry, remaining,
+        )?;
+    let quarantine_bound = checked_live_bytes(
+        remaining,
+        [
+            state
+                .repo_session_type_quarantine
+                .status_rows_bytes(remaining)?,
+            package_bytes,
+        ],
+    )?;
+    let quarantine_rows = state
+        .repo_session_type_quarantine
+        .len()
+        .checked_add(package_rows)?;
+    // Every construction bound overlaps the retained seed and returned Core inventory.
+    checked_live_bytes(
+        limit,
+        [live, occupancy_bound, terminal_bound, quarantine_bound],
+    )?;
     let (occupancy, _) = crate::subscription::attach_routes::try_live_attach_occupancy_rows(
         &state.pending_runtime.live_attach_routes,
         inventory,
@@ -469,6 +491,15 @@ fn capture_current_sources(
     seed.session_count = state.maintenance.projection.rows.len();
     seed.occupancy = occupancy;
     seed.terminal_records = terminal_records;
+    // Exact capacity: the admitted bound counts one row size per row.
+    let mut quarantines = Vec::with_capacity(quarantine_rows);
+    quarantines.extend(state.repo_session_type_quarantine.status_rows());
+    crate::daemon::control::host_work::extend_package_quarantine_rows(
+        state,
+        &registry,
+        &mut quarantines,
+    );
+    seed.quarantines = quarantines;
     Some(())
 }
 
@@ -1243,6 +1274,124 @@ mod tests {
         state.pending_runtime.live_attach_routes.remove(&growth);
         assert!(capture_current_sources(&mut daemon, &state, &mut input, exact).is_some());
         assert_eq!(input.seed.as_ref().unwrap().occupancy.len(), 1);
+        drop(input);
+        drop(permit);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Quarantine rows are counted before they are copied: one byte short of
+    /// the rows refuses the capture, and an exact fit lists every row.
+    #[test]
+    fn status_current_sources_count_quarantine_rows_before_copy() {
+        use crate::daemon::control::session_type_quarantine::{
+            PendingRepoQuarantine, QuarantineCause, UnknownOutcomeKind,
+        };
+
+        let (mut daemon, directory) = test_daemon("status-quarantine-rows");
+        let mut state = DaemonControlState::default();
+        let evidence = crate::host_mutations::RepoWriteEvidence {
+            root: PathBuf::from("/repo/quarantined"),
+            target_path: PathBuf::from("/repo/quarantined/.botster/session-types.json"),
+            session_type_id: "review".to_string(),
+            operation: crate::host_mutations::SessionTypeOperation::Update,
+            prior_sha256: Some([1; 32]),
+            candidate_sha256: [2; 32],
+        };
+        let pending =
+            PendingRepoQuarantine::reserve(&evidence, &daemon.state_view().1.budget()).unwrap();
+        state.repo_session_type_quarantine.install(
+            pending,
+            QuarantineCause::UnknownOutcome(UnknownOutcomeKind::WorkerPanicked),
+            "test",
+        );
+        let package_dir = directory.join("quarantined.package");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("botster-package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "quarantined.package",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": "." },
+                "capabilities": [],
+                "entrypoints": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut registry = daemon.package_registry().clone();
+        registry
+            .install_local_path(package_dir, "status quarantine fixture")
+            .unwrap();
+        assert!(registry.set_quarantine(
+            "quarantined.package",
+            Some(crate::PackageQuarantine {
+                original: "original failure".to_string(),
+                compensation: "compensation failure".to_string(),
+                quarantined_at_ms: 1,
+            }),
+        ));
+        daemon.replace_package_registry(registry).unwrap();
+        let mut input = capture_seed(&daemon, &state, "43".into(), false, usize::MAX);
+        let permit = daemon
+            .runtime()
+            .unwrap()
+            .host_executor()
+            .try_reserve()
+            .unwrap();
+        input.core = Some(StatusCoreSnapshot::new(
+            Default::default(),
+            Ok(Some(botster_core::TerminalSubscriptionInventory {
+                logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
+                records: Vec::new(),
+            })),
+            permit.retain_prepared_reservation(),
+        ));
+        let live = input.logical_bytes(usize::MAX).unwrap();
+        let terminal = daemon
+            .local_webrtc()
+            .terminal_records_bytes(usize::MAX)
+            .unwrap();
+        let occupancy = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+            &state.pending_runtime.live_attach_routes,
+            &[],
+            usize::MAX,
+        )
+        .unwrap();
+        let rows = state
+            .repo_session_type_quarantine
+            .status_rows_bytes(usize::MAX)
+            .unwrap();
+        let (package_rows, package_bytes) =
+            crate::daemon::control::host_work::package_quarantine_rows_bytes(
+                &state,
+                daemon.package_registry(),
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(package_rows, 1);
+        let exact = live + occupancy + terminal + rows + package_bytes;
+        assert!(capture_current_sources(&mut daemon, &state, &mut input, exact - 1).is_none());
+        assert!(input.seed.as_ref().unwrap().quarantines.is_empty());
+        assert!(capture_current_sources(&mut daemon, &state, &mut input, exact).is_some());
+        let quarantines = &input.seed.as_ref().unwrap().quarantines;
+        assert_eq!(quarantines.len(), 2);
+        assert!(matches!(
+            &quarantines[0],
+            botster_hub_client::DaemonQuarantine::RepositorySessionTypes { cause, .. }
+                if cause == "unknown_outcome_worker_panicked"
+        ));
+        assert!(matches!(
+            &quarantines[1],
+            botster_hub_client::DaemonQuarantine::Package {
+                package_name,
+                durable: true,
+                ..
+            } if package_name == "quarantined.package"
+        ));
+        assert_eq!(quarantines.capacity(), 2, "the row vector is sized exactly");
         drop(input);
         drop(permit);
         daemon.stop();

@@ -411,6 +411,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         enabled_provider_count: stopped.enabled_provider_count,
         session_count: 0,
         retention: None,
+        quarantines: Vec::new(),
         local_webrtc_terminal_records: Vec::new(),
         recovered_sessions: stopped
             .recovered_sessions
@@ -2767,6 +2768,10 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             if let Some(status) = response.update_status.as_ref() {
                 print_package_update_status(status);
             }
+        }
+        DaemonResponseKind::QuarantineResolved => {
+            println!("response=quarantine_resolved");
+            print_packages(&response.packages, false);
         }
         DaemonResponseKind::PackageDecision => {
             if let Some(decision) = response.package_decision {

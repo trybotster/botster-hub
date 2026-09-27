@@ -551,6 +551,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("disable_package", &[("package_name", "string")]),
             ("remove_package", &[("package_name", "string")]),
             (
+                "resolve_quarantine",
+                &[("target", "DaemonQuarantineTarget")],
+            ),
+            (
                 "start_package_entrypoint",
                 &[
                     ("package_name", "string"),
@@ -841,6 +845,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "package_install_plan",
             "package_update_status",
             "package_decision",
+            "quarantine_resolved",
             "plugin_lifecycle",
             "plugin_mcp_tools",
             "plugin_mcp_tool_result",
@@ -1546,6 +1551,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("live_attach_occupancy?", "DaemonAttachOccupancy[]"),
             ("observability?", "DaemonObservabilityCounters"),
             ("retention?", "DaemonRetentionAccounting | null"),
+            ("quarantines?", "DaemonQuarantine[]"),
             (
                 "local_webrtc_terminal_records?",
                 "DaemonLocalWebrtcTerminalRecord[]",
@@ -1563,6 +1569,41 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("total_bytes", "number"),
             ("sessions", "number"),
             ("evictions", "number"),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "DaemonQuarantine",
+        "kind",
+        &[
+            (
+                "repository_session_types",
+                &[
+                    ("root", "string"),
+                    ("cause", "string"),
+                    ("detail", "string"),
+                    ("quarantined_at_ms", "number"),
+                ],
+            ),
+            (
+                "package",
+                &[
+                    ("package_name", "string"),
+                    ("original", "string"),
+                    ("compensation", "string"),
+                    ("durable", "boolean"),
+                    ("quarantined_at_ms", "number"),
+                ],
+            ),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "DaemonQuarantineTarget",
+        "kind",
+        &[
+            ("package", &[("package_name", "string")]),
+            ("repository_session_types", &[("root", "string")]),
         ],
     );
     emit_interface(
@@ -1694,6 +1735,13 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("stalled_write_timeouts", "number"),
             ("queue_ages?", "DaemonQueueAgeObservation[]"),
             ("global_in_flight_bytes?", "number"),
+            ("event_replacements_stranded?", "number"),
+            ("event_deliveries_generation_unloaded?", "number"),
+            ("event_deliveries_package_unloaded?", "number"),
+            ("event_deliveries_handler_absent?", "number"),
+            ("event_stage_overlaps?", "number"),
+            ("events_stranded?", "number"),
+            ("package_quarantines_not_durable?", "number"),
         ],
     );
     emit_interface(

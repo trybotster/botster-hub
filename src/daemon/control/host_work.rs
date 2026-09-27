@@ -1,6 +1,9 @@
 //! Bounded host execution for control reads and durable mutations.
 
-use botster_hub_client::{DaemonDiagnostic, DaemonOperatorError, DaemonRequest, DaemonResponse};
+use botster_hub_client::{
+    DaemonDiagnostic, DaemonOperatorError, DaemonQuarantine, DaemonQuarantineTarget, DaemonRequest,
+    DaemonResponse,
+};
 
 use crate::HubDaemon;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
@@ -16,8 +19,9 @@ use crate::host_executor::{
 };
 use crate::host_mutations::{
     HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPackageEffect,
-    HostPackageRestore, HostPackageRuntimeRestore, HostPrepare, HostRead, HostRecover,
-    PackageRuntimeEffect, PreparedMutation, RecoveryOutcome, SessionTypeRecovery,
+    HostPackageQuarantineRecord, HostPackageRestore, HostPackageRuntimeRestore, HostPrepare,
+    HostRead, HostRecover, PackageQuarantineWrite, PackageRuntimeEffect, PreparedMutation,
+    RecoveryOutcome, SessionTypeRecovery,
 };
 use crate::owner_identity::WaiterId;
 
@@ -275,6 +279,8 @@ pub(crate) struct PackageRecoveryRequired {
     /// The stranded packages this record covers. An explicit operator enable
     /// or reload of one resolves it; the record is released once none remain.
     pub(crate) packages: std::collections::BTreeSet<String>,
+    /// Milliseconds since the Unix epoch.
+    pub(crate) quarantined_at_ms: u64,
     _effect: PackageRuntimeEffect,
     _permit: HostWorkPermit,
 }
@@ -286,10 +292,14 @@ impl PackageRecoveryRequired {
         effect: PackageRuntimeEffect,
         permit: HostWorkPermit,
     ) -> Self {
+        use crate::daemon::error::{COMPENSATION_MESSAGE_BOUND, bound_compensation_message};
         Self {
             owner_permit: None,
-            original,
-            compensation,
+            original: bound_compensation_message(original, COMPENSATION_MESSAGE_BOUND),
+            compensation: bound_compensation_message(compensation, COMPENSATION_MESSAGE_BOUND),
+            quarantined_at_ms: crate::daemon::control::session_type_quarantine::unix_millis(
+                std::time::SystemTime::now(),
+            ),
             packages: effect
                 .package_names()
                 .into_iter()
@@ -301,22 +311,133 @@ impl PackageRecoveryRequired {
     }
 }
 
-/// The package an explicit operator enable or reload names. Only these
-/// requests resolve a stranded package; an automatic refresh never does.
+/// Visit every quarantined package once: durable registry records first,
+/// then stranded packages that only this run's recovery records cover.
+/// Arguments: name, original, compensation, durable, quarantined_at_ms.
+fn for_each_package_quarantine(
+    state: &DaemonControlState,
+    registry: &crate::PackageRegistry,
+    mut visit: impl FnMut(&str, &str, &str, bool, u64),
+) {
+    for record in registry.package_records() {
+        if let Some(quarantine) = record.quarantine.as_ref() {
+            visit(
+                &record.manifest.name,
+                &quarantine.original,
+                &quarantine.compensation,
+                true,
+                quarantine.quarantined_at_ms,
+            );
+        }
+    }
+    let recoveries = || {
+        state
+            .host_recovery
+            .values()
+            .filter_map(|recovery| match recovery {
+                HostRecoveryRequired::Package(record) => Some(record),
+                _ => None,
+            })
+    };
+    for (index, recovery) in recoveries().enumerate() {
+        for package_name in &recovery.packages {
+            let durable = registry
+                .package(package_name)
+                .is_some_and(|record| record.quarantine.is_some());
+            let listed = recoveries()
+                .take(index)
+                .any(|earlier| earlier.packages.contains(package_name));
+            if !durable && !listed {
+                visit(
+                    package_name,
+                    &recovery.original,
+                    &recovery.compensation,
+                    false,
+                    recovery.quarantined_at_ms,
+                );
+            }
+        }
+    }
+}
+
+fn package_is_quarantined(
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+    package_name: &str,
+) -> bool {
+    daemon
+        .package_registry()
+        .package(package_name)
+        .is_some_and(|record| record.quarantine.is_some())
+        || covered_by_package_recovery(state, package_name)
+        || daemon
+            .runtime()
+            .is_some_and(|runtime| runtime.stranded_packages().contains(package_name))
+}
+
+/// The package Status row count and logical bytes, without allocating them.
+pub(crate) fn package_quarantine_rows_bytes(
+    state: &DaemonControlState,
+    registry: &crate::PackageRegistry,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let mut rows = 0usize;
+    let mut bytes = Some(0usize);
+    for_each_package_quarantine(state, registry, |name, original, compensation, _, _| {
+        rows += 1;
+        bytes = bytes
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<DaemonQuarantine>()))
+            .and_then(|bytes| bytes.checked_add(name.len()))
+            .and_then(|bytes| bytes.checked_add(original.len()))
+            .and_then(|bytes| bytes.checked_add(compensation.len()))
+            .filter(|bytes| *bytes <= limit);
+    });
+    Some((rows, bytes?))
+}
+
+/// Append the package Status rows. Call after `package_quarantine_rows_bytes`
+/// admitted them.
+pub(crate) fn extend_package_quarantine_rows(
+    state: &DaemonControlState,
+    registry: &crate::PackageRegistry,
+    rows: &mut Vec<DaemonQuarantine>,
+) {
+    for_each_package_quarantine(
+        state,
+        registry,
+        |name, original, compensation, durable, quarantined_at_ms| {
+            rows.push(DaemonQuarantine::Package {
+                package_name: name.to_string(),
+                original: original.to_string(),
+                compensation: compensation.to_string(),
+                durable,
+                quarantined_at_ms,
+            });
+        },
+    );
+}
+
+/// The package an explicit operator enable, reload, or quarantine resolve
+/// names. Only these requests resolve a stranded package; an automatic
+/// refresh never does.
 fn explicit_resolution_target(request: &DaemonRequest) -> Option<&str> {
     match request {
         DaemonRequest::EnablePackage { package_name }
-        | DaemonRequest::ReloadPackage { package_name } => Some(package_name),
+        | DaemonRequest::ReloadPackage { package_name }
+        | DaemonRequest::ResolveQuarantine {
+            target: DaemonQuarantineTarget::Package { package_name },
+        } => Some(package_name),
         _ => None,
     }
 }
 
-/// The package an explicit enable or reload effect loads. Enable and Reload
+/// The package an explicit enable, reload, or resolve effect settles. These
 /// effects come only from those explicit operator requests.
 fn explicit_effect_target(effect: &PackageRuntimeEffect) -> Option<&str> {
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. }
-        | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name),
+        | PackageRuntimeEffect::Reload { package_name, .. }
+        | PackageRuntimeEffect::Resolve { package_name } => Some(package_name),
         _ => None,
     }
 }
@@ -347,6 +468,9 @@ pub(crate) fn resolve_package_recovery(state: &mut DaemonControlState, package_n
 fn host_operation_label(request: &DaemonRequest) -> &'static str {
     use crate::PackageAction;
 
+    if matches!(request, DaemonRequest::ResolveQuarantine { .. }) {
+        return "resolve_quarantine";
+    }
     let action = match request {
         DaemonRequest::InstallPackageRegistryEntry { .. }
         | DaemonRequest::InstallPackageLocalPath { .. } => PackageAction::Install,
@@ -373,6 +497,37 @@ pub(crate) fn handle(
     request: DaemonRequest,
 ) -> Option<ControlStep> {
     let waiter_id = state.current_waiter_id?;
+    // A durably quarantined package runs nothing until it is resolved, or
+    // explicitly enabled or reloaded. Before a restart the recovery record
+    // refuses these requests; after one, only the durable record remains.
+    if let DaemonRequest::StartPackageEntrypoint { package_name, .. }
+    | DaemonRequest::RestartPackageEntrypoint { package_name, .. } = &request
+        && daemon
+            .package_registry()
+            .package(package_name)
+            .is_some_and(|record| record.quarantine.is_some())
+    {
+        return Some(ControlStep::ready(error_response(
+            "package_quarantined",
+            host_operation_label(&request),
+            &format!(
+                "package {package_name} is quarantined; resolve it, or enable or reload it explicitly"
+            ),
+        )));
+    }
+    // A package resolve names a quarantine that Status lists: durable,
+    // stranded, or covered by a recovery record.
+    if let DaemonRequest::ResolveQuarantine {
+        target: DaemonQuarantineTarget::Package { package_name },
+    } = &request
+        && !package_is_quarantined(daemon, state, package_name)
+    {
+        return Some(ControlStep::ready(error_response(
+            "quarantine_not_found",
+            "resolve_quarantine",
+            &format!("package {package_name} is not quarantined"),
+        )));
+    }
     let must_finish = crate::daemon::control::pending::request_must_finish(&request);
     let operation = host_operation_label(&request);
     let (base_revision, state_view) = daemon.state_view();
@@ -772,7 +927,14 @@ impl HostMutationContinuation {
         }
         // Any mutation result settles the submitted commit's obligation.
         let obligation = commit_obligation.take();
-        if !matches!(result, HostMutationResult::PublishedUncertain { .. }) {
+        if !matches!(
+            result,
+            HostMutationResult::PublishedUncertain { .. }
+                | HostMutationResult::PackageQuarantineRecorded {
+                    write: PackageQuarantineWrite::Uncertain(_),
+                    ..
+                }
+        ) {
             state.release_uncertain_reservation(waiter_id);
         }
         if let Some(cleanup) = package_event_cleanup(&mut result) {
@@ -1058,8 +1220,8 @@ impl HostMutationContinuation {
                     .runtime_mut()
                     .expect("package recovery retains its runtime")
                     .apply_host_package_cleanup(cleanup);
-                release_document(state, waiter_id);
                 if rollbacks.is_empty() {
+                    release_document(state, waiter_id);
                     // The durable state and runtime are restored. A plugin
                     // load failure is this request's typed refusal, never a
                     // reason to close the client connection.
@@ -1068,24 +1230,53 @@ impl HostMutationContinuation {
                         None => finish_transport_error(permit, original),
                     }
                 } else {
-                    state.host_recovery.insert(
+                    submit_package_quarantine_record(
+                        daemon,
+                        state,
                         waiter_id,
-                        HostRecoveryRequired::Package(PackageRecoveryRequired::new(
-                            original.to_string(),
-                            rollbacks
-                                .iter()
-                                .map(|failure| failure.error.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; "),
+                        PackageCompensationFailure {
                             effect,
-                            permit,
-                        )),
-                    );
-                    ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
-                        original: Box::new(original),
-                        rollbacks,
-                    }))
+                            original,
+                            rollbacks,
+                        },
+                        permit,
+                        next_phase,
+                    )
                 }
+            }
+            HostMutationResult::PackageQuarantineRecorded {
+                write,
+                effect,
+                original,
+                rollbacks,
+            } => {
+                let durable = match write {
+                    PackageQuarantineWrite::Synced {
+                        state: view,
+                        packages,
+                    } => {
+                        daemon.publish_state(view);
+                        daemon.publish_package_registry_view(packages);
+                        Ok(())
+                    }
+                    PackageQuarantineWrite::NotDurable(reason) => Err(reason),
+                    PackageQuarantineWrite::Uncertain(write) => {
+                        // Later state writes stay refused until this
+                        // publication is resolved, as for any uncertain write.
+                        state.retain_uncertain_publication(waiter_id, write, None, None);
+                        Err("the quarantine write's durable result is unconfirmed".to_string())
+                    }
+                };
+                release_document(state, waiter_id);
+                let failure = PackageCompensationFailure {
+                    effect,
+                    original,
+                    rollbacks,
+                };
+                if let Err(reason) = durable {
+                    record_quarantine_not_durable(daemon, &failure.effect, &reason);
+                }
+                retain_compensation_failure(state, waiter_id, failure, permit)
             }
             HostMutationResult::PackageRestoreFailed(error) => {
                 let failure = PackageRollbackFailure {
@@ -1221,7 +1412,17 @@ fn submit_package_restore(
                 "package restore requires the original document reservation",
             )),
         };
-        return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+        return retain_package_recovery(
+            daemon,
+            state,
+            waiter_id,
+            PackageCompensationFailure {
+                effect,
+                original,
+                rollbacks: vec![failure],
+            },
+            permit,
+        );
     }
     if !state.reserve_uncertain_publication(waiter_id) {
         release_document(state, waiter_id);
@@ -1232,7 +1433,17 @@ fn submit_package_restore(
                 "another unresolved state publication owns the retention cell",
             )),
         };
-        let _ = retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+        let _ = retain_package_recovery(
+            daemon,
+            state,
+            waiter_id,
+            PackageCompensationFailure {
+                effect,
+                original,
+                rollbacks: vec![failure],
+            },
+            permit,
+        );
         return ControlPoll::Ready(Ok(error_response(
             "state_publication_slot_occupied",
             "hub_state",
@@ -1287,7 +1498,17 @@ fn submit_package_quarantine(
     };
     let Some(runtime) = daemon.runtime() else {
         release_document(state, waiter_id);
-        return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+        return retain_package_recovery(
+            daemon,
+            state,
+            waiter_id,
+            PackageCompensationFailure {
+                effect,
+                original,
+                rollbacks: vec![failure],
+            },
+            permit,
+        );
     };
     let command = HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
         effect,
@@ -1300,27 +1521,133 @@ fn submit_package_quarantine(
     submit_phase(daemon, state, waiter_id, command, permit, next_phase)
 }
 
-fn retain_package_recovery(
-    state: &mut DaemonControlState,
-    waiter_id: WaiterId,
+/// A failed compensation: the effect, its original failure, and every
+/// rollback that failed.
+struct PackageCompensationFailure {
     effect: PackageRuntimeEffect,
     original: DaemonTransportError,
-    failure: PackageRollbackFailure,
+    rollbacks: Vec<PackageRollbackFailure>,
+}
+
+/// Persist the quarantine that a failed compensation just applied, as one
+/// more phase under this waiter's document reservation. When no write can be
+/// attempted, the quarantine stays in memory only and is counted.
+fn submit_package_quarantine_record(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    failure: PackageCompensationFailure,
+    permit: HostWorkPermit,
+    next_phase: &mut u64,
+) -> ControlPoll {
+    use crate::daemon::error::{COMPENSATION_MESSAGE_BOUND, bound_compensation_message};
+
+    let authority = daemon
+        .runtime()
+        .and_then(crate::HubRuntime::state_authority);
+    let refusal = if state.document_owner != Some(waiter_id) {
+        Some("the quarantine write requires the original document reservation")
+    } else if authority.is_none() {
+        Some("the quarantine write requires File state authority")
+    } else if !state.reserve_uncertain_publication(waiter_id) {
+        Some("another unresolved state publication owns the retention cell")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        release_document(state, waiter_id);
+        record_quarantine_not_durable(daemon, &failure.effect, reason);
+        return retain_compensation_failure(state, waiter_id, failure, permit);
+    }
+    let runtime = daemon.runtime().expect("the state authority has a runtime");
+    let (base_revision, current_state) = daemon.state_view();
+    let quarantine = crate::PackageQuarantine {
+        original: bound_compensation_message(
+            failure.original.to_string(),
+            COMPENSATION_MESSAGE_BOUND,
+        ),
+        compensation: bound_compensation_message(
+            compensation_message(&failure.rollbacks),
+            COMPENSATION_MESSAGE_BOUND,
+        ),
+        quarantined_at_ms: crate::daemon::control::session_type_quarantine::unix_millis(
+            std::time::SystemTime::now(),
+        ),
+    };
+    let command = HostMutationCommand::RecordPackageQuarantine(HostPackageQuarantineRecord {
+        base_revision,
+        authority: authority.expect("checked above"),
+        state: current_state,
+        packages: daemon.package_registry_view(),
+        data_directory: runtime.config().data_directory.clone(),
+        quarantine,
+        effect: failure.effect,
+        original: failure.original,
+        rollbacks: failure.rollbacks,
+    });
+    submit_phase(daemon, state, waiter_id, command, permit, next_phase)
+}
+
+fn compensation_message(rollbacks: &[PackageRollbackFailure]) -> String {
+    rollbacks
+        .iter()
+        .map(|failure| failure.error.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The quarantine lasts only until the Hub restarts: count it and log why.
+fn record_quarantine_not_durable(daemon: &HubDaemon, effect: &PackageRuntimeEffect, reason: &str) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime
+            .event_plane_counters()
+            .record_package_quarantine_not_durable();
+    }
+    crate::hub_log::hub_log!(
+        "package_quarantine_not_durable packages={} reason={reason}",
+        effect.package_names().join(",")
+    );
+}
+
+/// Keep the recovery record, which holds this request's Host slot, and
+/// answer the client with the compensation failure.
+fn retain_compensation_failure(
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    failure: PackageCompensationFailure,
     permit: HostWorkPermit,
 ) -> ControlPoll {
+    let PackageCompensationFailure {
+        effect,
+        original,
+        rollbacks,
+    } = failure;
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::Package(PackageRecoveryRequired::new(
             original.to_string(),
-            failure.error.to_string(),
+            compensation_message(&rollbacks),
             effect,
             permit,
         )),
     );
     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
         original: Box::new(original),
-        rollbacks: vec![failure],
+        rollbacks,
     }))
+}
+
+/// No compensation or quarantine phase can run: retain the recovery in
+/// memory only, and count it as not durable.
+fn retain_package_recovery(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    failure: PackageCompensationFailure,
+    permit: HostWorkPermit,
+) -> ControlPoll {
+    record_quarantine_not_durable(daemon, &failure.effect, "no compensation phase could run");
+    retain_compensation_failure(state, waiter_id, failure, permit)
 }
 
 pub(crate) fn handles(request: &DaemonRequest) -> bool {
@@ -1360,8 +1687,8 @@ fn admit_or_park_commit(
     // Anything that reaches this site can park on the document reservation.
     // Transport closure must not retire its handoff.
     debug_assert!(must_finish, "a parkable host mutation must finish");
-    // An explicit enable or reload of a stranded package is its resolution
-    // and may commit; every other package mutation waits for recovery.
+    // An explicit enable, reload, or resolve of a stranded package is its
+    // resolution and may commit; every other package mutation waits.
     let resolves_stranded = match &prepared.change {
         crate::host_mutations::PreparedChange::PackageConfiguration(change) => change
             .package_effect()
@@ -1809,6 +2136,39 @@ fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
     }
 }
 
+/// An operator resolve of a quarantined repository root. It runs on the
+/// owner, which alone touches the quarantine map; a recovery write still in
+/// flight for the root refuses it, typed.
+pub(crate) fn resolve_repo_quarantine(
+    state: &mut DaemonControlState,
+    root: &std::path::Path,
+) -> DaemonResponse {
+    use crate::daemon::control::session_type_quarantine::ResolveRefusal;
+
+    let write_in_flight = state.blocked_session_type_roots.contains_key(root);
+    match state
+        .repo_session_type_quarantine
+        .resolve(root, write_in_flight)
+    {
+        Ok(()) => crate::client_api_dto::response::daemon_response_base(
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+        ),
+        Err(ResolveRefusal::NotFound) => error_response(
+            "quarantine_not_found",
+            "resolve_quarantine",
+            &format!("{} is not quarantined", root.display()),
+        ),
+        Err(ResolveRefusal::WriteInFlight) => error_response(
+            "quarantine_write_in_flight",
+            "resolve_quarantine",
+            &format!(
+                "a session-type write for {} is still in flight; resolve after it completes",
+                root.display()
+            ),
+        ),
+    }
+}
+
 fn error_response(code: &str, operation: &str, message: &str) -> DaemonResponse {
     let diagnostic = DaemonDiagnostic::action_failure(operation, message);
     let mut response = crate::client_api_dto::response::daemon_response_base(
@@ -1891,7 +2251,7 @@ pub(crate) fn recovery_response(
             HostRecoveryRequired::Package(recovery) => Some(recovery),
             _ => None,
         })?;
-    // An explicit enable or reload of a stranded package resolves it.
+    // An explicit enable, reload, or resolve of a stranded package resolves it.
     let resolves_stranded = explicit_resolution_target(request)
         .is_some_and(|package_name| covered_by_package_recovery(state, package_name));
     let blocked = !resolves_stranded
@@ -2057,6 +2417,9 @@ fn is_package_prepare(request: &DaemonRequest) -> bool {
             | DaemonRequest::EnablePackage { .. }
             | DaemonRequest::DisablePackage { .. }
             | DaemonRequest::RemovePackage { .. }
+            | DaemonRequest::ResolveQuarantine {
+                target: DaemonQuarantineTarget::Package { .. },
+            }
     )
 }
 
@@ -2112,6 +2475,58 @@ mod tests {
     use crate::runtime::package_effect::HostPackageCleanup;
     use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The owner refuses a repository resolve while a recovery write for the
+    /// root is in flight, then accepts it once the write settles.
+    #[test]
+    fn a_repository_resolve_waits_for_the_root_write_in_flight() {
+        use crate::daemon::control::session_type_quarantine::{
+            PendingRepoQuarantine, QuarantineCause, UnknownOutcomeKind,
+        };
+
+        let root = std::path::PathBuf::from("/repo/in-flight");
+        let evidence = crate::host_mutations::RepoWriteEvidence {
+            root: root.clone(),
+            target_path: root.join(".botster/session-types.json"),
+            session_type_id: "review".to_string(),
+            operation: crate::host_mutations::SessionTypeOperation::Create,
+            prior_sha256: None,
+            candidate_sha256: [3; 32],
+        };
+        let budget = crate::shared_view::SharedViewBudget::with_capacity(4096);
+        let mut state = DaemonControlState::default();
+        state.repo_session_type_quarantine.install(
+            PendingRepoQuarantine::reserve(&evidence, &budget).expect("reserve"),
+            QuarantineCause::UnknownOutcome(UnknownOutcomeKind::Other),
+            "test",
+        );
+        state
+            .blocked_session_type_roots
+            .insert(root.clone(), WaiterId(7));
+        let refused = resolve_repo_quarantine(&mut state, &root);
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("quarantine_write_in_flight"),
+            "{refused:?}"
+        );
+        assert!(state.repo_session_type_quarantine.contains(&root));
+
+        state.blocked_session_type_roots.remove(&root);
+        let resolved = resolve_repo_quarantine(&mut state, &root);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert!(!state.repo_session_type_quarantine.contains(&root));
+        assert_eq!(budget.used(), 0);
+        let absent = resolve_repo_quarantine(&mut state, &root);
+        assert_eq!(
+            absent.error.as_ref().map(|error| error.code.as_str()),
+            Some("quarantine_not_found"),
+            "{absent:?}"
+        );
+    }
 
     // Parallel tests can read the same clock value; the counter keeps each
     // test daemon's directory, and so its directory lock, distinct.

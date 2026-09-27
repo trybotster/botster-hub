@@ -547,6 +547,7 @@ impl PackageRegistry {
             updated_at: None,
             last_audit_reason: audit_reason,
             admitted_host_profile: None,
+            quarantine: None,
         };
 
         self.records.insert(package_name.clone(), record);
@@ -779,6 +780,7 @@ impl PackageRegistry {
                 updated_at: current.updated_at,
                 last_audit_reason: audit_reason.clone(),
                 admitted_host_profile: None,
+                quarantine: current.quarantine,
             },
         );
         if was_enabled {
@@ -1095,6 +1097,20 @@ impl PackageRegistry {
         &self,
     ) -> std::collections::btree_map::Values<'_, String, PackageRecord> {
         self.records.values()
+    }
+
+    /// Set or clear an installed package's quarantine. Returns false when the
+    /// package is not installed.
+    pub(crate) fn set_quarantine(
+        &mut self,
+        package_name: &str,
+        quarantine: Option<PackageQuarantine>,
+    ) -> bool {
+        let Some(record) = self.records.get_mut(package_name) else {
+            return false;
+        };
+        record.quarantine = quarantine;
+        true
     }
 
     /// Resolve one installed package through the core dependency and feature matrix.
@@ -1423,6 +1439,22 @@ pub struct PackageRecord {
     /// core runtime result, not a serde-stable storage contract.
     #[serde(skip)]
     pub admitted_host_profile: Option<AdmittedHostProfile>,
+    /// Set when a failed compensation stranded this package. Nothing loads it
+    /// until an operator resolves the quarantine, or explicitly enables or
+    /// reloads the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<PackageQuarantine>,
+}
+
+/// Why a package is quarantined, as the operator sees it in Status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageQuarantine {
+    /// The failure that started the failed mutation, bounded.
+    pub original: String,
+    /// The compensation failure, bounded.
+    pub compensation: String,
+    /// Milliseconds since the Unix epoch.
+    pub quarantined_at_ms: u64,
 }
 
 impl PackageRecord {
@@ -3587,6 +3619,7 @@ mod tests {
             updated_at: None,
             last_audit_reason: "test fixture".to_string(),
             admitted_host_profile: None,
+            quarantine: None,
         }
     }
 

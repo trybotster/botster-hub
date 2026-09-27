@@ -17,9 +17,9 @@ use crate::config::{
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::{
     HubEmittedEvent, HubPackageEvents, HubPackageManifest, PackageClassification,
-    PackageCompatibility, PackageConfigurationState, PackagePin, PackageProvenance, PackageRecord,
-    PackageRegistrySnapshot, PackageRunnableEntrypoint, PackageSourceMetadata, PackageState,
-    PackageTrust, PackageUpdatePolicy,
+    PackageCompatibility, PackageConfigurationState, PackagePin, PackageProvenance,
+    PackageQuarantine, PackageRecord, PackageRegistrySnapshot, PackageRunnableEntrypoint,
+    PackageSourceMetadata, PackageState, PackageTrust, PackageUpdatePolicy,
 };
 use crate::persistence::{
     BootstrapGrantRecord, CapabilityGrantRecord, CredentialKeyReference, DeviceSessionTypeSource,
@@ -580,6 +580,7 @@ impl HeapSize for PackageRecord {
             updated_at,
             last_audit_reason,
             admitted_host_profile,
+            quarantine,
         } = self;
         manifest.add_to(walk);
         state.add_to(walk);
@@ -598,6 +599,7 @@ impl HeapSize for PackageRecord {
         updated_at.add_to(walk);
         last_audit_reason.add_to(walk);
         admitted_host_profile.add_to(walk);
+        quarantine.add_to(walk);
     }
 }
 
@@ -720,6 +722,19 @@ impl HeapSize for PackageSourceMetadata {
         source_kind.add_to(walk);
         source_label.add_to(walk);
         git_repo.add_to(walk);
+    }
+}
+
+impl HeapSize for PackageQuarantine {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            original,
+            compensation,
+            quarantined_at_ms,
+        } = self;
+        original.add_to(walk);
+        compensation.add_to(walk);
+        quarantined_at_ms.add_to(walk);
     }
 }
 

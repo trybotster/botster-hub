@@ -388,17 +388,18 @@ pub struct EventPlaneCounters {
     max_ready_operation_wait_us: AtomicU64,
     stalled_write_timeouts: AtomicU64,
     /// Package replacements whose commit failed after a successful preview
-    /// had already unloaded the previous generation. Hub-local until a
-    /// protocol revision exposes it.
+    /// had already unloaded the previous generation.
     replacements_stranded: AtomicU64,
     /// Deliveries retired because the consumer generation they matched is no
     /// longer installed, the plugin is unloaded, or the handler is absent.
-    /// Hub-local until a protocol revision exposes them.
     deliveries_generation_unloaded: AtomicU64,
     deliveries_package_unloaded: AtomicU64,
     deliveries_handler_absent: AtomicU64,
     stage_overlaps: AtomicU64,
     events_stranded: AtomicU64,
+    /// Package quarantines the Hub could not persist; each lasts only until
+    /// the Hub restarts.
+    package_quarantines_not_durable: AtomicU64,
     global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
@@ -451,6 +452,7 @@ impl EventPlaneCounters {
             deliveries_handler_absent: AtomicU64::new(0),
             stage_overlaps: AtomicU64::new(0),
             events_stranded: AtomicU64::new(0),
+            package_quarantines_not_durable: AtomicU64::new(0),
             global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
@@ -577,7 +579,6 @@ impl EventPlaneCounters {
         self.stage_overlaps.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Read by tests until the C3 protocol revision exposes these counters.
     #[cfg(test)]
     pub(crate) fn stage_overlaps(&self) -> u64 {
         self.stage_overlaps.load(Ordering::Relaxed)
@@ -591,6 +592,12 @@ impl EventPlaneCounters {
     #[cfg(test)]
     pub(crate) fn events_stranded(&self) -> u64 {
         self.events_stranded.load(Ordering::Relaxed)
+    }
+
+    /// A package quarantine that could not be persisted.
+    pub(crate) fn record_package_quarantine_not_durable(&self) {
+        self.package_quarantines_not_durable
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_delivery_refusal(&self, reason: crate::lifecycle::EventDeliveryRefusal) {
@@ -752,6 +759,17 @@ impl EventPlaneCounters {
         snapshot.max_ready_operation_wait_us =
             self.max_ready_operation_wait_us.load(Ordering::Relaxed);
         snapshot.stalled_write_timeouts = self.stalled_write_timeouts.load(Ordering::Relaxed);
+        snapshot.event_replacements_stranded = self.replacements_stranded.load(Ordering::Relaxed);
+        snapshot.event_deliveries_generation_unloaded =
+            self.deliveries_generation_unloaded.load(Ordering::Relaxed);
+        snapshot.event_deliveries_package_unloaded =
+            self.deliveries_package_unloaded.load(Ordering::Relaxed);
+        snapshot.event_deliveries_handler_absent =
+            self.deliveries_handler_absent.load(Ordering::Relaxed);
+        snapshot.event_stage_overlaps = self.stage_overlaps.load(Ordering::Relaxed);
+        snapshot.events_stranded = self.events_stranded.load(Ordering::Relaxed);
+        snapshot.package_quarantines_not_durable =
+            self.package_quarantines_not_durable.load(Ordering::Relaxed);
         snapshot.queue_ages = queue_ages;
         snapshot.global_in_flight_bytes = self.global_in_flight_bytes.load(Ordering::Relaxed);
         snapshot
@@ -929,6 +947,44 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    /// Each package counter reaches its own snapshot field. Distinct counts
+    /// catch two fields that read the same counter.
+    #[test]
+    fn package_counters_reach_their_snapshot_fields() {
+        use crate::lifecycle::EventDeliveryRefusal;
+
+        let counters = EventPlaneCounters::new();
+        counters.record_replacement_stranded();
+        for _ in 0..2 {
+            counters.record_delivery_refusal(EventDeliveryRefusal::GenerationUnloaded);
+        }
+        for _ in 0..3 {
+            counters.record_delivery_refusal(EventDeliveryRefusal::PackageUnloaded);
+        }
+        for _ in 0..4 {
+            counters.record_delivery_refusal(EventDeliveryRefusal::HandlerAbsent);
+        }
+        for _ in 0..5 {
+            counters.record_stage_overlap();
+        }
+        counters.record_events_stranded(6);
+        for _ in 0..7 {
+            counters.record_package_quarantine_not_durable();
+        }
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.event_replacements_stranded, 1);
+        assert_eq!(snapshot.event_deliveries_generation_unloaded, 2);
+        assert_eq!(snapshot.event_deliveries_package_unloaded, 3);
+        assert_eq!(snapshot.event_deliveries_handler_absent, 4);
+        assert_eq!(snapshot.event_stage_overlaps, 5);
+        assert_eq!(snapshot.events_stranded, 6);
+        assert_eq!(snapshot.package_quarantines_not_durable, 7);
+        let (bounded, _) = counters
+            .bounded_snapshot(usize::MAX)
+            .expect("an unbounded snapshot");
+        assert_eq!(bounded, snapshot);
+    }
 
     #[test]
     fn histogram_bucket_is_one_leading_zeros_step() {

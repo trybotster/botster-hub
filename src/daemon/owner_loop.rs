@@ -10138,6 +10138,13 @@ return botster.register({tools = {{
             "{error:?}"
         );
         assert!(
+            daemon
+                .package_registry()
+                .package("stranded.resolution")
+                .is_some_and(|record| record.quarantine.is_some()),
+            "the quarantine is durable before the explicit reload"
+        );
+        assert!(
             state.staged_package_generation.is_none(),
             "the staged generation moved to the quarantine job"
         );
@@ -10198,6 +10205,333 @@ return botster.register({tools = {{
                 .unwrap()
                 .stranded_packages()
                 .contains("stranded.resolution")
+        );
+        assert!(
+            daemon
+                .package_registry()
+                .package("stranded.resolution")
+                .is_some_and(|record| record.quarantine.is_none()),
+            "the explicit reload clears the durable quarantine"
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Install one Lua package, then fail its enable after the stage and fail
+    /// the durable restore, so compensation fails and quarantines it. The
+    /// third scripted commit is the quarantine write.
+    fn quarantine_by_failed_compensation(
+        name: &str,
+        quarantine_write: crate::persistence::InjectedCommit,
+    ) -> (PathBuf, crate::HubConfig, HubDaemon, DaemonControlState) {
+        use crate::persistence::InjectedCommit;
+
+        let root = unique_package_control_dir(name);
+        let package_dir = root.join(name);
+        write_package_control_manifest(
+            &package_dir,
+            name,
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config.clone()).expect("start quarantine daemon");
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install");
+        crate::runtime::package_effect::panic_after_stage_for(name);
+        FileHubStateStore::script_commits(
+            &config.data_directory,
+            &[
+                InjectedCommit::Succeed,
+                InjectedCommit::FailBeforeRename,
+                quarantine_write,
+            ],
+        );
+        let error = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect_err("effect panic plus failed durable restore");
+        assert!(
+            matches!(error, DaemonTransportError::PackageCompensation { .. }),
+            "{error:?}"
+        );
+        (root, config, daemon, state)
+    }
+
+    fn package_quarantine_rows(
+        daemon: &HubDaemon,
+        state: &DaemonControlState,
+    ) -> Vec<botster_hub_client::DaemonQuarantine> {
+        let mut rows = Vec::new();
+        crate::daemon::control::host_work::extend_package_quarantine_rows(
+            state,
+            daemon.package_registry(),
+            &mut rows,
+        );
+        rows
+    }
+
+    fn durable_quarantine(
+        rows: &[botster_hub_client::DaemonQuarantine],
+        name: &str,
+    ) -> Option<bool> {
+        rows.iter().find_map(|row| match row {
+            botster_hub_client::DaemonQuarantine::Package {
+                package_name,
+                durable,
+                ..
+            } if package_name == name => Some(*durable),
+            _ => None,
+        })
+    }
+
+    fn quarantines_not_durable(daemon: &HubDaemon) -> u64 {
+        daemon
+            .runtime()
+            .expect("runtime")
+            .event_plane_counters()
+            .snapshot()
+            .package_quarantines_not_durable
+    }
+
+    fn resolve_package_quarantine(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        name: &str,
+    ) -> DaemonResponse {
+        drive_package_request_with_state(
+            daemon,
+            state,
+            DaemonRequest::ResolveQuarantine {
+                target: botster_hub_client::DaemonQuarantineTarget::Package {
+                    package_name: name.to_string(),
+                },
+            },
+        )
+        .expect("the resolve answers with a response")
+    }
+
+    /// A failed compensation persists its quarantine. After a restart on the
+    /// same data directory the package stays unloaded and stranded, Status
+    /// lists it as durable, and an automatic refresh is refused. The operator
+    /// resolve commits it Disabled with the quarantine cleared.
+    #[test]
+    fn a_durable_package_quarantine_survives_restart_until_resolved() {
+        let name = "durable.quarantine";
+        let (root, config, mut daemon, state) =
+            quarantine_by_failed_compensation(name, crate::persistence::InjectedCommit::Succeed);
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable, "the quarantine write is published");
+        assert!(
+            daemon
+                .package_registry()
+                .package(name)
+                .is_some_and(|record| record.quarantine.is_some())
+        );
+        assert_eq!(
+            durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
+            Some(true)
+        );
+        assert_eq!(quarantines_not_durable(&daemon), 0);
+        daemon.stop();
+        drop(state);
+
+        let mut daemon = HubDaemon::start(config.clone()).expect("restart on the same data");
+        let mut state = DaemonControlState::default();
+        assert!(
+            !plugin_is_loaded(&daemon, name),
+            "startup skips a quarantined package"
+        );
+        assert!(daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert_eq!(
+            durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
+            Some(true)
+        );
+        let refused = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RefreshLocalPackages,
+        )
+        .expect("the refusal is a typed response");
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("package_stranded"),
+            "{refused:?}"
+        );
+        // After a restart only the durable record refuses an entrypoint start.
+        let start = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: name.to_string(),
+                entrypoint_id: "any".to_string(),
+                environment_overrides: BTreeMap::new(),
+            },
+        )
+        .expect("the refusal is a typed response");
+        assert_eq!(
+            start.error.as_ref().map(|error| error.code.as_str()),
+            Some("package_quarantined"),
+            "{start:?}"
+        );
+
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        let record = daemon.package_registry().package(name).expect("record");
+        assert_eq!(record.state, PackageState::Disabled);
+        assert!(record.quarantine.is_none());
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable, "the resolve is durable");
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(package_quarantine_rows(&daemon, &state).is_empty());
+        assert!(
+            !plugin_is_loaded(&daemon, name),
+            "resolve never loads the package"
+        );
+        let refreshed = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RefreshLocalPackages,
+        )
+        .expect("refresh after resolve");
+        assert!(refreshed.error.is_none(), "{refreshed:?}");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An explicit enable resolves a durable quarantine, as a reload does.
+    #[test]
+    fn an_explicit_enable_clears_a_durable_quarantine() {
+        let name = "enable.quarantine";
+        let (root, config, mut daemon, mut state) =
+            quarantine_by_failed_compensation(name, crate::persistence::InjectedCommit::Succeed);
+        assert!(
+            daemon
+                .package_registry()
+                .package(name)
+                .is_some_and(|record| record.quarantine.is_some())
+        );
+        let enabled = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect("the explicit enable resolves the quarantine");
+        assert!(enabled.error.is_none(), "{enabled:?}");
+        assert!(
+            daemon
+                .package_registry()
+                .package(name)
+                .is_some_and(|record| record.quarantine.is_none())
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(plugin_is_loaded(&daemon, name));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A quarantine write that fails leaves the quarantine in memory only:
+    /// Status reports it not durable and the counter records it. The resolve
+    /// still releases the recovery record and the stranded marker.
+    #[test]
+    fn a_failed_quarantine_write_is_reported_not_durable() {
+        let name = "volatile.quarantine";
+        let (root, _config, mut daemon, mut state) = quarantine_by_failed_compensation(
+            name,
+            crate::persistence::InjectedCommit::FailBeforeRename,
+        );
+        assert!(
+            daemon
+                .package_registry()
+                .package(name)
+                .is_some_and(|record| record.quarantine.is_none())
+        );
+        assert_eq!(
+            durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
+            Some(false)
+        );
+        assert_eq!(quarantines_not_durable(&daemon), 1);
+
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
+            "the resolve releases the recovery record"
+        );
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert_eq!(package_state(&daemon, name), PackageState::Disabled);
+        assert!(package_quarantine_rows(&daemon, &state).is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A quarantine write whose rename completed but whose sync failed is
+    /// retained as an uncertain publication, and reported not durable.
+    #[test]
+    fn an_uncertain_quarantine_write_keeps_the_publication_cell() {
+        let name = "uncertain.quarantine";
+        let (root, _config, mut daemon, state) = quarantine_by_failed_compensation(
+            name,
+            crate::persistence::InjectedCommit::SyncFailure,
+        );
+        assert!(
+            state.uncertain_publication.is_some(),
+            "the uncertain write is retained"
+        );
+        assert_eq!(
+            durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
+            Some(false)
+        );
+        assert_eq!(quarantines_not_durable(&daemon), 1);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A resolve names a quarantine that exists; any other target is refused.
+    #[test]
+    fn resolving_a_package_that_is_not_quarantined_is_refused() {
+        let root = unique_package_control_dir("not-quarantined");
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        let refused = resolve_package_quarantine(&mut daemon, &mut state, "absent.package");
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("quarantine_not_found"),
+            "{refused:?}"
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);

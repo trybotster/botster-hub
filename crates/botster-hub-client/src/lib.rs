@@ -55,7 +55,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 50;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
@@ -2223,6 +2223,10 @@ pub enum DaemonRequest {
     RemovePackage {
         package_name: String,
     },
+    /// Operator resolution of one quarantine listed in Status.
+    ResolveQuarantine {
+        target: DaemonQuarantineTarget,
+    },
     StartPackageEntrypoint {
         package_name: String,
         entrypoint_id: String,
@@ -2339,6 +2343,7 @@ impl DaemonRequest {
             Self::EnablePackage { .. } => "enable_package",
             Self::DisablePackage { .. } => "disable_package",
             Self::RemovePackage { .. } => "remove_package",
+            Self::ResolveQuarantine { .. } => "resolve_quarantine",
             Self::StartPackageEntrypoint { .. } => "start_package_entrypoint",
             Self::IssueLocalWebrtcBootstrap { .. } => "issue_local_webrtc_bootstrap",
             Self::LocalWebrtcSignal { .. } => "local_webrtc_signal",
@@ -2484,6 +2489,7 @@ pub enum DaemonResponseKind {
     PackageInstallPlan,
     PackageUpdateStatus,
     PackageDecision,
+    QuarantineResolved,
     PluginLifecycle,
     PluginMcpTools,
     PluginMcpToolResult,
@@ -3514,6 +3520,9 @@ pub struct DaemonStatus {
     /// Retained ended-session history policy and accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<DaemonRetentionAccounting>,
+    /// Quarantines awaiting operator resolution. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantines: Vec<DaemonQuarantine>,
     /// Recent local WebRTC peer-close evidence, bounded by the Hub.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_webrtc_terminal_records: Vec<DaemonLocalWebrtcTerminalRecord>,
@@ -3731,6 +3740,62 @@ pub struct DaemonObservabilityCounters {
     /// Occupied envelope bytes across all producer queues. Saturation-safe.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub global_in_flight_bytes: u64,
+    /// Package replacements whose commit failed after a passed preview.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub event_replacements_stranded: u64,
+    /// Deliveries retired because the consumer generation they matched is
+    /// no longer installed.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub event_deliveries_generation_unloaded: u64,
+    /// Deliveries retired because their consumer package is unloaded.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub event_deliveries_package_unloaded: u64,
+    /// Deliveries retired because the installed generation has no such handler.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub event_deliveries_handler_absent: u64,
+    /// Second stages refused while one was pending (an invariant break).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub event_stage_overlaps: u64,
+    /// Queued events of quarantined packages retired by their unload.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub events_stranded: u64,
+    /// Package quarantines whose durable write failed: they last until restart.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub package_quarantines_not_durable: u64,
+}
+
+/// One quarantine the operator must resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonQuarantine {
+    /// A repository session-type write whose outcome is unknown or uncertain.
+    RepositorySessionTypes {
+        root: PathBuf,
+        cause: String,
+        detail: String,
+        quarantined_at_ms: u64,
+    },
+    /// A package stranded by a failed compensation. Nothing loads it until an
+    /// operator resolves it or explicitly enables or reloads it.
+    Package {
+        package_name: String,
+        original: String,
+        compensation: String,
+        /// False when the quarantine could not be persisted: it lasts only
+        /// until the Hub restarts.
+        durable: bool,
+        quarantined_at_ms: u64,
+    },
+}
+
+/// The quarantine an operator resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonQuarantineTarget {
+    /// Resolve a stranded package to Disabled; the operator enables it later.
+    Package { package_name: String },
+    /// Clear a repository root; its session types are re-read from disk.
+    RepositorySessionTypes { root: PathBuf },
 }
 
 impl DaemonObservabilityCounters {
@@ -7345,6 +7410,11 @@ mod tests {
                 }))
                 .expect("typed action request"),
             },
+            DaemonRequest::ResolveQuarantine {
+                target: DaemonQuarantineTarget::Package {
+                    package_name: "stranded.plugin".to_string(),
+                },
+            },
             DaemonRequest::DaemonShutdown,
         ]
     }
@@ -7415,6 +7485,7 @@ mod tests {
             DaemonRequest::EnablePackage { .. } => "enable_package",
             DaemonRequest::DisablePackage { .. } => "disable_package",
             DaemonRequest::RemovePackage { .. } => "remove_package",
+            DaemonRequest::ResolveQuarantine { .. } => "resolve_quarantine",
             DaemonRequest::StartPackageEntrypoint { .. } => "start_package_entrypoint",
             DaemonRequest::IssueLocalWebrtcBootstrap { .. } => "issue_local_webrtc_bootstrap",
             DaemonRequest::LocalWebrtcSignal { .. } => "local_webrtc_signal",
@@ -7465,6 +7536,7 @@ mod tests {
             DaemonResponseKind::PackageInstallPlan,
             DaemonResponseKind::PackageUpdateStatus,
             DaemonResponseKind::PackageDecision,
+            DaemonResponseKind::QuarantineResolved,
             DaemonResponseKind::PluginLifecycle,
             DaemonResponseKind::PluginMcpTools,
             DaemonResponseKind::PluginMcpToolResult,
@@ -7518,6 +7590,7 @@ mod tests {
             DaemonResponseKind::PackageInstallPlan => "package_install_plan",
             DaemonResponseKind::PackageUpdateStatus => "package_update_status",
             DaemonResponseKind::PackageDecision => "package_decision",
+            DaemonResponseKind::QuarantineResolved => "quarantine_resolved",
             DaemonResponseKind::PluginLifecycle => "plugin_lifecycle",
             DaemonResponseKind::PluginMcpTools => "plugin_mcp_tools",
             DaemonResponseKind::PluginMcpToolResult => "plugin_mcp_tool_result",
@@ -7579,6 +7652,7 @@ mod tests {
                     sessions: 1,
                     evictions: 0,
                 }),
+                quarantines: Vec::new(),
                 local_webrtc_terminal_records: Vec::new(),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),

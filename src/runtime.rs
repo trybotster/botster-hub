@@ -1586,6 +1586,15 @@ impl HubRuntime {
         context
     }
 
+    /// Restore a durable quarantine at startup: automatic reloads refuse the
+    /// package until an operator resolves it.
+    pub(crate) fn mark_package_stranded(&self, package_name: &str) {
+        self.stranded_packages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(package_name.to_string());
+    }
+
     /// Packages automatic reloads must refuse until an operator resolves them.
     pub(crate) fn stranded_packages(&self) -> BTreeSet<String> {
         self.stranded_packages

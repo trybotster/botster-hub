@@ -389,7 +389,24 @@ pub(crate) fn load_enabled_local_plugins(
 ) -> HubDaemonResult<()> {
     let prepared = package_registry
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
+    // A durably quarantined package stays unloaded and stranded, so automatic
+    // reloads keep refusing it, until an operator resolves it.
+    for record in package_registry.package_records() {
+        if record.quarantine.is_some() {
+            runtime.mark_package_stranded(&record.manifest.name);
+            crate::hub_log::hub_log!(
+                "package_quarantine_restored package={}",
+                record.manifest.name
+            );
+        }
+    }
     for package in prepared {
+        if package_registry
+            .package(&package.package_name)
+            .is_some_and(|record| record.quarantine.is_some())
+        {
+            continue;
+        }
         if package.selected_lua_entrypoint().is_some()
             && let Err(error) =
                 runtime.load_lua_plugin_package(package_registry, &package.package_name)
