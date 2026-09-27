@@ -3570,6 +3570,7 @@ impl CausalScopeTable {
         inner.acquire(scope_id, identity, admission)
     }
 
+    #[cfg(test)]
     /// Acquire for the retained publication head without queuing or waiting on a lock.
     /// Waiting registers an unlock notification. The owner must retain its request.
     pub(crate) fn try_acquire_or_wait(

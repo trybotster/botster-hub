@@ -1914,13 +1914,6 @@ fn note_released_entity_generations(state: &mut DaemonControlState, before: usiz
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 }
 
-pub(crate) fn session_subscribers_need_delivery(state: &DaemonControlState) -> bool {
-    state.entity_subscriptions.values().any(|subscription| {
-        subscription.entity_type == "session"
-            && (subscription.needs_delivery || subscription.resync_reason.is_some())
-    })
-}
-
 pub(crate) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     crate::daemon::control::entities::begin_package_entity_fanout(daemon, state);
 }

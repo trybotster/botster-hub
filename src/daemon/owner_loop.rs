@@ -4983,7 +4983,6 @@ mod tests {
             waiter_id,
             PendingControlRequest {
                 waiter_id,
-                ready_class: crate::daemon::owner_schedule::ReadyClass::HostCompletion,
                 ready_key: None,
                 deadline_key: None,
                 last_core_phase: 0,
@@ -6472,8 +6471,6 @@ mod tests {
     ) -> DaemonTransportResult<DaemonResponse> {
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
         let observability = DaemonObservability {
-            egress: Vec::new(),
-            lifecycle: DaemonLifecycleCounters::default(),
             client_id: None,
             grant_id: None,
             transport_request_id: None,
@@ -12060,8 +12057,6 @@ return botster.register({tools = {{
     ) -> u64 {
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
         let observability = DaemonObservability {
-            egress: Vec::new(),
-            lifecycle: DaemonLifecycleCounters::default(),
             client_id: Some("reconcile-client".to_string()),
             grant_id: None,
             transport_request_id: None,

@@ -2001,6 +2001,7 @@ impl super::HubRuntime {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn entity_model_available(&self) -> bool {
         self.entity_model_owner.active.borrow().is_none()
             && self.causal_queue.is_empty()

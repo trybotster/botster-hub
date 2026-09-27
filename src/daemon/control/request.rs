@@ -149,16 +149,12 @@ pub(crate) fn handle(
     ) {
         // Status captures diagnostics only after its original Host permit is admitted.
         DaemonObservability {
-            egress: Vec::new(),
-            lifecycle: Default::default(),
             client_id: None,
             grant_id: None,
             transport_request_id,
         }
     } else {
         DaemonObservability {
-            egress: state.egress_diagnostics.diagnostics(),
-            lifecycle: state.lifecycle_counters.clone(),
             client_id: client_id.clone(),
             grant_id: grant_id.clone(),
             transport_request_id,
@@ -171,7 +167,6 @@ pub(crate) fn handle(
     state.current_waiter_id = None;
     let entry = PendingControlRequest {
         waiter_id,
-        ready_class: ReadyClass::CoreCompletion,
         ready_key: None,
         deadline_key: None,
         last_core_phase: 0,
@@ -199,7 +194,6 @@ pub(crate) fn handle(
                 PendingControlRequest {
                     continuation: pending.continuation,
                     retire: pending.retire,
-                    ready_class,
                     ..entry
                 },
             );

@@ -83,6 +83,7 @@ impl CausalOwnerQueue {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn has_capacity(&self) -> bool {
         self.inner.pending.borrow().len() + self.inner.reserved.get() < CAUSAL_OWNER_CAPACITY
             && u64::MAX - self.inner.committed.get() > self.inner.reserved.get() as u64

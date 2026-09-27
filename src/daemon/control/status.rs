@@ -732,7 +732,6 @@ mod tests {
         let (reply_tx, reply_rx) = control_reply_channel();
         let mut entry = PendingControlRequest {
             waiter_id,
-            ready_class: crate::daemon::owner_schedule::ReadyClass::HostCompletion,
             ready_key: None,
             deadline_key: None,
             last_core_phase: 0,
