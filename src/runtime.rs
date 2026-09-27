@@ -8048,6 +8048,81 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A delivery pulled before a reload and looked up only after it matched
+    /// the previous generation, so it never reaches the new plugin.
+    #[test]
+    fn a_delivery_pulled_before_a_reload_is_refused_after_it() {
+        use crate::lifecycle::EventDeliveryRefusal;
+        use crate::package_event_router::HUB_EVENT_OWNER;
+
+        let (mut runtime, root, policy) = subscribed_provider_runtime("pulled-before-reload");
+        let ingress = |runtime: &HubRuntime| {
+            assert_eq!(
+                runtime.package_event_router.try_ingress(
+                    HUB_EVENT_OWNER,
+                    "worktree_created",
+                    &serde_json::json!({ "event": "worktree_created" }),
+                    Instant::now(),
+                ),
+                crate::package_event_router::EventPlaneStatus::Accepted
+            );
+            let mut batch = runtime
+                .package_event_router
+                .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+                .expect("pull");
+            assert_eq!(batch.len(), 1);
+            batch.remove(0)
+        };
+        let pulled = ingress(&runtime);
+        let v1 = pulled.holder.plugin_generation;
+
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("pulled-before-reload".into()),
+                policy.registry(),
+                "producer",
+            )
+            .expect("reload");
+
+        // The first lookup happens only now, after the reload completed.
+        assert_eq!(
+            runtime.package_event_handler(&pulled).err(),
+            Some(EventDeliveryRefusal::GenerationUnloaded)
+        );
+        let handler_ref = botster_core::PluginHandlerRef {
+            plugin_key: PluginKey("producer".into()),
+            kind: botster_core::PluginHandlerKind::Event,
+            handler_id: pulled.holder.handler_id.clone(),
+        };
+        let admission = runtime.try_admit_package_event(
+            &pulled,
+            PluginInvocationClass::Background,
+            PluginInvocationRequest {
+                request_id: RequestId("pulled-before-reload-admit".into()),
+                handler: handler_ref,
+                timeout_ms: 1_000,
+                context: PluginInvocationContext::default(),
+                payload: BoundaryJson(pulled.payload_json.clone()),
+            },
+        );
+        assert_eq!(admission.err(), Some(EventDeliveryRefusal::GenerationUnloaded));
+        runtime
+            .package_event_router
+            .complete_pulled_delivery(pulled)
+            .expect("retire the refused delivery");
+
+        // A new event matches the new generation and resolves.
+        let fresh = ingress(&runtime);
+        assert!(fresh.holder.plugin_generation > v1);
+        assert!(runtime.package_event_handler(&fresh).is_ok());
+        runtime
+            .package_event_router
+            .complete_pulled_delivery(fresh)
+            .expect("retire the fresh delivery");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn an_enable_event_plane_rejection_keeps_the_live_plugin_and_event_generation() {
         let (mut runtime, root, policy) = subscribed_provider_runtime("enable-event-plane");
