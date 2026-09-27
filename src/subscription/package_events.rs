@@ -17,6 +17,9 @@ use tokio::sync::Notify;
 
 use crate::client_api_dto::response::daemon_response_base;
 use crate::config::PackageEventPlanePolicy;
+use crate::daemon::owner_signal::{
+    OwnerLock, OwnerSignal, Parked, SignalKey, SignalingGuard, SignalingMutex, TryLock,
+};
 use crate::event_plane_counters::{AgeIdentity, EventPlaneCounters, QueueAgeMetric};
 use crate::package_event_router::{ClientEventHolder, EventPlaneStatus, PackageEventRouter};
 use botster_hub_client::DaemonQueueKind;
@@ -46,6 +49,32 @@ pub(crate) enum ClientEventAdmitError {
     NotNegotiated,
     ConnectionCapacity,
     Router(EventPlaneStatus),
+}
+
+/// An owner-path refusal: a typed error for the client, or contention that the
+/// owner waits on before it tries again. Contention never reaches the client.
+#[derive(Debug)]
+pub(crate) enum AdmitRefusal {
+    Error(ClientEventAdmitError),
+    Busy(Parked),
+}
+
+impl From<ClientEventAdmitError> for AdmitRefusal {
+    fn from(error: ClientEventAdmitError) -> Self {
+        Self::Error(error)
+    }
+}
+
+/// The owner's attempt on one of the plane's locks: contention parks, poison
+/// is a typed terminal refusal.
+fn owner_lock<T>(mutex: &SignalingMutex<T>) -> Result<SignalingGuard<'_, T>, AdmitRefusal> {
+    match mutex.try_lock_or_arm() {
+        OwnerLock::Locked(guard) => Ok(guard),
+        OwnerLock::Busy(parked) => Err(AdmitRefusal::Busy(parked)),
+        OwnerLock::Poisoned => Err(AdmitRefusal::Error(ClientEventAdmitError::Router(
+            EventPlaneStatus::RejectedInvalid,
+        ))),
+    }
 }
 
 impl ClientEventAdmitError {
@@ -167,9 +196,21 @@ impl std::fmt::Debug for ClientEventMailbox {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConnectionEventPool {
-    inner: Mutex<ConnectionResidency>,
+    inner: SignalingMutex<ConnectionResidency>,
+}
+
+impl ConnectionEventPool {
+    fn new(signal: Arc<OwnerSignal>) -> Self {
+        Self {
+            inner: SignalingMutex::new(
+                ConnectionResidency::default(),
+                signal,
+                SignalKey::ConnectionPool,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -551,7 +592,7 @@ struct ClientEventSlot {
 pub(crate) struct ClientEventConnection {
     pub(crate) identity: Arc<str>,
     pool: Arc<ConnectionEventPool>,
-    slots: Mutex<BTreeMap<Arc<str>, Arc<ClientEventSlot>>>,
+    slots: SignalingMutex<BTreeMap<Arc<str>, Arc<ClientEventSlot>>>,
     reader: OnceLock<Weak<ClientEventReader>>,
     reader_waiting: AtomicBool,
     closing: AtomicBool,
@@ -646,7 +687,7 @@ impl ClientEventReader {
 
 struct ClientSlotsGuard<'a> {
     connection: &'a ClientEventConnection,
-    guard: Option<std::sync::MutexGuard<'a, BTreeMap<Arc<str>, Arc<ClientEventSlot>>>>,
+    guard: Option<SignalingGuard<'a, BTreeMap<Arc<str>, Arc<ClientEventSlot>>>>,
 }
 
 impl std::ops::Deref for ClientSlotsGuard<'_> {
@@ -672,10 +713,14 @@ impl Drop for ClientSlotsGuard<'_> {
 }
 
 impl ClientEventConnection {
+    /// Bind the connection's reader once. Only the first bind signals it: a
+    /// repeated bind on every subscribe woke the reader into the slot lock
+    /// just as the owner tried it.
     pub(crate) fn bind_reader(self: &Arc<Self>, reader: &Arc<ClientEventReader>) {
-        let _ = self.reader.set(Arc::downgrade(reader));
-        let _ = reader.connection.set(Arc::clone(self));
-        reader.signal();
+        if self.reader.set(Arc::downgrade(reader)).is_ok() {
+            let _ = reader.connection.set(Arc::clone(self));
+            reader.signal();
+        }
     }
 
     fn wake_reader(&self) {
@@ -684,37 +729,44 @@ impl ClientEventConnection {
         }
     }
 
+    /// The reader's attempt: on contention it arms the reader's own wake.
     fn try_slots(&self) -> Result<ClientSlotsGuard<'_>, EventPlaneStatus> {
         match self.slots.try_lock() {
-            Ok(guard) => Ok(ClientSlotsGuard {
-                connection: self,
-                guard: Some(guard),
-            }),
-            Err(TryLockError::Poisoned(_)) => Err(EventPlaneStatus::RejectedInvalid),
-            Err(TryLockError::WouldBlock) => {
+            Ok(guard) => Ok(self.slots_guard(guard)),
+            Err(TryLock::Poisoned) => Err(EventPlaneStatus::RejectedInvalid),
+            Err(TryLock::WouldBlock) => {
                 self.reader_waiting.store(true, Ordering::Release);
                 // Recheck after arming so a concurrent unlock cannot lose the wake.
                 self.slots
                     .try_lock()
-                    .map(|guard| ClientSlotsGuard {
-                        connection: self,
-                        guard: Some(guard),
-                    })
+                    .map(|guard| self.slots_guard(guard))
                     .map_err(|error| match error {
-                        TryLockError::WouldBlock => EventPlaneStatus::ShedBusy,
-                        TryLockError::Poisoned(_) => EventPlaneStatus::RejectedInvalid,
+                        TryLock::WouldBlock => EventPlaneStatus::ShedBusy,
+                        TryLock::Poisoned => EventPlaneStatus::RejectedInvalid,
                     })
             }
+        }
+    }
+
+    /// The owner's attempt: on contention it parks on the slots key.
+    fn owner_slots(&self) -> Result<ClientSlotsGuard<'_>, AdmitRefusal> {
+        owner_lock(&self.slots).map(|guard| self.slots_guard(guard))
+    }
+
+    fn slots_guard<'a>(
+        &'a self,
+        guard: SignalingGuard<'a, BTreeMap<Arc<str>, Arc<ClientEventSlot>>>,
+    ) -> ClientSlotsGuard<'a> {
+        ClientSlotsGuard {
+            connection: self,
+            guard: Some(guard),
         }
     }
 
     fn lock_slots(&self) -> Result<ClientSlotsGuard<'_>, PoisonedCleanupLock> {
         self.slots
             .lock()
-            .map(|guard| ClientSlotsGuard {
-                connection: self,
-                guard: Some(guard),
-            })
+            .map(|guard| self.slots_guard(guard))
             .map_err(|_| PoisonedCleanupLock::Connection)
     }
 
@@ -759,10 +811,7 @@ impl ClientEventConnection {
 
     #[cfg(test)]
     pub(crate) fn test_slot_count(&self) -> usize {
-        self.slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.slots.lock_or_recover().len()
     }
 
     #[cfg(test)]
@@ -780,6 +829,22 @@ impl ClientEventConnection {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_with_slots_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self.slots.try_lock().expect("test hold must acquire slots");
+        body()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_pool_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .pool
+            .inner
+            .try_lock()
+            .expect("test hold must acquire the pool");
+        body()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_panic_cleanup(&self) {
         self.panic_cleanup.store(true, Ordering::Release);
     }
@@ -791,9 +856,17 @@ impl ClientEventConnection {
 }
 
 /// Shared lookup for connection mailboxes. Cleanup keeps the original connection record.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ClientEventPlane {
-    connections: Arc<Mutex<HashMap<Arc<str>, Arc<ClientEventConnection>>>>,
+    connections: Arc<SignalingMutex<HashMap<Arc<str>, Arc<ClientEventConnection>>>>,
+    /// The Hub owner's signal: every lock of this plane raises it.
+    owner_signal: Arc<OwnerSignal>,
+}
+
+impl Default for ClientEventPlane {
+    fn default() -> Self {
+        Self::new(Arc::default())
+    }
 }
 
 impl std::fmt::Debug for ClientEventPlane {
@@ -928,22 +1001,38 @@ impl ClientCleanupWork {
 }
 
 impl ClientEventPlane {
+    pub(crate) fn new(owner_signal: Arc<OwnerSignal>) -> Self {
+        Self {
+            connections: Arc::new(SignalingMutex::new(
+                HashMap::new(),
+                Arc::clone(&owner_signal),
+                SignalKey::EventConnections,
+            )),
+            owner_signal,
+        }
+    }
+
+    pub(crate) fn owner_signal(&self) -> &Arc<OwnerSignal> {
+        &self.owner_signal
+    }
+
     pub(crate) fn admit_connection(
         &self,
         connection_id: &str,
-    ) -> Result<Arc<ClientEventConnection>, ClientEventAdmitError> {
-        let mut connections = self
-            .connections
-            .try_lock()
-            .map_err(|_| ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))?;
+    ) -> Result<Arc<ClientEventConnection>, AdmitRefusal> {
+        let mut connections = owner_lock(&self.connections)?;
         if let Some(connection) = connections.get(connection_id) {
             return Ok(Arc::clone(connection));
         }
         let identity: Arc<str> = Arc::from(connection_id);
         let connection = Arc::new(ClientEventConnection {
             identity: Arc::clone(&identity),
-            pool: Arc::new(ConnectionEventPool::default()),
-            slots: Mutex::new(BTreeMap::new()),
+            pool: Arc::new(ConnectionEventPool::new(Arc::clone(&self.owner_signal))),
+            slots: SignalingMutex::new(
+                BTreeMap::new(),
+                Arc::clone(&self.owner_signal),
+                SignalKey::ConnectionSlots,
+            ),
             reader: OnceLock::new(),
             reader_waiting: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -960,7 +1049,16 @@ impl ClientEventPlane {
     }
 
     #[cfg(test)]
-    fn connection(&self, connection_id: &str) -> Option<Arc<ClientEventConnection>> {
+    pub(crate) fn test_with_connections_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .connections
+            .try_lock()
+            .expect("test hold must acquire the connection table");
+        body()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection(&self, connection_id: &str) -> Option<Arc<ClientEventConnection>> {
         self.connections
             .try_lock()
             .ok()?
@@ -1000,7 +1098,7 @@ impl ClientEventPlane {
         policy: PackageEventPlanePolicy,
         router: &PackageEventRouter,
     ) -> Result<(), ClientEventAdmitError> {
-        self.subscribe_mailbox(
+        match self.subscribe_mailbox(
             connection_id,
             subscription_id,
             owner,
@@ -1008,8 +1106,17 @@ impl ClientEventPlane {
             subjects,
             policy,
             router,
-        )
-        .map(|_| ())
+        ) {
+            Ok(SubscribeProgress::Done(_)) => Ok(()),
+            Ok(SubscribeProgress::RouterBusy(pending, _)) => {
+                pending.abandon();
+                Err(ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))
+            }
+            Err(AdmitRefusal::Error(error)) => Err(error),
+            Err(AdmitRefusal::Busy(_)) => {
+                Err(ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1022,33 +1129,25 @@ impl ClientEventPlane {
         subjects: Vec<String>,
         policy: PackageEventPlanePolicy,
         router: &PackageEventRouter,
-    ) -> Result<Arc<ClientEventMailbox>, ClientEventAdmitError> {
+    ) -> Result<SubscribeProgress, AdmitRefusal> {
         let compiled = compile_subjects(&subjects)?;
         let connection = self.admit_connection(connection_id)?;
-        let mut slots = connection
-            .try_slots()
-            .map_err(ClientEventAdmitError::Router)?;
+        let mut slots = connection.owner_slots()?;
         if connection.closing.load(Ordering::Acquire) || connection.faulted.load(Ordering::Acquire)
         {
-            return Err(ClientEventAdmitError::Router(
-                EventPlaneStatus::RejectedInvalid,
-            ));
+            return Err(ClientEventAdmitError::Router(EventPlaneStatus::RejectedInvalid).into());
         }
         if slots.contains_key(subscription_id) {
-            return Err(ClientEventAdmitError::DuplicateSubscription);
+            return Err(ClientEventAdmitError::DuplicateSubscription.into());
         }
         if slots.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
-            return Err(ClientEventAdmitError::TooManySubscriptions);
+            return Err(ClientEventAdmitError::TooManySubscriptions.into());
         }
-        let mut residency = connection
-            .pool
-            .inner
-            .try_lock()
-            .map_err(|_| ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))?;
+        let mut residency = owner_lock(&connection.pool.inner)?;
         if residency.events > CONNECTION_EVENT_MAX.saturating_sub(SUBSCRIPTION_EVENT_RESERVE)
             || residency.bytes > CONNECTION_BYTE_MAX.saturating_sub(SUBSCRIPTION_BYTE_RESERVE)
         {
-            return Err(ClientEventAdmitError::ConnectionCapacity);
+            return Err(ClientEventAdmitError::ConnectionCapacity.into());
         }
         let mut mailbox = ClientEventMailbox::new_with_counters(
             policy,
@@ -1060,68 +1159,51 @@ impl ClientEventPlane {
         mailbox.connection = Some(Arc::downgrade(&connection));
         let mailbox = Arc::new(mailbox);
         // Retain the provisional slot before residency, gap, or router effects can require cleanup.
-        slots.insert(
-            Arc::from(subscription_id),
-            Arc::new(ClientEventSlot {
-                mailbox: Arc::clone(&mailbox),
-                active: AtomicBool::new(false),
-            }),
-        );
+        let slot = Arc::new(ClientEventSlot {
+            mailbox: Arc::clone(&mailbox),
+            active: AtomicBool::new(false),
+        });
+        slots.insert(Arc::from(subscription_id), Arc::clone(&slot));
         mailbox.register_age();
         residency
             .subscriptions
             .insert(subscription_id.to_string(), (0, 0));
         drop(residency);
-        let result = mailbox
-            .register_gap_slot(subscription_id, owner, name)
-            .and_then(|gap| {
-                let status = router.try_subscribe_client(ClientEventHolder {
-                    connection_id: connection_id.to_string(),
-                    subscription_id: subscription_id.to_string(),
-                    owner: owner.to_string(),
-                    name: name.to_string(),
-                    subjects: compiled,
-                    mailbox: Arc::clone(&mailbox),
-                    gap,
-                });
-                if status == EventPlaneStatus::Accepted {
-                    Ok(())
-                } else {
-                    Err(status)
-                }
-            });
-        match result {
-            Ok(()) => {
-                slots
-                    .get_mut(subscription_id)
-                    .expect("provisional slot remains owned")
-                    .active
-                    .store(true, Ordering::Release);
-                Ok(mailbox)
-            }
+        let gap = match mailbox.register_gap_slot(subscription_id, owner, name) {
+            Ok(gap) => gap,
             Err(status) => {
                 mailbox.retire();
                 connection.request_cleanup();
-                Err(ClientEventAdmitError::Router(status))
+                return Err(ClientEventAdmitError::Router(status).into());
             }
-        }
+        };
+        let pending = PendingRouterSubscribe {
+            connection: Arc::clone(&connection),
+            slot,
+            holder: ClientEventHolder {
+                connection_id: connection_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+                owner: owner.to_string(),
+                name: name.to_string(),
+                subjects: compiled,
+                mailbox,
+                gap,
+            },
+        };
+        drop(slots);
+        pending.resume(router)
     }
 
     pub(crate) fn retire_subscription(
         &self,
         connection_id: &str,
         subscription_id: &str,
-    ) -> Result<Arc<ClientEventMailbox>, ClientEventAdmitError> {
-        let connection = self
-            .connections
-            .try_lock()
-            .map_err(|_| ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy))?
+    ) -> Result<Arc<ClientEventMailbox>, AdmitRefusal> {
+        let connection = owner_lock(&self.connections)?
             .get(connection_id)
             .cloned()
             .ok_or(ClientEventAdmitError::UnknownSubscription)?;
-        let slots = connection
-            .try_slots()
-            .map_err(ClientEventAdmitError::Router)?;
+        let slots = connection.owner_slots()?;
         let slot = slots
             .get(subscription_id)
             .filter(|slot| slot.active.load(Ordering::Acquire) && !slot.mailbox.is_retired())
@@ -1179,6 +1261,73 @@ pub(crate) fn compile_subjects(
         }
     }
     Ok(compiled)
+}
+
+/// Where an owner subscribe stands.
+pub(crate) enum SubscribeProgress {
+    Done(Arc<ClientEventMailbox>),
+    /// The local admission holds a provisional slot; only the router
+    /// registration waits, on the router lock.
+    RouterBusy(PendingRouterSubscribe, Parked),
+}
+
+/// A subscribe whose provisional slot is admitted and whose router
+/// registration waits for the router lock. The slot stays inactive, so the
+/// reader ignores it and cleanup keeps it, until [`Self::resume`] activates it
+/// or [`Self::abandon`] retires it.
+pub(crate) struct PendingRouterSubscribe {
+    connection: Arc<ClientEventConnection>,
+    slot: Arc<ClientEventSlot>,
+    holder: ClientEventHolder,
+}
+
+impl PendingRouterSubscribe {
+    /// Register with the router. Contention arms the router lock and retries
+    /// once; a poisoned router or any other refusal retires the slot.
+    pub(crate) fn resume(
+        self,
+        router: &PackageEventRouter,
+    ) -> Result<SubscribeProgress, AdmitRefusal> {
+        if self.connection.closing.load(Ordering::Acquire)
+            || self.connection.faulted.load(Ordering::Acquire)
+        {
+            self.abandon();
+            return Err(ClientEventAdmitError::Router(EventPlaneStatus::RejectedInvalid).into());
+        }
+        let status = match router.try_subscribe_client(self.holder.clone()) {
+            EventPlaneStatus::ShedBusy if !router.lock_poisoned() => {
+                let parked = router.arm_lock_parked();
+                match router.try_subscribe_client(self.holder.clone()) {
+                    EventPlaneStatus::ShedBusy if !router.lock_poisoned() => {
+                        return Ok(SubscribeProgress::RouterBusy(self, parked));
+                    }
+                    status => status,
+                }
+            }
+            status => status,
+        };
+        match status {
+            EventPlaneStatus::Accepted => {
+                self.slot.active.store(true, Ordering::Release);
+                Ok(SubscribeProgress::Done(self.holder.mailbox))
+            }
+            EventPlaneStatus::ShedBusy => {
+                // Only a poisoned router reaches here: a fault, not a wait.
+                self.abandon();
+                Err(ClientEventAdmitError::Router(EventPlaneStatus::RejectedInvalid).into())
+            }
+            status => {
+                self.abandon();
+                Err(ClientEventAdmitError::Router(status).into())
+            }
+        }
+    }
+
+    /// Retire the provisional slot; connection cleanup reclaims it.
+    pub(crate) fn abandon(self) {
+        self.holder.mailbox.retire();
+        self.connection.request_cleanup();
+    }
 }
 
 fn lock_mailbox(
@@ -1243,7 +1392,13 @@ mod tests {
             subscription_id: &str,
             router: &PackageEventRouter,
         ) -> Result<(), ClientEventAdmitError> {
-            self.retire_subscription(connection_id, subscription_id)?;
+            match self.retire_subscription(connection_id, subscription_id) {
+                Ok(_) => {}
+                Err(AdmitRefusal::Error(error)) => return Err(error),
+                Err(AdmitRefusal::Busy(_)) => {
+                    return Err(ClientEventAdmitError::Router(EventPlaneStatus::ShedBusy));
+                }
+            }
             self.test_reclaim(router);
             Ok(())
         }
@@ -1285,10 +1440,7 @@ mod tests {
         pool: &Arc<ConnectionEventPool>,
         operation: impl FnOnce() -> R + Send + 'static,
     ) -> R {
-        let guard = pool
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = pool.inner.lock_or_recover();
         let start = Arc::new(Barrier::new(2));
         let worker_start = Arc::clone(&start);
         let (result_tx, result_rx) = mpsc::channel();
@@ -1306,10 +1458,7 @@ mod tests {
     }
 
     fn assert_pool_empty(pool: &ConnectionEventPool, expected_subscriptions: usize) {
-        let residency = pool
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let residency = pool.inner.lock_or_recover();
         assert_eq!(residency.events, 0);
         assert_eq!(residency.bytes, 0);
         assert_eq!(residency.subscriptions.len(), expected_subscriptions);

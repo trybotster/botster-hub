@@ -163,7 +163,9 @@ impl HubDaemon {
             state,
             state_source,
             package_registry,
-            local_webrtc: LocalWebrtcTransport::default(),
+            local_webrtc: LocalWebrtcTransport::with_owner_signal(std::sync::Arc::clone(
+                runtime.owner_signal(),
+            )),
             runtime: Some(runtime),
             lifecycle_state: HubDaemonState::Running,
             installation_home,
