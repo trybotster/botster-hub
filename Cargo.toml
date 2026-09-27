@@ -95,3 +95,10 @@ botster-ui-contract = { path = "crates/botster-ui-contract" }
 # Hub runtime builds use the ordered channel close fix documented in this directory.
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
+
+# The lifecycle harness verifies the candidate manifest (SHA-256 of the
+# ~110 MB Hub binary) on every IsolatedHub start. Unoptimized sha2 takes
+# seconds per hash; optimizing only sha2 keeps the same check at a fraction
+# of the cost. Release builds are already optimized.
+[profile.dev.package.sha2]
+opt-level = 3
