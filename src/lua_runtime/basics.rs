@@ -1,6 +1,6 @@
-//! Runtime basics every plugin receives with no grant: `botster.json` and
-//! `botster.clock`. They run inside the VM, never suspend, and return the one
-//! result shape (`result.rs`).
+//! Runtime basics every plugin receives with no grant: `botster.json`,
+//! `botster.clock`, and `botster.log`. They run inside the VM, never suspend,
+//! and return the one result shape (`result.rs`).
 
 use std::fmt;
 use std::io;
@@ -13,6 +13,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visit
 use super::result::{self, ErrorKind};
 use super::{AdmissionError, lua_json};
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
+use crate::plugin_logs::{AppendOutcome, LogLevel, MAX_RECORD_BYTES, PluginLogBook};
 
 const ENCODE_USAGE: &str = "json.encode takes { value = <any>, arrays = nil | \"empty\" }";
 const DECODE_USAGE: &str = "json.decode takes { text = <string> }";
@@ -21,10 +22,101 @@ pub(super) fn install(
     lua: &Lua,
     botster: &Table,
     memory: Arc<LuaMemoryAccount>,
+    plugin: &str,
+    logs: Arc<PluginLogBook>,
 ) -> mlua::Result<()> {
-    botster.set("json", json_table(lua, memory)?)?;
+    botster.set("json", json_table(lua, Arc::clone(&memory))?)?;
     botster.set("clock", clock_table(lua)?)?;
+    botster.set("log", log_table(lua, memory, plugin, logs)?)?;
     Ok(())
+}
+
+const LOG_USAGE: &str = "botster.log.<level> takes { message = <string>, fields = <table or nil> }";
+
+fn log_table(
+    lua: &Lua,
+    memory: Arc<LuaMemoryAccount>,
+    plugin: &str,
+    logs: Arc<PluginLogBook>,
+) -> mlua::Result<Table> {
+    let log = lua.create_table()?;
+    for level in [
+        LogLevel::Debug,
+        LogLevel::Info,
+        LogLevel::Warn,
+        LogLevel::Error,
+    ] {
+        let memory = Arc::clone(&memory);
+        let logs = Arc::clone(&logs);
+        let plugin = plugin.to_string();
+        log.set(
+            level.as_str(),
+            lua.create_function(move |lua, args: Value| {
+                let Value::Table(args) = args else {
+                    return result::err(lua, ErrorKind::InvalidRequest, LOG_USAGE);
+                };
+                let Value::String(message) = args.raw_get::<Value>("message")? else {
+                    return result::err(lua, ErrorKind::InvalidRequest, LOG_USAGE);
+                };
+                let Ok(message) = message.to_str() else {
+                    return result::err(lua, ErrorKind::InvalidRequest, "log messages must be UTF-8");
+                };
+                if message.len() > MAX_RECORD_BYTES {
+                    return result::err(lua, ErrorKind::InvalidRequest, "a log record is limited to 65536 bytes");
+                }
+                let fields = match args.raw_get::<Value>("fields")? {
+                    Value::Nil => None,
+                    value @ Value::Table(_) => match encode(lua, &memory, &value, false) {
+                        Ok(encoded) => Some(encoded),
+                        Err((kind, message)) => return result::err(lua, kind, &message),
+                    },
+                    _ => return result::err(lua, ErrorKind::InvalidRequest, LOG_USAGE),
+                };
+                let fields_text = fields
+                    .as_ref()
+                    .map(|(bytes, _charge)| std::str::from_utf8(bytes).expect("JSON text is UTF-8"));
+                let outcome = logs.append(&plugin, level, &message, fields_text, monotonic_ms(), wall_ms());
+                drop(fields);
+                match outcome {
+                    AppendOutcome::Accepted { seq } => {
+                        result::ok(lua, Value::Integer(i64::try_from(seq).unwrap_or(i64::MAX)))
+                    }
+                    AppendOutcome::RateLimited => result::err(
+                        lua,
+                        ErrorKind::Backpressured,
+                        "the plugin's log rate limit (100 records per second, burst 200) is reached",
+                    ),
+                    AppendOutcome::TooLarge => result::err(
+                        lua,
+                        ErrorKind::InvalidRequest,
+                        "a log record is limited to 65536 bytes",
+                    ),
+                    AppendOutcome::Capacity => result::err(
+                        lua,
+                        ErrorKind::QuotaExceeded,
+                        "the Lua callback memory capacity is exhausted",
+                    ),
+                }
+            })?,
+        )?;
+    }
+    Ok(log)
+}
+
+fn started() -> Instant {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
+}
+
+fn monotonic_ms() -> u64 {
+    u64::try_from(started().elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn json_table(lua: &Lua, memory: Arc<LuaMemoryAccount>) -> mlua::Result<Table> {
@@ -264,24 +356,24 @@ impl<'de> Visitor<'de> for LuaKeySeed<'_> {
 }
 
 fn clock_table(lua: &Lua) -> mlua::Result<Table> {
-    static STARTED: OnceLock<Instant> = OnceLock::new();
-    let started = *STARTED.get_or_init(Instant::now);
+    started();
     let clock = lua.create_table()?;
     clock.set(
         "now",
         lua.create_function(|lua, _: Value| {
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
-            result::ok(lua, Value::Integer(millis))
+            result::ok(
+                lua,
+                Value::Integer(i64::try_from(wall_ms()).unwrap_or(i64::MAX)),
+            )
         })?,
     )?;
     clock.set(
         "monotonic",
-        lua.create_function(move |lua, _: Value| {
-            let millis = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-            result::ok(lua, Value::Integer(millis))
+        lua.create_function(|lua, _: Value| {
+            result::ok(
+                lua,
+                Value::Integer(i64::try_from(monotonic_ms()).unwrap_or(i64::MAX)),
+            )
         })?,
     )?;
     Ok(clock)
@@ -307,7 +399,8 @@ mod tests {
         })
         .unwrap();
         let botster = lua.create_table().unwrap();
-        install(&lua, &botster, Arc::clone(&memory)).unwrap();
+        let logs = Arc::new(PluginLogBook::new(Arc::clone(&memory)));
+        install(&lua, &botster, Arc::clone(&memory), "test.plugin", logs).unwrap();
         lua.globals().set("botster", botster).unwrap();
         (lua, memory)
     }
@@ -381,6 +474,27 @@ mod tests {
         .exec()
         .unwrap();
         assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn log_returns_results_and_refuses_bad_records() {
+        let (lua, memory) = vm(256 * 1024);
+        lua.load(
+            r#"
+            local log = botster.log
+            local first = log.info({ message = "ready", fields = { n = 1 } })
+            assert(first.ok and first.value == 1)
+            assert(log.debug({ message = "two" }).value == 2)
+            assert(log.warn({}).error.kind == "invalid_request")
+            assert(log.error({ message = 7 }).error.kind == "invalid_request")
+            assert(log.info({ message = "x", fields = "no" }).error.kind == "invalid_request")
+            local huge = log.info({ message = string.rep("m", 65537) })
+            assert(huge.error.kind == "invalid_request")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(memory.usage().1 > 0, "the ring's records stay charged");
     }
 
     #[test]
