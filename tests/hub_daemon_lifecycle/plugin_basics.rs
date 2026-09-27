@@ -172,3 +172,85 @@ return botster.register({{
     assert_eq!(again["text"], "hello again", "the daemon keeps serving: {again}");
     daemon.shutdown();
 }
+
+/// A daemon-loaded plugin writes structured log records that an operator
+/// reads back with `ReadPluginLogs`, including fields and paging by sequence.
+#[test]
+fn live_daemon_reads_structured_plugin_logs() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("logs-data");
+    let package_dir = unique_short_test_dir("logs-package");
+    fs::create_dir_all(&package_dir).expect("create logs package root");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {{
+    name = "logs.probe.write",
+    description = "Write two log records.",
+    handler = "write",
+    call = function()
+      local first = botster.log.info({ message = "ticket advanced", fields = { ticket_id = "t1" } })
+      local second = botster.log.warn({ message = "gate slow" })
+      local bad = botster.log.error({})
+      return { first = first.value, second = second.value, bad_kind = bad.error.kind }
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write logs plugin");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "logs.probe",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": "." },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }))
+        .expect("serialize logs manifest"),
+    )
+    .expect("write logs manifest");
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "plugin logs daemon cleanup");
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir.clone() },
+    )
+    .expect("enable logs package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision, "{enabled:?}");
+    let wrote = call_plugin_tool(&data_dir, "logs.probe.write", serde_json::json!({}));
+    assert_eq!(
+        (wrote["first"].as_u64(), wrote["second"].as_u64()),
+        (Some(1), Some(2)),
+        "{wrote}"
+    );
+    assert_eq!(wrote["bad_kind"], "invalid_request", "{wrote}");
+
+    let read = |after_seq: u64| {
+        botster_hub::daemon_transport_request(
+            &explicit_config(&data_dir),
+            botster_hub::DaemonRequest::ReadPluginLogs {
+                package_name: "logs.probe".to_string(),
+                after_seq,
+            },
+        )
+        .expect("read plugin logs")
+    };
+    let all = read(0);
+    assert_eq!(all.kind, botster_hub::DaemonResponseKind::PluginLogs, "{all:?}");
+    let logs = all.plugin_logs.expect("plugin logs page");
+    assert_eq!(logs.records.len(), 2, "{logs:?}");
+    assert_eq!(logs.records[0].level, "info");
+    assert_eq!(logs.records[0].message, "ticket advanced");
+    assert_eq!(logs.records[0].fields, Some(serde_json::json!({ "ticket_id": "t1" })));
+    assert_eq!(logs.records[1].level, "warn");
+    assert_eq!((logs.next_seq, logs.first_available_seq), (3, 1));
+    let later = read(1).plugin_logs.expect("paged plugin logs");
+    assert_eq!(later.records.len(), 1);
+    assert_eq!(later.records[0].seq, 2);
+    daemon.shutdown();
+}

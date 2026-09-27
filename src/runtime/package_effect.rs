@@ -500,6 +500,7 @@ impl HostPackageRuntime {
         let plugin_key = PluginKey(package_name.to_string());
         let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
         self.revoke_grants(package_name);
+        self.host_api.logs.remove(package_name);
         let mut lifecycle_cleanup = self
             .plugin_lifecycle
             .unload_package(request_id, package_name);
