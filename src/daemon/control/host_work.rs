@@ -2228,7 +2228,7 @@ fn wake_next_document_waiter(state: &mut DaemonControlState) {
 
 fn finish_reply(permit: HostWorkPermit, reply: crate::host_mutations::HostReply) -> ControlPoll {
     let charge = permit.into_prepared_charge(reply.logical_bytes);
-    ControlPoll::ReadyHost(Ok(reply.response), charge)
+    ControlPoll::ReadyHost(Ok(*reply.response), charge)
 }
 
 fn finish_error(
