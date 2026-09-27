@@ -156,6 +156,9 @@ struct CoreCompletionWake {
     owner: Mutex<Option<ControlSender>>,
     terminal_owner: Mutex<Option<thread::Thread>>,
     identities: Mutex<CoreCompletionIdentities>,
+    /// Test-only: signalled after each publish, for event waits in tests.
+    #[cfg(test)]
+    published: std::sync::Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +175,43 @@ impl CoreCompletionWake {
             owner: Mutex::new(None),
             terminal_owner: Mutex::new(None),
             identities: Mutex::new(CoreCompletionIdentities::default()),
+            #[cfg(test)]
+            published: std::sync::Condvar::new(),
         }
+    }
+
+    /// Test-only: the identities still registered for a waiter, in order.
+    #[cfg(test)]
+    fn registered_for(&self, waiter_id: WaiterId) -> Vec<OwnerWorkIdentity> {
+        self.identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .registered
+            .iter()
+            .copied()
+            .filter(|identity| identity.waiter_id == waiter_id)
+            .collect()
+    }
+
+    /// Test-only: wait on the publish signal until `identity` is ready or no
+    /// longer registered. False at the deadline.
+    #[cfg(test)]
+    fn wait_ready(&self, identity: OwnerWorkIdentity, deadline: std::time::Instant) -> bool {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.registered.contains(&identity) && !state.ready.contains(&identity) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            state = self
+                .published
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+        true
     }
 
     fn register_phases(
@@ -293,6 +332,8 @@ impl CoreCompletionWake {
                 state.ready.insert(identity) && !self.pending.swap(true, Ordering::AcqRel)
             }
         };
+        #[cfg(test)]
+        self.published.notify_all();
         if should_wake {
             self.notify_owner();
         }
@@ -654,6 +695,20 @@ impl CoreOperationTicket {
 }
 
 impl<T> CoreTicket<T> {
+    /// Test-only: wait until this ticket's phase is published, without
+    /// collecting it. True at once for a ticket with no owner registration.
+    #[cfg(test)]
+    pub(crate) fn test_wait_published(&self, deadline: std::time::Instant) -> bool {
+        match &self.slot {
+            CoreTicketSlot::Queued {
+                identity,
+                owner_wake: Some(wake),
+                ..
+            } => wake.wait_ready(*identity, deadline),
+            _ => true,
+        }
+    }
+
     /// Collect only this ticket's ready phase during terminal progression.
     /// A ticket without an owner wake has no registration to collect.
     pub(crate) fn collect_ready_phase(&self) {
@@ -920,6 +975,14 @@ impl CoreDaemonHandle {
             });
         }
         None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_registered_owner_identities(
+        &self,
+        waiter_id: WaiterId,
+    ) -> Vec<OwnerWorkIdentity> {
+        self.completion_wake.registered_for(waiter_id)
     }
 
     #[cfg(test)]

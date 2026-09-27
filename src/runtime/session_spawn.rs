@@ -464,6 +464,19 @@ impl HubRuntime {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AWAIT_REMOVE_BEFORE_POLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: on this thread, the next abandon cleanup waits after
+/// `begin(RemoveSession)` until Remove is published, so its next poll finds
+/// Remove complete and advances two Core stages in one call.
+#[cfg(test)]
+pub(crate) fn await_remove_before_next_poll() {
+    AWAIT_REMOVE_BEFORE_POLL.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
 impl SessionTypeSpawnStart {
     pub(crate) fn test_reservation_identity(
         &self,
@@ -589,6 +602,16 @@ impl SessionTypeSpawnStart {
                             CoreOperation::RemoveSession(self.spawn.request.session_id.clone()),
                         );
                         self.cleanup = CleanupStage::Remove;
+                        #[cfg(test)]
+                        if AWAIT_REMOVE_BEFORE_POLL.with(|flag| flag.replace(false)) {
+                            // timer: deadline — bounds a lost Core completion.
+                            assert!(
+                                self.tracker.test_wait_published(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(5)
+                                ),
+                                "Remove must complete before its first poll"
+                            );
+                        }
                     }
                     _ => self.cleanup = CleanupStage::Unresolved,
                 },
