@@ -311,6 +311,9 @@ pub(crate) enum HostMutationResult {
     PackageEffectApplied {
         reply: Result<HostReply, HostMutationError>,
         cleanup: HostPackageCleanup,
+        /// The package an explicit enable or reload loaded; it resolves any
+        /// package recovery that covers it.
+        loaded: Option<String>,
     },
     PackageEffectFailed {
         effect: PackageRuntimeEffect,
@@ -428,7 +431,16 @@ fn execute_package_effect(
                     "package reply preparation panicked",
                 ))
             });
-            HostMutationResult::PackageEffectApplied { reply, cleanup }
+            let loaded = match &effect {
+                PackageRuntimeEffect::Enable { package_name, .. }
+                | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name.clone()),
+                _ => None,
+            };
+            HostMutationResult::PackageEffectApplied {
+                reply,
+                cleanup,
+                loaded,
+            }
         }
         Err(error) => HostMutationResult::PackageEffectFailed {
             effect,
@@ -597,6 +609,13 @@ pub(crate) struct PreparedStateChange {
     reply: HostReply,
     packages: Option<SharedView<PackageRegistry>>,
     package_effect: Option<PackageRuntimeEffect>,
+}
+
+impl PreparedStateChange {
+    /// The runtime effect this change applies after it commits, if any.
+    pub(crate) fn package_effect(&self) -> Option<&PackageRuntimeEffect> {
+        self.package_effect.as_ref()
+    }
 }
 
 /// One runtime effect that a host worker applies after a package commit.

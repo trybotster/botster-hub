@@ -272,8 +272,76 @@ pub(crate) struct PackageRecoveryRequired {
     owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) original: String,
     pub(crate) compensation: String,
+    /// The stranded packages this record covers. An explicit operator enable
+    /// or reload of one resolves it; the record is released once none remain.
+    pub(crate) packages: std::collections::BTreeSet<String>,
     _effect: PackageRuntimeEffect,
     _permit: HostWorkPermit,
+}
+
+impl PackageRecoveryRequired {
+    fn new(
+        original: String,
+        compensation: String,
+        effect: PackageRuntimeEffect,
+        permit: HostWorkPermit,
+    ) -> Self {
+        Self {
+            owner_permit: None,
+            original,
+            compensation,
+            packages: effect
+                .package_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            _effect: effect,
+            _permit: permit,
+        }
+    }
+}
+
+/// The package an explicit operator enable or reload names. Only these
+/// requests resolve a stranded package; an automatic refresh never does.
+fn explicit_resolution_target(request: &DaemonRequest) -> Option<&str> {
+    match request {
+        DaemonRequest::EnablePackage { package_name }
+        | DaemonRequest::ReloadPackage { package_name } => Some(package_name),
+        _ => None,
+    }
+}
+
+/// The package an explicit enable or reload effect loads. Enable and Reload
+/// effects come only from those explicit operator requests.
+fn explicit_effect_target(effect: &PackageRuntimeEffect) -> Option<&str> {
+    match effect {
+        PackageRuntimeEffect::Enable { package_name, .. }
+        | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name),
+        _ => None,
+    }
+}
+
+fn covered_by_package_recovery(state: &DaemonControlState, package_name: &str) -> bool {
+    state.host_recovery.values().any(|recovery| {
+        matches!(recovery, HostRecoveryRequired::Package(record) if record.packages.contains(package_name))
+    })
+}
+
+/// An explicit enable or reload of a stranded package succeeded: it is
+/// resolved. Release each package recovery record that covers nothing more.
+pub(crate) fn resolve_package_recovery(state: &mut DaemonControlState, package_name: &str) {
+    let mut released = Vec::new();
+    for (waiter, recovery) in &mut state.host_recovery {
+        if let HostRecoveryRequired::Package(record) = recovery
+            && record.packages.remove(package_name)
+            && record.packages.is_empty()
+        {
+            released.push(*waiter);
+        }
+    }
+    for waiter in released {
+        state.host_recovery.remove(&waiter);
+    }
 }
 
 fn host_operation_label(request: &DaemonRequest) -> &'static str {
@@ -900,11 +968,18 @@ impl HostMutationContinuation {
                     });
                 submit_phase(daemon, state, waiter_id, command, permit, next_phase)
             }
-            HostMutationResult::PackageEffectApplied { reply, cleanup } => {
+            HostMutationResult::PackageEffectApplied {
+                reply,
+                cleanup,
+                loaded,
+            } => {
                 daemon
                     .runtime_mut()
                     .expect("package effect retains its runtime")
                     .apply_host_package_cleanup(cleanup);
+                if let Some(package_name) = loaded {
+                    resolve_package_recovery(state, &package_name);
+                }
                 state
                     .maintenance
                     .wakes
@@ -995,17 +1070,16 @@ impl HostMutationContinuation {
                 } else {
                     state.host_recovery.insert(
                         waiter_id,
-                        HostRecoveryRequired::Package(PackageRecoveryRequired {
-                            owner_permit: None,
-                            original: original.to_string(),
-                            compensation: rollbacks
+                        HostRecoveryRequired::Package(PackageRecoveryRequired::new(
+                            original.to_string(),
+                            rollbacks
                                 .iter()
                                 .map(|failure| failure.error.to_string())
                                 .collect::<Vec<_>>()
                                 .join("; "),
-                            _effect: effect,
-                            _permit: permit,
-                        }),
+                            effect,
+                            permit,
+                        )),
                     );
                     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
                         original: Box::new(original),
@@ -1236,13 +1310,12 @@ fn retain_package_recovery(
 ) -> ControlPoll {
     state.host_recovery.insert(
         waiter_id,
-        HostRecoveryRequired::Package(PackageRecoveryRequired {
-            owner_permit: None,
-            original: original.to_string(),
-            compensation: failure.error.to_string(),
-            _effect: effect,
-            _permit: permit,
-        }),
+        HostRecoveryRequired::Package(PackageRecoveryRequired::new(
+            original.to_string(),
+            failure.error.to_string(),
+            effect,
+            permit,
+        )),
     );
     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
         original: Box::new(original),
@@ -1287,13 +1360,23 @@ fn admit_or_park_commit(
     // Anything that reaches this site can park on the document reservation.
     // Transport closure must not retire its handoff.
     debug_assert!(must_finish, "a parkable host mutation must finish");
+    // An explicit enable or reload of a stranded package is its resolution
+    // and may commit; every other package mutation waits for recovery.
+    let resolves_stranded = match &prepared.change {
+        crate::host_mutations::PreparedChange::PackageConfiguration(change) => change
+            .package_effect()
+            .and_then(explicit_effect_target)
+            .is_some_and(|package_name| covered_by_package_recovery(state, package_name)),
+        _ => false,
+    };
     if matches!(
         prepared.change,
         crate::host_mutations::PreparedChange::PackageConfiguration(_)
-    ) && state
-        .host_recovery
-        .values()
-        .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
+    ) && !resolves_stranded
+        && state
+            .host_recovery
+            .values()
+            .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
     {
         state.document_waiters.remove(&waiter_id);
         wake_next_document_waiter(state);
@@ -1808,13 +1891,17 @@ pub(crate) fn recovery_response(
             HostRecoveryRequired::Package(recovery) => Some(recovery),
             _ => None,
         })?;
-    let blocked = is_package_read(request)
-        || is_package_prepare(request)
-        || matches!(
-            request,
-            DaemonRequest::StartPackageEntrypoint { .. }
-                | DaemonRequest::RestartPackageEntrypoint { .. }
-        );
+    // An explicit enable or reload of a stranded package resolves it.
+    let resolves_stranded = explicit_resolution_target(request)
+        .is_some_and(|package_name| covered_by_package_recovery(state, package_name));
+    let blocked = !resolves_stranded
+        && (is_package_read(request)
+            || is_package_prepare(request)
+            || matches!(
+                request,
+                DaemonRequest::StartPackageEntrypoint { .. }
+                    | DaemonRequest::RestartPackageEntrypoint { .. }
+            ));
     blocked.then(|| {
         error_response(
             "package_recovery_required",
@@ -2103,6 +2190,7 @@ mod tests {
                         event: None,
                     }),
                     cleanup: HostPackageCleanup::default(),
+                    loaded: None,
                 },
             ),
             (

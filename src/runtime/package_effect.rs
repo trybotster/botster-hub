@@ -76,6 +76,21 @@ pub(crate) fn on_next_activation(hook: impl FnOnce() + 'static) {
     ACTIVATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
+#[cfg(test)]
+static PANIC_AFTER_STAGE_FOR: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Make the next load of `package_name`, on any thread (the Host worker
+/// included), panic right after it stages its event generation. Tests use a
+/// package name no other test loads.
+#[cfg(test)]
+pub(crate) fn panic_after_stage_for(package_name: &str) {
+    PANIC_AFTER_STAGE_FOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(package_name.to_string());
+}
+
 /// Make this thread's next plugin load panic right after it stages its event
 /// generation, before the plugin install.
 #[cfg(test)]
@@ -269,7 +284,12 @@ impl HostPackageRuntime {
         let generation = staged.generation();
         self.staged = Some(staged);
         #[cfg(test)]
-        if PANIC_AFTER_STAGE.with(|armed| armed.replace(false)) {
+        if PANIC_AFTER_STAGE.with(|armed| armed.replace(false))
+            || PANIC_AFTER_STAGE_FOR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(package_name)
+        {
             panic!("injected panic between the event plane stage and the plugin install");
         }
         Ok(generation)
