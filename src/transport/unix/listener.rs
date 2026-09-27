@@ -52,6 +52,9 @@ pub(crate) struct SocketOwnerLock {
 
 impl Drop for SocketOwnerLock {
     fn drop(&mut self) {
+        // The pathname is kept: an unlink here would let one contender lock
+        // the orphaned inode while another locks a fresh file at the same path.
+        let _ = self.file.sync_all();
         // SAFETY: `flock` takes a valid open descriptor and an integer flag.
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
@@ -69,15 +72,6 @@ impl SocketOwnerLock {
             .unwrap_or_default();
         name.push(SOCKET_OWNER_LOCK_SUFFIX);
         socket_path.with_file_name(name)
-    }
-}
-
-impl Drop for SocketOwnerLock {
-    fn drop(&mut self) {
-        // Closing the descriptor releases the lock. The pathname is kept: an
-        // unlink here would let one contender lock the orphaned inode while
-        // another locks a fresh file at the same path.
-        let _ = self.file.sync_all();
     }
 }
 
