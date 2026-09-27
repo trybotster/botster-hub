@@ -119,16 +119,8 @@ pub(crate) fn spawn_local_runtime_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    unsafe {
-        // SAFETY: this hook runs in the daemon child after fork and only creates a new process
-        // group, keeping terminal-generated signals scoped away from the operator console.
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // A new process group keeps terminal-generated signals scoped away from the operator console.
+    command.process_group(0);
     let (mut child, ready_reader) =
         spawn_with_ready_fd(&mut command).map_err(|source| LocalRuntimeError::SpawnDaemon {
             path: hub_bin.to_path_buf(),

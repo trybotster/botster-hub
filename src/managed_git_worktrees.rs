@@ -979,14 +979,7 @@ fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Ma
 }
 
 fn configure_owned_process_group(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
 }
 
 fn owned_child_group_exited(child: &mut Child, deadline: Instant) -> Result<bool, ManagedGitError> {
