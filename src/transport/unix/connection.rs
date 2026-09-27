@@ -51,7 +51,9 @@ use crate::subscription::entity::EntityFrameSender;
 use crate::subscription::route_cleanup::{
     CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
+use crate::transport::shared::ingress::IngressStore;
 use crate::transport::unix::UnixConnectionMux;
+use crate::transport::unix::adapter::UnixTerminalAdapterHandle;
 use crate::transport::unix::listener::{NEXT_SOCKET_CLIENT_ID, daemon_endpoint};
 use crate::transport::unix::mux_write::{
     MuxWriteState, UnixInbound, UnixInboundError, flush_pending_responses, flush_unix_mux_writes,
@@ -224,12 +226,17 @@ pub(crate) async fn handle_connection_async(
     let (entity_tx, mut entity_rx) = tokio_mpsc::channel(UNIX_CONNECTION_ENTITY_QUEUE_CAPACITY);
     let mut in_flight: JoinSet<CompletedRequest> = JoinSet::new();
     let mut last_request_id: u64 = 0;
+    // One input frame that met a full adapter ingress. While it is parked,
+    // the connection stops reading the socket (input backpressure) and
+    // retries it when Core frees ingress room or the route closes.
+    let mut parked_input: Option<(UnixTerminalAdapterHandle, Vec<u8>)> = None;
 
     loop {
         let inbound = {
             let inbound = read_async_inbound(&mut reader, None);
             tokio::pin!(inbound);
             loop {
+                let parked_route = parked_input.as_ref().map(|(handle, _)| handle.clone());
                 let event_mailbox = event_reader.mailbox();
                 let event_output_ready = event_mailbox
                     .as_ref()
@@ -240,7 +247,16 @@ pub(crate) async fn handle_connection_async(
                 }
                 tokio::select! {
                     biased;
-                    inbound = &mut inbound => break inbound,
+                    inbound = &mut inbound, if parked_route.is_none() => break inbound,
+                    () = async {
+                        if let Some(handle) = parked_route.as_ref() {
+                            handle.ingress_room().await;
+                        }
+                    }, if parked_route.is_some() => {
+                        if let Some((handle, bytes)) = parked_input.take() {
+                            parked_input = park_or_store_input(handle, bytes);
+                        }
+                    }
                     completed = in_flight.join_next(), if !in_flight.is_empty() => {
                         let Some(Ok(completed)) = completed else {
                             cleanup.set_reason(ConnectionTerminalReason::Protocol);
@@ -348,10 +364,8 @@ pub(crate) async fn handle_connection_async(
                 .await;
             }
             Ok(UnixInbound::Terminal(frame)) => {
-                if let Some(handle) = mux.live_handle_for_route(&frame.route, frame.generation)
-                    && handle.push_ingress(frame.body).is_err()
-                {
-                    handle.close();
+                if let Some(handle) = mux.live_handle_for_route(&frame.route, frame.generation) {
+                    parked_input = park_or_store_input(handle, frame.body);
                 }
                 mux.clear_deferred_flushes();
                 if let Err(error) = flush_unix_mux_writes(
@@ -917,3 +931,177 @@ pub(crate) fn handle_connection(
 
 #[allow(dead_code)]
 const _: usize = DAEMON_MAX_CONNECTIONS;
+
+/// Store one input frame, or keep it when the adapter ingress is full.
+/// Returns the frame to park; `None` when it was stored or its route ended.
+fn park_or_store_input(
+    handle: UnixTerminalAdapterHandle,
+    bytes: Vec<u8>,
+) -> Option<(UnixTerminalAdapterHandle, Vec<u8>)> {
+    match handle.try_push_ingress(bytes) {
+        IngressStore::Full(bytes) => Some((handle, bytes)),
+        IngressStore::Stored | IngressStore::Closed | IngressStore::Malformed => None,
+    }
+}
+
+#[cfg(test)]
+mod input_backpressure_tests {
+    use super::*;
+    use crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY;
+    use crate::admission::unix_hello::UnixTerminalAdmission;
+    use crate::client_api_dto::response::daemon_response_base;
+    use crate::daemon::control::ControlMessage;
+    use crate::transport::unix::test_harness::{
+        read_hello_ack, read_response, receive_test_control_message, write_hello, write_request,
+    };
+    use botster_core::contract::terminal_adapter::{
+        MIN_ADAPTER_INGRESS_BUFFER_FRAMES, TerminalAdapter, TerminalIngress,
+    };
+    use botster_core::contract::terminal_wake::{TerminalWakeSource, WakingTerminalAdapter};
+    use botster_core::{SessionId, SubscriptionId, TerminalSubscriptionGeneration};
+    use botster_hub_client::{
+        DaemonRequest, DaemonResponseKind, DaemonUnixFrameReader, write_unix_terminal_frame,
+    };
+    use std::net::Shutdown;
+
+    fn input_frame(index: usize) -> Vec<u8> {
+        use botster_terminal_protocol::{
+            INPUT_HEADER_BYTES, TERMINAL_INPUT_SCHEME_VERSION, TerminalInputKind,
+        };
+        let data = format!("paste-{index:03}");
+        let len = u16::try_from(data.len()).expect("fixture body fits");
+        let mut bytes = Vec::with_capacity(INPUT_HEADER_BYTES + data.len());
+        bytes.push(TERMINAL_INPUT_SCHEME_VERSION);
+        bytes.push(TerminalInputKind::RawBytes.as_byte());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(&(index as u64 + 1).to_be_bytes());
+        bytes.extend_from_slice(data.as_bytes());
+        bytes
+    }
+
+    /// S5: a paste burst larger than the 64-frame adapter ingress, sent while
+    /// Core reads nothing, is delivered whole: the connection parks the
+    /// frame that met a full ingress and stops reading the socket until Core
+    /// removes a frame. A Status request queued behind the burst on the same
+    /// socket is read only after the connection stored the last frame.
+    #[test]
+    fn a_paste_burst_past_the_ingress_is_delivered_whole_and_holds_the_socket() {
+        const BURST: usize = 100;
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound daemon client reads");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
+        let ControlMessage::RegisterUnixAdmission {
+            admission,
+            reply_tx,
+            ..
+        } = receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected RegisterUnixAdmission after Hello");
+        };
+        let UnixTerminalAdmission::Admitted { mux, .. } = admission else {
+            panic!("expected terminal admission");
+        };
+        let (mut adapter, handle) = mux.create_adapter();
+        assert!(mux.register("s".into(), "paste".into(), 1, handle.clone()));
+        let wakes = TerminalWakeSource::new();
+        adapter.set_wake_sink(wakes.bind_route(
+            SessionId("s".into()),
+            SubscriptionId("paste".into()),
+            TerminalSubscriptionGeneration(1),
+        ));
+        let (full_tx, full_rx) = std::sync::mpsc::channel();
+        handle.set_ingress_full_observer(full_tx);
+        reply_tx.send(()).expect("ack unix admission");
+
+        // Core is stalled: nothing reads the ingress while the burst arrives.
+        for index in 0..BURST {
+            write_unix_terminal_frame(&mut client, "paste", 1, 0, &input_frame(index))
+                .expect("write paste frame");
+        }
+        write_request(&mut client, 1, DaemonRequest::Status);
+        // timer: deadline — bounds a connection that never fills the ingress.
+        full_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the 65th frame meets a full ingress and the connection parks");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a parked connection has not read the request behind the burst"
+        );
+
+        // timer: deadline — bounds a lost wake; progress arrives as ingress
+        // wakes and the control request.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut delivered = Vec::new();
+        let mut status_seen_after = None;
+        while delivered.len() < BURST || status_seen_after.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "burst stalled: delivered={} status_seen_after={status_seen_after:?}",
+                delivered.len()
+            );
+            if status_seen_after.is_none()
+                && let Ok(message) = control_rx.try_recv()
+            {
+                let ControlMessage::Request {
+                    request, reply_tx, ..
+                } = message
+                else {
+                    continue;
+                };
+                assert!(matches!(*request, DaemonRequest::Status));
+                status_seen_after = Some(delivered.len());
+                reply_tx
+                    .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
+                    .expect("reply to status");
+                continue;
+            }
+            match adapter.try_read() {
+                TerminalIngress::Frame(frame) => delivered.push(frame),
+                TerminalIngress::Empty if delivered.len() < BURST => {
+                    let _ = wakes.wait_wakes(deadline.saturating_duration_since(Instant::now()));
+                }
+                TerminalIngress::Empty => {
+                    let message = receive_test_control_message(&mut control_rx);
+                    let ControlMessage::Request {
+                        request, reply_tx, ..
+                    } = message
+                    else {
+                        continue;
+                    };
+                    assert!(matches!(*request, DaemonRequest::Status));
+                    status_seen_after = Some(delivered.len());
+                    reply_tx
+                        .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
+                        .expect("reply to status");
+                }
+                other => panic!("a stalled ingress must not end the route: {other:?}"),
+            }
+        }
+        assert_eq!(
+            delivered,
+            (0..BURST).map(input_frame).collect::<Vec<_>>(),
+            "every frame arrives once, in order"
+        );
+        assert!(!handle.is_closed(), "backpressure keeps the route open");
+        let status_seen_after = status_seen_after.expect("status answered");
+        assert!(
+            status_seen_after >= BURST - MIN_ADAPTER_INGRESS_BUFFER_FRAMES,
+            "the connection read past the burst before storing it: status after {status_seen_after} frames"
+        );
+        let response = read_response(&mut client, &mut reader, 1);
+        assert_eq!(response.kind, DaemonResponseKind::Status);
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect daemon client");
+        connection
+            .join()
+            .expect("join daemon connection")
+            .expect("client disconnect is a clean connection close");
+    }
+}
