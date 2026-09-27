@@ -66,12 +66,17 @@ pub(crate) struct PendingRepoQuarantine {
 
 impl PendingRepoQuarantine {
     /// Reserve an entry's bytes before the file effect.
+    /// Reserve an entry's bytes before the file effect, then copy the
+    /// borrowed evidence under that charge. A refusal allocates nothing.
     pub(crate) fn reserve(
-        evidence: RepoWriteEvidence,
+        evidence: &RepoWriteEvidence,
         budget: &std::sync::Arc<SharedViewBudget>,
     ) -> Result<Self, SharedViewCapacityError> {
-        let charge = budget.reserve(entry_bytes(&evidence))?;
-        Ok(Self { evidence, charge })
+        let charge = budget.reserve(entry_bytes(evidence))?;
+        Ok(Self {
+            evidence: evidence.clone(),
+            charge,
+        })
     }
 }
 
@@ -99,11 +104,17 @@ impl RepoSessionTypeQuarantines {
 
     /// Install the entry funded by `pending`. The map is touched only on the
     /// owner, and the bytes were reserved before the effect.
-    pub(crate) fn install(&mut self, pending: PendingRepoQuarantine, cause: QuarantineCause) {
+    /// `detail` is the full cause text; it goes to the local Hub log only.
+    pub(crate) fn install(
+        &mut self,
+        pending: PendingRepoQuarantine,
+        cause: QuarantineCause,
+        detail: &str,
+    ) {
         let PendingRepoQuarantine { evidence, charge } = pending;
         self.next_id = self.next_id.saturating_add(1);
         crate::hub_log::hub_log!(
-            "repo_session_type_quarantined id={} root={} target={} session_type_id={} operation={:?} prior_sha256={} candidate_sha256={} cause={cause:?}",
+            "repo_session_type_quarantined id={} root={} target={} session_type_id={} operation={:?} prior_sha256={} candidate_sha256={} cause={cause:?} detail={detail}",
             self.next_id,
             evidence.root.display(),
             evidence.target_path.display(),
@@ -171,4 +182,42 @@ fn hex(digest: &[u8; 32]) -> String {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence() -> RepoWriteEvidence {
+        RepoWriteEvidence {
+            root: PathBuf::from("/repo/root"),
+            target_path: PathBuf::from("/repo/root/.botster/session-types.json"),
+            session_type_id: "review".to_string(),
+            operation: crate::host_mutations::SessionTypeOperation::Create,
+            prior_sha256: None,
+            candidate_sha256: [7; 32],
+        }
+    }
+
+    #[test]
+    fn an_unfunded_entry_is_refused_before_anything_is_retained() {
+        let evidence = evidence();
+        let needed = entry_bytes(&evidence);
+        let short = SharedViewBudget::with_capacity(needed - 1);
+        assert!(PendingRepoQuarantine::reserve(&evidence, &short).is_err());
+        assert_eq!(short.used(), 0, "a refused reservation charges nothing");
+
+        let exact = SharedViewBudget::with_capacity(needed);
+        let pending = PendingRepoQuarantine::reserve(&evidence, &exact).expect("exact fit");
+        assert_eq!(exact.used(), needed);
+        let mut quarantines = RepoSessionTypeQuarantines::default();
+        quarantines.install(
+            pending,
+            QuarantineCause::UnknownOutcome(UnknownOutcomeKind::Other),
+            "test",
+        );
+        assert_eq!(exact.used(), needed, "installation needs no new capacity");
+        drop(quarantines);
+        assert_eq!(exact.used(), 0, "the entry returns its charge when dropped");
+    }
 }
