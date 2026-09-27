@@ -616,7 +616,8 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     let bytes = serde_json::to_vec(&value).unwrap();
     fixture.replace_initialized_document(&bytes);
     let loaded = fixture.state();
-    assert_eq!(loaded.schema_version, 4);
+    // Schema 3 migrates to the current schema, 5 (durable package quarantine).
+    assert_eq!(loaded.schema_version, 5);
     assert_eq!(loaded.session_type_generation, 71);
     assert_eq!(loaded.recovery, RecoveryLedger::default());
     let (prior, authority) = fixture.retained_view();

@@ -834,6 +834,7 @@ pub(crate) fn daemon_status_from_status(
         live_attach_occupancy: Vec::new(),
         observability,
         retention,
+        quarantines: Vec::new(),
         local_webrtc_terminal_records: Vec::new(),
         diagnostics,
     }
@@ -1268,6 +1269,7 @@ mod tests {
             updated_at: None,
             last_audit_reason: "projection fixture".to_string(),
             admitted_host_profile: None,
+            quarantine: None,
         }
     }
 

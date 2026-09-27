@@ -24,8 +24,8 @@ pub(crate) mod webrtc;
 
 use botster_core::RequestId;
 use botster_hub_client::{
-    DaemonDiagnostic, DaemonLifecycleCounters, DaemonOperatorError, DaemonRequest, DaemonResponse,
-    DaemonResponseKind,
+    DaemonDiagnostic, DaemonLifecycleCounters, DaemonOperatorError, DaemonQuarantineTarget,
+    DaemonRequest, DaemonResponse, DaemonResponseKind,
 };
 
 use crate::HubDaemon;
@@ -292,6 +292,12 @@ pub(crate) fn handle_runtime_control_request(
         DaemonRequest::SpawnSessionType { .. } => {
             session_types::handle_runtime(daemon, state, observability, request)
         }
+        DaemonRequest::ResolveQuarantine {
+            target: DaemonQuarantineTarget::RepositorySessionTypes { root },
+        } => ControlStep::ready(host_work::resolve_repo_quarantine(state, &root)),
+        DaemonRequest::ResolveQuarantine {
+            target: DaemonQuarantineTarget::Package { .. },
+        } => unreachable!("a package quarantine resolve uses the host executor"),
         DaemonRequest::Whoami { .. }
         | DaemonRequest::PostMessage { .. }
         | DaemonRequest::ReceiveMessages { .. }
