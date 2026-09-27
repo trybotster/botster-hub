@@ -467,6 +467,16 @@ fn execute_package_runtime_restore(
             )),
         }]
     });
+    if !rollbacks.is_empty() {
+        // Compensation failed: no version of these packages may keep serving.
+        // Unload them here, on the Host worker; their recorded router unloads
+        // clear any staged generation and retire their queued events.
+        crate::daemon::control::packages::mutations::quarantine_after_failed_compensation(
+            &mut runtime,
+            entrypoints,
+            &effect,
+        );
+    }
     HostMutationResult::PackageRuntimeRestored {
         effect,
         original,
@@ -607,6 +617,20 @@ pub(crate) enum PackageRuntimeEffect {
 }
 
 impl PackageRuntimeEffect {
+    /// Every package whose runtime this effect changes.
+    pub(crate) fn package_names(&self) -> Vec<&str> {
+        match self {
+            Self::Enable { package_name, .. }
+            | Self::Disable { package_name }
+            | Self::Remove { package_name }
+            | Self::Reload { package_name, .. } => vec![package_name.as_str()],
+            Self::Refresh { packages, .. } => packages
+                .iter()
+                .map(|package| package.package_name.as_str())
+                .collect(),
+        }
+    }
+
     pub(crate) fn restore_command(
         &self,
         data_directory: PathBuf,

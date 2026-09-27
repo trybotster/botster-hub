@@ -221,6 +221,30 @@ pub(crate) fn apply_committed_runtime_effect(
     }
 }
 
+/// After a failed compensation, unload every package the effect touched so no
+/// handler of any generation serves it. A generation the restore itself staged
+/// is aborted first. Each recorded router unload retires the package's queued
+/// events; they are counted as stranded here, where the reason is known.
+pub(crate) fn quarantine_after_failed_compensation(
+    runtime: &mut HostPackageRuntime,
+    supervisor: &mut EntrypointSupervisor,
+    effect: &PackageRuntimeEffect,
+) {
+    if let Some(staged) = runtime.take_staged() {
+        runtime.abort_staged(staged);
+    }
+    for package_name in effect.package_names() {
+        supervisor.stop_package(package_name);
+        runtime.record_package_stranded(package_name);
+        let _ = runtime.unload_plugin_package(
+            request_id(&format!("daemon-quarantine-{package_name}")),
+            package_name,
+        );
+        runtime.record_event_plane_unload(package_name);
+        crate::hub_log::hub_log!("package_quarantined package={package_name}");
+    }
+}
+
 /// Restore runtime effects after the host restores durable package state.
 ///
 /// A package whose plugin load failed without a swap is left alone: its

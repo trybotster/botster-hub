@@ -999,6 +999,23 @@ impl PackageEventRouter {
         })
     }
 
+    /// Queued event copies for one consumer plugin. Host workers only.
+    pub fn queued_copies_blocking(&self, plugin_key: &str) -> u64 {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .consumers
+            .get(plugin_key)
+            .map_or(0, |queue| queue.copies.len() as u64)
+    }
+
+    #[must_use]
+    pub(crate) fn counters(&self) -> &EventPlaneCounters {
+        &self.counters
+    }
+
     /// Discard a staged generation and release its capacity and funding.
     /// Host workers only; the lock is taken blocking as for activation.
     /// Returns whether the staged generation was still pending.

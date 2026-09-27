@@ -75,6 +75,20 @@ impl HostPackageRuntime {
         self.staging_funding = Some(funding);
     }
 
+    /// A generation this runtime staged but did not activate.
+    pub(crate) fn take_staged(&mut self) -> Option<StagedGeneration> {
+        self.staged.take()
+    }
+
+    /// Count a quarantined package's queued events as stranded before its
+    /// unload retires them. Host workers only; the lock is taken blocking.
+    pub(crate) fn record_package_stranded(&self, package_name: &str) {
+        let queued = self.package_event_router.queued_copies_blocking(package_name);
+        self.package_event_router
+            .counters()
+            .record_events_stranded(queued);
+    }
+
     /// Discard a generation a failed attempt staged but never activated.
     /// Runs on a Host worker; the router lock is taken blocking.
     pub(crate) fn abort_staged(&mut self, staged: StagedGeneration) {
