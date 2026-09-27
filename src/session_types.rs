@@ -698,7 +698,25 @@ pub(crate) enum RepoSessionTypeFileSnapshot {
 #[must_use]
 pub(crate) enum RepoSessionTypeFileCommit {
     Synced,
-    PublishedUncertain(SessionTypeError),
+    PublishedUncertain {
+        cause: RepoPublicationCause,
+        error: SessionTypeError,
+    },
+}
+
+/// Why a renamed repository session-types file has no confirmed durable result.
+/// Every variant means the rename completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepoPublicationCause {
+    /// The `.botster` directory or repository root fsync failed.
+    SyncFailed(std::io::ErrorKind),
+    /// The `.botster` directory could not be reopened to confirm its identity.
+    IdentityUnconfirmed(std::io::ErrorKind),
+    /// The `.botster` name no longer refers to the directory that was synced.
+    ChangedAfterRename,
+    /// A test-injected fault after the rename.
+    #[cfg(test)]
+    Injected,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -725,7 +743,7 @@ pub(crate) fn commit_repo_session_type_mutation(
         let bytes = encode_repo_session_type_bytes(&definitions)?;
         match commit_repo_session_type_bytes(&root, &bytes)? {
             RepoSessionTypeFileCommit::Synced => {}
-            RepoSessionTypeFileCommit::PublishedUncertain(error) => return Err(error),
+            RepoSessionTypeFileCommit::PublishedUncertain { error, .. } => return Err(error),
         }
     }
     Ok(())
@@ -1008,17 +1026,26 @@ pub(crate) fn commit_repo_session_type_bytes(
     })?;
     #[cfg(test)]
     if repo_sync_failure_is_due(root) {
-        return Ok(RepoSessionTypeFileCommit::PublishedUncertain(
-            SessionTypeError::new(
+        return Ok(RepoSessionTypeFileCommit::PublishedUncertain {
+            cause: RepoPublicationCause::Injected,
+            error: SessionTypeError::new(
                 "repo_session_type_sync_uncertain",
                 "injected repository directory sync failure after rename",
             ),
-        ));
+        });
     }
     let sync_result = (|| {
-        directory_file.sync_all()?;
+        let synced =
+            |error: std::io::Error| (RepoPublicationCause::SyncFailed(error.kind()), error);
+        let unconfirmed = |error: std::io::Error| {
+            (
+                RepoPublicationCause::IdentityUnconfirmed(error.kind()),
+                error,
+            )
+        };
+        directory_file.sync_all().map_err(synced)?;
         if created_directory {
-            root_file.sync_all()?;
+            root_file.sync_all().map_err(synced)?;
         }
         let current = openat(
             &root_file,
@@ -1026,25 +1053,27 @@ pub(crate) fn commit_repo_session_type_bytes(
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(std::io::Error::from)?;
+        .map_err(|error| unconfirmed(std::io::Error::from(error)))?;
         let current = File::from(current);
-        let held = directory_file.metadata()?;
-        let named = current.metadata()?;
+        let held = directory_file.metadata().map_err(unconfirmed)?;
+        let named = current.metadata().map_err(unconfirmed)?;
         if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino() {
-            return Err(std::io::Error::other(
-                "repo session type directory changed after rename",
+            return Err((
+                RepoPublicationCause::ChangedAfterRename,
+                std::io::Error::other("repo session type directory changed after rename"),
             ));
         }
-        Ok::<_, std::io::Error>(())
+        Ok(())
     })();
     match sync_result {
         Ok(()) => Ok(RepoSessionTypeFileCommit::Synced),
-        Err(error) => Ok(RepoSessionTypeFileCommit::PublishedUncertain(
-            SessionTypeError::new(
+        Err((cause, error)) => Ok(RepoSessionTypeFileCommit::PublishedUncertain {
+            cause,
+            error: SessionTypeError::new(
                 "repo_session_type_sync_uncertain",
                 format!("repo session type file was renamed but directory sync failed: {error}"),
             ),
-        )),
+        }),
     }
 }
 

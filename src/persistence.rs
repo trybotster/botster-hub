@@ -464,6 +464,13 @@ pub(crate) struct PreparedHubStateWrite {
     bytes: Vec<u8>,
 }
 
+impl PreparedHubStateWrite {
+    /// Share the prior and candidate views that this write would publish.
+    pub(crate) fn views(&self) -> (Option<SharedView<HubState>>, SharedView<HubState>) {
+        (self.evidence.prior.clone(), self.evidence.candidate.clone())
+    }
+}
+
 impl FileHubStateStore {
     /// Build a store at `<data_directory>/hub-state.json`.
     #[must_use]
