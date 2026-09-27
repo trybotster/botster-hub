@@ -1245,7 +1245,12 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 .in_flight_by_request
                 .insert(request_id.0, plugin_key);
         }
-        _ => {
+        other => {
+            crate::hub_log::hub_log!(
+                "session_family_admission_not_queued plugin={} request_id={} result={other:?}",
+                plugin_key,
+                request_id.0
+            );
             state.session_family.mark_gap(&plugin_key);
             start_baseline_recovery(state);
         }
@@ -1467,7 +1472,12 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     }
                 }
             }
-            _ => {
+            other => {
+                crate::hub_log::hub_log!(
+                    "package_event_admission_not_queued plugin={} request_id={} result={other:?}",
+                    delivery.holder.plugin_key,
+                    request_id.0
+                );
                 reservation.commit(crate::package_event_router::CausalOp::Release {
                     scope_id,
                     identity: crate::package_event_router::LeaseIdentity::EventInFlight,
