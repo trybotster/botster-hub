@@ -5892,6 +5892,10 @@ pub enum HubLuaPluginLoadError {
     Lua(LuaPluginRuntimeError),
     Lifecycle(crate::HubLifecycleError),
     EventPlane(EventPlaneStatus),
+    /// A replacement's commit failed after its preview passed: the previous
+    /// event generation is unloaded, the new one is not committed, and the
+    /// previous plugin still runs without its event subscriptions.
+    EventPlaneStranded(EventPlaneStatus),
     EventPlaneCleanup,
     EntityFamilyCleanup(PackageEntityCleanupError),
 }
@@ -5900,7 +5904,9 @@ impl HubLuaPluginLoadError {
     pub(crate) const fn is_package_scoped_startup_failure(&self) -> bool {
         match self {
             Self::Package(_) | Self::Lua(_) | Self::Lifecycle(_) => true,
-            Self::EventPlaneCleanup | Self::EntityFamilyCleanup(_) => false,
+            Self::EventPlaneStranded(_)
+            | Self::EventPlaneCleanup
+            | Self::EntityFamilyCleanup(_) => false,
             // List package failures explicitly. A new event-plane status must
             // stop startup until code classifies it as package-scoped.
             Self::EventPlane(status) => matches!(
@@ -5922,6 +5928,7 @@ impl HubLuaPluginLoadError {
             Self::Lua(_) => "lua_load_failed",
             Self::Lifecycle(_) => "plugin_lifecycle_rejected",
             Self::EventPlane(status) => status.as_str(),
+            Self::EventPlaneStranded(_) => "event_plane_replacement_stranded",
             Self::EventPlaneCleanup => "event_plane_cleanup_failed",
             Self::EntityFamilyCleanup(PackageEntityCleanupError::GenerationExhausted) => {
                 "entity_family_generation_exhausted"
@@ -5940,6 +5947,13 @@ impl fmt::Display for HubLuaPluginLoadError {
             Self::Lua(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
             Self::EventPlane(status) => write!(formatter, "{}", status.as_str()),
+            Self::EventPlaneStranded(status) => write!(
+                formatter,
+                "event plane replacement failed after its preview ({}): the previous \
+                 event generation is unloaded, the new one is not committed, and the \
+                 previous plugin version still runs without event subscriptions",
+                status.as_str()
+            ),
             Self::EventPlaneCleanup => {
                 formatter.write_str("event router cleanup requires recovery")
             }
@@ -5959,7 +5973,7 @@ impl Error for HubLuaPluginLoadError {
             Self::Package(_) => None,
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
-            Self::EventPlane(_) => None,
+            Self::EventPlane(_) | Self::EventPlaneStranded(_) => None,
             Self::EventPlaneCleanup | Self::EntityFamilyCleanup(_) => None,
         }
     }
@@ -7900,6 +7914,127 @@ pub(crate) mod tests {
         assert_eq!(memory.usage(), (limits.per_vm_bytes, owner_sum));
         drop(runtime);
         assert_eq!(memory.usage(), (0, 0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A provider loaded with one hub event subscription, plus its policy.
+    fn subscribed_provider_runtime(
+        name: &str,
+    ) -> (
+        HubRuntime,
+        std::path::PathBuf,
+        crate::packages::PackageAdmissionPolicy,
+    ) {
+        let (mut runtime, root) = publication_provider_runtime(name);
+        let entrypoint = root.join("plugin.lua");
+        let source = std::fs::read_to_string(&entrypoint).unwrap();
+        std::fs::write(
+            &entrypoint,
+            format!(
+                "events.on('hub', 'worktree_created', function(event) return {{ received = event.event }} end)\n{source}"
+            ),
+        )
+        .unwrap();
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install subscribed test provider")
+            .unwrap();
+        policy
+            .enable("producer", "enable subscribed test provider")
+            .unwrap();
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        (runtime, root, policy)
+    }
+
+    #[test]
+    fn a_reload_lifecycle_rejection_keeps_the_live_plugin_and_event_generation() {
+        let (mut runtime, root, policy) = subscribed_provider_runtime("reload-preflight");
+        let registration = runtime
+            .plugin_lifecycle()
+            .entity_provider_registrations()
+            .select("producer", "producer.item")
+            .unwrap();
+        let generation = runtime
+            .package_event_router
+            .current_package_generation("producer");
+        assert!(matches!(generation, Ok(value) if value > 0));
+
+        crate::lifecycle::inject_next_prepare_failure("producer");
+        let error = runtime
+            .reload_lua_plugin_package(
+                RequestId("reload-preflight".into()),
+                policy.registry(),
+                "producer",
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, HubLuaPluginLoadError::Lifecycle(_)),
+            "{error:?}"
+        );
+        assert!(registration.is_live(), "the previous plugin still runs");
+        assert_eq!(
+            runtime
+                .package_event_router
+                .current_package_generation("producer"),
+            generation,
+            "the previous event generation is still committed"
+        );
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_enable_event_plane_rejection_keeps_the_live_plugin_and_event_generation() {
+        let (mut runtime, root, policy) = subscribed_provider_runtime("enable-event-plane");
+        let registration = runtime
+            .plugin_lifecycle()
+            .entity_provider_registrations()
+            .select("producer", "producer.item")
+            .unwrap();
+        let generation = runtime
+            .package_event_router
+            .current_package_generation("producer");
+        let entrypoint = root.join("plugin.lua");
+        let source = std::fs::read_to_string(&entrypoint).unwrap();
+        std::fs::write(
+            &entrypoint,
+            format!(
+                "events.on('hub', 'botster_undeclared_event', function() return {{}} end)\n{source}"
+            ),
+        )
+        .unwrap();
+
+        let error = runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap_err();
+
+        assert!(
+            matches!(error, HubLuaPluginLoadError::EventPlane(_)),
+            "{error:?}"
+        );
+        assert!(registration.is_live(), "the previous plugin still runs");
+        assert_eq!(
+            runtime
+                .package_event_router
+                .current_package_generation("producer"),
+            generation
+        );
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 
