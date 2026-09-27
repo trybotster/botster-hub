@@ -2041,7 +2041,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     assert_eq!(status.state_source, HubStateLoadSource::Initialized);
     assert_eq!(status.host_id, "hub-daemon-test");
     assert_eq!(status.host_display_name, "Hub Daemon Test");
-    assert_eq!(status.schema_version, 4);
+    assert_eq!(status.schema_version, 5);
     assert!(status.data_dir_configured);
     assert!(status.core_initialized);
     assert_eq!(status.package_count, 0);
@@ -2071,7 +2071,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
         .load_retained(&config)
         .expect("reload committed daemon state");
     let authority = authority.expect("File reload retains state authority");
-    assert_eq!(reopened.schema_version, 4);
+    assert_eq!(reopened.schema_version, 5);
     assert_eq!(reopened.host.id, "hub-daemon-test");
     drop(authority);
 }
@@ -2394,7 +2394,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.enabled_package_count, 1);
     assert_eq!(status.provider_count, 1);
     assert_eq!(status.enabled_provider_count, 1);
-    assert_eq!(status.schema_version, 4);
+    assert_eq!(status.schema_version, 5);
 
     daemon.stop();
     drop(daemon);
@@ -2427,7 +2427,7 @@ fn cli_start_and_status_print_scrubbed_lifecycle_status() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("event=status"));
     assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("schema_version=4"));
+    assert!(stdout.contains("schema_version=5"));
     assert!(stdout.contains("core_initialized=true"));
     assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
