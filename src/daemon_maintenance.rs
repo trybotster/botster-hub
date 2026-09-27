@@ -1284,8 +1284,23 @@ fn flush_pending_event_retirements(runtime: &HubRuntime, state: &mut Maintenance
     let Some(mut flight) = state.pending_retirements.pop_front() else {
         return;
     };
-    if !retire_event_holder(runtime, &mut flight) {
-        state.event_causal_blocked = flight.holder_retired && flight.scope_id.is_some();
+    let mut retired = retire_event_holder(runtime, &mut flight);
+    if !retired && !flight.holder_retired {
+        // The router lock was busy: contention. Arm it and retry once; if the
+        // holder still has it, park the slice on the router key, with no mark.
+        let lock_seen = runtime.package_event_router().arm_lock();
+        retired = retire_event_holder(runtime, &mut flight);
+        if !retired && !flight.holder_retired {
+            state.pending_retirements.push_front(flight);
+            state
+                .signal_waits
+                .insert(MaintenanceSliceKind::PackageEventDelivery, lock_seen);
+            return;
+        }
+    }
+    if !retired {
+        // Only the causal release refused: causal progress marks the slice.
+        state.event_causal_blocked = flight.scope_id.is_some();
         state.event_causal_faulted = state.event_causal_blocked && runtime.causal_faulted();
         state.pending_retirements.push_front(flight);
     }
@@ -1314,6 +1329,12 @@ fn retire_event_holder(runtime: &HubRuntime, flight: &mut EventDeliveryFlight) -
         };
         match result {
             Ok(_) => {
+                flight.holder_retired = true;
+                flight.pull_id = None;
+            }
+            // A poisoned router loses its holder records with it; the flight
+            // still releases its causal lease below.
+            Err(_) if runtime.package_event_router().lock_poisoned() => {
                 flight.holder_retired = true;
                 flight.pull_id = None;
             }
@@ -1348,19 +1369,34 @@ fn queue_event_retirement(
 }
 
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    flush_pending_event_retirements(runtime, state);
     // A parked slice stays parked until its epoch moves, even when another
-    // site marks every slice; readiness is the epoch, not the mark.
+    // site marks every slice; readiness is the epoch, not the mark. A router
+    // wait blocks retirements and pulls, which both need the router; a wait
+    // for new events blocks only the pull, so a queued retirement still runs.
     if let Some(seen) = state
         .signal_waits
         .get(&MaintenanceSliceKind::PackageEventDelivery)
         && !runtime.owner_signal().moved(*seen)
+        && (seen.key() == crate::daemon::owner_signal::SignalKey::EventRouter
+            || state.pending_retirements.is_empty())
     {
         return;
     }
     state
         .signal_waits
         .remove(&MaintenanceSliceKind::PackageEventDelivery);
+    if runtime.package_event_router().lock_poisoned() {
+        // Terminal: no new pulls. Queued retirements still release their
+        // causal leases, one per run, and the slice then marks nothing.
+        fault_event_delivery(state);
+    }
+    flush_pending_event_retirements(runtime, state);
+    if state
+        .signal_waits
+        .contains_key(&MaintenanceSliceKind::PackageEventDelivery)
+    {
+        return;
+    }
     // Causal capacity progress marks this slice again.
     if state.event_causal_blocked || state.event_causal_faulted || state.event_router_faulted {
         return;
@@ -4330,6 +4366,107 @@ return botster.register({})
             "no attempt on the poisoned router raised its own key"
         );
         let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// A runtime with the probe plugin and its admitted in-flight events,
+    /// taken out of the slice's in-flight table as if their invocations ended.
+    fn completed_probe_flights(
+        name: &str,
+    ) -> (HubRuntime, PathBuf, PathBuf, Vec<EventDeliveryFlight>) {
+        let (registry, package_root) = install_event_probe_registry(name);
+        let (mut runtime, data_directory) = event_delivery_runtime(name);
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        while state.event_in_flight.is_empty()
+            && !state
+                .signal_waits
+                .contains_key(&MaintenanceSliceKind::PackageEventDelivery)
+        {
+            run_package_event_delivery_slice(&runtime, &mut state);
+        }
+        let flights: Vec<_> = std::mem::take(&mut state.event_in_flight)
+            .into_values()
+            .collect();
+        assert!(!flights.is_empty(), "the probe admitted its events");
+        (runtime, data_directory, package_root, flights)
+    }
+
+    #[test]
+    fn a_poisoned_router_releases_queued_retirements_and_then_marks_nothing() {
+        let (runtime, data_directory, package_root, flights) =
+            completed_probe_flights("delivery-poison-retire");
+        assert!(
+            flights.iter().all(|flight| flight.scope_id.is_some()),
+            "admitted events hold causal leases"
+        );
+        let router = runtime.package_event_router().clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            router.test_with_inner_held(|| panic!("poison the router"))
+        }));
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        let queued = flights.len();
+        for flight in flights {
+            queue_event_retirement(&runtime, &mut state, flight);
+        }
+        let mut runs = 0;
+        while state.wakes.take(MaintenanceSliceKind::PackageEventDelivery) {
+            runs += 1;
+            assert!(runs <= queued, "each run retires one flight: {state:?}");
+            run_package_event_delivery_slice(&runtime, &mut state);
+            state.mark_signaled_waits(runtime.owner_signal());
+        }
+        assert!(
+            state.event_router_faulted,
+            "poison is a typed terminal fault"
+        );
+        assert!(state.pending_retirements.is_empty(), "every flight retired");
+        assert!(state.signal_waits.is_empty());
+        assert!(!state.wakes.has_any(), "the faulted slice marks nothing");
+        // A flight leaves the queue only after its EventInFlight lease release
+        // was applied, so an empty queue with no causal block proves it.
+        assert!(
+            !state.event_causal_blocked && !state.event_causal_faulted,
+            "the causal lease releases were applied although the router is gone"
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
+    fn a_retirement_that_meets_a_busy_router_parks_until_the_release() {
+        let (runtime, data_directory, package_root, mut flights) =
+            completed_probe_flights("delivery-busy-retire");
+        let flight = flights.remove(0);
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        queue_event_retirement(&runtime, &mut state, flight);
+        assert!(state.wakes.take(MaintenanceSliceKind::PackageEventDelivery));
+        runtime.package_event_router().test_with_inner_held(|| {
+            run_package_event_delivery_slice(&runtime, &mut state);
+            // A blanket mark while parked on the router must not retry it.
+            run_package_event_delivery_slice(&runtime, &mut state);
+            state.mark_signaled_waits(runtime.owner_signal());
+            assert!(
+                !state.wakes.has_any(),
+                "contention parks, with no mark: {state:?}"
+            );
+            assert_eq!(state.pending_retirements.len(), 1);
+        });
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
+            "the router's release wakes the parked retirement"
+        );
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(state.pending_retirements.is_empty(), "the retirement ran");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+        let _ = std::fs::remove_dir_all(package_root);
     }
 
     #[test]
