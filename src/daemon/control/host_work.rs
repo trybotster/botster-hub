@@ -1585,13 +1585,12 @@ fn finish_error(
 /// plugin, or to find the socket binding its entrypoint restart needs.
 fn package_load_refusal(error: &DaemonTransportError) -> Option<HostMutationError> {
     match error {
-        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error)) => {
-            Some(HostMutationError {
-                code: error.code().to_string(),
-                message: error.to_string(),
-                event: None,
-            })
-        }
+        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error))
+        | DaemonTransportError::PluginLoadRefused { error, .. } => Some(HostMutationError {
+            code: error.code().to_string(),
+            message: error.to_string(),
+            event: None,
+        }),
         DaemonTransportError::MissingSocketBinding => Some(HostMutationError {
             code: "socket_binding_missing".to_string(),
             message: "the entrypoint restart has no socket binding".to_string(),

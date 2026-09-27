@@ -27,10 +27,36 @@ fn load_package_after_enable(
             .load_lua_plugin_package(registry, package_name)
             .map_err(|error| {
                 log_plugin_load_failure("enable", package_name, &prepared, &error);
-                crate::HubDaemonError::from(error)
+                plugin_load_error(package_name, error)
             })?;
     }
     Ok(())
+}
+
+/// Classify a plugin load failure. Both load paths prepare the package and
+/// build the Lua bundle before they change the running plugin, so a failure
+/// there is a refusal that leaves the previous version loaded.
+fn plugin_load_error(
+    package_name: &str,
+    error: crate::HubLuaPluginLoadError,
+) -> DaemonTransportError {
+    match error {
+        crate::HubLuaPluginLoadError::Package(_) | crate::HubLuaPluginLoadError::Lua(_) => {
+            DaemonTransportError::PluginLoadRefused {
+                package_name: package_name.to_string(),
+                error,
+            }
+        }
+        error => crate::HubDaemonError::from(error).into(),
+    }
+}
+
+/// The package whose plugin load was refused before the runtime changed.
+fn refused_package(original: &DaemonTransportError) -> Option<&str> {
+    match original {
+        DaemonTransportError::PluginLoadRefused { package_name, .. } => Some(package_name),
+        _ => None,
+    }
 }
 
 /// Record a plugin load failure with its local context. Lua reports errors
@@ -68,7 +94,7 @@ fn reload_package(
             )
             .map_err(|error| {
                 log_plugin_load_failure("reload", package_name, &prepared, &error);
-                crate::HubDaemonError::from(error)
+                plugin_load_error(package_name, error)
             })?;
     }
     Ok(())
@@ -188,19 +214,27 @@ pub(crate) fn apply_committed_runtime_effect(
 }
 
 /// Restore runtime effects after the host restores durable package state.
+///
+/// A package whose plugin load was refused is left alone: its runtime never
+/// changed, and its source on disk is the version that failed, so reloading
+/// it could only fail again or replace the version still serving.
 pub(crate) fn restore_runtime_after_failed_effect(
     runtime: &mut HostPackageRuntime,
     supervisor: &mut EntrypointSupervisor,
     config: &HubConfig,
     effect: &PackageRuntimeEffect,
+    original: &DaemonTransportError,
 ) -> Vec<PackageRollbackFailure> {
+    let refused = refused_package(original);
     let mut rollbacks = Vec::new();
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. } => {
-            let _ = runtime.unload_plugin_package(
-                request_id(&format!("daemon-disable-{package_name}")),
-                package_name,
-            );
+            if refused != Some(package_name.as_str()) {
+                let _ = runtime.unload_plugin_package(
+                    request_id(&format!("daemon-disable-{package_name}")),
+                    package_name,
+                );
+            }
         }
         PackageRuntimeEffect::Reload {
             package_name,
@@ -214,6 +248,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
+                refused,
                 &mut rollbacks,
             );
         }
@@ -228,6 +263,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 running_entrypoints,
+                refused,
                 &mut rollbacks,
             );
         }
@@ -242,10 +278,16 @@ fn restore_registry_runtime(
     config: &HubConfig,
     previous: &PackageRegistry,
     running_entrypoints: &BTreeMap<String, Vec<String>>,
+    refused: Option<&str>,
     rollbacks: &mut Vec<PackageRollbackFailure>,
 ) {
     for record in previous.packages() {
         let package_name = record.manifest.name.as_str();
+        // The refused load precedes this package's entrypoint restarts, so
+        // neither its plugin nor its entrypoints changed.
+        if refused == Some(package_name) {
+            continue;
+        }
         if record.state == PackageState::Enabled
             && has_lua(previous, package_name)
             && let Err(error) = reload_package(

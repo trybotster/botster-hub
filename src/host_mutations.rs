@@ -446,6 +446,7 @@ fn execute_package_runtime_restore(
             entrypoints,
             &config,
             &effect,
+            &original,
         )
     }))
     .unwrap_or_else(|_| {

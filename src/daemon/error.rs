@@ -160,7 +160,7 @@ pub(crate) fn bound_compensation_message(message: String, bound: usize) -> Strin
 }
 
 /// A plugin load failure outside a package mutation's own typed reply.
-pub(crate) fn daemon_plugin_load_error(error: crate::HubLuaPluginLoadError) -> DaemonResponse {
+pub(crate) fn daemon_plugin_load_error(error: &crate::HubLuaPluginLoadError) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
     let message = error.to_string();
     response.error = Some(DaemonOperatorError {
@@ -449,6 +449,12 @@ pub enum DaemonTransportError {
     LocalWebrtc(crate::LocalWebrtcError),
     Runtime(crate::HubRuntimeError),
     Lifecycle(crate::HubLifecycleError),
+    /// A plugin failed to load before the runtime changed: whatever version of
+    /// the package was loaded before is still loaded and serving.
+    PluginLoadRefused {
+        package_name: String,
+        error: crate::HubLuaPluginLoadError,
+    },
     /// A package mutation side effect failed, and one or more rollback steps also failed.
     PackageCompensation {
         original: Box<DaemonTransportError>,
@@ -500,6 +506,7 @@ impl fmt::Display for DaemonTransportError {
             Self::LocalWebrtc(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error:?}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
+            Self::PluginLoadRefused { error, .. } => write!(formatter, "{error}"),
             Self::PackageCompensation {
                 original,
                 rollbacks,
