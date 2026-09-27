@@ -385,19 +385,38 @@ approved for this plan.
 | Request-body credit (Core ingress; then the Hub retained charge) | per plugin | host-call request bodies until backend disposal | 512 KiB (approved) |
 | Result producer and encoding (Hub callback account) | per plugin | producer buffer plus encoded bytes during overlap | 2 x 512 KiB (derived from the pool) |
 | Stream records and ledger charges (Hub callback account) | per plugin | one record per armed stream; one charge per open chain | about 160 KiB (derived: 128 records of fixed size plus `PATH_MAX`) |
+| Lifecycle maps (Hub callback account) | per plugin | the plugin's rows in the Hub lifecycle maps (`descriptors`, `event_handlers`, `loaded`), sized from the admitted manifest and registration at load and charged in the retained share. Unfunded today: `plugin_worker_metadata_bytes` has only a test caller (`prepare_worker_resources`). | derived from the manifest (no new number) |
+| Log ring (Hub callback account) | per plugin, charged as records arrive (not reserved at load) | `botster.log` records (section 7.1) | up to 256 records / 512 KiB (approved); 8 x 512 KiB = 4 MiB at most, taken from the remainder below |
 | Module staging (Hub callback account) | global, temporary | ONE 16 MiB staging permit; package loads stage one at a time and release the permit when the VM holds the text | 16 MiB (approved) |
-| Hub callback account total | global | 8 x about 3.7 MiB retained shares + 16 MiB staging = about 45.6 MiB; the rest (about 18 MiB) stays for existing users (for example up to 8 MiB of entity publishes in flight) | 64 MiB (existing, unchanged) |
+| Hub callback account total | global | 8 x about 3.7 MiB retained shares + 16 MiB staging = about 45.6 MiB; the rest (about 18 MiB) stays for existing users (for example up to 8 MiB of entity publishes in flight) and the log rings (at most 4 MiB) | 64 MiB (existing, unchanged) |
 
 Load reserves the plugin's whole retained share (queue split, completion
 entries and bytes, reply and request credits, callback share) in one
 all-or-nothing step, then waits for the staging permit. If any part cannot be
 reserved, the load fails with `quota_exceeded` and nothing stays reserved.
 
-Required proofs (slice 3): 8 plugins load, and an ordinary event is still
-delivered while all 8 hold their full shares; the early-final ordering test
-(section 4.2); a 3rd concurrent request-response call to one plugin is
-`backpressured` while a sibling answers; a 9th plugin's load is refused with
-`quota_exceeded`.
+**Reload headroom (orchestrator decision, 2026-09-27).** Each loaded plugin
+holds its full 16 MiB per-VM charge against the 128 MiB total from load to
+unload (`LuaPluginRuntime::new_named` calls `reserve_vm`). A reload builds the
+new VM before it drops the old one, so for a moment it holds two charges.
+- The load maximum stays 8.
+- The steady state that keeps reload working is 7 plugins plus 1 reload slot.
+  The Hub does not reserve that slot.
+- A reload while 8 plugins are loaded is refused with a typed error that names
+  the cause: the VM budget is full during reload; unload another plugin or
+  retry.
+
+Required proofs (slice 3):
+- 8 plugins load, and an ordinary event is still delivered while all 8 hold
+  their full shares.
+- The early-final ordering test (section 4.2).
+- A 3rd concurrent request-response call to one plugin is `backpressured`
+  while a sibling answers.
+- A 9th plugin's load is refused with `quota_exceeded`.
+- A reload while 8 are loaded gets the typed reload refusal. A reload while 7
+  are loaded succeeds.
+- The lifecycle-map charge is taken at load and returned at unload (ablation:
+  skip the charge, and the accounting assertion fails).
 
 ### 5.1 The delivery pool (host calls only)
 
