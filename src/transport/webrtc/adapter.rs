@@ -1622,4 +1622,73 @@ mod tests {
         );
         assert_eq!(ClosedHandle::core_close_reason(&host_first_handle), None);
     }
+
+    /// Both close orders race through the one-slot cause: the competing
+    /// close runs inside the first close's window (the commit seam). The
+    /// winner decides every hook report, the handle's state and the mux
+    /// event; late and repeated closes change none of them.
+    #[test]
+    fn competing_host_and_core_closes_report_only_the_first_close() {
+        for core_starts in [true, false] {
+            let mux = WebRtcConnectionMux::new();
+            let (mut adapter, handle) = mux.create_adapter();
+            mux.register("s".into(), "sub".into(), 1, handle.clone());
+            let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = std::sync::Arc::clone(&reports);
+            handle.attach_close_hook(move |report| captured.lock().unwrap().push(report));
+            let competitor = handle.clone();
+            if core_starts {
+                // Core observed open; the Host close lands before its commit.
+                handle
+                    .inner
+                    .slot
+                    .set_close_commit_seam(move || competitor.close_from_host());
+                TerminalAdapter::close(&mut adapter, botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed);
+            } else {
+                handle.inner.slot.set_close_commit_seam({
+                    let slot_handle = handle.clone();
+                    move || slot_handle.inner.slot.close_from_core(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed)
+                });
+                handle.close_from_host();
+            }
+            // Late and repeated closes from every side.
+            TerminalAdapter::close(&mut adapter, botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed);
+            TerminalAdapter::close(
+                &mut adapter,
+                botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+            );
+            handle.close_from_host();
+            drop(adapter);
+            // The competitor inside the window commits first, so it wins.
+            let (host_won, worker_lost) = (core_starts, !core_starts);
+            let winner = crate::transport::shared::close_reason::CloseReport {
+                host_closed: host_won,
+                worker_lost,
+            };
+            let reports = reports.lock().unwrap().clone();
+            assert!(!reports.is_empty(), "core_starts={core_starts}");
+            assert!(
+                reports.iter().all(|report| *report == winner),
+                "core_starts={core_starts} reports={reports:?}"
+            );
+            assert_eq!(ClosedHandle::host_closed(&handle), host_won);
+            assert_eq!(
+                ClosedHandle::core_close_reason(&handle),
+                (!core_starts).then_some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed)
+            );
+            // The registry calls the session ended: only a lost worker reports.
+            mux.queue_closed_subscription_events(|_| false);
+            match mux.pop_pending_event() {
+                Some(DaemonEvent::TerminalSubscriptionClosed { reason, .. }) => {
+                    assert!(!core_starts, "a Host-won close must stay silent here");
+                    assert_eq!(
+                        reason,
+                        botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST
+                    );
+                }
+                None => assert!(core_starts, "a Core-won worker loss must report"),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+    }
 }
