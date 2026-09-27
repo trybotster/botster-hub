@@ -2792,6 +2792,28 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 );
             }
         }
+        DaemonResponseKind::PluginLogs => {
+            println!("response=plugin_logs");
+            if let Some(logs) = response.plugin_logs {
+                println!("package_name={}", logs.package_name);
+                println!("next_seq={}", logs.next_seq);
+                println!("first_available_seq={}", logs.first_available_seq);
+                for record in logs.records {
+                    let fields = record
+                        .fields
+                        .map(|fields| fields.to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "record seq={} at_ms={} level={} dropped_before={} message={} fields={fields}",
+                        record.seq,
+                        record.at_ms,
+                        record.level,
+                        record.dropped_before,
+                        record.message
+                    );
+                }
+            }
+        }
         DaemonResponseKind::PluginMcpTools => {
             println!("response=plugin_mcp_tools");
             println!("tool_count={}", response.plugin_tools.len());

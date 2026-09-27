@@ -333,6 +333,24 @@ pub(crate) fn handle_runtime(
             .unwrap_or(ControlStep::Ready(Err(
                 DaemonTransportError::DaemonNotRunning,
             ))),
+        DaemonRequest::ReadPluginLogs {
+            package_name,
+            after_seq,
+        } => {
+            let Some(runtime) = daemon.runtime() else {
+                return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
+            };
+            // The owner never waits: a plugin appending right now yields a
+            // retryable refusal instead of a lock wait.
+            match runtime.plugin_logs().read(&package_name, after_seq) {
+                Ok(page) => ControlStep::ready(
+                    crate::client_api_dto::response::daemon_plugin_logs(package_name, page),
+                ),
+                Err(crate::plugin_logs::ReadError::Busy) => {
+                    ControlStep::ready(daemon_plugin_logs_busy())
+                }
+            }
+        }
         DaemonRequest::PluginMcpCallTool { name, arguments } => {
             let Some(request_id) = state.plugin_controls.next_request_id() else {
                 return plugin_control_refused(
@@ -691,6 +709,20 @@ pub(crate) fn submit_host_job(
             .submission_failure = Some(failure);
         state.plugin_controls.capacity_waiters.insert(waiter_id);
     }
+}
+
+fn daemon_plugin_logs_busy() -> botster_hub_client::DaemonResponse {
+    let mut response = crate::client_api_dto::response::daemon_response_base(
+        botster_hub_client::DaemonResponseKind::OperatorError,
+    );
+    response.error = Some(botster_hub_client::DaemonOperatorError {
+        code: "plugin_logs_busy".to_string(),
+        request_id: "daemon-read-plugin-logs".to_string(),
+        operation: "read_plugin_logs".to_string(),
+        message: "the plugin is writing a log record; retry the read".to_string(),
+        diagnostics: Vec::new(),
+    });
+    response
 }
 
 fn plugin_control_refused(

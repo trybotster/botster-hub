@@ -212,6 +212,7 @@ export type DaemonRequest =
   | { type: "package_entrypoint_status"; package_name: string; entrypoint_id: string }
   | { type: "plugin_lifecycle_status" }
   | { type: "plugin_mcp_list_tools" }
+  | { type: "read_plugin_logs"; package_name: string; after_seq?: number }
   | { type: "plugin_mcp_call_tool"; name: string; arguments: JsonValue }
   | { type: "plugin_surface_render"; package_name: string; surface_id: string; payload: JsonValue }
   | { type: "plugin_surface_action"; package_name: string; request: UiActionRequest }
@@ -253,6 +254,7 @@ export interface DaemonResponse {
   plugin_tools: JsonValue[];
   plugin_tool_result: JsonValue;
   plugin_surface?: DaemonPluginSurface | null;
+  plugin_logs?: DaemonPluginLogs | null;
   plugin_action_result?: UiActionResult;
   local_webrtc_bootstrap?: DaemonLocalWebrtcBootstrap | null;
   local_webrtc_answer?: DaemonLocalWebrtcAnswer | null;
@@ -336,6 +338,22 @@ export interface DaemonSnapshotPage {
   bytes: number;
 }
 
+export interface DaemonPluginLogs {
+  package_name: string;
+  records: DaemonPluginLogRecord[];
+  next_seq: number;
+  first_available_seq: number;
+}
+
+export interface DaemonPluginLogRecord {
+  seq: number;
+  at_ms: number;
+  level: string;
+  message: string;
+  fields?: JsonValue;
+  dropped_before: number;
+}
+
 export interface DaemonPluginSurface {
   package_name: string;
   surface_id: string;
@@ -396,6 +414,7 @@ export type DaemonResponseKind =
   | "quarantine_resolved"
   | "plugin_lifecycle"
   | "plugin_mcp_tools"
+  | "plugin_logs"
   | "plugin_mcp_tool_result"
   | "plugin_surface"
   | "plugin_action_result"
