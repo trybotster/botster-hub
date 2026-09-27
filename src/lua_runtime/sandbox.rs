@@ -492,6 +492,7 @@ mod tests {
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
             memory: hub.lua_plugin_host_api().memory,
+            logs: hub.lua_plugin_host_api().logs,
         }
     }
 
