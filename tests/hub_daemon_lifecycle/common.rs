@@ -614,6 +614,8 @@ thread_local! {
     /// its own thread, so the registry is per test.
     static TEST_OWNED_DIR_TOKENS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Test seam: the census program. Only the sweep's own proofs change it.
+    static TEST_OWNED_CENSUS_PROGRAM: Cell<&'static str> = const { Cell::new("ps") };
 }
 
 /// How long a process that names a test-owned directory may take to exit on
@@ -621,7 +623,7 @@ thread_local! {
 const TEST_OWNED_PROCESS_SETTLE: Duration = Duration::from_secs(2);
 const TEST_OWNED_PROCESS_TERM_GRACE: Duration = Duration::from_secs(2);
 
-fn register_test_owned_dir(path: &Path) {
+pub(crate) fn register_test_owned_dir(path: &Path) {
     // The final component is unique per call, and it survives both a relative
     // `--data-dir` argument and /tmp → /private/tmp canonicalization.
     if let Some(token) = path.file_name().and_then(|name| name.to_str()) {
@@ -629,72 +631,184 @@ fn register_test_owned_dir(path: &Path) {
     }
 }
 
-/// Processes whose command line names a directory this test created.
-pub(crate) fn test_owned_process_rows(tokens: &[String]) -> Vec<(u32, u32, String)> {
-    let Ok(output) = Command::new("ps")
-        .args(["-axo", "pid=,pgid=,command="])
+pub(crate) fn set_test_owned_census_program(program: &'static str) {
+    TEST_OWNED_CENSUS_PROGRAM.with(|slot| slot.set(program));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestOwnedProcess {
+    pub(crate) pid: u32,
+    pub(crate) ppid: u32,
+    pub(crate) pgid: u32,
+    pub(crate) command: String,
+}
+
+/// Every live (non-zombie) process except this one. A census that cannot run
+/// or exits nonzero is an error, never an empty host.
+fn test_owned_census() -> Result<Vec<TestOwnedProcess>, String> {
+    let program = TEST_OWNED_CENSUS_PROGRAM.with(Cell::get);
+    let output = Command::new(program)
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
         .output()
-    else {
-        return Vec::new();
-    };
+        .map_err(|error| format!("test-owned process census `{program}` did not run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "test-owned process census `{program}` exited with {}: stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let own_pid = std::process::id();
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
             let pid: u32 = parts.next()?.parse().ok()?;
+            let ppid: u32 = parts.next()?.parse().ok()?;
             let pgid: u32 = parts.next()?.parse().ok()?;
+            let stat = parts.next()?;
             let command = parts.collect::<Vec<_>>().join(" ");
-            (pid != own_pid && tokens.iter().any(|token| command.contains(token.as_str())))
-                .then_some((pid, pgid, command))
+            (pid != own_pid && !stat.contains('Z')).then_some(TestOwnedProcess {
+                pid,
+                ppid,
+                pgid,
+                command,
+            })
         })
-        .collect()
+        .collect())
 }
 
-fn wait_for_test_owned_rows_absent(tokens: &[String], grace: Duration) -> Vec<(u32, u32, String)> {
-    let deadline = Instant::now() + grace;
-    loop {
-        let rows = test_owned_process_rows(tokens);
-        if rows.is_empty() || Instant::now() >= deadline {
-            return rows;
+/// Processes whose command line names a directory this test created.
+pub(crate) fn test_owned_process_rows(tokens: &[String]) -> Result<Vec<TestOwnedProcess>, String> {
+    Ok(test_owned_census()?
+        .into_iter()
+        .filter(|row| {
+            tokens
+                .iter()
+                .any(|token| row.command.contains(token.as_str()))
+        })
+        .collect())
+}
+
+/// The identities the sweep owns once it has found a leak: the matched PIDs,
+/// every descendant of them, and every process group they started (never the
+/// harness's own group). Ownership is retained, not rediscovered from argv, so
+/// a descendant without the token still counts after its parent exits.
+struct TestOwnedIdentities {
+    tokens: Vec<String>,
+    pids: std::collections::BTreeSet<u32>,
+    pgids: std::collections::BTreeSet<u32>,
+    own_pgid: u32,
+}
+
+impl TestOwnedIdentities {
+    fn new(tokens: Vec<String>) -> Self {
+        Self {
+            tokens,
+            pids: Default::default(),
+            pgids: Default::default(),
+            own_pgid: unsafe { libc::getpgrp() } as u32,
         }
-        thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Adds token matches, descendants and started groups from one census,
+    /// then returns the live owned rows.
+    fn census(&mut self) -> Result<Vec<TestOwnedProcess>, String> {
+        let rows = test_owned_census()?;
+        loop {
+            let before = (self.pids.len(), self.pgids.len());
+            for row in &rows {
+                let owned = self
+                    .tokens
+                    .iter()
+                    .any(|token| row.command.contains(token.as_str()))
+                    || self.pids.contains(&row.pid)
+                    || self.pids.contains(&row.ppid)
+                    || self.pgids.contains(&row.pgid);
+                if owned {
+                    self.pids.insert(row.pid);
+                    if row.pgid != self.own_pgid && row.pgid > 1 {
+                        self.pgids.insert(row.pgid);
+                    }
+                }
+            }
+            if (self.pids.len(), self.pgids.len()) == before {
+                break;
+            }
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|row| self.pids.contains(&row.pid) || self.pgids.contains(&row.pgid))
+            .collect())
+    }
+
+    fn signal(&self, live: &[TestOwnedProcess], signal: libc::c_int) {
+        for pgid in &self.pgids {
+            unsafe { libc::killpg(*pgid as libc::pid_t, signal) };
+        }
+        for row in live.iter().filter(|row| !self.pgids.contains(&row.pgid)) {
+            unsafe { libc::kill(row.pid as libc::pid_t, signal) };
+        }
+    }
+
+    fn wait_absent(&mut self, grace: Duration) -> Result<Vec<TestOwnedProcess>, String> {
+        let deadline = Instant::now() + grace;
+        loop {
+            let live = self.census()?;
+            if live.is_empty() || Instant::now() >= deadline {
+                return Ok(live);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
-/// Stops every process left behind that names a directory this test created.
-/// It signals only recorded PIDs, or the process groups they lead, never by
-/// name. On the success path a leftover process is a test defect and fails
-/// the test; while unwinding it is cleaned up and reported.
-fn sweep_test_owned_processes() {
+/// Stops every process left behind that names a directory this test created,
+/// with its descendants and the groups they started. It signals only those
+/// recorded identities, never by name. On the success path a leftover process
+/// or a failed census fails the test; while unwinding, the original panic
+/// stays the reported failure and the sweep only reports. A survivor or a
+/// failed census also taints the harness, because absence is unproven.
+pub(crate) fn sweep_test_owned_processes() {
     let tokens = TEST_OWNED_DIR_TOKENS.with(|tokens| std::mem::take(&mut *tokens.borrow_mut()));
     if tokens.is_empty() {
         return;
     }
-    let leaked = wait_for_test_owned_rows_absent(&tokens, TEST_OWNED_PROCESS_SETTLE);
-    if leaked.is_empty() {
-        return;
-    }
-    let own_pgid = unsafe { libc::getpgrp() } as u32;
-    for signal in [libc::SIGTERM, libc::SIGKILL] {
-        for (pid, pgid, _) in test_owned_process_rows(&tokens) {
-            if pgid == pid && pgid != own_pgid {
-                let _ = signal_test_group_or_child(pid, signal);
-            } else {
-                unsafe { libc::kill(pid as libc::pid_t, signal) };
+    let mut owned = TestOwnedIdentities::new(tokens);
+    let outcome = (|| -> Result<Option<String>, String> {
+        // A fixture may still be exiting on its own. Each census retains the
+        // descendants and groups it sees, so a child that outlives its
+        // token-named parent during the settle is still owned.
+        let leaked = owned.wait_absent(TEST_OWNED_PROCESS_SETTLE)?;
+        if leaked.is_empty() {
+            return Ok(None);
+        }
+        let mut live = leaked.clone();
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            owned.signal(&live, signal);
+            live = owned.wait_absent(TEST_OWNED_PROCESS_TERM_GRACE)?;
+            if live.is_empty() {
+                break;
             }
         }
-        if wait_for_test_owned_rows_absent(&tokens, TEST_OWNED_PROCESS_TERM_GRACE).is_empty() {
-            break;
+        if live.is_empty() {
+            Ok(Some(format!(
+                "test-owned processes outlived the test: leaked={leaked:?}"
+            )))
+        } else {
+            Err(format!(
+                "test-owned processes outlived the test and survived SIGKILL: leaked={leaked:?} survivors={live:?}"
+            ))
         }
-    }
-    let survivors = test_owned_process_rows(&tokens);
-    let report = format!(
-        "test-owned processes outlived the test: leaked={leaked:?} survivors_after_sigkill={survivors:?}"
-    );
-    if !survivors.is_empty() {
-        record_harness_taint(report.clone());
-    }
+    })();
+    let report = match outcome {
+        Ok(None) => return,
+        Ok(Some(report)) => report,
+        Err(error) => {
+            record_harness_taint(error.clone());
+            error
+        }
+    };
     if std::thread::panicking() {
         eprintln!("{report}");
     } else {
