@@ -667,13 +667,19 @@ impl HostMutationContinuation {
                 // A commit whose Host job returned no mutation result has an
                 // unknown outcome: preserve it, then release admission.
                 if let Some(obligation) = commit_obligation.take() {
-                    let kind = match &result {
-                        HostResult::Failed { error, .. } => {
-                            UnknownOutcomeKind::from_host_code(&error.code)
-                        }
-                        _ => UnknownOutcomeKind::Other,
+                    let (kind, detail) = match &result {
+                        HostResult::Failed { error, .. } => (
+                            UnknownOutcomeKind::from_host_code(&error.code),
+                            format!("{}: {}", error.code, error.message),
+                        ),
+                        _ => (
+                            UnknownOutcomeKind::Other,
+                            "the host returned a non-mutation result".to_string(),
+                        ),
                     };
-                    return finish_unknown_commit(state, waiter_id, permit, obligation, kind);
+                    return finish_unknown_commit(
+                        state, waiter_id, permit, obligation, kind, &detail,
+                    );
                 }
                 state.release_uncertain_reservation(waiter_id);
                 return finish_error(
@@ -778,15 +784,17 @@ impl HostMutationContinuation {
                 let (code, message) = cause.client_error();
                 let crate::host_mutations::ExternalEffectCause::RepoPublicationSyncUnconfirmed {
                     cause: publication,
-                    ..
+                    _error: error,
                 } = cause;
                 let Some(CommitObligation::Repo(pending)) = obligation else {
                     unreachable!("a repository commit carries its funded quarantine entry");
                 };
                 // Scoped: only this repository root stops accepting writes.
-                state
-                    .repo_session_type_quarantine
-                    .install(pending, QuarantineCause::PublishedUncertain(publication));
+                state.repo_session_type_quarantine.install(
+                    pending,
+                    QuarantineCause::PublishedUncertain(publication),
+                    &error.message,
+                );
                 release_document(state, waiter_id);
                 drop(permit);
                 ControlPoll::Ready(Ok(error_response(code, "repo_session_type", message)))
@@ -1237,8 +1245,7 @@ fn admit_or_park_commit(
         daemon.state_view().0,
     ) {
         DocumentAdmission::Granted => {
-            let evidence = prepared.commit_evidence();
-            if let crate::host_mutations::CommitEvidence::RepoFile(repo) = &evidence
+            if let Some(repo) = prepared.repo_evidence()
                 && state.repo_session_type_quarantine.contains(&repo.root)
             {
                 #[cfg(test)]
@@ -1262,8 +1269,8 @@ fn admit_or_park_commit(
                     },
                 );
             }
-            let held = match evidence {
-                crate::host_mutations::CommitEvidence::RepoFile(repo) => {
+            let held = match (prepared.repo_evidence(), prepared.document_views()) {
+                (Some(repo), _) => {
                     // Fund the quarantine entry before the file effect.
                     let budget = daemon.state_view().1.budget();
                     match PendingRepoQuarantine::reserve(repo, &budget) {
@@ -1286,15 +1293,14 @@ fn admit_or_park_commit(
                         }
                     }
                 }
-                crate::host_mutations::CommitEvidence::Document {
-                    base_revision,
-                    prior,
-                    candidate,
-                } => CommitObligation::Document {
-                    base_revision,
+                (None, Some((prior, candidate))) => CommitObligation::Document {
+                    base_revision: prepared.base_revision,
                     prior,
                     candidate,
                 },
+                (None, None) => {
+                    unreachable!("every prepared change writes a repository file or a document")
+                }
             };
             *obligation = Some(held);
             let poll = submit_phase(
@@ -1766,13 +1772,16 @@ fn finish_unknown_commit(
     permit: HostWorkPermit,
     obligation: CommitObligation,
     kind: UnknownOutcomeKind,
+    detail: &str,
 ) -> ControlPoll {
     let (code, message) = match obligation {
         CommitObligation::Repo(pending) => {
             state.release_uncertain_reservation(waiter_id);
-            state
-                .repo_session_type_quarantine
-                .install(pending, QuarantineCause::UnknownOutcome(kind));
+            state.repo_session_type_quarantine.install(
+                pending,
+                QuarantineCause::UnknownOutcome(kind),
+                detail,
+            );
             (
                 "repo_session_type_publication_uncertain",
                 "the repository session-type write ended without a result; its outcome is unknown",
@@ -1783,6 +1792,9 @@ fn finish_unknown_commit(
             prior,
             candidate,
         } => {
+            crate::hub_log::hub_log!(
+                "state_publication_outcome_unknown base_revision={base_revision} kind={kind:?} detail={detail}"
+            );
             state.retain_uncertain_unknown(
                 waiter_id,
                 UnknownDocumentOutcome {
@@ -2703,7 +2715,6 @@ mod tests {
             // One owner turn routes Host completions, absorbs the catalog
             // build, and runs subscriber delivery, as production does.
             crate::daemon::owner_loop::drive_ready_test_turn(daemon, state);
-            crate::subscription::entity::drive_entity_subscriptions(daemon, state);
             while let Ok(frame) = receiver.try_recv() {
                 if found(&frame) {
                     return frame;

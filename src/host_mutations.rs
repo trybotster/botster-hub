@@ -676,35 +676,33 @@ pub(crate) struct RepoWriteEvidence {
     pub(crate) candidate_sha256: [u8; 32],
 }
 
-/// What the owner keeps from a prepared commit before the Host runs it.
-pub(crate) enum CommitEvidence {
-    RepoFile(RepoWriteEvidence),
-    Document {
-        base_revision: u64,
-        prior: Option<SharedView<HubState>>,
-        candidate: SharedView<HubState>,
-    },
-}
-
 impl PreparedMutation {
-    /// Copy the pre-effect evidence the owner keeps while the Host commits.
-    /// Document views are shared, so this retains no new allocation.
-    pub(crate) fn commit_evidence(&self) -> CommitEvidence {
-        let write = match &self.change {
+    /// Borrow a repository write's pre-effect evidence, so the owner can fund
+    /// its quarantine entry before copying it.
+    pub(crate) fn repo_evidence(&self) -> Option<&RepoWriteEvidence> {
+        match &self.change {
             PreparedChange::SessionType(PreparedSessionTypeChange::RepoFile {
                 evidence, ..
-            }) => return CommitEvidence::RepoFile(evidence.clone()),
+            }) => Some(evidence),
+            _ => None,
+        }
+    }
+
+    /// Share a document write's prior and candidate views. The views are
+    /// already charged, so this retains no new allocation.
+    pub(crate) fn document_views(
+        &self,
+    ) -> Option<(Option<SharedView<HubState>>, SharedView<HubState>)> {
+        let write = match &self.change {
+            PreparedChange::SessionType(PreparedSessionTypeChange::RepoFile { .. }) => {
+                return None;
+            }
             PreparedChange::SessionType(PreparedSessionTypeChange::Document(change))
             | PreparedChange::PackageConfiguration(change)
             | PreparedChange::SpawnTarget(change)
             | PreparedChange::RegisteredWorktree(change) => &change.write,
         };
-        let (prior, candidate) = write.views();
-        CommitEvidence::Document {
-            base_revision: self.base_revision,
-            prior,
-            candidate,
-        }
+        Some(write.views())
     }
 }
 
@@ -2051,12 +2049,25 @@ fn prepare_session_type(
     } else {
         pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?
     };
+    // The retained repository change: its root, the exact encoded file bytes,
+    // and the evidence the owner copies (root, target path, and id again).
     let repo_write_bytes = repo_write
         .as_ref()
         .map(|(root, definitions)| {
+            let root_len = root.as_os_str().as_encoded_bytes().len();
             checked_total(&[
-                root.as_os_str().as_encoded_bytes().len(),
-                encoded_len(definitions, "host_prepared_session_types_encode_failed")?,
+                root_len,
+                encoded_len(
+                    &RepoSessionTypesFile {
+                        session_types: definitions,
+                    },
+                    "host_prepared_session_types_encode_failed",
+                )?,
+                std::mem::size_of::<RepoWriteEvidence>(),
+                root_len,
+                root_len,
+                REPO_SESSION_TYPES_TARGET.len(),
+                session_type_id.len(),
             ])
         })
         .transpose()?
@@ -2075,13 +2086,26 @@ fn prepare_session_type(
         ));
     }
     let change = if let Some((root, definitions)) = repo_write {
-        let bytes = encode_repo_session_type_bytes(&definitions).map_err(session_type_error)?;
+        let mut bytes = encode_repo_session_type_bytes(&definitions).map_err(session_type_error)?;
+        // The change retains these bytes, so retain no spare capacity.
+        bytes.shrink_to_fit();
+        debug_assert_eq!(
+            Some(bytes.len()),
+            encoded_len(
+                &RepoSessionTypesFile {
+                    session_types: &definitions,
+                },
+                "host_prepared_session_types_encode_failed",
+            )
+            .ok(),
+            "the counted file length is the written length"
+        );
         let prior_sha256 = match repo_file.as_ref().map(|rollback| &rollback.prior) {
             Some(RepoSessionTypeFileSnapshot::Present(prior)) => Some(sha256(prior)),
             Some(RepoSessionTypeFileSnapshot::Missing) | None => None,
         };
         let evidence = RepoWriteEvidence {
-            target_path: root.join(".botster/session-types.json"),
+            target_path: root.join(REPO_SESSION_TYPES_TARGET),
             root: root.clone(),
             session_type_id,
             operation,
@@ -2454,6 +2478,16 @@ fn fire_commit_panic(key: &std::path::Path, point: CommitPanicPoint) {
     if armed {
         panic!("test-injected commit panic at {point:?}");
     }
+}
+
+/// The repository session-types file, relative to its root.
+const REPO_SESSION_TYPES_TARGET: &str = ".botster/session-types.json";
+
+/// The written shape of the repository session-types file, for counting its
+/// exact encoded length before allocating it.
+#[derive(serde::Serialize)]
+struct RepoSessionTypesFile<'a> {
+    session_types: &'a [crate::session_types::PackageSessionType],
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -3654,12 +3688,34 @@ mod tests {
             panic!("session-type preparation must succeed");
         };
         crate::session_types::inject_next_repo_directory_sync_failure(&root);
-        let CommitEvidence::RepoFile(evidence) = prepared.commit_evidence() else {
-            panic!("a repository prepare carries repository evidence");
-        };
+        let evidence = prepared
+            .repo_evidence()
+            .expect("a repository prepare carries repository evidence")
+            .clone();
         assert_eq!(evidence.prior_sha256, None, "the prior file was missing");
         assert_eq!(evidence.session_type_id, "review");
         assert_eq!(evidence.operation, SessionTypeOperation::Create);
+        let root_len = evidence.root.as_os_str().len();
+        let file_len = match &prepared.change {
+            PreparedChange::SessionType(PreparedSessionTypeChange::RepoFile { bytes, .. }) => {
+                assert_eq!(
+                    bytes.capacity(),
+                    bytes.len(),
+                    "no spare capacity is retained"
+                );
+                bytes.len()
+            }
+            _ => panic!("a repository prepare carries its file bytes"),
+        };
+        assert!(
+            prepared.logical_bytes
+                >= file_len
+                    + std::mem::size_of::<RepoWriteEvidence>()
+                    + 3 * root_len
+                    + REPO_SESSION_TYPES_TARGET.len()
+                    + evidence.session_type_id.len(),
+            "the Host bound counts the retained file bytes and the copied evidence"
+        );
         let HostMutationResult::ExternalEffectUncertain {
             cause:
                 ExternalEffectCause::RepoPublicationSyncUnconfirmed {
