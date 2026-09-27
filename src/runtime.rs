@@ -179,6 +179,8 @@ pub struct HubRuntime {
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
+    /// Cross-thread wakes for owner work; producers raise, the owner waits.
+    owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     causal_queue: CausalOwnerQueue,
@@ -679,9 +681,13 @@ impl HubRuntime {
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
         let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
-        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
-            config.package_event_plane,
-        ));
+        let owner_signal = Arc::<crate::daemon::owner_signal::OwnerSignal>::default();
+        let package_event_router = Arc::new(
+            crate::package_event_router::PackageEventRouter::with_owner_signal(
+                config.package_event_plane,
+                Arc::clone(&owner_signal),
+            ),
+        );
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
         Ok(Self {
@@ -740,6 +746,7 @@ impl HubRuntime {
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
+            owner_signal,
             event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
@@ -873,9 +880,13 @@ impl HubRuntime {
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
         let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
-        let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
-            config.package_event_plane,
-        ));
+        let owner_signal = Arc::<crate::daemon::owner_signal::OwnerSignal>::default();
+        let package_event_router = Arc::new(
+            crate::package_event_router::PackageEventRouter::with_owner_signal(
+                config.package_event_plane,
+                Arc::clone(&owner_signal),
+            ),
+        );
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
         let mut runtime = Self {
@@ -934,6 +945,7 @@ impl HubRuntime {
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
+            owner_signal,
             event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
@@ -1091,6 +1103,10 @@ impl HubRuntime {
     #[must_use]
     pub fn package_event_router(&self) -> &Arc<crate::package_event_router::PackageEventRouter> {
         &self.package_event_router
+    }
+
+    pub(crate) fn owner_signal(&self) -> &Arc<crate::daemon::owner_signal::OwnerSignal> {
+        &self.owner_signal
     }
 
     #[must_use]

@@ -428,6 +428,11 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if let Some(runtime) = daemon.runtime() {
+        state
+            .maintenance
+            .mark_signaled_waits(runtime.owner_signal());
+    }
     if state.entity_capacity_wake.take() {
         state
             .maintenance
@@ -650,18 +655,31 @@ fn classify_owner_poll(
 
 async fn receive_owner_event(
     control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
+    signal: Option<&crate::daemon::owner_signal::OwnerSignal>,
     deadline: Option<Instant>,
 ) -> OwnerEvent {
+    let rung = async {
+        match signal {
+            Some(signal) => signal.rung().await,
+            None => std::future::pending().await,
+        }
+    };
     match deadline {
         Some(deadline) if deadline <= Instant::now() => OwnerEvent::Reconcile,
         Some(deadline) => tokio::select! {
             biased;
             message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
+            () = rung => OwnerEvent::Reconcile,
+            // timer: deadline — the owner's next retained-obligation or request deadline
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 OwnerEvent::Reconcile
             }
         },
-        None => OwnerEvent::Control(Box::new(control_rx.recv().await)),
+        None => tokio::select! {
+            biased;
+            message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
+            () = rung => OwnerEvent::Reconcile,
+        },
     }
 }
 
@@ -761,9 +779,6 @@ fn run_owner_maintenance_slice(
         }
         other => {
             if let Some(runtime) = daemon.runtime() {
-                if runtime.package_event_router().peek_delivery_wake() {
-                    state.maintenance.try_wake();
-                }
                 if let Some(core_work) = maintenance_core_work(other) {
                     if let Some(waiter_id) = background_waiter_id(state, core_work) {
                         run_maintenance_kind_for_owner(
@@ -1336,6 +1351,9 @@ fn serve_daemon_inner(
             OwnerPollDecision::Block => {
                 match transport_runtime.block_on(receive_owner_event(
                     &mut control_rx,
+                    daemon
+                        .runtime()
+                        .map(|runtime| runtime.owner_signal().as_ref()),
                     next_owner_deadline(&control_state),
                 )) {
                     OwnerEvent::Control(message) => Some(OwnerEvent::Control(message)),
@@ -5520,16 +5538,38 @@ mod tests {
             .expect("build owner event test runtime");
 
         assert!(matches!(
-            runtime.block_on(receive_owner_event(&mut control_rx, Some(Instant::now()))),
+            runtime.block_on(receive_owner_event(
+                &mut control_rx,
+                None,
+                Some(Instant::now())
+            )),
             OwnerEvent::Reconcile
         ));
         let OwnerEvent::Control(message) = runtime.block_on(receive_owner_event(
             &mut control_rx,
+            None,
             Some(Instant::now() + Duration::from_secs(1)),
         )) else {
             panic!("ready control message must win before a future reconciliation deadline");
         };
         assert!(matches!(*message, Some(ControlMessage::RejectedConnection)));
+    }
+
+    #[test]
+    fn a_signal_raised_before_the_wait_ends_the_owner_wait() {
+        let (_control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        let signal = crate::daemon::owner_signal::OwnerSignal::default();
+        signal.raise(crate::daemon::owner_signal::SignalKey::PackageEvents);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build owner event test runtime");
+        // No deadline and no control message: only the stored doorbell permit
+        // can end this wait.
+        assert!(matches!(
+            runtime.block_on(receive_owner_event(&mut control_rx, Some(&signal), None)),
+            OwnerEvent::Reconcile
+        ));
     }
 
     #[test]
