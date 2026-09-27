@@ -1592,6 +1592,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("original", "string"),
                     ("compensation", "string"),
                     ("durable", "boolean"),
+                    ("loaded", "boolean"),
                     ("quarantined_at_ms", "number"),
                 ],
             ),

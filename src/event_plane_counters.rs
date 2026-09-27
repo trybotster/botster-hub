@@ -620,6 +620,8 @@ impl EventPlaneCounters {
             EventDeliveryRefusal::GenerationUnloaded => &self.deliveries_generation_unloaded,
             EventDeliveryRefusal::PackageUnloaded => &self.deliveries_package_unloaded,
             EventDeliveryRefusal::HandlerAbsent => &self.deliveries_handler_absent,
+            // A quarantined package's deliveries retire as stranded.
+            EventDeliveryRefusal::PackageStranded => &self.events_stranded,
         }
     }
 
@@ -968,7 +970,10 @@ mod tests {
         for _ in 0..5 {
             counters.record_stage_overlap();
         }
-        counters.record_events_stranded(6);
+        // Retired copies and refused deliveries of a stranded package both
+        // count as stranded events.
+        counters.record_events_stranded(5);
+        counters.record_delivery_refusal(EventDeliveryRefusal::PackageStranded);
         for _ in 0..7 {
             counters.record_package_quarantine_not_durable();
         }

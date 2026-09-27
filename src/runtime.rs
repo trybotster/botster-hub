@@ -178,9 +178,6 @@ pub struct HubRuntime {
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
-    /// Packages whose compensation failed. Automatic reloads refuse them; an
-    /// explicit operator enable or reload clears the marker. In memory only.
-    stranded_packages: Arc<std::sync::Mutex<BTreeSet<String>>>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     causal_queue: CausalOwnerQueue,
     direct_family_cleanup: std::cell::RefCell<Option<HostPackageCleanup>>,
@@ -739,7 +736,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
-            stranded_packages: Arc::default(),
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -934,7 +930,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
-            stranded_packages: Arc::default(),
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -1563,7 +1558,7 @@ impl HubRuntime {
         HostPackageRuntime::new(
             self.plugin_lifecycle().clone(),
             self.lua_plugin_host_api(),
-            Arc::clone(&self.stranded_packages),
+            self.plugin_lifecycle().stranded_handle(),
         )
     }
 
@@ -1586,21 +1581,17 @@ impl HubRuntime {
         context
     }
 
-    /// Restore a durable quarantine at startup: automatic reloads refuse the
-    /// package until an operator resolves it.
+    /// Strand a package: automatic reloads refuse it, and it receives no
+    /// event and no invocation even while its runtime is loaded, until an
+    /// operator resolves it. Startup restores it from a durable quarantine;
+    /// the owner sets it at once when a compensation fails.
     pub(crate) fn mark_package_stranded(&self, package_name: &str) {
-        self.stranded_packages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(package_name.to_string());
+        self.plugin_lifecycle().mark_stranded(package_name);
     }
 
     /// Packages automatic reloads must refuse until an operator resolves them.
     pub(crate) fn stranded_packages(&self) -> BTreeSet<String> {
-        self.stranded_packages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.plugin_lifecycle().stranded_packages()
     }
 
     /// Apply cleanup identities after host execution completes.
@@ -1889,7 +1880,7 @@ impl HubRuntime {
     }
 
     /// Return the lifecycle before the daemon transfers its terminal ownership.
-    fn plugin_lifecycle(&self) -> &HubPluginLifecycle {
+    pub(crate) fn plugin_lifecycle(&self) -> &HubPluginLifecycle {
         self.plugin_lifecycle
             .as_ref()
             .expect("plugin lifecycle was taken for terminal disposal")
