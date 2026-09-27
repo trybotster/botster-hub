@@ -16,6 +16,7 @@ pub(crate) mod owner_turn;
 pub(crate) mod publication_owner;
 pub mod readiness;
 pub(crate) mod shutdown;
+pub(crate) mod worker_warm_up;
 
 use std::error::Error;
 use std::fmt;
