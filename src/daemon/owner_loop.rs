@@ -1928,6 +1928,13 @@ pub(crate) struct DaemonControlState {
     causal_wake_again: bool,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    /// A package event generation the document owner's failed effect staged
+    /// but never activated. Package mutations are serialized by the document
+    /// owner, so at most one exists; that attempt's runtime restore aborts it.
+    pub(crate) staged_package_generation: Option<(
+        crate::owner_identity::WaiterId,
+        crate::package_event_router::StagedGeneration,
+    )>,
     pub(crate) host_completion_drain_pending: bool,
     pub(crate) host_completion_drain_faulted: bool,
     pub(crate) host_capacity_wake_pending: bool,
@@ -2186,6 +2193,7 @@ impl Default for DaemonControlState {
             uncertain_publication: None,
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
+            staged_package_generation: None,
             host_completion_drain_pending: false,
             host_completion_drain_faulted: false,
             host_capacity_wake_pending: false,
@@ -10076,6 +10084,477 @@ return botster.register({tools = {{
         assert_eq!(entrypoint_command(&daemon, "zeta.plugin"), "bin/sleeper");
         assert!(entrypoint_is_running(&mut daemon, "zeta.plugin"));
         daemon.stop();
+    }
+
+    /// Production path of a failed compensation and its operator resolution:
+    /// the staged generation moves from the failed effect through the owner
+    /// to the quarantine Host job, which aborts it; the package is stranded and
+    /// an automatic refresh is refused; an explicit reload then commits,
+    /// releases the recovery record, and clears the stranded marker.
+    #[test]
+    fn explicit_reload_resolves_a_package_stranded_by_failed_compensation() {
+        let root = unique_package_control_dir("stranded-resolution");
+        let data_directory = root.join("data");
+        let package_dir = root.join("stranded.resolution");
+        write_package_control_manifest(
+            &package_dir,
+            "stranded.resolution",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start stranded daemon");
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+
+        // The enable commits, its effect stages and then panics on the Host
+        // worker, and the durable restore then fails: no restore is possible.
+        crate::runtime::package_effect::panic_after_stage_for("stranded.resolution");
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
+        let error = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "stranded.resolution".to_string(),
+            },
+        )
+        .expect_err("effect panic plus failed durable restore");
+        assert!(
+            matches!(error, DaemonTransportError::PackageCompensation { .. }),
+            "{error:?}"
+        );
+        assert!(
+            state.staged_package_generation.is_none(),
+            "the staged generation moved to the quarantine job"
+        );
+        assert!(
+            state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(record)
+                    if record.packages.contains("stranded.resolution")
+            )),
+            "the recovery record covers the stranded package"
+        );
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .stranded_packages()
+                .contains("stranded.resolution")
+        );
+
+        // An automatic refresh is refused while the package is stranded.
+        let refused = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RefreshLocalPackages,
+        )
+        .expect("the refusal is a typed response");
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("package_recovery_required"),
+            "{refused:?}"
+        );
+
+        // The explicit reload passes both recovery gates, stages cleanly (the
+        // failed attempt's pending generation was aborted), and resolves.
+        let resolved = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: "stranded.resolution".to_string(),
+            },
+        )
+        .expect("the explicit reload resolves the stranded package");
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::PackageDecision,
+            "{resolved:?}"
+        );
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
+            "resolution releases the recovery record"
+        );
+        assert!(
+            !daemon
+                .runtime()
+                .unwrap()
+                .stranded_packages()
+                .contains("stranded.resolution")
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A plugin entrypoint that does not parse. The unbalanced brace is built
+    /// from its code point so this source keeps balanced braces for the
+    /// production source scanners.
+    fn unparsable_lua() -> String {
+        format!("return botster.register({}\n", char::from(0x7b_u8))
+    }
+
+    /// Resolving one stranded package never reloads another. A failed refresh
+    /// strands A and B; an explicit reload of A that fails before its install
+    /// compensates A only, and B stays unloaded, stranded, and covered.
+    #[test]
+    fn a_failed_explicit_reload_never_reloads_another_stranded_package() {
+        let root = unique_package_control_dir("requarantine");
+        let data_directory = root.join("data");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start requarantine daemon");
+        let mut state = DaemonControlState::default();
+        let mut package_dirs = Vec::new();
+        for name in ["a.requarantine", "b.requarantine"] {
+            let package_dir = root.join(name);
+            write_package_control_manifest(
+                &package_dir,
+                name,
+                serde_json::json!({
+                    "capabilities": [{ "surface": "surfaces" }],
+                    "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+                }),
+            );
+            std::fs::write(
+                package_dir.join("plugin.lua"),
+                "return botster.register({})\n",
+            )
+            .expect("write lua");
+            drive_package_request_with_state(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::InstallPackageLocalPath {
+                    path: package_dir.clone(),
+                },
+            )
+            .expect("install");
+            let enabled = drive_package_request_with_state(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::EnablePackage {
+                    package_name: name.to_string(),
+                },
+            )
+            .expect("enable");
+            assert!(enabled.error.is_none(), "{enabled:?}");
+            package_dirs.push(package_dir);
+        }
+        assert!(plugin_is_loaded(&daemon, "b.requarantine"));
+
+        // The refresh panics after staging A and its durable restore fails:
+        // both refreshed packages are quarantined and stranded.
+        crate::runtime::package_effect::panic_after_stage_for("a.requarantine");
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
+        let error = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RefreshLocalPackages,
+        )
+        .expect_err("refresh panic plus failed durable restore");
+        assert!(
+            matches!(error, DaemonTransportError::PackageCompensation { .. }),
+            "{error:?}"
+        );
+        let stranded = daemon.runtime().unwrap().stranded_packages();
+        assert!(stranded.contains("a.requarantine") && stranded.contains("b.requarantine"));
+        assert!(!plugin_is_loaded(&daemon, "b.requarantine"));
+
+        // An explicit reload of A whose plugin no longer parses is refused
+        // before its install. Its compensation must not touch B.
+        std::fs::write(package_dirs[0].join("plugin.lua"), unparsable_lua()).expect("break A");
+        let refused = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: "a.requarantine".to_string(),
+            },
+        );
+        assert!(
+            !matches!(refused, Ok(ref response) if response.error.is_none()),
+            "the broken reload of A is refused: {refused:?}"
+        );
+        assert!(
+            !plugin_is_loaded(&daemon, "b.requarantine"),
+            "B was never resolved, so nothing may reload it"
+        );
+        let stranded = daemon.runtime().unwrap().stranded_packages();
+        assert!(stranded.contains("a.requarantine") && stranded.contains("b.requarantine"));
+        assert!(
+            state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(record)
+                    if record.packages.contains("b.requarantine")
+            )),
+            "B stays covered by its recovery record"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Compensation restores only the packages its effect changed. A failed
+    /// explicit reload of stranded A must not reload B, an unrelated enabled
+    /// package that is not stranded (its event generation must not move).
+    #[test]
+    fn compensation_never_reloads_an_unrelated_package() {
+        let root = unique_package_control_dir("unrelated-restore");
+        let data_directory = root.join("data");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start unrelated daemon");
+        let mut state = DaemonControlState::default();
+        let a_dir = root.join("a.unrelated");
+        write_package_control_manifest(
+            &a_dir,
+            "a.unrelated",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(a_dir.join("plugin.lua"), "return botster.register({})\n").expect("write A");
+        let b_dir = root.join("b.unrelated");
+        write_package_control_manifest(
+            &b_dir,
+            "b.unrelated",
+            serde_json::json!({
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            b_dir.join("plugin.lua"),
+            "events.on('hub', 'worktree_created', function() return {} end)\nreturn botster.register({})\n",
+        )
+        .expect("write B");
+        for dir in [&a_dir, &b_dir] {
+            drive_package_request_with_state(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::InstallPackageLocalPath { path: dir.clone() },
+            )
+            .expect("install");
+        }
+        let enabled = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "b.unrelated".to_string(),
+            },
+        )
+        .expect("enable B");
+        assert!(enabled.error.is_none(), "{enabled:?}");
+        let b_generation = daemon
+            .runtime()
+            .unwrap()
+            .package_event_router()
+            .current_package_generation("b.unrelated");
+        assert!(matches!(b_generation, Ok(generation) if generation > 0));
+
+        // Strand only A: its enable panics after the stage and the durable
+        // restore fails.
+        crate::runtime::package_effect::panic_after_stage_for("a.unrelated");
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "a.unrelated".to_string(),
+            },
+        )
+        .expect_err("A is stranded by a failed compensation");
+        let stranded = daemon.runtime().unwrap().stranded_packages();
+        assert!(stranded.contains("a.unrelated") && !stranded.contains("b.unrelated"));
+
+        // A's explicit reload is refused before its install; its compensation
+        // restores A only.
+        std::fs::write(a_dir.join("plugin.lua"), unparsable_lua()).expect("break A");
+        let refused = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: "a.unrelated".to_string(),
+            },
+        );
+        assert!(
+            !matches!(refused, Ok(ref response) if response.error.is_none()),
+            "the broken reload of A is refused: {refused:?}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .package_event_router()
+                .current_package_generation("b.unrelated"),
+            b_generation,
+            "A's compensation must not reload the unrelated package B"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A stranded package that an explicit reload changes and then fails to
+    /// finish goes back to quarantine; its compensation never reloads it from
+    /// disk.
+    #[test]
+    fn compensation_returns_a_stranded_target_to_quarantine() {
+        let root = unique_package_control_dir("stranded-target");
+        let data_directory = root.join("data");
+        let package_dir = root.join("stranded.target");
+        write_package_control_manifest(
+            &package_dir,
+            "stranded.target",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start stranded-target daemon");
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+        // Strand it: the enable panics after its stage and the durable
+        // restore fails.
+        crate::runtime::package_effect::panic_after_stage_for("stranded.target");
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "stranded.target".to_string(),
+            },
+        )
+        .expect_err("stranded by a failed compensation");
+        assert!(!plugin_is_loaded(&daemon, "stranded.target"));
+
+        // The explicit reload panics after its stage; the durable restore
+        // succeeds, so the runtime restore reaches the stranded target.
+        crate::runtime::package_effect::panic_after_stage_for("stranded.target");
+        let failed = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: "stranded.target".to_string(),
+            },
+        );
+        assert!(
+            !matches!(failed, Ok(ref response) if response.error.is_none()),
+            "the panicked reload fails: {failed:?}"
+        );
+        assert!(
+            !plugin_is_loaded(&daemon, "stranded.target"),
+            "the failed resolution leaves the package quarantined, not reloaded from disk"
+        );
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .stranded_packages()
+                .contains("stranded.target")
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A failed effect's staged generation travels from the Host effect,
+    /// through the owner, to the runtime restore job, which aborts it. Nothing
+    /// else clears it on this path (an enable restore records no router
+    /// unload), so a later enable can stage only if the transfer happened.
+    #[test]
+    fn a_failed_effect_hands_its_staged_generation_to_the_restore_job() {
+        let root = unique_package_control_dir("staged-transfer");
+        let data_directory = root.join("data");
+        let package_dir = root.join("staged.transfer");
+        write_package_control_manifest(
+            &package_dir,
+            "staged.transfer",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config).expect("start transfer daemon");
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+
+        crate::runtime::package_effect::panic_after_stage_for("staged.transfer");
+        let failed = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "staged.transfer".to_string(),
+            },
+        );
+        assert!(
+            !matches!(failed, Ok(ref response) if response.error.is_none()),
+            "the panicked enable fails: {failed:?}"
+        );
+        assert!(
+            state.staged_package_generation.is_none(),
+            "the owner handed the staged generation to the restore job"
+        );
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
+            "the durable and runtime restore succeeded"
+        );
+
+        let enabled = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "staged.transfer".to_string(),
+            },
+        )
+        .expect("the retried enable stages because the restore aborted the pending generation");
+        assert_eq!(
+            enabled.kind,
+            botster_hub_client::DaemonResponseKind::PackageDecision,
+            "{enabled:?}"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Typed host-side bodies for durable Hub reads and mutations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::mem;
 use std::path::PathBuf;
@@ -215,6 +215,8 @@ pub(crate) enum HostPrepare {
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
         data_directory: PathBuf,
+        /// Packages an automatic refresh must refuse to reload.
+        stranded: BTreeSet<String>,
     },
     ManagedWorktree {
         worktree: crate::Worktree,
@@ -296,6 +298,12 @@ pub(crate) struct HostPackageRuntimeRestore {
     pub(crate) original: DaemonTransportError,
     pub(crate) runtime: HostPackageRuntime,
     pub(crate) config: HubConfig,
+    /// The failed effect's staged event generation, aborted before restoring.
+    pub(crate) staged: Option<crate::package_event_router::StagedGeneration>,
+    /// Set when no runtime restore is possible (no restore command, or the
+    /// durable restore failed): skip the restore, report this failure, and
+    /// quarantine the effect's packages.
+    pub(crate) quarantine: Option<crate::daemon::error::PackageRollbackFailure>,
 }
 
 /// One typed host result.
@@ -303,6 +311,9 @@ pub(crate) enum HostMutationResult {
     PackageEffectApplied {
         reply: Result<HostReply, HostMutationError>,
         cleanup: HostPackageCleanup,
+        /// The package an explicit enable or reload loaded; it resolves any
+        /// package recovery that covers it.
+        loaded: Option<String>,
     },
     PackageEffectFailed {
         effect: PackageRuntimeEffect,
@@ -420,7 +431,16 @@ fn execute_package_effect(
                     "package reply preparation panicked",
                 ))
             });
-            HostMutationResult::PackageEffectApplied { reply, cleanup }
+            let loaded = match &effect {
+                PackageRuntimeEffect::Enable { package_name, .. }
+                | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name.clone()),
+                _ => None,
+            };
+            HostMutationResult::PackageEffectApplied {
+                reply,
+                cleanup,
+                loaded,
+            }
         }
         Err(error) => HostMutationResult::PackageEffectFailed {
             effect,
@@ -439,25 +459,47 @@ fn execute_package_runtime_restore(
         original,
         mut runtime,
         config,
+        staged,
+        quarantine,
     } = job;
-    let rollbacks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
+    // Release the failed attempt's staged generation, its reserved capacity
+    // and its funding, before the restore stages anything of its own. This
+    // runs on the Host worker, where the router lock may be taken blocking.
+    if let Some(staged) = staged {
+        runtime.abort_staged(staged);
+    }
+    let rollbacks = match quarantine {
+        // No runtime restore is possible: report the failure and quarantine.
+        Some(failure) => vec![failure],
+        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
+                &mut runtime,
+                entrypoints,
+                &config,
+                &effect,
+                &original,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            vec![crate::daemon::error::PackageRollbackFailure {
+                step: "runtime",
+                package_name: None,
+                error: Box::new(DaemonTransportError::Protocol(
+                    "host package runtime restore panicked",
+                )),
+            }]
+        }),
+    };
+    if !rollbacks.is_empty() {
+        // Compensation failed: no version of these packages may keep serving.
+        // Unload them here, on the Host worker; their recorded router unloads
+        // clear any staged generation and retire their queued events.
+        crate::daemon::control::packages::mutations::quarantine_after_failed_compensation(
             &mut runtime,
             entrypoints,
-            &config,
             &effect,
-            &original,
-        )
-    }))
-    .unwrap_or_else(|_| {
-        vec![crate::daemon::error::PackageRollbackFailure {
-            step: "runtime",
-            package_name: None,
-            error: Box::new(DaemonTransportError::Protocol(
-                "host package runtime restore panicked",
-            )),
-        }]
-    });
+        );
+    }
     HostMutationResult::PackageRuntimeRestored {
         effect,
         original,
@@ -569,6 +611,13 @@ pub(crate) struct PreparedStateChange {
     package_effect: Option<PackageRuntimeEffect>,
 }
 
+impl PreparedStateChange {
+    /// The runtime effect this change applies after it commits, if any.
+    pub(crate) fn package_effect(&self) -> Option<&PackageRuntimeEffect> {
+        self.package_effect.as_ref()
+    }
+}
+
 /// One runtime effect that a host worker applies after a package commit.
 pub(crate) enum PackageRuntimeEffect {
     Enable {
@@ -598,6 +647,20 @@ pub(crate) enum PackageRuntimeEffect {
 }
 
 impl PackageRuntimeEffect {
+    /// Every package whose runtime this effect changes.
+    pub(crate) fn package_names(&self) -> Vec<&str> {
+        match self {
+            Self::Enable { package_name, .. }
+            | Self::Disable { package_name }
+            | Self::Remove { package_name }
+            | Self::Reload { package_name, .. } => vec![package_name.as_str()],
+            Self::Refresh { packages, .. } => packages
+                .iter()
+                .map(|package| package.package_name.as_str())
+                .collect(),
+        }
+    }
+
     pub(crate) fn restore_command(
         &self,
         data_directory: PathBuf,
@@ -1414,6 +1477,7 @@ fn execute_prepare(
             state,
             packages,
             data_directory,
+            stranded,
         } => prepare_package(
             request,
             base_revision,
@@ -1424,6 +1488,7 @@ fn execute_prepare(
                 .expect("package preparation has the host supervisor")
                 .snapshots(),
             data_directory,
+            &stranded,
         ),
         HostPrepare::SpawnTarget {
             request,
@@ -1559,6 +1624,7 @@ fn prepare_managed_worktree_record(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_package(
     request: DaemonRequest,
     base_revision: u64,
@@ -1567,6 +1633,7 @@ fn prepare_package(
     packages: SharedView<PackageRegistry>,
     entrypoint_processes: Vec<EntrypointProcessSnapshot>,
     data_directory: PathBuf,
+    stranded: &BTreeSet<String>,
 ) -> Result<PreparedMutation, HostMutationError> {
     let advances_generation = !matches!(&request, DaemonRequest::SetPackageConfiguration { .. });
     let before = advances_generation
@@ -1673,6 +1740,22 @@ fn prepare_package(
                 .map_err(package_error)?;
             let running_entrypoints = running_entrypoint_ids(&entrypoint_processes, None);
             let effects = refresh_effects(&packages, &candidate, &decisions, &running_entrypoints);
+            // A refresh is automatic (dev source update, local runtime start):
+            // it must not reload a stranded package. Only an explicit operator
+            // enable or reload resolves one.
+            if let Some(effect) = effects
+                .iter()
+                .find(|effect| effect.reload_plugin && stranded.contains(&effect.package_name))
+            {
+                return Err(HostMutationError {
+                    code: "package_stranded".to_string(),
+                    message: format!(
+                        "package {} is stranded after a failed compensation; enable or reload it explicitly",
+                        effect.package_name
+                    ),
+                    event: None,
+                });
+            }
             candidate_packages = candidate;
             (
                 package_list_reply(&candidate_packages, entrypoint_processes.clone()),
@@ -3269,6 +3352,7 @@ mod tests {
                     state: state.clone(),
                     packages: packages.clone(),
                     data_directory: data_directory.clone(),
+                    stranded: Default::default(),
                 }))
             else {
                 panic!("package preparation must succeed");
@@ -3285,6 +3369,84 @@ mod tests {
                 .state,
             PackageState::Installed
         );
+    }
+
+    /// A refresh is automatic, so it must not reload a stranded package.
+    #[test]
+    fn an_automatic_refresh_refuses_a_stranded_package() {
+        let (state, _git_packages, data_directory, authority) =
+            package_inputs("package-refresh-stranded");
+        // An enabled local-path plugin, which a refresh reloads.
+        let root = data_directory.join("local-plugin");
+        fs::create_dir_all(&root).expect("create local package");
+        fs::write(root.join("plugin.lua"), "return botster.register({})\n").expect("write plugin");
+        fs::write(
+            root.join("botster-package.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "local.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": "." },
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }))
+            .expect("encode manifest"),
+        )
+        .expect("write manifest");
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install local plugin")
+            .expect("install local plugin");
+        policy
+            .enable("local.plugin", "enable local plugin")
+            .expect("enable local plugin");
+        let packages = SharedView::try_new(
+            &crate::shared_view::SharedViewBudget::new(),
+            policy.registry().clone(),
+            0,
+        )
+        .expect("registry view");
+        let prepared = prepare_package(
+            DaemonRequest::RefreshLocalPackages,
+            5,
+            Arc::clone(&authority),
+            state.clone(),
+            packages.clone(),
+            Vec::new(),
+            data_directory.clone(),
+            &Default::default(),
+        )
+        .expect("an unstranded refresh prepares");
+        let PreparedChange::PackageConfiguration(change) = prepared.change else {
+            panic!("package refresh must keep its mutation family");
+        };
+        let Some(PackageRuntimeEffect::Refresh {
+            packages: effects, ..
+        }) = change.package_effect
+        else {
+            panic!("package refresh must return its runtime effect");
+        };
+        let stranded: BTreeSet<String> = effects
+            .iter()
+            .filter(|effect| effect.reload_plugin)
+            .map(|effect| effect.package_name.clone())
+            .collect();
+        assert!(!stranded.is_empty(), "the fixture refresh reloads a plugin");
+
+        let refused = prepare_package(
+            DaemonRequest::RefreshLocalPackages,
+            5,
+            authority,
+            state,
+            packages,
+            Vec::new(),
+            data_directory,
+            &stranded,
+        )
+        .map(|_| ())
+        .expect_err("a stranded package blocks the automatic refresh");
+        assert_eq!(refused.code, "package_stranded", "{refused:?}");
     }
 
     #[test]
@@ -3310,6 +3472,7 @@ mod tests {
             packages.clone(),
             vec![snapshot],
             data_directory,
+            &Default::default(),
         )
         .expect("package refresh preparation must succeed");
         let PreparedChange::PackageConfiguration(change) = prepared.change else {
@@ -3361,6 +3524,7 @@ mod tests {
                 state: state.clone(),
                 packages: packages.clone(),
                 data_directory: data_directory.clone(),
+                stranded: Default::default(),
             }));
             if let HostMutationResult::Failed(error) = result {
                 assert_ne!(error.code, "unsupported_host_mutation");
@@ -3408,6 +3572,7 @@ mod tests {
                 state,
                 packages: packages.clone(),
                 data_directory,
+                stranded: Default::default(),
             }))
         else {
             panic!("package configuration prepare must succeed");

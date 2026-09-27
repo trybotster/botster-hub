@@ -175,31 +175,7 @@ pub(crate) fn value_build(
 
 #[cfg(test)]
 pub(crate) fn retained_bytes(value: &serde_json::Value) -> Option<usize> {
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            Some(0)
-        }
-        serde_json::Value::String(text) => Some(text.capacity()),
-        serde_json::Value::Array(items) => {
-            let mut bytes = items
-                .capacity()
-                .checked_mul(std::mem::size_of::<serde_json::Value>())?;
-            for item in items {
-                bytes = bytes.checked_add(retained_bytes(item)?)?;
-            }
-            Some(bytes)
-        }
-        serde_json::Value::Object(map) => {
-            let mut heap = 0usize;
-            for (key, item) in map {
-                heap = heap
-                    .checked_add(key.capacity())?
-                    .checked_add(retained_bytes(item)?)?;
-            }
-            btree_nodes_checked::<String, serde_json::Value>(map.len())
-                .and_then(|nodes| nodes.checked_add(heap))
-        }
-    }
+    crate::lua_memory::layout::json_value_retained_bytes(value)
 }
 
 /// table + 1 fetched value + `metatable()` probe.
