@@ -8039,13 +8039,28 @@ pub(crate) mod tests {
         std::path::PathBuf,
         crate::packages::PackageAdmissionPolicy,
     ) {
-        let (mut runtime, root) = publication_provider_runtime(name);
+        let (mut runtime, root, policy) = subscribed_provider_enabled(name);
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        (runtime, root, policy)
+    }
+
+    /// The same provider, installed and enabled but not loaded.
+    fn subscribed_provider_enabled(
+        name: &str,
+    ) -> (
+        HubRuntime,
+        std::path::PathBuf,
+        crate::packages::PackageAdmissionPolicy,
+    ) {
+        let (runtime, root) = publication_provider_runtime(name);
         let entrypoint = root.join("plugin.lua");
         let source = std::fs::read_to_string(&entrypoint).unwrap();
         std::fs::write(
             &entrypoint,
             format!(
-                "events.on('hub', 'worktree_created', function(event) return {{ received = event.event }} end)\n{source}"
+                "botster.events.on({{ owner = 'hub', name = 'worktree_created' }}, function(event) return {{ received = event.event }} end)\n{source}"
             ),
         )
         .unwrap();
@@ -8056,10 +8071,41 @@ pub(crate) mod tests {
         policy
             .enable("producer", "enable subscribed test provider")
             .unwrap();
+        (runtime, root, policy)
+    }
+
+    #[test]
+    fn a_first_load_rejected_after_the_lua_load_revokes_the_package_grants() {
+        let (mut runtime, root, policy) = subscribed_provider_enabled("load-preflight-grants");
+        let key = PluginKey("producer".into());
+        crate::lifecycle::inject_next_prepare_failure("producer");
+        let error = runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap_err();
+        assert!(
+            matches!(error, HubLuaPluginLoadError::Lifecycle(_)),
+            "{error:?}"
+        );
+        assert!(
+            !runtime
+                .capability_runtime
+                .lock()
+                .unwrap()
+                .test_has_plugin_grants(&key),
+            "nothing was installed, so no grants may remain"
+        );
         runtime
             .load_lua_plugin_package(policy.registry(), "producer")
-            .unwrap();
-        (runtime, root, policy)
+            .expect("a refused load leaves nothing behind");
+        assert!(
+            runtime
+                .capability_runtime
+                .lock()
+                .unwrap()
+                .test_has_plugin_grants(&key)
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8568,7 +8614,7 @@ pub(crate) mod tests {
         std::fs::write(
             &entrypoint,
             format!(
-                "events.on('hub', 'botster_undeclared_event', function() return {{}} end)\n{source}"
+                "botster.events.on({{ owner = 'hub', name = 'botster_undeclared_event' }}, function() return {{}} end)\n{source}"
             ),
         )
         .unwrap();

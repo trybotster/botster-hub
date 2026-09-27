@@ -267,6 +267,11 @@ impl HubCapabilityRuntime {
         self.plugin_grants.remove(&plugin_key.0);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_has_plugin_grants(&self, plugin_key: &PluginKey) -> bool {
+        self.plugin_grants.contains_key(&plugin_key.0)
+    }
+
     fn ensure_plugin_grant(
         &self,
         plugin_key: &PluginKey,
