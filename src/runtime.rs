@@ -8180,59 +8180,141 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Callback-account bytes once the Hub log mirror holds no copy.
+    fn settled_callback_bytes(runtime: &HubRuntime) -> usize {
+        runtime.plugin_logs().wait_until_mirrored();
+        runtime.lua_memory.usage().1
+    }
+
+    /// An installed and enabled "producer" whose entrypoint first runs
+    /// `prelude`. No generation of it is loaded, so its next load is a first
+    /// load.
+    fn unloaded_logging_provider(
+        label: &str,
+        prelude: &str,
+    ) -> (
+        HubRuntime,
+        std::path::PathBuf,
+        crate::packages::PackageAdmissionPolicy,
+    ) {
+        let runtime = family_runtime(label);
+        let root =
+            std::env::temp_dir().join(format!("logging-provider-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "producer", "version": "1.0.0", "kind": "plugin",
+                "botster": ">=0.1.0",
+                "capabilities": [],
+                "source": { "type": "path", "path": root.canonicalize().unwrap() },
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plugin.lua"),
+            format!("{prelude}\nreturn botster.register({{ handlers = {{}} }})"),
+        )
+        .unwrap();
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install logging test provider")
+            .unwrap();
+        policy
+            .enable("producer", "enable logging test provider")
+            .unwrap();
+        assert!(!runtime.plugin_lifecycle().is_loaded("producer"));
+        (runtime, root, policy)
+    }
+
     #[test]
-    fn a_lua_load_that_fails_removes_the_records_its_entrypoint_wrote() {
-        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
+    fn a_lua_load_that_fails_releases_its_log_entry_and_charge() {
+        let (mut runtime, root, policy) = unloaded_logging_provider(
             "load-lua-failure-logs",
             "botster.log.info({ message = 'loading' })\nerror('refuse to load')",
         );
+        let baseline = settled_callback_bytes(&runtime);
         runtime
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap_err();
+        assert_eq!(
+            settled_callback_bytes(&runtime),
+            baseline,
+            "a failed first load leaves no log entry, ring, or record charged"
+        );
         assert!(logged_messages(&runtime).is_empty());
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_first_load_rejected_after_the_lua_load_removes_its_records() {
-        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
+    fn a_first_load_rejected_after_the_lua_load_releases_its_log_entry_and_charge() {
+        let (mut runtime, root, policy) = unloaded_logging_provider(
             "load-preflight-logs",
             "botster.log.info({ message = 'loading' })",
         );
+        let baseline = settled_callback_bytes(&runtime);
         crate::lifecycle::inject_next_prepare_failure("producer");
         runtime
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap_err();
+        assert_eq!(
+            settled_callback_bytes(&runtime),
+            baseline,
+            "a failed first load leaves no log entry, ring, or record charged"
+        );
         assert!(logged_messages(&runtime).is_empty());
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_reload_rejected_after_the_lua_load_removes_only_the_candidate_records() {
-        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
-            "reload-preflight-logs",
-            "botster.log.info({ message = 'loading' })",
+    fn a_failed_reload_keeps_its_records_beside_the_live_ones_on_a_full_ring() {
+        // Each load writes five records of about 65 KB. Ten do not fit the
+        // 512 KiB text cap, so the candidate's records evict the oldest live
+        // ones: the ring is full when the reload fails.
+        let (mut runtime, root, policy) = unloaded_logging_provider(
+            "reload-full-ring-logs",
+            "for _ = 1, 5 do botster.log.info({ message = string.rep('x', 65000) }) end",
         );
         runtime
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
         let live = logged_messages(&runtime);
-        assert_eq!(live.len(), 1);
+        assert_eq!(live.len(), 5);
+        let live_generation = live[0].1;
         crate::lifecycle::inject_next_prepare_failure("producer");
         runtime
             .reload_lua_plugin_package(
-                RequestId("reload-preflight-logs".into()),
+                RequestId("reload-full-ring-logs".into()),
                 policy.registry(),
                 "producer",
             )
             .unwrap_err();
+        let page = runtime.plugin_logs().read("producer", 0).unwrap();
+        assert_eq!(page.first_available_seq, 3, "two live records were evicted");
+        let generations: Vec<u64> = page
+            .records
+            .iter()
+            .map(|record| record.generation)
+            .collect();
+        let candidate_generation = generations[3];
+        assert_ne!(candidate_generation, live_generation);
         assert_eq!(
-            logged_messages(&runtime),
-            live,
-            "only the live generation's record stays"
+            generations,
+            [vec![live_generation; 3], vec![candidate_generation; 5]].concat(),
+            "the surviving live records and the failed candidate's records stay, in order"
         );
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            (3..=10).collect::<Vec<_>>()
+        );
+        drop(page);
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }

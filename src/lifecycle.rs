@@ -757,9 +757,6 @@ pub struct HubPluginRuntimeBundle {
     pub entrypoint: Option<String>,
     /// Optional plugin-owned load metadata.
     pub metadata: Option<BoundaryJson>,
-    /// The Lua VM's log generation, so a failed install can remove the
-    /// records it wrote. `None` for runtimes without plugin logs.
-    pub log_generation: Option<u64>,
 }
 
 /// Hub-owned event subscription metadata for one plugin handler.
