@@ -232,6 +232,9 @@ pub(crate) fn core_operator_error(
 ) -> DaemonResponse {
     let code = match error {
         CoreDaemonError::UnknownSession(_) => "unknown_session",
+        CoreDaemonError::Engine(botster_core::DefaultBotsterEngineError::NotSubscribed {
+            ..
+        }) => "not_attached",
         CoreDaemonError::UnknownCapture(_) => "unknown_capture",
         CoreDaemonError::SnapshotPageOutOfRange { .. } => "snapshot_page_out_of_range",
         CoreDaemonError::PendingLimit(_) => "pending_limit",

@@ -14,7 +14,7 @@ use botster_core::SessionId;
 use botster_core_daemon::{CoreDaemonError, RegistrySessionState, SessionRegistryStateLookup};
 use botster_hub_client::{
     DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
-    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
+    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER, TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST,
 };
 
 use crate::HubDaemon;
@@ -32,6 +32,10 @@ pub(crate) use crate::transport::shared::close_progress::{
 pub(crate) trait ClosedHandle {
     fn is_closed(&self) -> bool;
     fn host_closed(&self) -> bool;
+    /// Core's reason when Core closed the route first.
+    fn core_close_reason(
+        &self,
+    ) -> Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason>;
 }
 
 pub(crate) struct ClosedEventRoute<H> {
@@ -168,15 +172,24 @@ impl ClosedEventLedger {
                 route.reported = true;
                 continue;
             }
-            match classify(&route.session_id) {
-                None => continue,
-                Some(false) => {
-                    route.reported = true;
-                    continue;
+            // A lost worker ends the session without PROCESS_EXIT on this
+            // route, so its close is reported whatever the registry state.
+            let worker_lost = route.handle.core_close_reason()
+                == Some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed);
+            if !worker_lost {
+                match classify(&route.session_id) {
+                    None => continue,
+                    Some(false) => {
+                        route.reported = true;
+                        continue;
+                    }
+                    Some(true) => {}
                 }
-                Some(true) => route.reported = true,
             }
-            let reason = if route.handle.host_closed() {
+            route.reported = true;
+            let reason = if worker_lost {
+                TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST
+            } else if route.handle.host_closed() {
                 TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
             } else {
                 TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
@@ -494,6 +507,7 @@ mod tests {
     struct TestHandle {
         closed: bool,
         host_closed: bool,
+        core_reason: Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason>,
     }
 
     impl ClosedHandle for TestHandle {
@@ -503,6 +517,12 @@ mod tests {
 
         fn host_closed(&self) -> bool {
             self.host_closed
+        }
+
+        fn core_close_reason(
+            &self,
+        ) -> Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason> {
+            self.core_reason
         }
     }
 
@@ -522,6 +542,7 @@ mod tests {
                 handle: TestHandle {
                     closed: true,
                     host_closed,
+                    core_reason: None,
                 },
                 reported: false,
             },
@@ -773,5 +794,50 @@ mod tests {
             2,
             "a successful Detach must retire Unix and WebRTC direct close work"
         );
+    }
+
+    #[test]
+    fn worker_lost_close_skips_the_registry_gate_but_not_suppression() {
+        let ledger = ClosedEventLedger::default();
+        let mut routes = BTreeMap::new();
+        for (session, reason) in [
+            ("lost", Some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed)),
+            ("lost-detached", Some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::WorkerLinkFailed)),
+            ("ended", Some(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::SessionEnded)),
+        ] {
+            let (key, mut route) = closed_route(session, "sub", 1, false);
+            route.handle.core_reason = reason;
+            routes.insert(key, route);
+        }
+        ledger.suppress_generation("lost-detached", "sub", 1);
+        let mut classified = Vec::new();
+        ledger.queue_closed_subscription_events_bounded(
+            false,
+            &mut routes,
+            |session| {
+                classified.push(session.to_string());
+                Some(false)
+            },
+            8,
+            None,
+            8,
+            || {},
+        );
+        assert_eq!(
+            classified,
+            vec!["ended".to_string()],
+            "only the non-lost close asks the registry"
+        );
+        match ledger.pop_pending_event() {
+            Some(DaemonEvent::TerminalSubscriptionClosed {
+                session_id, reason, ..
+            }) => {
+                assert_eq!(session_id, "lost");
+                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST);
+            }
+            other => panic!("expected one worker_lost event, got {other:?}"),
+        }
+        assert!(ledger.pop_pending_event().is_none());
+        assert!(routes.values().all(|route| route.reported));
     }
 }

@@ -160,6 +160,9 @@ pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_cl
 pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
 /// Core closed this bound adapter while the connection stayed alive.
 pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
+/// The session's worker was lost, so Core closed this bound adapter without a
+/// PROCESS_EXIT. The session entity reports `failed` with `worker_lost`.
+pub const TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST: &str = "worker_lost";
 /// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
