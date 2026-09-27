@@ -24,8 +24,8 @@ pub(crate) mod webrtc;
 
 use botster_core::RequestId;
 use botster_hub_client::{
-    DaemonDiagnostic, DaemonLifecycleCounters, DaemonOperatorError, DaemonQuarantineTarget,
-    DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonDiagnostic, DaemonOperatorError, DaemonQuarantineTarget, DaemonRequest, DaemonResponse,
+    DaemonResponseKind,
 };
 
 use crate::HubDaemon;
@@ -39,8 +39,6 @@ pub(crate) use message::{ControlMessage, ControlSender};
 /// request. Owned so a deferred continuation can keep it past the turn.
 #[derive(Clone)]
 pub(crate) struct DaemonObservability {
-    pub(crate) egress: Vec<DaemonDiagnostic>,
-    pub(crate) lifecycle: DaemonLifecycleCounters,
     pub(crate) client_id: Option<String>,
     pub(crate) grant_id: Option<String>,
     pub(crate) transport_request_id: Option<String>,

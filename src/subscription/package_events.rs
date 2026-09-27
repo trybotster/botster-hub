@@ -829,7 +829,8 @@ pub(crate) struct ClientCleanupCompletion {
 #[derive(Debug)]
 pub(crate) struct ClientCleanupFailure {
     pub(crate) work: ClientCleanupWork,
-    pub(crate) fault: PoisonedCleanupLock,
+    /// Diagnostic only: which cleanup lock was poisoned. Kept for Debug.
+    pub(crate) _fault: PoisonedCleanupLock,
 }
 
 impl ClientCleanupWork {
@@ -848,7 +849,10 @@ impl ClientCleanupWork {
             }),
             Err(fault) => {
                 self.connection.faulted.store(true, Ordering::Release);
-                Err(ClientCleanupFailure { work: self, fault })
+                Err(ClientCleanupFailure {
+                    work: self,
+                    _fault: fault,
+                })
             }
         }
     }
@@ -955,6 +959,7 @@ impl ClientEventPlane {
         Ok(connection)
     }
 
+    #[cfg(test)]
     fn connection(&self, connection_id: &str) -> Option<Arc<ClientEventConnection>> {
         self.connections
             .try_lock()
@@ -963,11 +968,13 @@ impl ClientEventPlane {
             .cloned()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn mailbox(&self, connection_id: &str) -> Option<Arc<ClientEventMailbox>> {
         self.connection(connection_id)?.mailbox()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn subscription_mailbox(
         &self,

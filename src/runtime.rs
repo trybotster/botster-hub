@@ -78,7 +78,7 @@ use crate::persistence::{
 };
 use crate::session_types::{
     EnsuredManagedWorktree, HubSessionContext, ManagedSessionTypeRequest, SessionTypeRequest,
-    materialize_managed_session_type, materialize_session_type, show_session_type_for_target,
+    materialize_managed_session_type, show_session_type_for_target,
 };
 use crate::shared_view::{SharedView, SharedViewBudget};
 
@@ -1241,6 +1241,7 @@ impl HubRuntime {
         self.entity_model_readiness().releases
     }
 
+    #[cfg(test)]
     pub(crate) fn causal_family_release_ready(&self) -> bool {
         self.has_family_resync_releases()
             && !self.causal_faulted()
@@ -4684,6 +4685,7 @@ impl HubRuntime {
         &self.host_executor
     }
 
+    #[cfg(test)]
     pub(crate) fn next_waiter_id(&self) -> Option<crate::owner_identity::WaiterId> {
         self.core_daemon.waiter_ids().next()
     }
@@ -4705,13 +4707,6 @@ impl HubRuntime {
     ) {
         self.core_daemon
             .restore_owner_completion_identities(identities);
-    }
-
-    pub(crate) fn retire_owner_core_completion(
-        &self,
-        identity: crate::owner_identity::OwnerWorkIdentity,
-    ) -> bool {
-        self.core_daemon.retire_owner_completion(identity)
     }
 
     pub(crate) fn retire_owner_core_waiter(

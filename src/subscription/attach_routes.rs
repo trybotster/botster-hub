@@ -1000,6 +1000,7 @@ pub(crate) fn response_records_attach_ownership(response: &DaemonResponse) -> bo
     response.kind != DaemonResponseKind::OperatorError
 }
 
+#[cfg(test)]
 pub(crate) fn attached_subscription_change_for_response(
     request: &DaemonRequest,
     response: &DaemonResponse,

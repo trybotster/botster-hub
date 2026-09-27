@@ -15,7 +15,6 @@ pub(crate) enum Action {
 pub(crate) struct Observation {
     pub(crate) generation: Option<u64>,
     pub(crate) deadline: Option<Instant>,
-    pub(crate) degraded_leases: bool,
     pub(crate) attempted: bool,
     pub(crate) degraded: bool,
 }
@@ -65,7 +64,6 @@ impl PackageEntities {
             } else {
                 family.resync.next_attempt_at()
             },
-            degraded_leases: family.resync.degraded && !family.resync.leases.is_empty(),
             ..Observation::default()
         }
     }

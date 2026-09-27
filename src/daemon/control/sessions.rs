@@ -2074,8 +2074,6 @@ mod tests {
 
     fn observability() -> DaemonObservability {
         DaemonObservability {
-            egress: Vec::new(),
-            lifecycle: botster_hub_client::DaemonLifecycleCounters::default(),
             client_id: None,
             grant_id: None,
             transport_request_id: None,
@@ -2135,7 +2133,6 @@ mod tests {
             waiter_id,
             PendingControlRequest {
                 waiter_id,
-                ready_class: crate::daemon::owner_schedule::ReadyClass::CoreCompletion,
                 ready_key: None,
                 deadline_key: None,
                 last_core_phase: 0,

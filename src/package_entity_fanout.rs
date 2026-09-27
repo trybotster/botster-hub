@@ -229,6 +229,7 @@ impl PackageEntityFanoutQueue {
         self.next_sequence.checked_add(1).is_some()
     }
 
+    #[cfg(test)]
     /// Return the owned mutation unchanged if the sequence cannot advance.
     pub(crate) fn try_push(
         &mut self,
@@ -301,6 +302,7 @@ impl PackageEntityFanoutQueue {
             .map(|((family, _), _)| family.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn take_one_family(
         &mut self,
         family: &str,
@@ -352,6 +354,7 @@ impl PackageEntityFanoutQueue {
         self.pending_by_seq.is_empty()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.pending_by_seq.len()
@@ -738,6 +741,7 @@ impl PackageEntityFamilyState {
             .is_some_and(|next| self.pending_by_seq.contains_key(&next))
     }
 
+    #[cfg(test)]
     /// Move one consecutive mutation with its existing lease.
     pub(crate) fn take_next_pending(&mut self, now: Instant) -> Option<LeasedFanoutMutation> {
         let mut retained = None;

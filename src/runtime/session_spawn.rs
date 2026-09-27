@@ -96,7 +96,6 @@ impl SpawnConversionReceipt {
 }
 
 enum CoreBinding {
-    Ownerless,
     ClientOwner(crate::owner_identity::WaiterId),
     Owner {
         waiter_id: crate::owner_identity::WaiterId,
@@ -107,7 +106,6 @@ enum CoreBinding {
 impl CoreBinding {
     fn begin(&self, runtime: &HubRuntime, operation: CoreOperation) -> CoreOperationTracker {
         let ticket = match self {
-            Self::Ownerless => runtime.core_daemon.begin(operation),
             Self::ClientOwner(waiter_id) => {
                 runtime.core_daemon.begin_for_owner(*waiter_id, operation)
             }
@@ -129,9 +127,7 @@ impl CoreBinding {
                 allowance.parent.grow(bytes).ok()?;
                 allowance.parent.split_fixed(bytes)
             }
-            Self::Ownerless | Self::ClientOwner(_) => {
-                runtime.lua_memory.reserve_callback_total(bytes).ok()
-            }
+            Self::ClientOwner(_) => runtime.lua_memory.reserve_callback_total(bytes).ok(),
         }
     }
 }
@@ -295,30 +291,6 @@ impl HubRuntime {
             .map(|(ticket, publisher)| (ticket, SpawnDeliveryReceipt::new(publisher)))
     }
 
-    pub(super) fn fulfill_session_type_spawn(
-        &self,
-        pending: &PendingSessionTypeSpawn,
-    ) -> Result<SessionTypeSpawnStart, String> {
-        if !package_allows_session_type_spawn(&pending.package_records, &pending.plugin_key) {
-            return Err("plugin package lacks session_type_spawn capability".to_string());
-        }
-
-        let records = pending.package_records.packages();
-        let state = self.state();
-        let mut materialized = materialize_session_type(
-            &self.config,
-            &records,
-            &state,
-            &pending.session_type_id,
-            pending.request.clone(),
-        )
-        .map_err(|error| format!("{}: {}", error.kind, error.message))?;
-        drop(state);
-        materialized.metadata =
-            session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        Ok(self.begin_materialized_session_type_spawn(materialized, CoreBinding::Ownerless, None))
-    }
-
     /// Start the existing Core stages after the Host worker returns its product.
     /// The caller charges the reservation record before any Core work.
     pub(crate) fn begin_session_type_spawn_for_owner(
@@ -364,11 +336,9 @@ impl HubRuntime {
             metadata: materialized.metadata,
         };
         let session_id = spawn.request.session_id.clone();
-        let retry_tokens = match &binding {
-            CoreBinding::Ownerless => self.take_retained_reservations(),
-            // An owner row must not take another operation's cleanup authority.
-            CoreBinding::ClientOwner(_) | CoreBinding::Owner { .. } => Vec::new(),
-        };
+        // Every binding has an owner row, and an owner row must not take
+        // another operation's cleanup authority.
+        let retry_tokens: Vec<SessionReservation> = Vec::new();
         let stage = if retry_tokens.is_empty() {
             PluginSpawnStage::Reserve
         } else {
@@ -980,10 +950,8 @@ impl SessionTypeSpawnStart {
         // A client pending ends when it returns, so it hands its token and
         // record to the retained list here. An owner row keeps the complete
         // unresolved operation instead.
-        if matches!(
-            &self.binding,
-            CoreBinding::Ownerless | CoreBinding::ClientOwner(_)
-        ) && let Some(held) = self.reservation.take()
+        if matches!(&self.binding, CoreBinding::ClientOwner(_))
+            && let Some(held) = self.reservation.take()
         {
             runtime
                 .session_reservations()

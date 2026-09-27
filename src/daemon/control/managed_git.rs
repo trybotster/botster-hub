@@ -174,7 +174,6 @@ fn accept_confirmed_rollback(
         waiter_id,
         PendingControlRequest {
             waiter_id,
-            ready_class: ReadyClass::HostCompletion,
             ready_key: None,
             deadline_key: None,
             last_core_phase: 0,
@@ -339,7 +338,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         waiter_id,
         PendingControlRequest {
             waiter_id,
-            ready_class: ReadyClass::HostCompletion,
             ready_key: None,
             deadline_key: None,
             last_core_phase: 0,

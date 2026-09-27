@@ -405,7 +405,6 @@ impl From<DaemonTransportResult<DaemonResponse>> for ControlStep {
 /// owns cleanup) keeps running after its client left.
 pub(crate) struct PendingControlRequest {
     pub(crate) waiter_id: WaiterId,
-    pub(crate) ready_class: ReadyClass,
     pub(crate) ready_key: Option<ReadyKey>,
     pub(crate) deadline_key: Option<DeadlineKey>,
     pub(crate) last_core_phase: u64,
@@ -1129,7 +1128,6 @@ mod tests {
             waiter_id,
             PendingControlRequest {
                 waiter_id,
-                ready_class: step.ready_class,
                 ready_key: None,
                 deadline_key: None,
                 last_core_phase: 2,
@@ -1410,7 +1408,6 @@ mod tests {
             waiter_id,
             PendingControlRequest {
                 waiter_id,
-                ready_class: ReadyClass::CoreCompletion,
                 ready_key: None,
                 deadline_key: Some(arm.key()),
                 last_core_phase: 0,
@@ -1526,7 +1523,6 @@ mod tests {
             host_waiter,
             PendingControlRequest {
                 waiter_id: host_waiter,
-                ready_class: ReadyClass::HostCompletion,
                 ready_key: None,
                 deadline_key: None,
                 last_core_phase: 0,
@@ -1621,7 +1617,6 @@ mod tests {
             waiter_id,
             PendingControlRequest {
                 waiter_id,
-                ready_class: ReadyClass::HostCompletion,
                 ready_key: None,
                 deadline_key: None,
                 last_core_phase: 0,

@@ -123,6 +123,7 @@ impl Job {
         self.work.poll()
     }
 
+    #[cfg(test)]
     pub(crate) fn refused(&self) -> Option<crate::host_executor::HostSubmitError> {
         self.failure.as_ref().map(|failure| failure.error)
     }
