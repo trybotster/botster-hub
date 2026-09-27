@@ -134,7 +134,7 @@ fn entry_charge_survives_owner_accept_until_reply_retirement() {
     let memory = runtime.test_lua_memory();
     let before = memory.usage().1;
     let bridge = runtime.coordination_bridge();
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + TEST_HANG_GUARD;
     let caller = request(bridge.clone());
     // One owner turn can both see the caller's enqueue and accept it, so the
     // queued state may never be observed; the charge is the same in both.
