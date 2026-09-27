@@ -351,10 +351,22 @@ fn harness_taint_keeps_every_recorded_error() {
 #[test]
 fn taint_latch_refuses_next_daemon_start_without_spawning() {
     let _lock = daemon_test_guard();
-    record_harness_taint("injected prove-absence failure");
+    // Scoped: the taint is cleared on every exit path, so a failed assertion
+    // here cannot cascade into every later daemon test in the process.
+    let _taint = ScopedHarnessTaint::inject("injected prove-absence failure");
     let data_dir = unique_short_test_dir("tnt");
     fs::create_dir_all(&data_dir).expect("create data dir");
-    let before = session_worker_process_identities().unwrap_or_default().len();
+    let data_dir_workers = || {
+        session_worker_process_identities()
+            .expect("session worker census")
+            .into_iter()
+            .filter(|worker| worker_belongs_to_data_dir(worker, &data_dir))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        data_dir_workers().is_empty(),
+        "positive control: a fresh data dir has no workers"
+    );
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = start_cli_daemon(&data_dir);
     }));
@@ -363,9 +375,16 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
         !daemon_socket_path(&data_dir).exists(),
         "tainted start must not create a daemon socket"
     );
-    let after = session_worker_process_identities().unwrap_or_default().len();
-    assert_eq!(before, after, "tainted start must not spawn workers");
-    reset_harness_taint_after_proof();
+    // Attributed to this data dir: a host-wide worker count also counts
+    // workers that other sessions on the machine start meanwhile.
+    let workers = data_dir_workers();
+    assert!(workers.is_empty(), "tainted start must not spawn workers: {workers:?}");
+    let data_dir_token = data_dir.file_name().and_then(|name| name.to_str()).expect("data dir name");
+    assert_eq!(
+        test_owned_process_rows(&[data_dir_token.to_string()]),
+        Vec::new(),
+        "tainted start must not start any process for its data dir"
+    );
 }
 
 #[test]
@@ -1084,4 +1103,79 @@ fn guard_cleanup_after_panic_reaps_supervised_entrypoint() {
         !daemon_socket_path(&data_dir).exists(),
         "panic cleanup must remove the daemon socket"
     );
+}
+
+/// Starts an orphan (reparented to PID 1, like a detached daemon) whose
+/// command line names `dir`, and returns its PID.
+fn spawn_orphan_naming(dir: &Path) -> u32 {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("perl -e 'sleep 300' \"$1\" </dev/null >/dev/null 2>&1 & echo $!")
+        .arg("sh")
+        .arg(dir)
+        .output()
+        .expect("spawn orphan fixture");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("orphan fixture pid")
+}
+
+fn assert_orphan_gone(pid: u32) {
+    assert!(
+        process_snapshot(pid).is_none(),
+        "the guard sweep must stop orphan pid {pid}: {:?}",
+        process_snapshot(pid)
+    );
+}
+
+#[test]
+fn daemon_test_guard_sweeps_a_test_owned_orphan_when_the_test_panics() {
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let result = thread::spawn(move || {
+        let _guard = daemon_test_guard();
+        let dir = unique_short_test_dir("sweep-panic");
+        let pid = spawn_orphan_naming(&dir);
+        pid_tx.send(pid).expect("send orphan pid");
+        assert!(process_snapshot(pid).is_some(), "positive control: orphan pid {pid} is live");
+        panic!("injected test failure after starting an orphan");
+    })
+    .join();
+    let pid = pid_rx.recv().expect("orphan pid");
+    let message = result
+        .expect_err("the injected failure must still fail the test")
+        .downcast::<&str>()
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        message, "injected test failure after starting an orphan",
+        "the sweep must not replace the test's own failure"
+    );
+    assert_orphan_gone(pid);
+    assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
+}
+
+#[test]
+fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let result = thread::spawn(move || {
+        let _guard = daemon_test_guard();
+        let dir = unique_short_test_dir("sweep-pass");
+        let pid = spawn_orphan_naming(&dir);
+        pid_tx.send(pid).expect("send orphan pid");
+    })
+    .join();
+    let pid = pid_rx.recv().expect("orphan pid");
+    let message = result
+        .expect_err("a leaked orphan must fail an otherwise passing test")
+        .downcast::<String>()
+        .map(|text| *text)
+        .unwrap_or_default();
+    assert!(
+        message.contains("test-owned processes outlived the test")
+            && message.contains(&pid.to_string()),
+        "the failure must name the leaked pid {pid}: {message}"
+    );
+    assert_orphan_gone(pid);
+    assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
