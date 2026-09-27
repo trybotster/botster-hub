@@ -10203,6 +10203,81 @@ return botster.register({tools = {{
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A failed effect's staged generation travels from the Host effect,
+    /// through the owner, to the runtime restore job, which aborts it. Nothing
+    /// else clears it on this path (an enable restore records no router
+    /// unload), so a later enable can stage only if the transfer happened.
+    #[test]
+    fn a_failed_effect_hands_its_staged_generation_to_the_restore_job() {
+        let root = unique_package_control_dir("staged-transfer");
+        let data_directory = root.join("data");
+        let package_dir = root.join("staged.transfer");
+        write_package_control_manifest(
+            &package_dir,
+            "staged.transfer",
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config).expect("start transfer daemon");
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath {
+                path: package_dir.clone(),
+            },
+        )
+        .expect("install");
+
+        crate::runtime::package_effect::panic_after_stage_for("staged.transfer");
+        let failed = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "staged.transfer".to_string(),
+            },
+        );
+        assert!(
+            !matches!(failed, Ok(ref response) if response.error.is_none()),
+            "the panicked enable fails: {failed:?}"
+        );
+        assert!(
+            state.staged_package_generation.is_none(),
+            "the owner handed the staged generation to the restore job"
+        );
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
+            "the durable and runtime restore succeeded"
+        );
+
+        let enabled = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: "staged.transfer".to_string(),
+            },
+        )
+        .expect("the retried enable stages because the restore aborted the pending generation");
+        assert_eq!(
+            enabled.kind,
+            botster_hub_client::DaemonResponseKind::PackageDecision,
+            "{enabled:?}"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn enable_load_rollback_persist_failure_preserves_original_error() {
         let root = unique_package_control_dir("rollback-persist-failure");
