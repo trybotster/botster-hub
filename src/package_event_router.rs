@@ -7613,4 +7613,168 @@ mod tests {
             observ.event_router_queue_age_expiries
         );
     }
+
+    /// Counts how many staging funding handles the router has released.
+    struct CountedFunding(Arc<AtomicU64>);
+
+    impl Drop for CountedFunding {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn capped_router(per_plugin: usize, per_event: usize) -> PackageEventRouter {
+        PackageEventRouter::new(PackageEventPlanePolicy {
+            subscriptions_per_plugin_max: per_plugin,
+            subscribers_per_event_max: per_event,
+            ..PackageEventPlanePolicy::default()
+        })
+    }
+
+    fn holder(plugin: &str, owner: &str, name: &str) -> EventSubscription {
+        EventSubscription {
+            plugin_key: plugin.to_string(),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            handler_id: format!("event:{owner}:{name}"),
+            generation: 1,
+            ..EventSubscription::default()
+        }
+    }
+
+    /// Stage and activate `pkg`, which declares `pkg.ready` and subscribes to it.
+    fn stage_self_subscribed(
+        router: &PackageEventRouter,
+        released: &Arc<AtomicU64>,
+    ) -> Result<StagedGeneration, StageError> {
+        router.stage_package_generation(
+            "pkg",
+            vec![sample_contract("pkg", "pkg.ready")],
+            vec![holder("pkg", "pkg", "pkg.ready")],
+            Box::new(CountedFunding(Arc::clone(released))),
+            crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+        )
+    }
+
+    #[test]
+    fn a_staged_generation_is_invisible_until_activation() {
+        let router = router();
+        let released = Arc::new(AtomicU64::new(0));
+        let first = stage_self_subscribed(&router, &released).expect("stage v1");
+        assert_eq!(first.generation(), 1);
+        assert_eq!(router.activate_staged_generation(first).expect("activate v1"), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1, "activation releases funding");
+
+        let second = stage_self_subscribed(&router, &released).expect("stage v2");
+        assert_eq!(second.generation(), 2);
+        assert_eq!(router.current_package_generation("pkg"), Ok(1));
+        assert_eq!(
+            router.try_ingress("pkg", "pkg.ready", &serde_json::json!({"ok": true}), Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        let batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].holder.plugin_generation, 1,
+            "ingress matches only the live generation while v2 is staged"
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 1, "the pending entry holds its funding");
+        assert_eq!(router.activate_staged_generation(second).expect("activate v2"), 2);
+        assert_eq!(router.current_package_generation("pkg"), Ok(2));
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_refused_stage_changes_nothing_and_releases_its_funding() {
+        let router = router();
+        let released = Arc::new(AtomicU64::new(0));
+        let busy = router.test_with_inner_held(|| stage_self_subscribed(&router, &released));
+        assert!(
+            matches!(busy, Err(StageError::Rejected(EventPlaneStatus::ShedBusy))),
+            "{busy:?}"
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        let unfunded = router.stage_package_generation(
+            "pkg",
+            vec![sample_contract("pkg", "pkg.ready")],
+            vec![holder("pkg", "pkg", "pkg.ready")],
+            Box::new(CountedFunding(Arc::clone(&released))),
+            16,
+        );
+        assert!(matches!(unfunded, Err(StageError::Unfunded { reserved: 16, .. })), "{unfunded:?}");
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        assert_eq!(router.current_package_generation("pkg"), Ok(0));
+        // Nothing is pending, so a new stage is admitted.
+        let staged = stage_self_subscribed(&router, &released).expect("stage after refusals");
+        assert!(router.abort_staged_generation(staged));
+    }
+
+    #[test]
+    fn a_second_stage_is_refused_and_abort_releases_the_first() {
+        let router = router();
+        let released = Arc::new(AtomicU64::new(0));
+        let staged = stage_self_subscribed(&router, &released).expect("stage");
+        let overlap = stage_self_subscribed(&router, &released);
+        assert!(matches!(overlap, Err(StageError::AlreadyStaged)), "{overlap:?}");
+        assert_eq!(router.counters.stage_overlaps(), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1, "the refused stage's funding");
+        assert!(router.abort_staged_generation(staged));
+        assert_eq!(released.load(Ordering::SeqCst), 2, "abort releases the pending funding");
+        assert_eq!(router.current_package_generation("pkg"), Ok(0));
+    }
+
+    #[test]
+    fn an_unload_discards_a_pending_generation_and_its_funding() {
+        let router = router();
+        let released = Arc::new(AtomicU64::new(0));
+        let staged = stage_self_subscribed(&router, &released).expect("stage");
+        run_unload(&router, "pkg", 0);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!router.abort_staged_generation(staged), "the unload already cleared it");
+    }
+
+    #[test]
+    fn a_growing_stage_reserves_its_growth_against_other_subscribers() {
+        // One event bucket may hold two subscribers.
+        let router = capped_router(8, 2);
+        router
+            .try_register_contracts(vec![sample_contract("prod", "prod.ready")])
+            .expect("producer contract");
+        subscribe(&router, "a", "prod", "prod.ready");
+        let released = Arc::new(AtomicU64::new(0));
+        // pkg grows the bucket by one subscriber.
+        let staged = router
+            .stage_package_generation(
+                "pkg",
+                Vec::new(),
+                vec![holder("pkg", "prod", "prod.ready")],
+                Box::new(CountedFunding(Arc::clone(&released))),
+                crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+            )
+            .expect("the growth fits");
+        assert_eq!(
+            router.try_subscribe(holder("c", "prod", "prod.ready")),
+            EventPlaneStatus::RejectedOverFanout,
+            "the staged growth is reserved"
+        );
+        assert_eq!(router.activate_staged_generation(staged).expect("activate"), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_same_size_reload_of_a_full_bucket_is_not_double_counted() {
+        // pkg declares pkg.ready; pkg and another plugin fill its bucket.
+        let router = capped_router(8, 2);
+        let released = Arc::new(AtomicU64::new(0));
+        let first = stage_self_subscribed(&router, &released).expect("stage v1");
+        router.activate_staged_generation(first).expect("activate v1");
+        subscribe(&router, "other", "pkg", "pkg.ready");
+        // The unload predicate frees both holders, so the same-size
+        // replacement needs no reservation and is admitted.
+        let second = stage_self_subscribed(&router, &released).expect("stage v2 on a full bucket");
+        router.activate_staged_generation(second).expect("activate v2");
+        assert_eq!(router.current_package_generation("pkg"), Ok(2));
+    }
 }
