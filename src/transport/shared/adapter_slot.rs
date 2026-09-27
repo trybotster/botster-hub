@@ -77,7 +77,7 @@ impl<W: WakeSink> AdapterSlot<W> {
     }
 
     pub(crate) fn close_from_host(&self) {
-        self.cause.mark_host_if_open();
+        self.cause.close_from_host();
         self.close();
     }
 
@@ -86,7 +86,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         &self,
         reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
     ) {
-        self.cause.mark_core_if_open(reason);
+        self.cause.close_from_core(reason);
         self.close();
     }
 
@@ -94,6 +94,12 @@ impl<W: WakeSink> AdapterSlot<W> {
         &self,
     ) -> Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason> {
         self.cause.core_reason()
+    }
+
+    /// Run `seam` inside the next close, between its open check and commit.
+    #[cfg(test)]
+    pub(crate) fn set_close_commit_seam(&self, seam: impl FnOnce() + Send + 'static) {
+        self.cause.set_commit_seam(seam);
     }
 
     pub(crate) fn close(&self) {
