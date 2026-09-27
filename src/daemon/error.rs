@@ -453,7 +453,8 @@ pub enum DaemonTransportError {
     /// version of the package ran before still runs.
     PluginNotSwapped {
         package_name: String,
-        error: crate::HubLuaPluginLoadError,
+        // Boxed: carried inline it enlarges every `DaemonTransportError`.
+        error: Box<crate::HubLuaPluginLoadError>,
     },
     /// A package mutation side effect failed, and one or more rollback steps also failed.
     PackageCompensation {
