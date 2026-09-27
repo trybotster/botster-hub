@@ -79,6 +79,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 4. **Core plugin `Backpressured` has no retry event.** Class-queue space frees when a worker dequeues, and nothing notifies the host (`contract/actor.rs:1326-1330`).
 5. **Unbounded queues:** the WebRTC rtc send buffer, the Unix `queued_events`, the worker control mpsc, keyless PTY input, and the async capability result mpsc.
 6. **Silent drops:** the worker egress after a socket error, and the event retire on `LockBusy`.
+7. **Refused maintenance reads stall (live defect).** When the bounded Core request queue is full (`CoreTicketPoll::Refused`), the Observe, journal-pull, and baseline slices clear their read and return without marking themselves again (`daemon_maintenance.rs:955, 1004, 1111`). A freed queue slot publishes no owner wake. The read then waits for an unrelated wake. This is confirmed by code reading, and no test proves it yet. Step S4 fixes it: the slice becomes `Wait(Signal(DataPlaneCapacity))`, and a test that fills the request queue proves the fix.
 
 ### 1.6 Duplicate bounds (recorded; no value changes in this plan)
 
@@ -165,7 +166,7 @@ This is the `Future::poll` contract ("`Pending` must have registered a waker"), 
 | Package-event `delivery_wake` (atomic, no doorbell) | **Replaced** by `OwnerSignal(PackageEvents)`. This fixes the lost wake after an off-owner emit. |
 | Core completion notifier | **Kept** as Core mechanism, with the meaning in 2.4.1. Hub installs `raise(PluginEngine)`. |
 | `admission_retry_armed` (Core) | **Kept** inside Core as the arming detail of 2.4.1. Hub never sees it. |
-| Capability event notifier and `next_deadline` (Core `2cda9e9`) | **This plan owns the wake plumbing (step S4).** Hub installs `set_event_notifier` as `raise(CapabilityEvents)`, and it adds `next_deadline` to the owner's `DeadlineIndex`. The orchestrator paused this wiring in plugin-platform slice 3 because this redesign rewrites the plumbing. The plugin platform keeps the consumer: draining the events and resuming handlers (its §4.2). Today the results have no production consumer (`drain_capability_events` has test callers only). |
+| Capability event notifier and `next_deadline` (Core `2cda9e9`) | **This plan owns the wake plumbing (step S4; orchestrator decision, 2026-09-27).** Hub installs `set_event_notifier` as `raise(CapabilityEvents)`, and it adds `next_deadline` to the owner's `DeadlineIndex`. The orchestrator paused this wiring in plugin-platform slice 3 because this redesign rewrites the plumbing. The plugin platform keeps the consumer: draining the events and resuming handlers (its §4.2). Today the results have no production consumer (`drain_capability_events` has test callers only). |
 | Host executor `HostWake` (`completion_pending`, `capacity_pending`) | **Kept** as the producer side. It raises `HostCompletion` and `HostCapacity`. |
 | Publication sweep (`publication_owner.ready` every iteration) | **Deleted.** It is a source with derived readiness. |
 | Causal sweep (`causal_wake_through` walks every waiter) | **Deleted.** FIFO capacity waits (rule 2.1.4). |
@@ -257,7 +258,7 @@ The total is about 11 to 13 writer-days of new work. That exceeds the 3-day guid
 | S1 | 1 d | event spin; lost emit wake; `LockBusy` drops an event |
 | S2 | 0.5 d | contention opens a gap and a full baseline |
 | S3 | 0.5 d | `shed_busy` on the first subscribe |
-| S4 | 2 d | deletes the incidental wakes that hid the cursor defect; fixes the `Refused` spin and lost wake, and the permanent `recovery` flag |
+| S4 | 2 d | fixes the live `Refused` maintenance-read stall (1.5 item 7) and the `Refused` pump spin; deletes the incidental wakes that hid the cursor defect; fixes the permanent `recovery` flag and the capability-event wake |
 | S5 | 1 d | a paste burst ends the route |
 
 If time forces a cut, S4 is the only step that can move after cutover without leaving a known hang. The spins it fixes waste CPU; they do not hang. The recommendation is to keep S4 before cutover, because it makes the readiness model the only wake path in the Hub owner.
