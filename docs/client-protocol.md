@@ -1227,9 +1227,18 @@ The daemon never waits and never allocates unfunded memory for a read:
 - If the Lua callback memory cannot fund the page copy, it answers the
   retryable operator error `plugin_logs_capacity`.
 
-Records are dropped when the package unloads. A failed load or reload drops
-exactly the records its entrypoint wrote. Accepted records are also written to
-the daemon's standard error with package, generation, sequence, and level.
+Records are dropped when the package unloads. A failed reload keeps the records
+its entrypoint wrote, beside the serving version's, tagged with the failed
+load's `generation`: they explain the failure, and they may evict older records
+like any others. A failed load with no serving version drops the package's
+records.
+
+Accepted records are also written to the daemon's standard error with package,
+generation, sequence, level, `dropped_before`, and `unmirrored_before`. A
+separate writer produces these lines, so a slow standard error never delays a
+plugin or a read. `unmirrored_before` counts records that left the ring before
+that writer reached them; they are absent from standard error but were readable
+through `read_plugin_logs` until evicted.
 
 ## Many-PTY client attach proof
 
