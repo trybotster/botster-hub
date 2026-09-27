@@ -287,7 +287,8 @@ ended while its connection stayed up:
 - `worker_lost` (`TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST`): the session's
   worker died without an exit report, so the route got no PROCESS_EXIT. Hub
   reports it whatever the registry state. The session entity then reports
-  `lifecycle: "failed"` with `failure_reason: "worker_lost"`.
+  `lifecycle: "failed"` with `failure_reason: "worker_lost"` and
+  `lifecycle_class: "ended"`.
 A client that does not know a reason still treats the event as a close.
 Detach and ShutdownSession never produce one of these events for the
 generation they end.
@@ -363,7 +364,11 @@ other absolute family after generic `UiNode` validation. Its row id and
 `session_uuid` are the canonical session UUID. Every present
 `DaemonSessionEntity` has required `lifecycle_class` with this total mapping:
 
-- `registry_state == "stale"` => `indeterminate`, regardless of lifecycle;
+- `registry_state == "stale"` with lifecycle `failed` and `failure_reason`
+  `worker_lost` => `ended` (Core saw the worker die, so the session is known
+  to be gone);
+- any other `registry_state == "stale"` => `indeterminate`, regardless of
+  lifecycle;
 - otherwise `starting | running | stopping` => `current`;
 - otherwise `exited | failed` => `ended`;
 - otherwise an omitted lifecycle => `indeterminate`.

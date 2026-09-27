@@ -2567,12 +2567,22 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
 }
 
 #[cfg(test)]
+use crate::session_projection::WORKER_LOST_REASON;
+
+#[cfg(test)]
 fn session_lifecycle_class(
     registry_state: &RegistrySessionState,
     lifecycle: Option<&SessionLifecycleState>,
 ) -> &'static str {
     if registry_state == &RegistrySessionState::Stale {
-        "indeterminate"
+        // Stale is usually unknown (a row Hub could not adopt). A worker Core
+        // saw die is known to be gone, so that session has ended.
+        match lifecycle {
+            Some(SessionLifecycleState::Failed { reason }) if reason == WORKER_LOST_REASON => {
+                "ended"
+            }
+            _ => "indeterminate",
+        }
     } else {
         match lifecycle {
             Some(
