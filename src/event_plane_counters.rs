@@ -387,6 +387,10 @@ pub struct EventPlaneCounters {
     last_ready_operation_wait_us: AtomicU64,
     max_ready_operation_wait_us: AtomicU64,
     stalled_write_timeouts: AtomicU64,
+    /// Package replacements whose commit failed after a successful preview
+    /// had already unloaded the previous generation. Hub-local until a
+    /// protocol revision exposes it.
+    replacements_stranded: AtomicU64,
     global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
@@ -433,6 +437,7 @@ impl EventPlaneCounters {
             last_ready_operation_wait_us: AtomicU64::new(0),
             max_ready_operation_wait_us: AtomicU64::new(0),
             stalled_write_timeouts: AtomicU64::new(0),
+            replacements_stranded: AtomicU64::new(0),
             global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
@@ -543,6 +548,14 @@ impl EventPlaneCounters {
 
     pub fn record_stalled_write_timeout(&self) {
         self.stalled_write_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replacement_stranded(&self) {
+        self.replacements_stranded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn replacements_stranded(&self) -> u64 {
+        self.replacements_stranded.load(Ordering::Relaxed)
     }
 
     /// Control-path insert. Event paths must not call this.

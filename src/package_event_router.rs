@@ -185,11 +185,18 @@ pub enum EventOwnerWorkError {
 pub struct EventPlaneReplaceError {
     result: Result<u64, EventPlaneStatus>,
     cleanup: Option<EventOwnerWorkError>,
+    unloaded: bool,
 }
 
 impl EventPlaneReplaceError {
     pub fn into_parts(self) -> (Result<u64, EventPlaneStatus>, Option<EventOwnerWorkError>) {
         (self.result, self.cleanup)
+    }
+
+    /// Whether the replacement unloaded the previous generation before it
+    /// failed. A rejection that returns false left the router unchanged.
+    pub fn unloaded(&self) -> bool {
+        self.unloaded
     }
 }
 
@@ -198,6 +205,7 @@ impl From<EventPlaneStatus> for EventPlaneReplaceError {
         Self {
             result: Err(status),
             cleanup: None,
+            unloaded: false,
         }
     }
 }
@@ -714,6 +722,16 @@ impl PackageEventRouter {
             subscriptions,
         );
         drop(inner);
+        if let Err(status) = &result {
+            // The preview accepted this replacement, so its commit failing
+            // after the unload is an invariant break.
+            self.counters.record_replacement_stranded();
+            crate::hub_log::hub_log!(
+                "event_plane_replacement_stranded owner={owner} status={} total={}",
+                status.as_str(),
+                self.counters.replacements_stranded()
+            );
+        }
         let mut work = EventOwnerWork::new(OwnerOp {
             kind: OwnerOpKind::Unload,
             owner: owner.to_string(),
@@ -725,9 +743,14 @@ impl PackageEventRouter {
             return Err(EventPlaneReplaceError {
                 result,
                 cleanup: Some(cleanup),
+                unloaded: true,
             });
         }
-        result.map_err(EventPlaneReplaceError::from)
+        result.map_err(|status| EventPlaneReplaceError {
+            result: Err(status),
+            cleanup: None,
+            unloaded: true,
+        })
     }
 
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
