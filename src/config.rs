@@ -663,6 +663,7 @@ impl CoreEngineOptions {
                 crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY,
             completion_queue_capacity: 256,
             completion_queue_byte_capacity: 32 * 1024 * 1024,
+            test_queue_probe: None,
         }
     }
 

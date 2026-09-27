@@ -164,7 +164,12 @@ impl TerminalAdapter for UnixTerminalAdapter {
         self.inner.try_write(frame)
     }
 
-    fn close(&mut self) {
+    // The reason reaches the wire with the protocol-13 close-reason change;
+    // until then a Core close keeps reporting core_adapter_closed.
+    fn close(
+        &mut self,
+        _reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
         self.inner.close();
     }
 
@@ -686,7 +691,10 @@ mod tests {
     #[test]
     fn host_close_after_core_close_does_not_claim_host_reason() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
-        adapter.close();
+        TerminalAdapter::close(
+            &mut adapter,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
         assert!(handle.is_closed());
         assert!(!handle.host_closed());
         handle.close_from_host();

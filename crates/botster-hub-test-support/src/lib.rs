@@ -6370,7 +6370,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "549b3f62dabacf45cce4b4dfd19e1a6800bf8c7a"
+            "42a4b71d29b35115caa68d11387a3ac14c341039"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(
