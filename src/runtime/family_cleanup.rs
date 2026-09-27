@@ -59,8 +59,11 @@ impl HubRuntime {
         let selected = if let Some(selected) = cleanup.family_cursor.select_detached() {
             selected
         } else {
-            let selected =
-                self.with_direct_entity_model(|model| model.select_cleanup_live(cleanup));
+            let Ok(selected) =
+                self.with_direct_entity_model(|model| model.select_cleanup_live(cleanup))
+            else {
+                return FamilyCleanupStep::Fault;
+            };
             self.note_package_entity_resync_changed();
             selected
         };

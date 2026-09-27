@@ -703,7 +703,9 @@ mod tests {
             }))
             .unwrap();
         runtime.test_store_pending_lease(scope, family, 1);
-        runtime.begin_package_entity_provider_snapshot(family, 0);
+        runtime
+            .begin_package_entity_provider_snapshot(family, 0)
+            .expect("the test model is not poisoned");
         let crate::runtime::PackageEntitySnapshotStep::Ready(item) =
             runtime.step_package_entity_provider_snapshot(family)
         else {

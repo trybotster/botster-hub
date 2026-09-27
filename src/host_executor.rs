@@ -1247,7 +1247,14 @@ fn execute(
         | HostCommand::DiscardCompletion(_) => {
             unreachable!("worker handles disposal before execution")
         }
-        HostCommand::EntityModel(work) => HostResult::EntityModelComplete(work.run(identity)),
+        HostCommand::EntityModel(work) => match work.run(identity) {
+            Ok(kind) => HostResult::EntityModelComplete(kind),
+            // The owner faults the active model on any other result.
+            Err(error) => HostResult::Failed {
+                generation: 0,
+                error,
+            },
+        },
         HostCommand::ReclaimEntityModel(work) => {
             HostResult::EntityModelComplete(work.reclaim(identity))
         }

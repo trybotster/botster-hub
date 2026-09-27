@@ -436,7 +436,9 @@ mod tests {
                 runtime
                     .drop_package_entity_families_for("producer")
                     .unwrap();
-                runtime.begin_package_entity_provider_snapshot("producer.item", 40);
+                runtime
+                    .begin_package_entity_provider_snapshot("producer.item", 40)
+                    .expect("the test model is not poisoned");
                 assert_ne!(
                     runtime.package_entity_family_generation("producer.item"),
                     generation
@@ -449,7 +451,9 @@ mod tests {
                 assert_eq!(runtime.test_fanout_sequence(None), 1);
                 assert_eq!(state.budget.outstanding(), 0);
             } else if mode == "snapshot" {
-                runtime.begin_package_entity_provider_snapshot("producer.item", 3);
+                runtime
+                    .begin_package_entity_provider_snapshot("producer.item", 3)
+                    .expect("the test model is not poisoned");
                 phase(&daemon, &mut state);
                 assert_eq!(runtime.test_family_seq("producer.item"), 4);
                 assert!(response.try_recv().is_err());

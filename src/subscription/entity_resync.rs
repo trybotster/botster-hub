@@ -725,7 +725,9 @@ mod tests {
             }))
             .unwrap();
         runtime.test_store_pending_lease(scope, family, 1);
-        runtime.begin_package_entity_provider_snapshot(family, 0);
+        runtime
+            .begin_package_entity_provider_snapshot(family, 0)
+            .expect("the test model is not poisoned");
         let PackageEntitySnapshotStep::Ready(item) =
             runtime.step_package_entity_provider_snapshot(family)
         else {
@@ -907,7 +909,8 @@ mod tests {
         daemon
             .runtime()
             .unwrap()
-            .begin_package_entity_provider_snapshot("family", 1);
+            .begin_package_entity_provider_snapshot("family", 1)
+            .expect("the test model is not poisoned");
         let pending_attempt = daemon
             .runtime()
             .unwrap()

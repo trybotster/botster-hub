@@ -153,6 +153,189 @@ mod tests {
         drop(status);
     }
 
+    /// Once the active model faults, the next request fails fast with the
+    /// typed Fault; before the fault it waits for the release.
+    #[test]
+    fn a_faulted_active_model_faults_the_next_begin() {
+        let runtime = super::super::tests::family_runtime("faulted-active");
+        let first = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(identity(), Operation::TakeFanout { retained: None }, &first)
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        let second = runtime.host_executor().try_reserve().unwrap();
+        let next = HostJobIdentity::first(WaiterId(32));
+        assert!(matches!(
+            runtime.begin_entity_model(next, Operation::TakeFanout { retained: None }, &second),
+            Err((CausalTransitionStatus::Waiting, _))
+        ));
+        runtime.fault_entity_model(identity());
+        assert!(runtime.entity_model_faulted());
+        assert!(matches!(
+            runtime.begin_entity_model(next, Operation::TakeFanout { retained: None }, &second),
+            Err((CausalTransitionStatus::Fault, _))
+        ));
+        drop(work);
+    }
+
+    /// A stale-generation result is invalid but uncommitted: the consumer
+    /// fails only its own request (the worker reports entity_provider_stale)
+    /// and releases the model, so the next request proceeds.
+    #[test]
+    fn a_stale_generation_result_releases_the_active_model() {
+        let runtime = super::super::tests::family_runtime("stale-generation-release");
+        runtime
+            .with_direct_entity_model(|model| model.family("p.item").generation = 7)
+            .expect("the test model is not poisoned");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity(),
+                Operation::StepSnapshot {
+                    name: Some(Arc::new("p.item".to_string())),
+                    expected_generation: 6,
+                    preserve_resync_need: false,
+                    generation: None,
+                    retained: Default::default(),
+                },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        runtime
+            .host_executor()
+            .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
+            .unwrap();
+        let completed = completion(&runtime);
+        let HostResult::EntityModelComplete(kind) = completed.result else {
+            panic!("a stale snapshot step completes");
+        };
+        assert_eq!(
+            runtime.observe_entity_model(completed.identity, kind),
+            CausalTransitionStatus::Applied
+        );
+        let output = runtime
+            .entity_model_output(&work)
+            .expect("exact observation permits output access");
+        assert!(!output.valid, "the generation is stale");
+        drop(output);
+        assert!(
+            runtime.release_entity_model(&work),
+            "a stale result releases the model"
+        );
+        assert!(!runtime.entity_model_faulted());
+        let next = runtime.host_executor().try_reserve().unwrap();
+        assert!(
+            runtime
+                .begin_entity_model(
+                    HostJobIdentity::first(WaiterId(34)),
+                    Operation::TakeFanout { retained: None },
+                    &next,
+                )
+                .is_ok(),
+            "the next request proceeds"
+        );
+    }
+
+    /// A panic inside a Host model operation poisons the shared model. Every
+    /// later access then gets the typed restart-required Fault, never a
+    /// lock panic.
+    #[test]
+    fn a_panic_inside_work_run_leaves_only_typed_faults() {
+        let runtime = super::super::tests::family_runtime("poisoned-model");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity(),
+                Operation::TakeFanout { retained: None },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        work.0.state.lock().unwrap().fail_after_operation = true;
+        runtime
+            .host_executor()
+            .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
+            .unwrap();
+        assert!(matches!(
+            completion(&runtime).result,
+            HostResult::Failed { .. }
+        ));
+        assert!(runtime.entity_model_poisoned());
+
+        let second = runtime.host_executor().try_reserve().unwrap();
+        assert!(matches!(
+            runtime.begin_entity_model(
+                HostJobIdentity::first(WaiterId(33)),
+                Operation::TakeFanout { retained: None },
+                &second,
+            ),
+            Err((CausalTransitionStatus::Fault, _))
+        ));
+        assert_eq!(
+            runtime.with_direct_entity_model(|_| ()),
+            Err(EntityModelPoisoned)
+        );
+        assert!(runtime.take_one_package_entity_fanout().is_none());
+        assert!(matches!(
+            runtime.step_package_entity_provider_snapshot("p.item"),
+            super::super::PackageEntitySnapshotStep::Fault
+        ));
+        assert!(!runtime.record_package_entity_resync_attempt("p.item"));
+        assert_eq!(
+            runtime.begin_package_entity_provider_snapshot("p.item", 1),
+            Err(EntityModelPoisoned)
+        );
+        drop(work);
+    }
+
+    /// A model operation that starts on an already poisoned model returns
+    /// the typed restart-required error instead of reading it.
+    #[test]
+    fn work_run_on_a_poisoned_model_returns_the_typed_error() {
+        let runtime = super::super::tests::family_runtime("poisoned-before-run");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity(),
+                Operation::TakeFanout { retained: None },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        let model = Arc::clone(&runtime.package_entities);
+        let _ = std::thread::spawn(move || {
+            let _held = model.lock().unwrap();
+            panic!("poison the model");
+        })
+        .join();
+        assert!(runtime.entity_model_poisoned());
+        let error = work
+            .run(identity())
+            .expect_err("a poisoned model is never read");
+        assert_eq!(error.code, "causal_recovery_required");
+        assert_eq!(error.message, ENTITY_MODEL_POISONED_MESSAGE);
+    }
+
+    /// Terminal retirement of the active model publishes the same wake as a
+    /// normal release.
+    #[test]
+    fn terminal_retirement_of_the_active_model_publishes_the_wake() {
+        let runtime = super::super::tests::family_runtime("terminal-retire-wake");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity(),
+                Operation::TakeFanout { retained: None },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        let _ = runtime.take_entity_model_notification();
+        work.dispose_terminal_payload();
+        assert!(runtime.retire_terminal_entity_model(&work));
+        assert!(runtime.entity_model_available());
+        assert!(
+            runtime.take_entity_model_notification(),
+            "the retirement re-polls parked waiters"
+        );
+    }
+
     #[test]
     fn stale_resync_snapshot_preserves_attempts_and_degradation() {
         let mut model = behind_family();
@@ -236,7 +419,7 @@ mod tests {
                 },
                 &permit,
             );
-            assert_eq!(work.run(identity()), Kind::BeginSnapshot);
+            assert!(matches!(work.run(identity()), Ok(Kind::BeginSnapshot)));
             let state = work.0.state.lock().expect("model output");
             assert!(!state.valid);
             assert_eq!(state.family_progress(), None);
@@ -438,37 +621,41 @@ mod tests {
         assert_eq!(resync_charge.0, 1);
         assert!(resync_charge.1 > 0);
         let release_resync = matches!(case, TerminalSnapshotCase::ReleaseResync);
-        runtime.with_direct_entity_model(|model| {
-            let family = model.family("p.item");
-            family.generation = 7;
-            family.causal_token = Some(23);
-            assert!(
-                family
-                    .remember_resync_lease_with_admission(29, resync_source.admission().cloned(),)
-            );
-            drop(resync_source);
-            if release_resync {
-                drop(mutation);
-            } else {
-                let lease = EntityMutationLease {
-                    scope_id: 17,
-                    family_token: 23,
-                    family: "p.item".into(),
-                    generation: 7,
-                    seq: 3,
-                    admission: mutation.admission().cloned(),
+        runtime
+            .with_direct_entity_model(|model| {
+                let family = model.family("p.item");
+                family.generation = 7;
+                family.causal_token = Some(23);
+                assert!(
+                    family.remember_resync_lease_with_admission(
+                        29,
+                        resync_source.admission().cloned(),
+                    )
+                );
+                drop(resync_source);
+                if release_resync {
+                    drop(mutation);
+                } else {
+                    let lease = EntityMutationLease {
+                        scope_id: 17,
+                        family_token: 23,
+                        family: "p.item".into(),
+                        generation: 7,
+                        seq: 3,
+                        admission: mutation.admission().cloned(),
+                    };
+                    let (_, ready, discarded) = family.admit(mutation, Instant::now());
+                    assert!(ready.is_none() && discarded.is_none());
+                    family.store_pending_lease(lease);
+                }
+                let floor = if matches!(case, TerminalSnapshotCase::Ready) {
+                    2
+                } else {
+                    3
                 };
-                let (_, ready, discarded) = family.admit(mutation, Instant::now());
-                assert!(ready.is_none() && discarded.is_none());
-                family.store_pending_lease(lease);
-            }
-            let floor = if matches!(case, TerminalSnapshotCase::Ready) {
-                2
-            } else {
-                3
-            };
-            family.begin_provider_snapshot_seq(floor, Instant::now());
-        });
+                family.begin_provider_snapshot_seq(floor, Instant::now());
+            })
+            .expect("the test model is not poisoned");
         let expected_mutation_charge = if release_resync {
             (0, 0)
         } else {
@@ -619,13 +806,15 @@ mod tests {
                 resync_charge
             }
         );
-        runtime.with_direct_entity_model(|model| {
-            let family = model.family("p.item");
-            assert!(family.pending_by_seq.is_empty() && family.pending_leases.is_empty());
-            assert_eq!(family.resync.leases.contains_key(&29), !release_resync);
-            // Ready/Discarded must leave the independent resync owner untouched.
-            family.forget_resync_lease(29);
-        });
+        runtime
+            .with_direct_entity_model(|model| {
+                let family = model.family("p.item");
+                assert!(family.pending_by_seq.is_empty() && family.pending_leases.is_empty());
+                assert_eq!(family.resync.leases.contains_key(&29), !release_resync);
+                // Ready/Discarded must leave the independent resync owner untouched.
+                family.forget_resync_lease(29);
+            })
+            .expect("the test model is not poisoned");
         assert_eq!(resync_bridge.retained_counts(), (0, 0));
         drop(permit);
         assert_eq!(runtime.host_executor().outstanding(), 0);
@@ -740,11 +929,13 @@ mod tests {
         for scheduled_resync in [false, true] {
             let runtime = super::super::tests::family_runtime("host-model-table-receipt");
             if scheduled_resync {
-                runtime.with_direct_entity_model(|model| {
-                    let family = model.family("p.item");
-                    family.causal_token = Some(23);
-                    family.generation = 7;
-                });
+                runtime
+                    .with_direct_entity_model(|model| {
+                        let family = model.family("p.item");
+                        family.causal_token = Some(23);
+                        family.generation = 7;
+                    })
+                    .expect("the test model is not poisoned");
             }
             assert!(!runtime.entity_model_readiness().resync);
             assert!(!runtime.take_entity_model_notification());
@@ -1341,6 +1532,16 @@ struct Shared {
     terminal_disposed: std::sync::atomic::AtomicBool,
 }
 
+/// The package entity model's mutex is poisoned: a Host operation panicked
+/// while it held the model, which may be half-updated. No later access may
+/// trust it; entity work requires a daemon restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityModelPoisoned;
+
+/// The typed refusal for any entity access after the model is poisoned.
+pub(crate) const ENTITY_MODEL_POISONED_MESSAGE: &str =
+    "the package entity model was poisoned by an earlier failure; restart the daemon";
+
 /// The Owner keeps one handle until exact completion and causal application.
 #[derive(Clone)]
 pub(crate) struct Work(Arc<Shared>);
@@ -1473,22 +1674,32 @@ impl super::HubRuntime {
             .is_some_and(|active| Arc::ptr_eq(&active.work.0, &work.0))
         {
             active.take();
+            // Waiters parked on the active model are re-polled, as after a
+            // normal release, whatever path reaches this retirement.
+            self.entity_model_owner.changed.set(true);
         }
         true
     }
 
     /// Synchronous callers use the same model outside daemon execution.
+    /// A poisoned model is never read: `f` does not run, and the caller gets
+    /// the typed error.
     pub(super) fn with_direct_entity_model<R>(
         &self,
         f: impl FnOnce(&mut PackageEntities) -> R,
-    ) -> R {
-        let mut model = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock");
+    ) -> Result<R, EntityModelPoisoned> {
+        let Ok(mut model) = self.package_entities.lock() else {
+            crate::hub_log::hub_log!("package_entity_model_poisoned access=direct");
+            return Err(EntityModelPoisoned);
+        };
         let result = f(&mut model);
         self.entity_model_owner.update_readiness(&model);
-        result
+        Ok(result)
+    }
+
+    /// An earlier Host operation panicked while it held the model.
+    pub(crate) fn entity_model_poisoned(&self) -> bool {
+        self.package_entities.is_poisoned()
     }
 
     pub(crate) fn begin_detached_entity_cleanup(
@@ -1656,7 +1867,15 @@ impl super::HubRuntime {
         operation: Operation,
         permit: &HostWorkPermit,
     ) -> Result<Work, (CausalTransitionStatus, Operation)> {
-        if operation.kind() == Kind::CleanupDetached || self.causal_faulted() {
+        // A faulted active model is retained until shutdown retirement and
+        // requires a daemon restart, as for the request that faulted it:
+        // every later request fails fast with the same typed Fault instead of
+        // waiting for a release that cannot come.
+        if operation.kind() == Kind::CleanupDetached
+            || self.causal_faulted()
+            || self.entity_model_faulted()
+            || self.entity_model_poisoned()
+        {
             return Err((CausalTransitionStatus::Fault, operation));
         }
         if operation.input_bytes() > permit.reserved_prepared_bytes() {
@@ -1762,6 +1981,15 @@ impl super::HubRuntime {
         self.entity_model_owner.active.borrow().is_none()
             && self.causal_queue.is_empty()
             && !self.causal_faulted()
+    }
+
+    /// The active model faulted and is retained until shutdown retirement.
+    pub(crate) fn entity_model_faulted(&self) -> bool {
+        self.entity_model_owner
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.faulted)
     }
 
     pub(super) fn entity_model_in_flight(&self) -> bool {
@@ -1952,7 +2180,10 @@ impl Work {
         matches.then_some(state)
     }
 
-    pub(crate) fn run(&self, identity: HostJobIdentity) -> Kind {
+    pub(crate) fn run(
+        &self,
+        identity: HostJobIdentity,
+    ) -> Result<Kind, crate::host_executor::HostError> {
         let mut state = self.0.state.lock().expect("entity model work lock");
         assert_eq!(
             identity, self.0.identity,
@@ -1975,9 +2206,15 @@ impl Work {
                 "injected failure after detached cleanup"
             );
             state.phase = Phase::Completed;
-            return self.0.kind;
+            return Ok(self.0.kind);
         }
-        let mut model = self.0.model.lock().expect("package entity model lock");
+        let Ok(mut model) = self.0.model.lock() else {
+            // Never read a model an earlier panic may have half-updated.
+            return Err(crate::host_executor::HostError::new(
+                "causal_recovery_required",
+                ENTITY_MODEL_POISONED_MESSAGE,
+            ));
+        };
         let State {
             operation,
             causal,
@@ -2124,7 +2361,7 @@ impl Work {
         }
         // All fallible work must precede this flag, including input cleanup.
         state.phase = Phase::Completed;
-        self.0.kind
+        Ok(self.0.kind)
     }
 
     /// A released record can drop on the Owner only after the Host removes variable inputs.
