@@ -98,7 +98,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 5. **Unbounded queues:** the WebRTC rtc send buffer and SCTP pending queue, the Unix `queued_events`, the worker control mpsc, keyless input inside the worker, and the async capability result mpsc.
 6. **Silent drops:** the worker egress after a socket error, and the event retire on `LockBusy`.
 7. **Refused maintenance reads stall (live defect).** When the bounded Core request queue is full (`CoreTicketPoll::Refused`), the Observe, journal-pull, and baseline slices clear their read and return without marking themselves again (`daemon_maintenance.rs:955, 1004, 1111`). A freed queue slot publishes no owner wake. The read then waits for an unrelated wake. This is confirmed by code reading, and no test proves it yet. Step S4 fixes it: the slice becomes `Wait(Signal(DataPlaneCapacity))`, and a test that fills the request queue proves the fix.
-8. **The Unix client connection has no per-route flow control.** One Unix socket carries every terminal route plus the control frames (responses, events, entities). With C1's source backpressure, a client whose terminal budget is full can only stop reading the whole socket, so control frames wait head-of-line behind a flooding route. In the other direction, S5 stops the Hub reading the socket while one route's input ingress is full, and every later frame on that socket waits. WebRTC avoids both with one data channel per route. Step S13 adds per-route credit in both directions (section 4.4).
+8. **The Unix client connection has no per-route flow control.** One Unix socket carries every terminal route plus the control frames (responses, events, entities). With C1's source backpressure, a client whose terminal budget is full can only stop reading the whole socket, so control frames wait head-of-line behind a flooding route. In the other direction, S5 stops the Hub reading the socket while one route's input ingress is full, and every later frame on that socket waits. WebRTC avoids both with one data channel per route. Step S13 adds per-route credit in both directions (section 4.3).
 
 ### 1.6 Duplicate bounds (recorded; no value changes in this plan)
 
@@ -327,7 +327,7 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 | **S10** | Core + Hub | Derive `exit_hold` (2.4.4); `journal_advanced` as a wake (2.4.3) | hand-mirrored flags | post-exit capture tests; journal pull with no host poll | 0.5 d |
 | **S11** | Core | Data-plane fd reactor for worker and plugin-process sockets | 1 crossing per session; one reader thread per worker | worker process and plugin process suites | 2 to 3 d |
 | **S12** | Core | Coalesce adjacent `Output` frames in route egress | a line-buffered flood (`seq` to a tty) makes 7-byte frames, so the 64-frame route bound limits throughput, not the 4 MiB byte bound | a line-buffered flood fills the route by bytes, not by frame count; frame order and input-result order are kept | 0.5 d |
-| **S13** | Hub + client | Per-route credit in both directions on the Unix connection; the contract is in section 4.4. It replaces S5's whole-socket read pause for Unix and the TUI's interim blocking reader | a flooding route blocks control frames; one route's full input ingress blocks every later frame on the socket | see section 4.4 | 2 d |
+| **S13** | Hub + client | Per-route credit in both directions on the Unix connection; the contract is in section 4.3. It replaces S5's whole-socket read pause for Unix and the TUI's interim blocking reader | a flooding route blocks control frames; one route's full input ingress blocks every later frame on the socket | see section 4.3 | 2 d |
 
 ### 4.1 Cutover split
 
@@ -369,7 +369,7 @@ Every step in this list fixes a live defect.
 - **S1 lands in two parts.** S1a (the types, `OwnerSignal`, the interleaving harness, and the `PackageEvents` emit key) needs no Core change. S1b (the `PluginEngine` waits for `Backpressured` and `LockBusy`) requires C2 through S0: the incidental completion notification is not a retry edge, so S1b does not land before C2.
 - **S3 and S4a require S1a**, the types and the test harness. **S2 requires S1b**, because it uses `LockBusy`. S4b follows S2, S3, and S4a, so that it only deletes.
 
-### 4.4 S13: per-route credit on the Unix connection
+### 4.3 S13: per-route credit on the Unix connection
 
 Credit flows in both directions, so neither side ever has to stop reading the socket. Control frames therefore always flow.
 
@@ -396,7 +396,7 @@ Credit flows in both directions, so neither side ever has to stop reading the so
 6. A client that sends input beyond its credit is closed typed.
 7. A client that never grants credit ends `Stalled`.
 
-### 4.3 Execution (orchestrator assignment, 2026-09-27)
+### 4.4 Execution (orchestrator assignment, 2026-09-27)
 
 Each writer lands their own steps on main once their reviewer accepts and the landing procedure passes. Edits to `src/daemon/owner_loop.rs` are serialized through the owner-loop lead. Other writers branch after the lead's step lands, or they agree the edit with the lead first.
 
