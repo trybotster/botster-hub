@@ -421,9 +421,7 @@ fn finish(
         crate::daemon::owner_loop::mark_pump_ready(state);
     }
     if daemon.runtime().is_some_and(|runtime| {
-        runtime.package_event_router().peek_delivery_wake()
-            || runtime.package_entity_work_pending()
-            || runtime.package_entity_resync_still_needed()
+        runtime.package_entity_work_pending() || runtime.package_entity_resync_still_needed()
     }) {
         state.maintenance.try_wake();
     }
