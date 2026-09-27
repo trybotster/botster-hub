@@ -1565,10 +1565,10 @@ is replaced.
 13. Notification channel (13.4).
 14. Process host policy: kill grace, restart policy, OS limits (15).
 
-Open (not yet decided by the user):
-
-15. Publication credit (4.5.1): platform publications draw on each plugin's
-    own delivery pool (the approved 128 slots / 512 KiB), which replaces the
-    Hub-wide `PUBLICATION_CAPACITY` (256) as their bound (at most 8 x 128 in
-    total). This changes an existing bound, so it needs the user's
-    confirmation before slice 3 lands.
+15. Publication credit (4.5.1), DECIDED 2026-09-27: platform publications
+    draw credit only from each plugin's own delivery pool (the approved 128
+    slots / 512 KiB). There is no separate per-plugin publication credit, and
+    the Hub-wide `PUBLICATION_CAPACITY` (256) does not bound platform
+    publications (at most 8 x 128 items in total; bytes stay inside the
+    pools). No new number. Slice 3 is not gated on it. The sibling-isolation
+    proof (4.5.8) stays.
