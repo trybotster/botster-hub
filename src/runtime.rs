@@ -6796,7 +6796,9 @@ pub(crate) fn attach_and_bind_on_core(
     ) {
         Ok(generation) => generation,
         Err(error) => {
-            adapter.close();
+            // The attach failed before any bind: the route never existed.
+            adapter
+                .close(botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Failed);
             return Err(error);
         }
     };

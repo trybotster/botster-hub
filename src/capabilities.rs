@@ -10,24 +10,24 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use botster_core::{
-    Capability, CapabilityOperation, CapabilityOperationCompleted, CapabilityOperationFailure,
-    CapabilityOperationId, CapabilityOperationResult, CapabilityResourceEvent,
-    CapabilityResourceId, CapabilityRuntimeError, CapabilityRuntimeErrorKind,
-    CapabilityRuntimeEvent, CapabilityRuntimeHandle, CapabilityRuntimeRequest, CapabilitySet,
-    CapabilitySurface, CapabilityTimerEvent, FilesystemCapabilityGrant, FilesystemCapabilityLimits,
-    FilesystemCapabilityPermissions, FilesystemCapabilityRequest, FilesystemCapabilityResult,
-    FilesystemEntry, FilesystemEntryKind, FilesystemMetadata, FilesystemOperation,
-    HttpCapabilityEndpointPolicy, HttpCapabilityResponse, HttpCapabilityRuntime,
-    HttpCapabilityRuntimeConfig, HttpCapabilityTransport, HttpHeader, HttpTransportRequest,
-    InMemoryWebSocketCapabilityRuntime, PluginCancellationToken, PluginCapabilityRuntime,
-    PluginCleanupResult, PluginKey, PluginResourceKind, PluginResourceRef, PluginStoreBackend,
-    PluginStoreCapabilityRequest, PluginStoreEntry, PluginStoreKey, PluginStoreLimits,
-    PluginStoreOperation, PluginStoreRecord, PluginStoreResult, RequestId, ScopedRelativePath,
-    TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig, apply_plugin_store_merge_patch,
-    plugin_store_payload_bytes,
+    Capability, CapabilityEventNotifier, CapabilityOperation, CapabilityOperationCompleted,
+    CapabilityOperationFailure, CapabilityOperationId, CapabilityOperationResult,
+    CapabilityResourceEvent, CapabilityResourceId, CapabilityRuntimeError,
+    CapabilityRuntimeErrorKind, CapabilityRuntimeEvent, CapabilityRuntimeHandle,
+    CapabilityRuntimeRequest, CapabilitySet, CapabilitySurface, CapabilityTimerEvent,
+    FilesystemCapabilityGrant, FilesystemCapabilityLimits, FilesystemCapabilityPermissions,
+    FilesystemCapabilityRequest, FilesystemCapabilityResult, FilesystemEntry, FilesystemEntryKind,
+    FilesystemMetadata, FilesystemOperation, HttpCapabilityEndpointPolicy, HttpCapabilityResponse,
+    HttpCapabilityRuntime, HttpCapabilityRuntimeConfig, HttpCapabilityTransport, HttpHeader,
+    HttpTransportRequest, InMemoryWebSocketCapabilityRuntime, PluginCancellationToken,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginKey, PluginResourceKind, PluginResourceRef,
+    PluginStoreBackend, PluginStoreCapabilityRequest, PluginStoreEntry, PluginStoreKey,
+    PluginStoreLimits, PluginStoreOperation, PluginStoreRecord, PluginStoreResult, RequestId,
+    ScopedRelativePath, TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig,
+    apply_plugin_store_merge_patch, plugin_store_payload_bytes,
 };
 use botster_core::{
     KeyedStore, MAX_RANGE_BYTES, MAX_RANGE_ITEMS, Namespace, RedbStore, StoreError, StoreOp,
@@ -55,6 +55,8 @@ pub struct HubCapabilityRuntime {
     pending_events: BTreeMap<String, VecDeque<CapabilityRuntimeEvent>>,
     completions_sender: mpsc::Sender<HubCapabilityCompletion>,
     completions_receiver: mpsc::Receiver<HubCapabilityCompletion>,
+    /// Called after a worker thread queues a completion, so the owner drains it.
+    notifier: Option<CapabilityEventNotifier>,
     operation_capacity: usize,
     event_capacity: usize,
 }
@@ -234,6 +236,7 @@ impl HubCapabilityRuntime {
             pending_events: BTreeMap::new(),
             completions_sender,
             completions_receiver,
+            notifier: None,
             operation_capacity: DEFAULT_CAPABILITY_OPERATION_CAPACITY,
             event_capacity: DEFAULT_CAPABILITY_EVENT_CAPACITY,
         })
@@ -309,6 +312,7 @@ impl HubCapabilityRuntime {
             limits: merge_filesystem_limits(filesystem.limits, scope.grant.limits.clone()),
         };
         let sender = self.completions_sender.clone();
+        let notifier = self.notifier.clone();
         std::thread::Builder::new()
             .name("botster-hub-filesystem-capability".to_string())
             .spawn(move || {
@@ -318,6 +322,9 @@ impl HubCapabilityRuntime {
                     operation_id,
                     result,
                 });
+                if let Some(notifier) = notifier {
+                    notifier();
+                }
             })
             .map_err(|error| {
                 CapabilityRuntimeError::new(
@@ -347,6 +354,7 @@ impl HubCapabilityRuntime {
         let plugin_key = request.plugin_key.clone();
         let resource = request.resource_ref(CapabilityResourceId(operation_id.0.clone()));
         let sender = self.completions_sender.clone();
+        let notifier = self.notifier.clone();
         std::thread::Builder::new()
             .name("botster-hub-plugin-store-capability".to_string())
             .spawn(move || {
@@ -358,6 +366,9 @@ impl HubCapabilityRuntime {
                     operation_id,
                     result,
                 });
+                if let Some(notifier) = notifier {
+                    notifier();
+                }
             })
             .map_err(|error| {
                 CapabilityRuntimeError::new(
@@ -664,6 +675,23 @@ impl HubCapabilityRuntime {
 }
 
 impl PluginCapabilityRuntime for HubCapabilityRuntime {
+    fn set_event_notifier(&mut self, notifier: CapabilityEventNotifier) {
+        self.notifier = Some(Arc::clone(&notifier));
+        self.http.set_event_notifier(Arc::clone(&notifier));
+        self.websocket.set_event_notifier(notifier);
+    }
+
+    /// Hub timers run on a logical millisecond clock that the caller of
+    /// `drain_events_at` supplies, so they have no wall-clock deadline here.
+    /// Filesystem and plugin-store operations have no deadline either; their
+    /// workers notify when they finish.
+    fn next_deadline(&self) -> Option<Instant> {
+        [self.http.next_deadline(), self.websocket.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     fn submit(
         &mut self,
         request: CapabilityRuntimeRequest,

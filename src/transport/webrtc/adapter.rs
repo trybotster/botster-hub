@@ -333,7 +333,12 @@ impl TerminalAdapter for WebRtcTerminalAdapter {
         self.inner.try_write(frame)
     }
 
-    fn close(&mut self) {
+    // The reason reaches the wire with the protocol-13 close-reason change;
+    // until then a Core close keeps reporting core_adapter_closed.
+    fn close(
+        &mut self,
+        _reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
         self.inner.close();
     }
 
@@ -1469,7 +1474,10 @@ mod tests {
     #[test]
     fn close_from_host_does_not_rewrite_an_already_closed_handle() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        adapter.close();
+        TerminalAdapter::close(
+            &mut adapter,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
         handle.close_from_host();
         assert!(handle.is_closed());
         assert!(
