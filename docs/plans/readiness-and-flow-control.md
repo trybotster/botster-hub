@@ -1,6 +1,6 @@
 # Readiness and flow control
 
-Status: draft 6, 2026-09-27. Design only. No production code changes in this phase.
+Status: accepted by review (verdict a27dfa2c), 2026-09-27; pending the orchestrator and the user for scope. The design is accepted; the implementation tests in section 4 remain acceptance criteria. Design only. No production code changes in this phase.
 Scope: botster-hub at `1ec61b94`, and botster-core at `origin/main` `19edeb1`. Hub pins Core `549b3f62`. The unlanded roll branch `delivery/core-roll-85b3507-20260927` moves the pin to `85b3507`.
 
 ## 0. Summary
@@ -137,7 +137,7 @@ trait OwnerSource {
 Rules:
 1. **Readiness is derived.** `readiness` is a function of state. A source may keep an internal index, for example "subscribers with a pending frame and capacity". Only the mutators of the underlying state change that index, and a debug check recomputes it from scratch after each `run` in tests.
 2. **Every owner step is followed by re-evaluation.** "Owner step" means the dispatch of a control message, the run of a ready item, and the processing before a sleep. The scheduler re-evaluates every parked source after each step, and once more immediately before it blocks. This is the only path by which a source becomes ready, so no transition can skip it.
-3. **`Ready` from owner state promises progress.** When `readiness` says `Ready`, `run` returns `Progress`, unless it was refused by a resource that the owner does not own: a lock shared with another thread, a Core queue, or Core's completion store. `Outcome` has no "no progress" value. A refused source returns `Blocked(wake)`, and the wake carries the counter value that it read before its final attempt (2.2). A `Local` wake names an owner counter, for example a Host permit release count. A `Signal` wake names an `OwnerSignal` epoch. A `Blocked` return with no such refusal is a bug. Debug builds assert, and release builds fault the source with a typed error, counted and logged. It does not stay ready, so release builds cannot spin either.
+3. **`Ready` from owner state promises progress.** When `readiness` says `Ready`, `run` returns `Progress`, unless it was refused by a resource that the owner does not own: a lock shared with another thread, a Core queue, or Core's completion store. `Outcome` has no "no progress" value. A refused source returns `Blocked(wake)`, and the wake carries the counter value that it read before its final attempt (2.2). A `Local` wake names an owner counter, for example an owner-permit release count. A `Signal` wake names an `OwnerSignal` epoch. A `Blocked` return with no such refusal is a bug. Debug builds assert, and release builds fault the source with a typed error, counted and logged. It does not stay ready, so release builds cannot spin either.
 4. **Every wait names its event.** `Wait` cannot be built without a `Wake`, and a `Local` or `Signal` wake cannot be built without its `Seen` counter value. A refusal that crosses a boundary carries its cause, so the caller can pick the right `Wake` (2.3).
 5. **Three kinds of wait; each has one mechanism.**
 
@@ -166,7 +166,7 @@ Proof sketch:
 
 **One key per resource, and the refused attempt never raises it.** A key belongs to exactly one resource: one lock, one queue, or one pool. A refusal names the resource that refused, and the source arms that resource's key. The failed attempt never acquired that resource, so nothing the attempt releases can advance the armed counter. This rules out a retry that feeds itself (see the `ShedBusy` rows in 2.3). A poisoned lock is a terminal fault, never a wait.
 
-**The one combined key: `PluginEngine`.** It deliberately covers several Core edges: an armed lock release, a freed class slot, and a returned completion reservation. The same no-self-trigger property holds by a Core rule instead of by resource identity: only releases of held state fire the notifier (a worker's dequeue or lock release, a drain, a fund close, a retire). A refused `try_admit` rolls back what it reserved and fires nothing. The Core conformance test (C2) asserts that a refused admission fires no notification.
+**The one combined key: `PluginEngine`.** It deliberately covers several Core edges: an armed lock release, a freed class slot, and a returned completion reservation. The same no-self-trigger property holds by a Core rule instead of by resource identity: only releases of held state fire the notifier (a worker's dequeue or lock release, a drain, a fund close, a retire). A refused `try_admit` rolls back what it reserved and fires nothing. The Core conformance test (C2) asserts that a refused admission fires no notification of its own. A concurrent legitimate release may still notify.
 
 **Producer duty.** A producer of a cross-thread key must raise on **every** release that can turn a refusal into success. Alternatively, it can follow Core's `try_admit` pattern (`plugin_worker.rs:920-950`): arm inside the refusing call before its last retry, and fire on the next release while armed. Each key names its producer in 2.3. A key with no producer cannot be registered.
 
