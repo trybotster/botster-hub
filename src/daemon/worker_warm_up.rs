@@ -16,8 +16,8 @@ use crate::process_exit::PidExitWatch;
 
 /// Bound on the wait for the probe's exit after `spawn` returns: a third of
 /// the daemon readiness budget (user decision, 2026-09-27). `spawn` itself is
-/// not bounded; the log records it separately (`spawn_ms`). Measured cold
-/// execs paid their cost after `spawn` returned, inside this bounded wait.
+/// not bounded; the log records it separately (`spawn_ms`), which shows
+/// whether a first exec's cost falls inside `spawn` or after it.
 pub(crate) const WORKER_WARM_UP_DEADLINE: Duration =
     Duration::from_millis(crate::LOCAL_RUNTIME_DAEMON_READINESS_BUDGET.as_millis() as u64 / 3);
 
