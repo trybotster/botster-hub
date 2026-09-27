@@ -275,11 +275,14 @@ fn read_plugin_logs(data_dir: &Path, package_name: &str) -> botster_hub_client::
     response.plugin_logs.expect("plugin logs page")
 }
 
-/// A plugin that floods its log in one call is refused past the burst with a
-/// typed, retryable `backpressured` that counts every dropped record, and the
-/// call returns without waiting for the rate to refill.
+/// A plugin that floods its log in one call through a live daemon keeps every
+/// accepted record, and any refusal is a typed, retryable `backpressured`
+/// that counts its drop. The real clock refills one record per 10 ms, so
+/// whether a refusal happens depends on speed; every assertion here holds
+/// either way. Refusal itself is proven with a frozen rate clock in
+/// `lua_runtime::basics` (`log_refuses_past_the_burst_...`).
 #[test]
-fn live_daemon_log_flood_is_refused_with_a_dropped_count_and_never_blocks() {
+fn live_daemon_log_flood_keeps_every_accepted_record_and_types_any_refusal() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("logs-flood-data");
     let package_dir = unique_short_test_dir("logs-flood-package");
@@ -293,23 +296,23 @@ return botster.register({
     description = "Write 250 log records in one call.",
     handler = "write",
     call = function()
-      local accepted, refused, last = 0, 0, nil
+      local accepted, refused, first = 0, 0, nil
       for index = 1, 250 do
         local result = botster.log.info({ message = "record " .. index })
         if result.ok then
           accepted = accepted + 1
         else
           refused = refused + 1
-          last = result.error
+          first = first or result.error
         end
       end
-      return {
-        accepted = accepted,
-        refused = refused,
-        kind = last.kind,
-        retryable = last.retryable,
-        dropped = last.detail.dropped,
-      }
+      local report = { accepted = accepted, refused = refused }
+      if first then
+        report.kind = first.kind
+        report.retryable = first.retryable
+        report.dropped = first.detail.dropped
+      end
+      return report
     end,
   }},
 })
@@ -331,13 +334,22 @@ return botster.register({
         "{enabled:?}"
     );
     let flooded = call_plugin_tool(&data_dir, "logs.flood.write", serde_json::json!({}));
-    assert_eq!(flooded["accepted"], 200, "the burst is accepted: {flooded}");
-    assert_eq!(flooded["refused"], 50, "{flooded}");
-    assert_eq!(flooded["kind"], "backpressured", "{flooded}");
-    assert_eq!(flooded["retryable"], true, "{flooded}");
-    assert_eq!(flooded["dropped"], 50, "every refusal is counted: {flooded}");
+    let accepted = flooded["accepted"].as_u64().expect("accepted count");
+    let refused = flooded["refused"].as_u64().expect("refused count");
+    assert_eq!(accepted + refused, 250, "{flooded}");
+    assert!(accepted >= 200, "the full bucket accepts the burst: {flooded}");
+    if refused > 0 {
+        assert_eq!(flooded["kind"], "backpressured", "{flooded}");
+        assert_eq!(flooded["retryable"], true, "{flooded}");
+        assert_eq!(
+            flooded["dropped"], 1,
+            "the first refusal after an accepted record counts one drop: {flooded}"
+        );
+    }
     let logs = read_plugin_logs(&data_dir, "logs.flood");
-    assert_eq!(logs.records.len(), 200, "only accepted records are kept");
+    let kept = usize::try_from(accepted).unwrap().min(256);
+    assert_eq!(logs.records.len(), kept, "only accepted records are kept");
+    assert_eq!(logs.records.last().map(|record| record.seq), Some(accepted));
     daemon.shutdown();
 }
 
