@@ -1,5 +1,10 @@
 local PAYLOAD_PAD = string.rep("x", 4096)
 
+local function emit_status(result)
+  if result.ok then return result.value.status end
+  return result.error.detail.status
+end
+
 local function emit_one(token, subject, notice, pad)
   local payload = {
     ok = true,
@@ -14,7 +19,7 @@ local function emit_one(token, subject, notice, pad)
   if pad ~= nil then
     payload.pad = pad
   end
-  return events.emit("sample.ready", payload)
+  return { status = emit_status(botster.events.emit({ name = "sample.ready", payload = payload })) }
 end
 
 return botster.register({

@@ -7940,7 +7940,7 @@ pub(crate) mod tests {
         std::fs::write(
             &entrypoint,
             format!(
-                "events.on('hub', 'worktree_created', function(event) return {{ received = event.event }} end)\n{source}"
+                "botster.events.on({{ owner = 'hub', name = 'worktree_created' }}, function(event) return {{ received = event.event }} end)\n{source}"
             ),
         )
         .unwrap();
