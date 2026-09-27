@@ -7823,6 +7823,37 @@ mod tests {
     }
 
     #[test]
+    fn a_growing_stage_reserves_its_plugin_capacity() {
+        // A plugin may hold one subscription.
+        let router = capped_router(1, 8);
+        router
+            .try_register_contracts(vec![
+                sample_contract("prod", "prod.ready"),
+                sample_contract("prod", "prod.other"),
+            ])
+            .expect("producer contracts");
+        let released = Arc::new(AtomicU64::new(0));
+        let staged = router
+            .stage_package_generation(
+                "pkg",
+                Vec::new(),
+                vec![holder("pkg", "prod", "prod.ready")],
+                Box::new(CountedFunding(Arc::clone(&released))),
+                crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+            )
+            .expect("the growth fits");
+        assert_eq!(
+            router.try_subscribe(holder("pkg", "prod", "prod.other")),
+            EventPlaneStatus::RejectedInvalid,
+            "the staged subscription holds the plugin's only slot"
+        );
+        assert_eq!(
+            router.activate_staged_generation(staged).expect("activate"),
+            1
+        );
+    }
+
+    #[test]
     fn a_same_size_reload_of_a_full_bucket_is_not_double_counted() {
         // pkg declares pkg.ready; pkg and another plugin fill its bucket.
         let router = capped_router(8, 2);
