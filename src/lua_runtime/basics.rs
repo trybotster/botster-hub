@@ -24,27 +24,29 @@ thread_local! {
     static ENCODE_BUILT_USAGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// Where one VM's `botster.log` records go.
+pub(super) struct LogSink {
+    pub(super) book: Arc<PluginLogBook>,
+    pub(super) plugin: String,
+    /// The VM's log generation (see `plugin_logs`).
+    pub(super) generation: u64,
+}
+
 pub(super) fn install(
     lua: &Lua,
     botster: &Table,
     memory: Arc<LuaMemoryAccount>,
-    plugin: &str,
-    logs: Arc<PluginLogBook>,
+    logs: LogSink,
 ) -> mlua::Result<()> {
     botster.set("json", json_table(lua, Arc::clone(&memory))?)?;
     botster.set("clock", clock_table(lua)?)?;
-    botster.set("log", log_table(lua, memory, plugin, logs)?)?;
+    botster.set("log", log_table(lua, memory, logs)?)?;
     Ok(())
 }
 
 const LOG_USAGE: &str = "botster.log.<level> takes { message = <string>, fields = <table or nil> }";
 
-fn log_table(
-    lua: &Lua,
-    memory: Arc<LuaMemoryAccount>,
-    plugin: &str,
-    logs: Arc<PluginLogBook>,
-) -> mlua::Result<Table> {
+fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::Result<Table> {
     let log = lua.create_table()?;
     for level in [
         LogLevel::Debug,
@@ -53,8 +55,9 @@ fn log_table(
         LogLevel::Error,
     ] {
         let memory = Arc::clone(&memory);
-        let logs = Arc::clone(&logs);
-        let plugin = plugin.to_string();
+        let logs = Arc::clone(&sink.book);
+        let plugin = sink.plugin.clone();
+        let generation = sink.generation;
         log.set(
             level.as_str(),
             lua.create_function(move |lua, args: Value| {
@@ -81,7 +84,15 @@ fn log_table(
                 let fields_text = fields
                     .as_ref()
                     .map(|(bytes, _charge)| std::str::from_utf8(bytes).expect("JSON text is UTF-8"));
-                let outcome = logs.append(&plugin, level, &message, fields_text, monotonic_ms(), wall_ms());
+                let outcome = logs.append(
+                    &plugin,
+                    generation,
+                    level,
+                    &message,
+                    fields_text,
+                    monotonic_ms(),
+                    wall_ms(),
+                );
                 drop(fields);
                 match outcome {
                     AppendOutcome::Accepted { seq } => {
@@ -408,7 +419,17 @@ mod tests {
         .unwrap();
         let botster = lua.create_table().unwrap();
         let logs = Arc::new(PluginLogBook::new(Arc::clone(&memory)));
-        install(&lua, &botster, Arc::clone(&memory), "test.plugin", logs).unwrap();
+        install(
+            &lua,
+            &botster,
+            Arc::clone(&memory),
+            LogSink {
+                book: logs,
+                plugin: "test.plugin".to_string(),
+                generation: 1,
+            },
+        )
+        .unwrap();
         lua.globals().set("botster", botster).unwrap();
         (lua, memory)
     }

@@ -255,6 +255,7 @@ fn bundle(
         resources: vec![resource(package_name, resource_id)],
         entrypoint: None,
         metadata: None,
+        log_generation: None,
     }
 }
 

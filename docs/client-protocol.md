@@ -1204,16 +1204,32 @@ the plugin through `botster.log.{debug,info,warn,error}`.
 ```
 
 The response kind is `plugin_logs`, with `plugin_logs = { package_name,
-records, next_seq, first_available_seq }`. Each record has `seq`, `at_ms`
-(Unix epoch milliseconds), `level` (`debug`, `info`, `warn`, `error`),
-`message`, optional `fields` (a JSON value), and `dropped_before` (records the
-plugin's rate limit refused just before this one). `after_seq` pages forward:
-pass the last `seq` you read. Records whose `seq` is below
-`first_available_seq` were evicted from the plugin's ring (256 records, 512 KiB
-per plugin, oldest first). An unknown package returns an empty page. If the
-plugin is writing a record at that instant, the daemon answers the retryable
-operator error `plugin_logs_busy` instead of waiting. Records are dropped when
-the package unloads.
+records, next_seq, first_available_seq }`. Each record has:
+- `seq`;
+- `generation`: the plugin load (VM) that wrote it, so records from different
+  loads of one package are distinguishable;
+- `at_ms` (Unix epoch milliseconds);
+- `level` (`debug`, `info`, `warn`, `error`);
+- `message`;
+- optional `fields_json`: the fields as JSON object text, exactly as the plugin
+  encoded them (the daemon does not parse it);
+- `dropped_before`: records the plugin's rate limit refused just before this
+  one.
+
+`after_seq` pages forward: pass the last `seq` you read. Records whose `seq` is
+below `first_available_seq` were evicted from the plugin's ring (256 records,
+512 KiB of record text per plugin, oldest first). An unknown package returns an
+empty page.
+
+The daemon never waits and never allocates unfunded memory for a read:
+- If the plugin is writing a record at that instant, it answers the retryable
+  operator error `plugin_logs_busy`.
+- If the Lua callback memory cannot fund the page copy, it answers the
+  retryable operator error `plugin_logs_capacity`.
+
+Records are dropped when the package unloads. A failed load or reload drops
+exactly the records its entrypoint wrote. Accepted records are also written to
+the daemon's standard error with package, generation, sequence, and level.
 
 ## Many-PTY client attach proof
 
