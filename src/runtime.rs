@@ -377,6 +377,9 @@ pub type SharedWorktrees = SharedHubState;
 pub enum PackageEntityCleanupError {
     GenerationExhausted,
     Busy,
+    /// The entity model was poisoned by an earlier Host panic; entity work
+    /// requires a daemon restart.
+    ModelPoisoned,
 }
 
 /// Prepared package entity-provider work and its causal lease.
@@ -1300,17 +1303,19 @@ impl HubRuntime {
     }
 
     fn next_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .next_epoch()
+        let Ok(model) = self.package_entities.lock() else {
+            crate::hub_log::hub_log!("package_entity_model_poisoned access=next_epoch");
+            return Err(PackageEntityCleanupError::ModelPoisoned);
+        };
+        model.next_epoch()
     }
 
     fn advance_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .advance_epoch()
+        let Ok(mut model) = self.package_entities.lock() else {
+            crate::hub_log::hub_log!("package_entity_model_poisoned access=advance_epoch");
+            return Err(PackageEntityCleanupError::ModelPoisoned);
+        };
+        model.advance_epoch()
     }
 
     #[cfg(test)]
@@ -1318,10 +1323,11 @@ impl HubRuntime {
         self.package_entities.lock().unwrap().epoch = u64::MAX;
     }
 
+    /// `None` when the family is absent or the model is poisoned.
     pub(crate) fn package_entity_family_generation(&self, family: &str) -> Option<u64> {
         self.package_entities
             .lock()
-            .expect("package entity model lock")
+            .ok()?
             .families
             .get(family)
             .map(|state| state.generation)
@@ -6055,6 +6061,9 @@ impl HubLuaPluginLoadError {
             Self::EntityFamilyCleanup(PackageEntityCleanupError::Busy) => {
                 "entity_family_cleanup_busy"
             }
+            Self::EntityFamilyCleanup(PackageEntityCleanupError::ModelPoisoned) => {
+                "causal_recovery_required"
+            }
         }
     }
 }
@@ -6091,6 +6100,9 @@ impl fmt::Display for HubLuaPluginLoadError {
             }
             Self::EntityFamilyCleanup(PackageEntityCleanupError::Busy) => {
                 formatter.write_str("a previous entity family cleanup remains owned")
+            }
+            Self::EntityFamilyCleanup(PackageEntityCleanupError::ModelPoisoned) => {
+                formatter.write_str(entity_model::ENTITY_MODEL_POISONED_MESSAGE)
             }
         }
     }

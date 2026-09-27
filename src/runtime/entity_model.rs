@@ -177,9 +177,11 @@ mod tests {
         drop(work);
     }
 
-    /// A stale-generation result is invalid but uncommitted: the consumer
-    /// fails only its own request (the worker reports entity_provider_stale)
-    /// and releases the model, so the next request proceeds.
+    /// A stale-generation result is invalid but uncommitted, and the model
+    /// stays eligible for release: once released, the next request proceeds.
+    /// This pins release eligibility only; the worker's entity_provider_stale
+    /// response is its caller's contract (worker.rs) and is not exercised
+    /// here.
     #[test]
     fn a_stale_generation_result_releases_the_active_model() {
         let runtime = super::super::tests::family_runtime("stale-generation-release");
@@ -283,6 +285,14 @@ mod tests {
             runtime.begin_package_entity_provider_snapshot("p.item", 1),
             Err(EntityModelPoisoned)
         );
+        // Production paths outside the model API: plugin load and unload
+        // take the next epoch; entity provider completion reads a family
+        // generation.
+        assert_eq!(
+            runtime.next_package_entity_epoch(),
+            Err(super::super::PackageEntityCleanupError::ModelPoisoned)
+        );
+        assert_eq!(runtime.package_entity_family_generation("p.item"), None);
         drop(work);
     }
 
@@ -883,6 +893,9 @@ mod tests {
         assert!(!runtime.release_entity_model(&work));
         assert!(!runtime.entity_model_available());
         assert!(runtime.entity_model_readiness().fanout);
+        // The fault is published once, so requests parked behind the model
+        // are re-polled and receive the typed Fault.
+        assert!(runtime.take_entity_model_notification());
         assert!(!runtime.take_entity_model_notification());
         assert_eq!(bridge.retained_counts(), charge);
         // Failure inspection is confined to this test. Production never opens poison.
@@ -1819,8 +1832,12 @@ impl super::HubRuntime {
     pub(crate) fn fault_entity_model(&self, identity: HostJobIdentity) {
         if let Some(active) = self.entity_model_owner.active.borrow_mut().as_mut()
             && active.work.0.identity == identity
+            && !active.faulted
         {
             active.faulted = true;
+            // Requests parked behind this model must be re-polled to receive
+            // the typed Fault; nothing else will release the model.
+            self.entity_model_owner.changed.set(true);
         }
     }
     /// Output access requires successful observation of this active reservation.
@@ -1917,7 +1934,13 @@ impl super::HubRuntime {
         let Some(active) = active.as_mut() else {
             return CausalTransitionStatus::Fault;
         };
-        active.observe(identity, kind, self.causal_scopes.is_faulted())
+        let was_faulted = active.faulted;
+        let status = active.observe(identity, kind, self.causal_scopes.is_faulted());
+        if !was_faulted && active.faulted {
+            // As in fault_entity_model: wake the requests parked behind it.
+            self.entity_model_owner.changed.set(true);
+        }
+        status
     }
 
     /// The consumer retains its work handle and outputs before it releases the reservation.
