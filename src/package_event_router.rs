@@ -1032,8 +1032,7 @@ impl PackageEventRouter {
     /// retires as stranded. Host workers only; the lock is taken blocking.
     pub fn mark_stranded_blocking(&self, owner: &str) {
         self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_or_recover()
             .stranded_owners
             .insert(owner.to_string());
     }
@@ -1043,10 +1042,7 @@ impl PackageEventRouter {
     /// Returns whether the staged generation was still pending.
     pub fn abort_staged_generation(&self, staged: StagedGeneration) -> bool {
         let pending = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.inner.lock_or_recover();
             take_staged(&mut inner, &staged)
         };
         pending.is_some()
@@ -1306,6 +1302,11 @@ impl PackageEventRouter {
     pub(crate) fn delivery_seen(&self) -> crate::daemon::owner_signal::Seen {
         self.owner_signal
             .seen(crate::daemon::owner_signal::SignalKey::PackageEvents)
+    }
+
+    /// Whether a panicking holder poisoned the router lock: a terminal fault.
+    pub(crate) fn lock_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
     }
 
     /// Arm an owner wait on the router lock before a retry after `ShedBusy`.
@@ -1791,14 +1792,9 @@ impl RouterInner {
 fn lock_inner(
     mutex: &crate::daemon::owner_signal::SignalingMutex<RouterInner>,
 ) -> Result<crate::daemon::owner_signal::SignalingGuard<'_, RouterInner>, EventPlaneStatus> {
-    match mutex.try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(TryLockError::WouldBlock) => Err(EventPlaneStatus::ShedBusy),
-        Err(TryLockError::Poisoned(poisoned)) => {
-            drop(poisoned.into_inner());
-            Err(EventPlaneStatus::ShedBusy)
-        }
-    }
+    // A poisoned router still reads as busy to these callers; the owner's
+    // delivery slice asks `lock_poisoned` and treats it as a terminal fault.
+    mutex.try_lock().map_err(|_| EventPlaneStatus::ShedBusy)
 }
 
 fn is_wildcard(value: &str) -> bool {
@@ -5202,7 +5198,10 @@ mod tests {
             .map(|end| host_start + end)
             .expect("Host staging methods end before subscribe");
         let host = &owner_apis[host_start..host_end];
-        assert_eq!(host.matches(".lock()").count(), 3);
+        assert_eq!(
+            host.matches(".lock()").count() + host.matches(".lock_or_recover()").count(),
+            3
+        );
         assert_eq!(host.matches("fn ").count(), 3);
         let owner_apis = format!("{}{}", &owner_apis[..host_start], &owner_apis[host_end..]);
         let without_try = owner_apis.replace("try_lock", "TRY");
@@ -5211,7 +5210,7 @@ mod tests {
             "router must not call Mutex::lock"
         );
         assert!(
-            !without_try.contains(".lock()"),
+            !without_try.contains(".lock()") && !without_try.contains(".lock_or_recover()"),
             "router must not call blocking lock"
         );
     }
@@ -6223,10 +6222,8 @@ mod tests {
         assert_eq!(work.identity().operation().generation, 1);
         assert!(work.metadata_applied);
         assert!(work.retired_payloads.is_empty());
-        let Err(TryLockError::Poisoned(poisoned)) = router.inner.try_lock() else {
-            panic!("poisoned guard");
-        };
-        let inner = poisoned.into_inner();
+        assert!(router.inner.is_poisoned(), "poisoned guard");
+        let inner = router.inner.lock_or_recover();
         assert_router_indexes(&inner);
         assert_eq!(inner.package_generation["producer"], 2);
         assert!(
