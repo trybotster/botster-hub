@@ -82,8 +82,14 @@ impl LogRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendOutcome {
-    Accepted { seq: u64 },
-    RateLimited,
+    Accepted {
+        seq: u64,
+    },
+    /// Refused by the rate limit; `dropped` counts the refusals since the
+    /// last accepted record, including this one.
+    RateLimited {
+        dropped: u64,
+    },
     TooLarge,
     Capacity,
 }
@@ -178,7 +184,9 @@ impl PluginLogBook {
         log.refilled_at_ms = now_ms;
         if log.tokens_milli < MILLI {
             log.rate_dropped = log.rate_dropped.saturating_add(1);
-            return AppendOutcome::RateLimited;
+            return AppendOutcome::RateLimited {
+                dropped: log.rate_dropped,
+            };
         }
         // Evict the oldest records first until the new one fits both caps.
         while !log.records.is_empty()
@@ -210,9 +218,8 @@ impl PluginLogBook {
 
     /// Create a plugin's entry with its ring at full capacity, charged first.
     fn new_log(&self, plugin: &str, now_ms: u64) -> Option<PluginLog> {
-        let fixed_bytes = size_of::<(String, PluginLog)>()
-            + plugin.len()
-            + RING_RECORDS * size_of::<LogRecord>();
+        let fixed_bytes =
+            size_of::<(String, PluginLog)>() + plugin.len() + RING_RECORDS * size_of::<LogRecord>();
         let mut charge = self.memory.reserve_callback_total(fixed_bytes).ok()?;
         let records = VecDeque::with_capacity(RING_RECORDS);
         // `with_capacity` may round up; fund what it actually allocated.
@@ -251,8 +258,8 @@ impl PluginLogBook {
         };
         let selected = || log.records.iter().filter(|record| record.seq > after_seq);
         let count = selected().count();
-        let bytes = count * size_of::<LogRecord>()
-            + selected().map(LogRecord::text_bytes).sum::<usize>();
+        let bytes =
+            count * size_of::<LogRecord>() + selected().map(LogRecord::text_bytes).sum::<usize>();
         let charge = self
             .memory
             .reserve_callback_total(bytes)
@@ -424,11 +431,20 @@ mod tests {
     fn the_rate_limit_refuses_a_burst_and_reports_the_drop() {
         let (book, _memory) = book();
         for _ in 0..BURST {
-            assert!(matches!(append(&book, "x", 0), AppendOutcome::Accepted { .. }));
+            assert!(matches!(
+                append(&book, "x", 0),
+                AppendOutcome::Accepted { .. }
+            ));
         }
-        assert_eq!(append(&book, "x", 0), AppendOutcome::RateLimited);
+        assert_eq!(
+            append(&book, "x", 0),
+            AppendOutcome::RateLimited { dropped: 1 }
+        );
         // 10 ms later one record's worth of tokens (100/s) has refilled.
-        assert!(matches!(append(&book, "late", 10), AppendOutcome::Accepted { .. }));
+        assert!(matches!(
+            append(&book, "late", 10),
+            AppendOutcome::Accepted { .. }
+        ));
         let page = book.read("p", 0).unwrap();
         let last = page.records.last().unwrap();
         assert_eq!((last.message.as_str(), last.dropped_before), ("late", 1));
@@ -446,7 +462,10 @@ mod tests {
         let page = book.read("p", 0).unwrap();
         let text: usize = page.records.iter().map(LogRecord::text_bytes).sum();
         assert!(text <= RING_TEXT_BYTES, "{text}");
-        assert!(page.first_available_seq > 1, "the oldest records were evicted");
+        assert!(
+            page.first_available_seq > 1,
+            "the oldest records were evicted"
+        );
         assert_eq!(page.records.last().unwrap().seq, 20);
         drop(page);
         book.remove("p");
