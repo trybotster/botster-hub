@@ -23,6 +23,9 @@ pub(crate) struct IngressBuffer {
     /// Raised when Core removes a frame (or the ingress is cleared on close).
     /// `notify_one` keeps one permit, so a removal between a transport's
     /// `Full` refusal and its wait is not lost.
+    /// A removal while no transport waits leaves that one permit stale: the
+    /// next `Full` retries once more before it really parks. The permit count
+    /// is at most one, so this is one extra retry, never a spin.
     room: tokio::sync::Notify,
     /// Test observer of each `Full` refusal (the transport is about to park).
     #[cfg(test)]
