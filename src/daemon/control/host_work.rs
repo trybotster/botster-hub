@@ -272,8 +272,76 @@ pub(crate) struct PackageRecoveryRequired {
     owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) original: String,
     pub(crate) compensation: String,
+    /// The stranded packages this record covers. An explicit operator enable
+    /// or reload of one resolves it; the record is released once none remain.
+    pub(crate) packages: std::collections::BTreeSet<String>,
     _effect: PackageRuntimeEffect,
     _permit: HostWorkPermit,
+}
+
+impl PackageRecoveryRequired {
+    fn new(
+        original: String,
+        compensation: String,
+        effect: PackageRuntimeEffect,
+        permit: HostWorkPermit,
+    ) -> Self {
+        Self {
+            owner_permit: None,
+            original,
+            compensation,
+            packages: effect
+                .package_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            _effect: effect,
+            _permit: permit,
+        }
+    }
+}
+
+/// The package an explicit operator enable or reload names. Only these
+/// requests resolve a stranded package; an automatic refresh never does.
+fn explicit_resolution_target(request: &DaemonRequest) -> Option<&str> {
+    match request {
+        DaemonRequest::EnablePackage { package_name }
+        | DaemonRequest::ReloadPackage { package_name } => Some(package_name),
+        _ => None,
+    }
+}
+
+/// The package an explicit enable or reload effect loads. Enable and Reload
+/// effects come only from those explicit operator requests.
+fn explicit_effect_target(effect: &PackageRuntimeEffect) -> Option<&str> {
+    match effect {
+        PackageRuntimeEffect::Enable { package_name, .. }
+        | PackageRuntimeEffect::Reload { package_name, .. } => Some(package_name),
+        _ => None,
+    }
+}
+
+fn covered_by_package_recovery(state: &DaemonControlState, package_name: &str) -> bool {
+    state.host_recovery.values().any(|recovery| {
+        matches!(recovery, HostRecoveryRequired::Package(record) if record.packages.contains(package_name))
+    })
+}
+
+/// An explicit enable or reload of a stranded package succeeded: it is
+/// resolved. Release each package recovery record that covers nothing more.
+pub(crate) fn resolve_package_recovery(state: &mut DaemonControlState, package_name: &str) {
+    let mut released = Vec::new();
+    for (waiter, recovery) in &mut state.host_recovery {
+        if let HostRecoveryRequired::Package(record) = recovery
+            && record.packages.remove(package_name)
+            && record.packages.is_empty()
+        {
+            released.push(*waiter);
+        }
+    }
+    for waiter in released {
+        state.host_recovery.remove(&waiter);
+    }
 }
 
 fn host_operation_label(request: &DaemonRequest) -> &'static str {
@@ -352,6 +420,10 @@ pub(crate) fn handle(
             state: state_view,
             packages,
             data_directory,
+            stranded: daemon
+                .runtime()
+                .map(crate::HubRuntime::stranded_packages)
+                .unwrap_or_default(),
         })
     } else if is_spawn_target_read(&request) {
         HostMutationCommand::Read(HostRead::SpawnTarget {
@@ -849,9 +921,12 @@ impl HostMutationContinuation {
                     let runtime = daemon
                         .runtime()
                         .expect("a committed package has a running runtime");
+                    let mut host_runtime = runtime.host_package_runtime();
+                    host_runtime
+                        .fund_staging(staging_funding(&permit, committed.reply.logical_bytes));
                     let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
                         effect,
-                        runtime: runtime.host_package_runtime(),
+                        runtime: host_runtime,
                         config: runtime.config().clone(),
                         packages: daemon.package_registry_view(),
                         reply: committed.reply,
@@ -871,20 +946,40 @@ impl HostMutationContinuation {
                 let runtime = daemon
                     .runtime()
                     .expect("package recovery retains its runtime");
+                let mut host_runtime = runtime.host_package_runtime();
+                host_runtime.fund_staging(staging_funding(&permit, 0));
+                // The failed effect's staged generation, if any, moves to the
+                // restore, which aborts it before it stages its own.
+                let staged = match state.staged_package_generation.take() {
+                    Some((owner, staged)) if owner == waiter_id => Some(staged),
+                    other => {
+                        state.staged_package_generation = other;
+                        None
+                    }
+                };
                 let command =
                     HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
                         effect,
                         original,
-                        runtime: runtime.host_package_runtime(),
+                        runtime: host_runtime,
                         config: runtime.config().clone(),
+                        staged,
+                        quarantine: None,
                     });
                 submit_phase(daemon, state, waiter_id, command, permit, next_phase)
             }
-            HostMutationResult::PackageEffectApplied { reply, cleanup } => {
+            HostMutationResult::PackageEffectApplied {
+                reply,
+                cleanup,
+                loaded,
+            } => {
                 daemon
                     .runtime_mut()
                     .expect("package effect retains its runtime")
                     .apply_host_package_cleanup(cleanup);
+                if let Some(package_name) = loaded {
+                    resolve_package_recovery(state, &package_name);
+                }
                 state
                     .maintenance
                     .wakes
@@ -898,8 +993,13 @@ impl HostMutationContinuation {
             HostMutationResult::PackageEffectFailed {
                 effect,
                 error,
-                cleanup,
+                mut cleanup,
             } => {
+                // A generation staged but not activated stays with this
+                // attempt until its restore aborts it or its unload clears it.
+                if let Some(staged) = cleanup.staged.take() {
+                    state.staged_package_generation = Some((waiter_id, staged));
+                }
                 daemon
                     .runtime_mut()
                     .expect("package effect retains its runtime")
@@ -930,8 +1030,8 @@ impl HostMutationContinuation {
                         failed_package_effect,
                     )
                 } else {
-                    release_document(state, waiter_id);
-                    retain_package_recovery(
+                    submit_package_quarantine(
+                        daemon,
                         state,
                         waiter_id,
                         effect,
@@ -944,6 +1044,7 @@ impl HostMutationContinuation {
                             )),
                         },
                         permit,
+                        next_phase,
                     )
                 }
             }
@@ -969,17 +1070,16 @@ impl HostMutationContinuation {
                 } else {
                     state.host_recovery.insert(
                         waiter_id,
-                        HostRecoveryRequired::Package(PackageRecoveryRequired {
-                            owner_permit: None,
-                            original: original.to_string(),
-                            compensation: rollbacks
+                        HostRecoveryRequired::Package(PackageRecoveryRequired::new(
+                            original.to_string(),
+                            rollbacks
                                 .iter()
                                 .map(|failure| failure.error.to_string())
                                 .collect::<Vec<_>>()
                                 .join("; "),
-                            _effect: effect,
-                            _permit: permit,
-                        }),
+                            effect,
+                            permit,
+                        )),
                     );
                     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
                         original: Box::new(original),
@@ -996,8 +1096,9 @@ impl HostMutationContinuation {
                 let (effect, original) = failed_package_effect
                     .take()
                     .expect("a package restore failure follows one failed runtime effect");
-                release_document(state, waiter_id);
-                retain_package_recovery(state, waiter_id, effect, original, failure, permit)
+                submit_package_quarantine(
+                    daemon, state, waiter_id, effect, original, failure, permit, next_phase,
+                )
             }
             HostMutationResult::Recovered(outcome) => match outcome {
                 RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -1162,6 +1263,43 @@ fn submit_package_restore(
     poll
 }
 
+/// No runtime restore is possible for a failed package effect: quarantine its
+/// packages on a Host worker (abort the attempt's staged generation, unload,
+/// mark them stranded), then answer as a failed compensation. Document
+/// ownership is released when that phase completes.
+#[allow(clippy::too_many_arguments)]
+fn submit_package_quarantine(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    effect: PackageRuntimeEffect,
+    original: DaemonTransportError,
+    failure: PackageRollbackFailure,
+    permit: HostWorkPermit,
+    next_phase: &mut u64,
+) -> ControlPoll {
+    let staged = match state.staged_package_generation.take() {
+        Some((owner, staged)) if owner == waiter_id => Some(staged),
+        other => {
+            state.staged_package_generation = other;
+            None
+        }
+    };
+    let Some(runtime) = daemon.runtime() else {
+        release_document(state, waiter_id);
+        return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+    };
+    let command = HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
+        effect,
+        original,
+        runtime: runtime.host_package_runtime(),
+        config: runtime.config().clone(),
+        staged,
+        quarantine: Some(failure),
+    });
+    submit_phase(daemon, state, waiter_id, command, permit, next_phase)
+}
+
 fn retain_package_recovery(
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
@@ -1172,13 +1310,12 @@ fn retain_package_recovery(
 ) -> ControlPoll {
     state.host_recovery.insert(
         waiter_id,
-        HostRecoveryRequired::Package(PackageRecoveryRequired {
-            owner_permit: None,
-            original: original.to_string(),
-            compensation: failure.error.to_string(),
-            _effect: effect,
-            _permit: permit,
-        }),
+        HostRecoveryRequired::Package(PackageRecoveryRequired::new(
+            original.to_string(),
+            failure.error.to_string(),
+            effect,
+            permit,
+        )),
     );
     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
         original: Box::new(original),
@@ -1223,13 +1360,23 @@ fn admit_or_park_commit(
     // Anything that reaches this site can park on the document reservation.
     // Transport closure must not retire its handoff.
     debug_assert!(must_finish, "a parkable host mutation must finish");
+    // An explicit enable or reload of a stranded package is its resolution
+    // and may commit; every other package mutation waits for recovery.
+    let resolves_stranded = match &prepared.change {
+        crate::host_mutations::PreparedChange::PackageConfiguration(change) => change
+            .package_effect()
+            .and_then(explicit_effect_target)
+            .is_some_and(|package_name| covered_by_package_recovery(state, package_name)),
+        _ => false,
+    };
     if matches!(
         prepared.change,
         crate::host_mutations::PreparedChange::PackageConfiguration(_)
-    ) && state
-        .host_recovery
-        .values()
-        .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
+    ) && !resolves_stranded
+        && state
+            .host_recovery
+            .values()
+            .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
     {
         state.document_waiters.remove(&waiter_id);
         wake_next_document_waiter(state);
@@ -1466,6 +1613,24 @@ fn submit_event_cleanup(
     }
 }
 
+/// Staging funding from the attempt's prepared-byte reservation: a handle
+/// that keeps it alive with the pending generation, and the reserved bytes
+/// the attempt does not already hold (`held_bytes`). With no reservation the
+/// funding is zero, so any staged storage is refused before it changes state.
+fn staging_funding(
+    permit: &HostWorkPermit,
+    held_bytes: usize,
+) -> crate::runtime::package_effect::StagingFunding {
+    let reserved = permit.reserved_prepared_bytes();
+    if reserved == 0 {
+        return crate::runtime::package_effect::StagingFunding::none();
+    }
+    crate::runtime::package_effect::StagingFunding::new(
+        std::sync::Arc::new(permit.retain_prepared_reservation()),
+        reserved.saturating_sub(held_bytes),
+    )
+}
+
 fn submit_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -1585,9 +1750,17 @@ fn finish_error(
 /// plugin, or to find the socket binding its entrypoint restart needs.
 fn package_load_refusal(error: &DaemonTransportError) -> Option<HostMutationError> {
     match error {
-        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error))
-        | DaemonTransportError::PluginLoadRefused { error, .. } => Some(HostMutationError {
-            code: error.code().to_string(),
+        DaemonTransportError::Daemon(crate::HubDaemonError::LuaPlugin(error)) => {
+            Some(HostMutationError {
+                code: error.code().to_string(),
+                message: error.to_string(),
+                event: None,
+            })
+        }
+        // The message names the package, so a stranded event plane names
+        // exactly which package runs without its subscriptions.
+        DaemonTransportError::PluginNotSwapped { error: load, .. } => Some(HostMutationError {
+            code: load.code().to_string(),
             message: error.to_string(),
             event: None,
         }),
@@ -1718,13 +1891,17 @@ pub(crate) fn recovery_response(
             HostRecoveryRequired::Package(recovery) => Some(recovery),
             _ => None,
         })?;
-    let blocked = is_package_read(request)
-        || is_package_prepare(request)
-        || matches!(
-            request,
-            DaemonRequest::StartPackageEntrypoint { .. }
-                | DaemonRequest::RestartPackageEntrypoint { .. }
-        );
+    // An explicit enable or reload of a stranded package resolves it.
+    let resolves_stranded = explicit_resolution_target(request)
+        .is_some_and(|package_name| covered_by_package_recovery(state, package_name));
+    let blocked = !resolves_stranded
+        && (is_package_read(request)
+            || is_package_prepare(request)
+            || matches!(
+                request,
+                DaemonRequest::StartPackageEntrypoint { .. }
+                    | DaemonRequest::RestartPackageEntrypoint { .. }
+            ));
     blocked.then(|| {
         error_response(
             "package_recovery_required",
@@ -2013,6 +2190,7 @@ mod tests {
                         event: None,
                     }),
                     cleanup: HostPackageCleanup::default(),
+                    loaded: None,
                 },
             ),
             (
@@ -2240,6 +2418,7 @@ mod tests {
                 state,
                 packages,
                 data_directory: directory.clone(),
+                stranded: Default::default(),
             }),
             Some(&mut entrypoints),
         ) else {
