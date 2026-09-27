@@ -448,6 +448,9 @@ fn execute_package_effect(
         packages,
         reply,
     } = job;
+    // A generation left staged by an unsubmitted quarantine would refuse
+    // this effect's stage as an overlap: settle it first.
+    runtime.settle_retained();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::daemon::control::packages::mutations::apply_committed_runtime_effect(
             &mut runtime,

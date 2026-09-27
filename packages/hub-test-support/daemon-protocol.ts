@@ -5,7 +5,7 @@ import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActio
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-// Host-control protocol 10 constants. See botster-hub-client/src/lib.rs.
+// Host-control protocol 11 constants. See botster-hub-client/src/lib.rs.
 export const PROTOCOL = "botster-hub-daemon-v1";
 export const PROTOCOL_VERSION = 11;
 export const CONFORMANCE_FIXTURE_REVISION = 50;

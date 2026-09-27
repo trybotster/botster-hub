@@ -1,6 +1,6 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.46",
+  "package_version": "0.1.47",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 11,
   "conformance_fixture_revision": 50,
@@ -13,7 +13,7 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "1409526351dc793aa76f0443412a9539501a6128512c5ebc4acc5fb7b28f7803"
+    "sha256": "33d3fe1d0d0050cc32c715167922f50056c8d6d3fd7e966e27294565f0a9de6b"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
