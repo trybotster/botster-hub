@@ -5,7 +5,6 @@
 
 pub(crate) mod record;
 pub(crate) mod state_directory;
-pub(crate) mod store;
 
 #[cfg(test)]
 mod tests;
