@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use crate::daemon::control::message::{
     BindReservedError, BoundSubscription, ControlMessage, ReservationInspectReply,
 };
+use crate::transport::shared::ingress::IngressStore;
 use crate::transport::webrtc::adapter::WebRtcTerminalAdapterHandle;
 use crate::transport::webrtc::control_channel::{
     LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW, decrypt_client_frame,
@@ -604,6 +605,10 @@ where
     // Per-channel outbound message id; the first Hub-to-client message is 1.
     let mut next_message_id: u64 = 1;
     let mut close_deadline = None;
+    // One assembled input frame that met a full adapter ingress. While it is
+    // parked the driver stops draining the channel, so the SCTP window closes
+    // (input backpressure); it retries on ingress room or route close.
+    let mut parked_input: Option<Vec<u8>> = None;
     loop {
         if handle.is_closed() {
             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
@@ -640,7 +645,15 @@ where
         tokio::select! {
             biased;
             _ = handle.wait_for_write() => {}
-            inbound = data_channel.local_poll() => {
+            () = handle.ingress_room(), if parked_input.is_some() => {
+                if let Some(bytes) = parked_input.take()
+                    && let Err(exit) = store_or_park_input(&handle, bytes, &mut parked_input)
+                {
+                    close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                    return exit;
+                }
+            }
+            inbound = data_channel.local_poll(), if parked_input.is_none() => {
                 match inbound {
                     Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
                         let bytes = match inbound_assembly.push(stream_key, message.data.as_ref()) {
@@ -652,10 +665,9 @@ where
                                 return TerminalDriverExit::IngressAssembly;
                             }
                         };
-                        if handle.push_ingress(bytes).is_err() {
-                            handle.close();
+                        if let Err(exit) = store_or_park_input(&handle, bytes, &mut parked_input) {
                             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-                            return TerminalDriverExit::IngressRejected;
+                            return exit;
                         }
                     }
                     Some(event @ (webrtc::data_channel::DataChannelEvent::OnBufferedAmountHigh
@@ -693,6 +705,23 @@ where
                 return TerminalDriverExit::SendFailed;
             }
         }
+    }
+}
+
+/// Store one assembled input frame, or park it when the adapter ingress is
+/// full. A malformed header ends the channel (the slot already closed).
+fn store_or_park_input(
+    handle: &WebRtcTerminalAdapterHandle,
+    bytes: Vec<u8>,
+    parked_input: &mut Option<Vec<u8>>,
+) -> Result<(), TerminalDriverExit> {
+    match handle.try_push_ingress(bytes) {
+        IngressStore::Stored | IngressStore::Closed => Ok(()),
+        IngressStore::Full(bytes) => {
+            *parked_input = Some(bytes);
+            Ok(())
+        }
+        IngressStore::Malformed => Err(TerminalDriverExit::IngressRejected),
     }
 }
 
@@ -3202,5 +3231,130 @@ mod tests {
             .map(SubscriptionChannelRejectReason::as_str)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(tokens.len(), reasons.len());
+    }
+
+    fn paste_input_frame(index: usize) -> Vec<u8> {
+        use botster_terminal_protocol::{
+            INPUT_HEADER_BYTES, TERMINAL_INPUT_SCHEME_VERSION, TerminalInputKind,
+        };
+        let data = format!("paste-{index:03}");
+        let len = u16::try_from(data.len()).expect("fixture body fits");
+        let mut bytes = Vec::with_capacity(INPUT_HEADER_BYTES + data.len());
+        bytes.push(TERMINAL_INPUT_SCHEME_VERSION);
+        bytes.push(TerminalInputKind::RawBytes.as_byte());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(&(index as u64 + 1).to_be_bytes());
+        bytes.extend_from_slice(data.as_bytes());
+        bytes
+    }
+
+    /// S5: a paste burst larger than the 64-frame adapter ingress, received
+    /// while Core reads nothing, is delivered whole. The driver parks the
+    /// frame that met a full ingress and stops draining the data channel (the
+    /// remaining messages stay queued in the channel, so SCTP's window
+    /// closes), then resumes when Core removes a frame.
+    #[test]
+    fn a_paste_burst_past_the_ingress_parks_the_channel_and_is_delivered_whole() {
+        use botster_core::contract::terminal_adapter::{
+            MIN_ADAPTER_INGRESS_BUFFER_FRAMES, TerminalAdapter, TerminalIngress,
+        };
+        use botster_core::contract::terminal_wake::{TerminalWakeSource, WakingTerminalAdapter};
+        use botster_core::{SessionId, SubscriptionId, TerminalSubscriptionGeneration};
+        use std::time::Instant;
+        const BURST: usize = 100;
+        let channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[23; 32]).expect("test key");
+        for index in 0..BURST {
+            let chunks = sealed_terminal_body_chunks(
+                &key,
+                &paste_input_frame(index),
+                1,
+                0,
+                index as u64 + 1,
+            )
+            .expect("seal paste frame");
+            assert_eq!(chunks.len(), 1, "one chunk per small frame");
+            channel.push_event(DataChannelEvent::OnMessage(RTCDataChannelMessage {
+                is_string: false,
+                data: chunks.into_iter().next().unwrap().as_slice().into(),
+            }));
+        }
+        let peer_state = test_peer_state("s5-paste");
+        let (mut adapter, handle) =
+            crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        let wakes = TerminalWakeSource::new();
+        adapter.set_wake_sink(wakes.bind_route(
+            SessionId("s".into()),
+            SubscriptionId("paste".into()),
+            TerminalSubscriptionGeneration(1),
+        ));
+        let (full_tx, full_rx) = std::sync::mpsc::channel();
+        handle.set_ingress_full_observer(full_tx);
+        let usage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        /// Closes the handle when the test body unwinds, so a failed assertion
+        /// ends the driver instead of hanging the scope's join on a parked driver.
+        struct CloseOnUnwind<'a>(
+            &'a crate::transport::webrtc::adapter::WebRtcTerminalAdapterHandle,
+        );
+        impl Drop for CloseOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let delivered = thread::scope(|scope| {
+            let _close_on_unwind = CloseOnUnwind(&handle);
+            let driver_handle = handle.clone();
+            let driver = scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build the driver runtime")
+                    .block_on(run_bound_terminal_channel(
+                        &channel,
+                        &key,
+                        &peer_state,
+                        1,
+                        driver_handle,
+                        usage,
+                    ))
+            });
+            // timer: deadline — bounds a driver that never fills the ingress.
+            full_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the 65th frame meets a full ingress and the driver parks");
+            assert_eq!(
+                channel.events.lock().expect("channel events").len(),
+                BURST - MIN_ADAPTER_INGRESS_BUFFER_FRAMES - 1,
+                "a parked driver stops draining the data channel"
+            );
+            // timer: deadline — bounds a lost wake; progress arrives as wakes.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut delivered = Vec::new();
+            while delivered.len() < BURST {
+                assert!(
+                    Instant::now() < deadline,
+                    "burst stalled: delivered={}",
+                    delivered.len()
+                );
+                match adapter.try_read() {
+                    TerminalIngress::Frame(frame) => delivered.push(frame),
+                    TerminalIngress::Empty => {
+                        let _ =
+                            wakes.wait_wakes(deadline.saturating_duration_since(Instant::now()));
+                    }
+                    other => panic!("a stalled ingress must not end the route: {other:?}"),
+                }
+            }
+            assert!(!handle.is_closed(), "backpressure keeps the route open");
+            handle.close();
+            let exit = driver.join().expect("join the driver");
+            assert_eq!(exit.as_str(), TerminalDriverExit::AdapterClosed.as_str());
+            delivered
+        });
+        assert_eq!(
+            delivered,
+            (0..BURST).map(paste_input_frame).collect::<Vec<_>>(),
+            "every frame arrives once, in order"
+        );
     }
 }

@@ -771,8 +771,20 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.slot.attach_close_hook(hook);
     }
 
-    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
-        self.inner.slot.push_ingress(bytes)
+    pub(crate) fn try_push_ingress(
+        &self,
+        bytes: Vec<u8>,
+    ) -> crate::transport::shared::ingress::IngressStore {
+        self.inner.slot.try_push_ingress(bytes)
+    }
+
+    pub(crate) async fn ingress_room(&self) {
+        self.inner.slot.ingress_room().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ingress_full_observer(&self, observer: std::sync::mpsc::Sender<()>) {
+        self.inner.slot.set_ingress_full_observer(observer);
     }
 }
 

@@ -20,6 +20,23 @@ pub(crate) struct IngressBuffer {
     partial: Mutex<Option<Vec<u8>>>,
     lost: AtomicBool,
     lost_reported: AtomicBool,
+    /// Raised when Core removes a frame (or the ingress is cleared on close).
+    /// `notify_one` keeps one permit, so a removal between a transport's
+    /// `Full` refusal and its wait is not lost.
+    room: tokio::sync::Notify,
+    /// Test observer of each `Full` refusal (the transport is about to park).
+    #[cfg(test)]
+    full_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// Outcome of a non-latching store: a full ingress hands the frame back so
+/// the transport can stop reading until [`IngressBuffer::room`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IngressStore {
+    Stored,
+    Full(Vec<u8>),
+    Closed,
+    Malformed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +54,48 @@ impl IngressBuffer {
             partial: Mutex::new(None),
             lost: AtomicBool::new(false),
             lost_reported: AtomicBool::new(false),
+            room: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            full_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_full_observer(&self, observer: std::sync::mpsc::Sender<()>) {
+        *self.full_observer.lock().unwrap() = Some(observer);
+    }
+
+    /// Validate the header and store one complete frame without latching
+    /// loss. A full ingress returns the frame; raising no wake.
+    pub(crate) fn try_store(&self, bytes: Vec<u8>, is_closed: impl Fn() -> bool) -> IngressStore {
+        if TerminalInputFrame::from_bytes(&bytes).is_err() {
+            return IngressStore::Malformed;
+        }
+        if is_closed() {
+            return IngressStore::Closed;
+        }
+        match self.frames_tx.try_send(bytes) {
+            Ok(()) => {
+                if is_closed() {
+                    self.clear();
+                    return IngressStore::Closed;
+                }
+                IngressStore::Stored
+            }
+            Err(TrySendError::Full(bytes)) => {
+                #[cfg(test)]
+                if let Some(observer) = self.full_observer.lock().unwrap().as_ref() {
+                    let _ = observer.send(());
+                }
+                IngressStore::Full(bytes)
+            }
+            Err(TrySendError::Disconnected(_)) => IngressStore::Closed,
+        }
+    }
+
+    /// Wait for room: a frame removal or a close since the last wait.
+    pub(crate) async fn room(&self) {
+        self.room.notified().await;
     }
 
     pub(crate) fn clear(&self) {
@@ -53,6 +111,8 @@ impl IngressBuffer {
         }
         self.lost.store(false, Ordering::SeqCst);
         self.lost_reported.store(false, Ordering::SeqCst);
+        // A transport parked on a full ingress must see the close.
+        self.room.notify_one();
     }
 
     /// Validate the header and buffer one complete frame.
@@ -192,7 +252,10 @@ impl IngressBuffer {
         }
         match self.frames_rx.lock() {
             Ok(frames) => match frames.try_recv() {
-                Ok(frame) => TerminalIngress::Frame(frame),
+                Ok(frame) => {
+                    self.room.notify_one();
+                    TerminalIngress::Frame(frame)
+                }
                 Err(TryRecvError::Empty) => TerminalIngress::Empty,
                 Err(TryRecvError::Disconnected) => TerminalIngress::Closed,
             },
@@ -227,6 +290,82 @@ mod tests {
         bytes.extend_from_slice(data);
         TerminalInputFrame::from_bytes(&bytes).expect("fixture frame has a valid header");
         bytes
+    }
+
+    /// Poll `room()` once without a runtime: Ready means a wake is stored.
+    fn room_is_ready(buffer: &IngressBuffer) -> bool {
+        use std::future::Future;
+        let mut room = std::pin::pin!(buffer.room());
+        room.as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready()
+    }
+
+    fn fill(buffer: &IngressBuffer) {
+        for index in 0..MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            let frame = input_frame(format!("f{index}").as_bytes());
+            assert_eq!(buffer.try_store(frame, || false), IngressStore::Stored);
+        }
+    }
+
+    #[test]
+    fn a_full_ingress_hands_the_frame_back_and_never_latches_loss() {
+        let buffer = IngressBuffer::new();
+        fill(&buffer);
+        let extra = input_frame(b"extra");
+        assert_eq!(
+            buffer.try_store(extra.clone(), || false),
+            IngressStore::Full(extra),
+            "the refused frame comes back unchanged"
+        );
+        let mut delivered = 0;
+        loop {
+            match buffer.try_read(false) {
+                TerminalIngress::Frame(_) => delivered += 1,
+                TerminalIngress::Empty => break,
+                other => panic!("a full ingress must not report {other:?}"),
+            }
+        }
+        assert_eq!(delivered, MIN_ADAPTER_INGRESS_BUFFER_FRAMES);
+    }
+
+    /// The race the backpressure wait must survive: Core removes a frame
+    /// between the transport's `Full` refusal and its park. The removal's
+    /// stored wake lets the parked retry store the frame with no other wake.
+    #[test]
+    fn a_removal_between_the_refusal_and_the_park_is_not_lost() {
+        let buffer = IngressBuffer::new();
+        fill(&buffer);
+        let IngressStore::Full(parked) = buffer.try_store(input_frame(b"parked"), || false) else {
+            panic!("the 65th frame is refused");
+        };
+        assert!(
+            !room_is_ready(&buffer),
+            "the transport's own refused store raises no wake"
+        );
+        // Between the refusal and the park: Core removes one frame.
+        assert!(matches!(buffer.try_read(false), TerminalIngress::Frame(_)));
+        assert!(
+            room_is_ready(&buffer),
+            "the removal's wake is kept for the park"
+        );
+        assert_eq!(buffer.try_store(parked, || false), IngressStore::Stored);
+    }
+
+    #[test]
+    fn a_close_wakes_a_parked_transport() {
+        let buffer = IngressBuffer::new();
+        fill(&buffer);
+        assert!(matches!(
+            buffer.try_store(input_frame(b"parked"), || false),
+            IngressStore::Full(_)
+        ));
+        buffer.clear();
+        assert!(room_is_ready(&buffer), "a close ends the park");
+        assert_eq!(
+            buffer.try_store(input_frame(b"late"), || true),
+            IngressStore::Closed
+        );
     }
 
     #[test]

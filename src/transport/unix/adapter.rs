@@ -571,9 +571,23 @@ impl UnixTerminalAdapterHandle {
         self.inner.slot.attach_close_hook(hook);
     }
 
-    /// Validate the input header and buffer one complete ingress frame.
-    pub(crate) fn push_ingress(&self, bytes: Vec<u8>) -> Result<(), ()> {
-        self.inner.slot.push_ingress(bytes)
+    /// Validate the input header and try to buffer one complete ingress
+    /// frame. A full ingress hands the frame back; see `IngressStore`.
+    pub(crate) fn try_push_ingress(
+        &self,
+        bytes: Vec<u8>,
+    ) -> crate::transport::shared::ingress::IngressStore {
+        self.inner.slot.try_push_ingress(bytes)
+    }
+
+    /// Resolves once Core removes a frame or the route closes.
+    pub(crate) async fn ingress_room(&self) {
+        self.inner.slot.ingress_room().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ingress_full_observer(&self, observer: std::sync::mpsc::Sender<()>) {
+        self.inner.slot.set_ingress_full_observer(observer);
     }
 
     #[cfg(test)]

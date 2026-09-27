@@ -138,7 +138,24 @@ pub(crate) fn sealed_terminal_chunks(
     frame: &RoutedTerminalFrame,
     message_id: u64,
 ) -> LocalWebrtcResult<Vec<Vec<u8>>> {
-    let body = frame.frame.as_bytes();
+    sealed_terminal_body_chunks(
+        key,
+        frame.frame.as_bytes(),
+        frame.generation,
+        frame.stream_epoch,
+        message_id,
+    )
+}
+
+/// Seal one opaque terminal body into ordered binary chunks for one route
+/// generation and stream epoch.
+pub(crate) fn sealed_terminal_body_chunks(
+    key: &AesGcmKey,
+    body: &[u8],
+    generation: u64,
+    stream_epoch: u32,
+    message_id: u64,
+) -> LocalWebrtcResult<Vec<Vec<u8>>> {
     if body.is_empty() {
         return Err(LocalWebrtcError::Webrtc(
             "terminal body must not be empty".to_string(),
@@ -158,8 +175,8 @@ pub(crate) fn sealed_terminal_chunks(
             })?,
             chunk_count,
             total_bytes,
-            generation: frame.generation,
-            stream_epoch: frame.stream_epoch,
+            generation,
+            stream_epoch,
         };
         let mut message = Vec::with_capacity(
             LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES
