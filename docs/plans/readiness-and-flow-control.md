@@ -329,7 +329,9 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 
 ### 4.1 Cutover split
 
-The total is about 13.75 to 15.75 writer-days of new work. That exceeds the 3-day guide, so the steps split as follows.
+**User decision (2026-09-27): every step, S6 to S12 included, lands before cutover, without lowering quality.** The split below remains the priority order: the first table fixes live defects.
+
+The total is about 13.75 to 15.75 writer-days of new work.
 
 **Must land before cutover: about 7.25 writer-days of new work.** These steps fix every live defect in the catalogue.
 
@@ -347,7 +349,7 @@ The total is about 13.75 to 15.75 writer-days of new work. That exceeds the 3-da
 
 Every step in this list fixes a live defect. If time forces a cut, only S4b can move after cutover without leaving a known hang: its defects waste CPU (the causal herd and incidental wakes), and the capability-event wake has no production consumer until plugin-platform slice 3. S4a stays before cutover, because it fixes two hangs.
 
-**Can follow cutover: about 6.5 to 8.5 writer-days.**
+**Second priority: about 6.5 to 8.5 writer-days.**
 
 | Step | Size | Note |
 | --- | --- | --- |
@@ -361,8 +363,32 @@ Every step in this list fixes a live defect. If time forces a cut, only S4b can 
 ### 4.2 Order constraints
 
 - **C1 must reach Hub in the same roll as Core `2845aec`.** The roll branch (`85b3507`) already contains `2845aec`. Landing S0 without C1 brings the flood storm into the Hub build. The orchestrator confirms that the roll already waits on C1.
-- **S1 requires C2.** The `PluginEngine` wait needs C2's class-slot edge. The incidental completion notification is not a retry edge, so S1 does not land before C2.
-- **S4a and S4b require S1** (the types and the test harness). S4b follows S2 and S3, so that it only deletes.
+- **S1 lands in two parts.** S1a (the types, `OwnerSignal`, the interleaving harness, and the `PackageEvents` emit key) needs no Core change. S1b (the `PluginEngine` waits for `Backpressured` and `LockBusy`) requires C2 through S0: the incidental completion notification is not a retry edge, so S1b does not land before C2.
+- **S3 and S4a require S1a**, the types and the test harness. **S2 requires S1b**, because it uses `LockBusy`. S4b follows S2, S3, and S4a, so that it only deletes.
+
+### 4.3 Execution (orchestrator assignment, 2026-09-27)
+
+Each writer lands their own steps on main once their reviewer accepts and the landing procedure passes. Edits to `src/daemon/owner_loop.rs` are serialized through the owner-loop lead. Other writers branch after the lead's step lands, or they agree the edit with the lead first.
+
+| Step | Owner | Starts after | Reaches Hub by |
+| --- | --- | --- | --- |
+| C1 | Core writer (006c) | now | S0 |
+| C2 | Core writer (006c) | now, in parallel with C1 | S0 |
+| S0 | Foundation writer (0058) | C1 and C2 on Core main | Hub main |
+| S1a | owner-loop lead (Claude architect, 008c) | now | Hub main |
+| S3 | owner-loop lead | S1a | Hub main |
+| S4a | owner-loop lead | S3 (serial on `owner_loop.rs`) | Hub main |
+| S1b | owner-loop lead | S0 and S4a | Hub main |
+| S2 | owner-loop lead | S1b | Hub main |
+| S4b | owner-loop lead | S2 | Hub main |
+| S5 | Foundation writer | S0 | Hub main |
+| S6 | Foundation writer | S5 | Hub main |
+| S8 | Plugin platform writer (0079) | S4b | Hub main |
+| S9, S12, S10 (Core half) | Core writer | C1 and C2 | a Core pin roll by the Foundation writer |
+| S11 | Core writer | S9 | a Core pin roll by the Foundation writer |
+| S10 (Hub half) | owner-loop lead | the roll with the S10 Core half | Hub main |
+
+The plugin platform writer also resumes its paused consumer of capability events after S4b, which installs the plumbing. Every Core step reaches Hub through a pin roll that the Foundation writer owns.
 
 ## 5. Open questions for review
 
