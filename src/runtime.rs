@@ -8137,13 +8137,25 @@ pub(crate) mod tests {
         std::path::PathBuf,
         crate::packages::PackageAdmissionPolicy,
     ) {
+        subscribed_provider_enabled_with(name, "")
+    }
+
+    /// The enabled provider whose entrypoint first runs `prelude`.
+    fn subscribed_provider_enabled_with(
+        name: &str,
+        prelude: &str,
+    ) -> (
+        HubRuntime,
+        std::path::PathBuf,
+        crate::packages::PackageAdmissionPolicy,
+    ) {
         let (runtime, root) = publication_provider_runtime(name);
         let entrypoint = root.join("plugin.lua");
         let source = std::fs::read_to_string(&entrypoint).unwrap();
         std::fs::write(
             &entrypoint,
             format!(
-                "botster.events.on({{ owner = 'hub', name = 'worktree_created' }}, function(event) return {{ received = event.event }} end)\n{source}"
+                "{prelude}\nbotster.events.on({{ owner = 'hub', name = 'worktree_created' }}, function(event) return {{ received = event.event }} end)\n{source}"
             ),
         )
         .unwrap();
@@ -8155,6 +8167,74 @@ pub(crate) mod tests {
             .enable("producer", "enable subscribed test provider")
             .unwrap();
         (runtime, root, policy)
+    }
+
+    fn logged_messages(runtime: &HubRuntime) -> Vec<(String, u64)> {
+        runtime
+            .plugin_logs()
+            .read("producer", 0)
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| (record.message, record.generation))
+            .collect()
+    }
+
+    #[test]
+    fn a_lua_load_that_fails_removes_the_records_its_entrypoint_wrote() {
+        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
+            "load-lua-failure-logs",
+            "botster.log.info({ message = 'loading' })\nerror('refuse to load')",
+        );
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap_err();
+        assert!(logged_messages(&runtime).is_empty());
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_first_load_rejected_after_the_lua_load_removes_its_records() {
+        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
+            "load-preflight-logs",
+            "botster.log.info({ message = 'loading' })",
+        );
+        crate::lifecycle::inject_next_prepare_failure("producer");
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap_err();
+        assert!(logged_messages(&runtime).is_empty());
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_reload_rejected_after_the_lua_load_removes_only_the_candidate_records() {
+        let (mut runtime, root, policy) = subscribed_provider_enabled_with(
+            "reload-preflight-logs",
+            "botster.log.info({ message = 'loading' })",
+        );
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let live = logged_messages(&runtime);
+        assert_eq!(live.len(), 1);
+        crate::lifecycle::inject_next_prepare_failure("producer");
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("reload-preflight-logs".into()),
+                policy.registry(),
+                "producer",
+            )
+            .unwrap_err();
+        assert_eq!(
+            logged_messages(&runtime),
+            live,
+            "only the live generation's record stays"
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
