@@ -64,7 +64,7 @@ pub struct CompiledEventSchema {
 impl CompiledEventSchema {
     /// Heap bytes this schema retains, by capacity. `None` on overflow.
     pub(crate) fn retained_bytes(&self) -> Option<usize> {
-        crate::lua_runtime::lua_json::retained_bytes(&self.spec)
+        crate::lua_memory::layout::json_value_retained_bytes(&self.spec)
     }
 
     /// Compile a closed schema subset. Rejects oversize, deep, or expanded schemas.
