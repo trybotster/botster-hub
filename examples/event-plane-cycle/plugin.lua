@@ -1,8 +1,13 @@
+local function emit_status(result)
+  if result.ok then return result.value.status end
+  return result.error.detail.status
+end
+
 local family = "event-plane-cycle.probe"
 local handler_status = "none"
 local provider_status = "none"
 
-events.on("event-plane-producer", "sample.ready", function(event)
+botster.events.on({ owner = "event-plane-producer", name = "sample.ready" }, function(event)
   botster.entity_publish({
     type = "entity_upsert",
     entity_type = family,
@@ -10,8 +15,9 @@ events.on("event-plane-producer", "sample.ready", function(event)
     id = "gap",
     entity = { id = "gap", token = event.token or "live" },
   })
-  local result = events.emit("cycle.probe", { ok = true, token = "handler" })
-  handler_status = result.status
+  handler_status = emit_status(
+    botster.events.emit({ name = "cycle.probe", payload = { ok = true, token = "handler" } })
+  )
 end)
 
 return botster.register({
@@ -36,8 +42,9 @@ return botster.register({
       descriptor_id = family,
       descriptor = { entity_type = family, id_field = "id" },
       call = function()
-        local result = events.emit("cycle.probe", { ok = true, token = "provider" })
-        provider_status = result.status
+        provider_status = emit_status(
+          botster.events.emit({ name = "cycle.probe", payload = { ok = true, token = "provider" } })
+        )
         return {
           type = "entity_snapshot",
           entity_type = family,

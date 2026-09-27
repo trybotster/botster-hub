@@ -3750,7 +3750,7 @@ mod tests {
         std::fs::write(
             root.join("plugin.lua"),
             r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     received = event.event,
     worktree_id = event.worktree_id,
@@ -3758,7 +3758,7 @@ events.on("hub", "worktree_created", function(event)
   }
 end)
 
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     received = event.event,
     observer = "second",
@@ -3868,7 +3868,7 @@ return botster.register({})
         let (registry, package_root) = install_lua_event_plugin(
             "capacity-block",
             r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return { received = event.event, body = string.rep("x", 4096) }
 end)
 return botster.register({})
@@ -4110,13 +4110,13 @@ return botster.register({})
     #[test]
     fn t1_hold_seam_times_out_distinct_from_handler_failure() {
         let hold_lua = r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return { received = event.event }
 end)
 return botster.register({})
 "#;
         let fail_lua = r#"
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   error("handler boom")
 end)
 return botster.register({})
