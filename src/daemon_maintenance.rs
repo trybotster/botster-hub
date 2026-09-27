@@ -338,6 +338,11 @@ impl SessionFamilyBridge {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_fanout_empty(&self) -> bool {
+        self.pending_fanout.is_empty()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_consumer_debug(&self, plugin_key: &str) -> String {
         format!("{:?}", self.consumers.get(plugin_key))
     }
@@ -601,6 +606,21 @@ fn event_flight(
 }
 
 impl MaintenanceState {
+    /// Queue one family delta for fanout the way a session change does.
+    #[cfg(test)]
+    pub(crate) fn test_queue_family_delta(&mut self, frame: serde_json::Value) {
+        let bytes = serde_json::to_vec(&frame)
+            .map(|body| body.len())
+            .unwrap_or(0);
+        self.session_family.fanout_bytes = self.session_family.fanout_bytes.saturating_add(bytes);
+        self.session_family.pending_fanout.push_back(FanoutJob {
+            frame,
+            after: None,
+            bytes,
+        });
+        self.wakes.mark_all();
+    }
+
     fn event_invocation_timeout_ms(&self) -> u64 {
         #[cfg(test)]
         if let Some(timeout_ms) = self.test_event_invocation_timeout_ms {
