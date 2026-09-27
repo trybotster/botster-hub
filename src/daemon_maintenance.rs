@@ -1573,7 +1573,11 @@ fn apply_plugin_completion(
                         .event_plane_counters()
                         .record_handler_backpressured();
                 }
-                PluginInvocationFailureKind::WorkerStopped => {
+                // A crashed or killed plugin process also ended the worker
+                // before the handler completed.
+                PluginInvocationFailureKind::WorkerStopped
+                | PluginInvocationFailureKind::WorkerCrashed
+                | PluginInvocationFailureKind::WorkerKilled => {
                     runtime
                         .event_plane_counters()
                         .record_handler_worker_stopped();
