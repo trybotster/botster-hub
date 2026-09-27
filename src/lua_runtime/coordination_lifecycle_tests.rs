@@ -136,7 +136,7 @@ fn entry_charge_survives_owner_accept_until_reply_retirement() {
     let bridge = runtime.coordination_bridge();
     let mut wakes = TestOwnerWakes::bind(&daemon, &state);
     // One hang guard covers all three stages.
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + TEST_HANG_GUARD;
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let describe = |_: &crate::HubDaemon, state: &DaemonControlState| {
         format!(
