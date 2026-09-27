@@ -2680,7 +2680,6 @@ mod tests {
                                             resources: Vec::new(),
                                             entrypoint: Some("terminal-probe".into()),
                                             metadata: None,
-                                            log_generation: None,
                                         },
                                     )
                                     .unwrap();
