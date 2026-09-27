@@ -5,17 +5,20 @@
 //! in-memory set only, so the VM never touches the filesystem after load.
 //! See docs/plans/plugin-platform.md section 7.4.
 
-use std::fs;
+use std::fs::File;
 use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use mlua::{Function, Lua, Table};
+use mlua::{Function, Lua};
+use rustix::fs::{Dir, Mode, OFlags, openat};
+use rustix::io::Errno;
 
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 
 /// The one global staging permit: package loads stage one at a time, and
-/// their staged text never exceeds this many bytes (a user-approved number).
+/// their staged bytes never exceed this many (a user-approved number).
 const STAGING_PERMIT_BYTES: usize = 16 * 1024 * 1024;
 static STAGING_PERMIT: Mutex<()> = Mutex::new(());
 
@@ -29,118 +32,236 @@ pub(super) struct StagedModule {
     pub(super) source: String,
 }
 
-/// Staged module text plus the charge that funds it until the VM holds it.
+/// Staged module text plus the charge that funds it and the staging permit.
+/// Both last until the VM holds the text and the caller drops this value.
 pub(super) struct StagedModules {
     pub(super) modules: Vec<StagedModule>,
     _charge: Option<LuaCallbackCharge>,
+    _permit: Option<StagingPermit>,
+}
+
+/// Holds the global staging permit for as long as the staged text exists.
+struct StagingPermit {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl StagingPermit {
+    fn acquire() -> Self {
+        let guard = STAGING_PERMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        PERMIT_HELD_HERE.with(|held| held.set(true));
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for StagingPermit {
+    fn drop(&mut self) {
+        PERMIT_HELD_HERE.with(|held| held.set(false));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread holds the staging permit.
+    static PERMIT_HELD_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A directory still to walk: its descriptor and its module name prefix.
+struct PendingDirectory {
+    descriptor: OwnedFd,
+    prefix: String,
+}
+
+/// Funds staging: every retained byte is charged to the callback account
+/// before it is allocated, and counted against the staging permit.
+struct StagingFunds {
+    charge: LuaCallbackCharge,
+    staged_bytes: usize,
+}
+
+impl StagingFunds {
+    fn admit(&mut self, bytes: usize) -> Result<(), String> {
+        self.staged_bytes = self
+            .staged_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= STAGING_PERMIT_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "the package's modules exceed the {STAGING_PERMIT_BYTES} byte staging permit"
+                )
+            })?;
+        self.charge
+            .grow(bytes)
+            .map_err(|_| "the Lua callback memory capacity is exhausted".to_string())
+    }
+
+    /// Push onto `items`, funding any growth of its allocation first.
+    fn push<T>(&mut self, items: &mut Vec<T>, item: T) -> Result<(), String> {
+        if items.len() == items.capacity() {
+            let target = items.capacity().max(4).saturating_mul(2);
+            let additional = target - items.len();
+            self.admit(additional.saturating_mul(std::mem::size_of::<T>()))?;
+            items.reserve_exact(additional);
+        }
+        items.push(item);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs after an entry is listed and before it is opened.
+    static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Read every module below `<package_root>/lua/` under the staging permit.
 ///
-/// The walk never follows a symlink, refuses non-UTF-8 names, and funds each
-/// file's bytes before it reads them. A file that grows past its funded size
-/// fails the load.
+/// The walk is descriptor-relative: each entry is opened once with
+/// `O_NOFOLLOW | O_NONBLOCK` below its parent's descriptor and classified by
+/// `fstat` on that descriptor, so a symlink or a swapped entry is refused and
+/// a FIFO or device never blocks. Only one directory stream is open at a
+/// time. Every retained byte (names, directory records, module text, and the
+/// vectors that hold them) is funded before it is allocated.
 pub(super) fn stage(
     package_root: &Path,
     memory: &Arc<LuaMemoryAccount>,
 ) -> Result<StagedModules, String> {
-    let root = package_root.join(MODULE_ROOT);
-    let metadata = match fs::symlink_metadata(&root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let package = File::open(package_root)
+        .map_err(|error| format!("cannot open the package directory: {error}"))?;
+    let root = match openat(
+        &package,
+        MODULE_ROOT,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(root) => root,
+        Err(Errno::NOENT) => {
             return Ok(StagedModules {
                 modules: Vec::new(),
                 _charge: None,
+                _permit: None,
             });
         }
-        Err(error) => return Err(format!("cannot read the lua module directory: {error}")),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err("the package's lua path must be a real directory".to_string());
+        }
+        Err(error) => return Err(format!("cannot open the lua module directory: {error}")),
     };
-    if !metadata.is_dir() {
-        return Err("the package's lua path must be a real directory".to_string());
-    }
-    let _permit = STAGING_PERMIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut charge = memory
-        .reserve_callback_total(0)
-        .map_err(|_| "the Lua callback memory capacity is exhausted".to_string())?;
-    let mut modules = Vec::new();
-    let mut staged_bytes = 0_usize;
+    let permit = StagingPermit::acquire();
+    let mut funds = StagingFunds {
+        charge: memory
+            .reserve_callback_total(0)
+            .map_err(|_| "the Lua callback memory capacity is exhausted".to_string())?,
+        staged_bytes: 0,
+    };
     let per_file_limit = memory.limits().per_callback_bytes;
-    let mut pending = vec![(root, String::new())];
-    while let Some((directory, prefix)) = pending.pop() {
-        let mut entries = fs::read_dir(&directory)
-            .map_err(|error| format!("cannot list {}: {error}", directory.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot list {}: {error}", directory.display()))?;
-        entries.sort_by_key(fs::DirEntry::file_name);
-        for entry in entries {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
+    let mut modules: Vec<StagedModule> = Vec::new();
+    let mut pending: Vec<PendingDirectory> = Vec::new();
+    funds.push(
+        &mut pending,
+        PendingDirectory {
+            descriptor: root,
+            prefix: String::new(),
+        },
+    )?;
+    while let Some(PendingDirectory { descriptor, prefix }) = pending.pop() {
+        // The stream reads a duplicate descriptor; entries open below the
+        // original, so no path is resolved again.
+        let directory = Dir::read_from(&descriptor)
+            .map_err(|error| format!("cannot list a module directory: {error}"))?;
+        for entry in directory {
+            let entry =
+                entry.map_err(|error| format!("cannot list a module directory: {error}"))?;
+            let raw = entry.file_name().to_bytes();
+            if raw == b"." || raw == b".." {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(raw) else {
                 return Err("module file names must be UTF-8".to_string());
             };
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("cannot inspect {name}: {error}"))?;
-            if kind.is_symlink() {
-                return Err(format!(
-                    "symlinks are not allowed below lua/: {prefix}{name}"
-                ));
-            }
-            if kind.is_dir() {
+            #[cfg(test)]
+            BEFORE_OPEN.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(name);
+                }
+            });
+            let opened = match openat(
+                &descriptor,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(opened) => File::from(opened),
+                Err(Errno::LOOP) => {
+                    return Err(format!(
+                        "symlinks are not allowed below lua/: {prefix}{name}"
+                    ));
+                }
+                Err(error) => return Err(format!("cannot open {prefix}{name}: {error}")),
+            };
+            let metadata = opened
+                .metadata()
+                .map_err(|error| format!("cannot inspect {prefix}{name}: {error}"))?;
+            if metadata.is_dir() {
                 if name.contains('.') {
                     return Err(format!(
                         "module directory names cannot contain '.': {prefix}{name}"
                     ));
                 }
-                pending.push((entry.path(), format!("{prefix}{name}.")));
+                let child_prefix_len = prefix.len() + name.len() + 1;
+                funds.admit(child_prefix_len)?;
+                funds.push(
+                    &mut pending,
+                    PendingDirectory {
+                        descriptor: OwnedFd::from(opened),
+                        prefix: format!("{prefix}{name}."),
+                    },
+                )?;
                 continue;
             }
             let Some(stem) = name.strip_suffix(".lua") else {
                 continue;
             };
+            if !metadata.is_file() {
+                return Err(format!("modules must be regular files: {prefix}{name}"));
+            }
             if stem.is_empty() || stem.contains('.') {
                 return Err(format!(
                     "module file names need one '.lua' suffix: {prefix}{name}"
                 ));
             }
-            let size = entry
-                .metadata()
-                .map_err(|error| format!("cannot inspect {name}: {error}"))?
-                .len();
-            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
             if size > per_file_limit {
                 return Err(format!(
                     "module {prefix}{stem} exceeds {per_file_limit} bytes"
                 ));
             }
-            staged_bytes = staged_bytes
-                .checked_add(size)
-                .filter(|total| *total <= STAGING_PERMIT_BYTES)
-                .ok_or_else(|| {
-                    format!("the package's modules exceed the {STAGING_PERMIT_BYTES} byte staging permit")
-                })?;
-            charge
-                .grow(size)
-                .map_err(|_| "the Lua callback memory capacity is exhausted".to_string())?;
-            let source = read_exact_size(&entry.path(), size)
+            let module_name_len = prefix.len() + stem.len();
+            funds.admit(size.saturating_add(module_name_len))?;
+            let source = read_exact_size(opened, size)
                 .map_err(|error| format!("cannot read module {prefix}{stem}: {error}"))?;
-            modules.push(StagedModule {
-                name: format!("{prefix}{stem}"),
-                source,
-            });
+            funds.push(
+                &mut modules,
+                StagedModule {
+                    name: format!("{prefix}{stem}"),
+                    source,
+                },
+            )?;
         }
     }
     Ok(StagedModules {
         modules,
-        _charge: Some(charge),
+        _charge: Some(funds.charge),
+        _permit: Some(permit),
     })
 }
-
 /// Read at most `size` bytes into a buffer allocated once at that size; a file
 /// that grew after it was measured fails instead of allocating more.
-fn read_exact_size(path: &Path, size: usize) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+fn read_exact_size(mut file: File, size: usize) -> Result<String, String> {
     let mut bytes = vec![0_u8; size];
     let mut filled = 0;
     while filled < size {
@@ -220,6 +341,7 @@ mod tests {
     use super::*;
     use crate::lua_memory::LuaMemoryLimits;
     use mlua::{LuaOptions, StdLib};
+    use std::fs;
 
     struct Package(std::path::PathBuf);
 
@@ -361,6 +483,73 @@ mod tests {
             .expect("unfunded staging refused");
         assert!(error.contains("capacity is exhausted"), "{error}");
         assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn many_empty_modules_are_funded_like_any_other() {
+        // Empty modules carry no text, but their names and records are
+        // retained; 2000 of them exceed a 64 KiB callback account.
+        let names: Vec<String> = (0..2000).map(|index| format!("lua/m{index}.lua")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "")).collect();
+        let package = Package::new(&files);
+        let memory = memory(64 * 1024);
+        let error = vm_with(&package, &memory)
+            .err()
+            .expect("unfunded module metadata refused");
+        assert!(error.contains("capacity is exhausted"), "{error}");
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn an_entry_swapped_for_a_symlink_after_listing_is_refused() {
+        let package = Package::new(&[("lua/a.lua", "return 'real'")]);
+        let target = package.0.join("outside.lua");
+        fs::write(&target, "return 'outside'").unwrap();
+        let module = package.0.join("lua/a.lua");
+        BEFORE_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |name: &str| {
+                if name == "a.lua" {
+                    fs::remove_file(&module).unwrap();
+                    std::os::unix::fs::symlink(&target, &module).unwrap();
+                }
+            }));
+        });
+        let result = vm_with(&package, &memory(64 * 1024));
+        BEFORE_OPEN.with(|hook| hook.borrow_mut().take());
+        let error = result.err().expect("the swapped symlink is refused");
+        assert!(error.contains("symlinks are not allowed"), "{error}");
+    }
+
+    #[test]
+    fn a_fifo_module_is_refused_without_blocking() {
+        let package = Package::new(&[("lua/real.lua", "return 1")]);
+        let fifo = std::ffi::CString::new(
+            package
+                .0
+                .join("lua/pipe.lua")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let error = vm_with(&package, &memory(64 * 1024))
+            .err()
+            .expect("a FIFO module is refused");
+        assert!(error.contains("must be regular files"), "{error}");
+    }
+
+    #[test]
+    fn the_staging_permit_lasts_as_long_as_the_staged_text() {
+        let package = Package::new(&[("lua/a.lua", "return 1")]);
+        let memory = memory(64 * 1024);
+        let staged = stage(&package.0, &memory).unwrap();
+        assert!(
+            PERMIT_HELD_HERE.with(std::cell::Cell::get),
+            "the permit is held while the staged text exists"
+        );
+        drop(staged);
+        assert!(!PERMIT_HELD_HERE.with(std::cell::Cell::get));
     }
 
     #[test]
