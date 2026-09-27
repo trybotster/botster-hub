@@ -8242,12 +8242,13 @@ return botster.register({{ handlers = {{{{
     fn lifetime_budget_allows_a_live_event_to_complete_512_publications() {
         let (mut daemon, mut state, mut wakes, root) =
             start_publishing_event_daemon("lifetime-live-event", 512);
-        let counters = drive_one_publishing_event(
-            &mut daemon,
-            &mut state,
-            &mut wakes,
-            Duration::from_secs(15),
-        );
+        // The property is that the publication budget recycles across 512
+        // publications in one handler, not that they fit the production
+        // event deadline, so the handler gets the shared test hang guard.
+        state.maintenance.test_event_invocation_timeout_ms =
+            Some(u64::try_from(TEST_HANG_GUARD.as_millis()).unwrap());
+        let counters =
+            drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
         assert_eq!(
             handler_outcomes(&counters),
             (1, 0, 0, 0, 0, 0),
