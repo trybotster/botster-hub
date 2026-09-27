@@ -320,6 +320,10 @@ pub(crate) struct PendingStep {
 }
 
 /// Result of starting one control request.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Ready carries the flat all-optional DaemonResponse (about 6 KB) inline; the client-protocol DaemonResponse redesign replaces it instead of boxing every Ready site"
+)]
 pub(crate) enum ControlStep {
     Ready(DaemonTransportResult<DaemonResponse>),
     Pending(PendingStep),

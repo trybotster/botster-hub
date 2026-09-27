@@ -444,6 +444,10 @@ fn submit_release(
     Some(runtime.begin_release_session_reservation_for_owner(waiter_id, reservation))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Ready carries the flat all-optional DaemonResponse (about 6 KB) inline; the client-protocol DaemonResponse redesign replaces it instead of boxing every Ready site"
+)]
 fn poll_tracker(
     tracker: &mut CoreOperationTracker,
     daemon: &HubDaemon,
