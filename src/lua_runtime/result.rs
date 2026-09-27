@@ -8,6 +8,10 @@ use mlua::{Lua, Table, Value};
 
 /// The closed set of error kinds shared by every helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the vocabulary is closed now; host calls in later slices construct the rest"
+)]
 pub(crate) enum ErrorKind {
     InvalidRequest,
     CapabilityDenied,
