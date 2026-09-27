@@ -19,6 +19,7 @@ use botster_hub_client::{
     DaemonDiagnostic, DaemonEndpoint, DaemonTransportError as ClientDaemonTransportError,
     ServerFrame,
 };
+#[cfg(not(target_os = "macos"))]
 use notify::{RecursiveMode, Watcher};
 use tokio::io::BufReader as AsyncBufReader;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
@@ -137,7 +138,7 @@ async fn accept_connections_with_events(
     if let Some(events) = socket_events.as_ref()
         && events.missing_at_start
     {
-        rebind_listener(&mut listener, &events.path);
+        let _ = rebind_listener(&mut listener, &events.path);
     }
 
     let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
@@ -194,7 +195,7 @@ async fn accept_connections_with_events(
             }
             event = async {
                 match socket_events.as_mut() {
-                    Some(events) => events.events.recv().await,
+                    Some(events) => events.source.next().await,
                     None => std::future::pending().await,
                 }
             } => {
@@ -207,10 +208,17 @@ async fn accept_connections_with_events(
                         socket_events = None;
                         continue;
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(())) => {}
                 }
                 if let Some(path) = watched_path.as_ref() {
-                    rebind_listener(&mut listener, path);
+                    let _outcome = rebind_listener(&mut listener, path);
+                    #[cfg(test)]
+                    if let Some(observer) = socket_events
+                        .as_ref()
+                        .and_then(|events| events.rebind_observer.as_ref())
+                    {
+                        let _ = observer.send(_outcome);
+                    }
                 }
             }
             changed = shutdown_rx.changed() => {
@@ -227,11 +235,64 @@ async fn accept_connections_with_events(
 }
 
 struct SocketPathEvents {
-    // The watcher must remain alive for its callback to keep receiving events.
-    _watcher: notify::RecommendedWatcher,
-    events: tokio_mpsc::Receiver<notify::Result<notify::Event>>,
+    source: SocketPathSource,
     path: PathBuf,
     missing_at_start: bool,
+    /// Test-only: every rebind attempt the accept loop makes, in order.
+    #[cfg(test)]
+    rebind_observer: Option<tokio_mpsc::UnboundedSender<RebindOutcome>>,
+}
+
+/// What wakes the accept loop when the socket's directory changes. The loop
+/// checks the path's current state, not the event, so one wake per burst is
+/// enough.
+enum SocketPathSource {
+    /// macOS: a kqueue `EVFILT_VNODE` watch on the parent directory. The
+    /// kernel posts `NOTE_WRITE` when an entry is added, removed, or renamed,
+    /// as part of that operation. FSEvents, which `notify` uses on macOS, is
+    /// delivered later through fseventsd and can be dropped under churn.
+    #[cfg(target_os = "macos")]
+    Kqueue(DirectoryVnodeWatch),
+    /// Elsewhere: `notify` (inotify on Linux, which the kernel also posts
+    /// synchronously).
+    #[cfg(not(target_os = "macos"))]
+    Notify {
+        // The watcher must remain alive for its callback to keep receiving events.
+        _watcher: notify::RecommendedWatcher,
+        events: tokio_mpsc::Receiver<notify::Result<notify::Event>>,
+    },
+    /// Test-only: changes injected by the test.
+    #[cfg(test)]
+    Injected(tokio_mpsc::Receiver<()>),
+    /// The watch failed and stopped.
+    Stopped,
+}
+
+impl SocketPathSource {
+    /// Wait for the next change. `None` once the source has stopped.
+    async fn next(&mut self) -> Option<Result<(), String>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Kqueue(watch) => match watch.changed().await {
+                Ok(DirectoryChange::Entries) => Some(Ok(())),
+                Ok(DirectoryChange::DirectoryGone) => {
+                    // The watched directory itself was removed or renamed: no
+                    // later change to it can be observed.
+                    *self = Self::Stopped;
+                    None
+                }
+                Err(error) => Some(Err(error.to_string())),
+            },
+            #[cfg(not(target_os = "macos"))]
+            Self::Notify { events, .. } => events
+                .recv()
+                .await
+                .map(|event| event.map(|_| ()).map_err(|error| error.to_string())),
+            #[cfg(test)]
+            Self::Injected(events) => events.recv().await.map(Ok),
+            Self::Stopped => None,
+        }
+    }
 }
 
 impl SocketPathEvents {
@@ -245,46 +306,247 @@ impl SocketPathEvents {
         let parent = path
             .parent()
             .ok_or_else(|| "socket path has no parent directory".to_string())?;
-        let (events_tx, events) = tokio_mpsc::channel(1);
-        let mut watcher = notify::recommended_watcher(move |event| {
-            // Coalesce bursts: one queued wake is enough because the accept
-            // loop checks the path's current state rather than event history.
-            let _ = events_tx.try_send(event);
-        })
-        .map_err(|error| error.to_string())?;
-        watcher
-            .watch(parent, RecursiveMode::NonRecursive)
-            .map_err(|error| error.to_string())?;
+        let source = watch_directory(parent)?;
         let missing_at_start = !path.exists();
         Ok(Self {
-            _watcher: watcher,
-            events,
+            source,
             path,
             missing_at_start,
+            #[cfg(test)]
+            rebind_observer: None,
         })
     }
 
     #[cfg(test)]
     fn closed(path: PathBuf) -> Self {
-        let watcher = notify::recommended_watcher(|_| {}).expect("create inert watcher");
         let (events_tx, events) = tokio_mpsc::channel(1);
         drop(events_tx);
+        Self::injected(path, events)
+    }
+
+    #[cfg(test)]
+    fn injected(path: PathBuf, events: tokio_mpsc::Receiver<()>) -> Self {
         Self {
-            _watcher: watcher,
-            events,
+            source: SocketPathSource::Injected(events),
             path,
             missing_at_start: false,
+            rebind_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_rebinds(mut self) -> (Self, tokio_mpsc::UnboundedReceiver<RebindOutcome>) {
+        let (observer, outcomes) = tokio_mpsc::unbounded_channel();
+        self.rebind_observer = Some(observer);
+        (self, outcomes)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn watch_directory(parent: &Path) -> Result<SocketPathSource, String> {
+    DirectoryVnodeWatch::new(parent)
+        .map(SocketPathSource::Kqueue)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_directory(parent: &Path) -> Result<SocketPathSource, String> {
+    let (events_tx, events) = tokio_mpsc::channel(1);
+    let mut watcher = notify::recommended_watcher(move |event| {
+        // Coalesce bursts: one queued wake is enough.
+        let _ = events_tx.try_send(event);
+    })
+    .map_err(|error| error.to_string())?;
+    watcher
+        .watch(parent, RecursiveMode::NonRecursive)
+        .map_err(|error| error.to_string())?;
+    Ok(SocketPathSource::Notify {
+        _watcher: watcher,
+        events,
+    })
+}
+
+/// A change the kernel reported for the watched directory.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryChange {
+    /// An entry was added, removed, or renamed.
+    Entries,
+    /// The directory itself was deleted, renamed, or revoked.
+    DirectoryGone,
+}
+
+/// A kqueue `EVFILT_VNODE` watch on one directory, polled by Tokio's reactor
+/// through the kqueue descriptor itself: no thread and no timer.
+///
+/// The kernel registration happens at construction, which may run outside a
+/// Tokio runtime (the accept loop's future is built synchronously), so no
+/// change after construction is missed. The reactor registration waits for
+/// the first `changed`, which runs inside the loop; changes queue in the
+/// kqueue until then.
+#[cfg(target_os = "macos")]
+struct DirectoryVnodeWatch {
+    queue: VnodeQueue,
+    // Held open for the registration's lifetime; O_EVTONLY does not block
+    // the volume from unmounting.
+    _directory: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+enum VnodeQueue {
+    Unregistered(Option<std::os::fd::OwnedFd>),
+    Registered(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>),
+}
+
+#[cfg(target_os = "macos")]
+const DIRECTORY_GONE: u32 = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+
+#[cfg(target_os = "macos")]
+impl DirectoryVnodeWatch {
+    fn new(directory: &Path) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket directory path contains a NUL byte",
+            )
+        })?;
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        let raw = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a descriptor this call just opened and owns.
+        let directory = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: kqueue takes no arguments; a negative result is an error.
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a kqueue descriptor this call just created.
+        // A kqueue is not inherited across fork, so no CLOEXEC is needed.
+        let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+        let change = libc::kevent {
+            ident: directory.as_raw_fd() as libc::uintptr_t,
+            filter: libc::EVFILT_VNODE,
+            // EV_CLEAR: one report per burst of changes, reset when read.
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: libc::NOTE_WRITE | DIRECTORY_GONE,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one valid change record in, no event buffer out.
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            queue: VnodeQueue::Unregistered(Some(queue)),
+            _directory: directory,
+        })
+    }
+
+    /// Wait for the kernel's next report on the directory. Must run inside a
+    /// Tokio runtime.
+    async fn changed(&mut self) -> std::io::Result<DirectoryChange> {
+        use std::os::fd::AsRawFd;
+
+        if let VnodeQueue::Unregistered(queue) = &mut self.queue {
+            let queue = queue
+                .take()
+                .expect("an unregistered queue retains its descriptor");
+            self.queue = VnodeQueue::Registered(tokio::io::unix::AsyncFd::with_interest(
+                queue,
+                tokio::io::Interest::READABLE,
+            )?);
+        }
+        let VnodeQueue::Registered(queue) = &self.queue else {
+            unreachable!("the queue was registered above");
+        };
+        loop {
+            let mut ready = queue.readable().await?;
+            let mut event = libc::kevent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let immediately = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: no changes in, one event buffer out, and a zero
+            // timeout so the call never blocks the reactor thread.
+            let count = unsafe {
+                libc::kevent(
+                    queue.get_ref().as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &immediately,
+                )
+            };
+            if count < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if count == 0 {
+                // Nothing pending: the readiness was spurious or already read.
+                ready.clear_ready();
+                continue;
+            }
+            if event.flags & libc::EV_ERROR != 0 {
+                return Err(std::io::Error::from_raw_os_error(event.data as i32));
+            }
+            if event.fflags & DIRECTORY_GONE != 0 {
+                return Ok(DirectoryChange::DirectoryGone);
+            }
+            return Ok(DirectoryChange::Entries);
         }
     }
 }
 
-fn rebind_listener(listener: &mut TokioUnixListener, path: &Path) {
+/// The result of one rebind attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebindOutcome {
+    /// The path exists, so nothing was rebound.
+    PathPresent,
+    /// The listener was rebound to the path.
+    Rebound,
+    /// The bind failed; the error was logged.
+    Failed,
+}
+
+fn rebind_listener(listener: &mut TokioUnixListener, path: &Path) -> RebindOutcome {
     if path.exists() {
-        return;
+        return RebindOutcome::PathPresent;
     }
     match TokioUnixListener::bind(path) {
-        Ok(rebound) => *listener = rebound,
-        Err(error) => eprintln!("botster-hub daemon socket rebind error: {error}"),
+        Ok(rebound) => {
+            *listener = rebound;
+            RebindOutcome::Rebound
+        }
+        Err(error) => {
+            eprintln!("botster-hub daemon socket rebind error: {error}");
+            RebindOutcome::Failed
+        }
     }
 }
 
@@ -517,6 +779,10 @@ mod tests {
         drop(owner);
     }
 
+    /// The platform watch (kqueue on macOS) reports the unlink of a live
+    /// socket, and the accept loop rebinds with no transport traffic. The
+    /// rebind is signalled by the loop itself; the deadline only bounds a
+    /// lost kernel event.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unlinking_live_socket_rebinds_without_transport_traffic() {
         let socket = temp_socket_path("event-rebind");
@@ -528,30 +794,29 @@ mod tests {
         let (control_tx, _control_rx) = tokio_mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // Creating the future synchronously registers the filesystem watcher,
-        // so no control message, connection, or terminal frame is needed to
-        // prompt the rebind after this unlink.
-        let accept_loop = accept_connections(
+        // The watch is registered before the unlink, so no control message,
+        // connection, or terminal frame is needed to prompt the rebind.
+        let (events, mut rebinds) = SocketPathEvents::new(&listener)
+            .expect("watch the socket directory")
+            .observe_rebinds();
+        fs::remove_file(&socket).expect("unlink live socket");
+        let accept_task = tokio::spawn(accept_connections_with_events(
             listener,
             control_tx,
             shutdown_rx,
             Arc::new(Semaphore::new(1)),
-        );
-        fs::remove_file(&socket).expect("unlink live socket");
-        let accept_task = tokio::spawn(accept_loop);
+            Ok(events),
+        ));
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if fs::symlink_metadata(&socket)
-                    .is_ok_and(|metadata| metadata.file_type().is_socket())
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("filesystem event should cause the listener to rebind");
+        // timer: deadline — bounds a lost kernel event; the rebind is signalled.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rebinds.recv())
+            .await
+            .expect("the directory change should reach the accept loop")
+            .expect("the accept loop reports its rebinds");
+        assert_eq!(outcome, RebindOutcome::Rebound);
+        assert!(
+            fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket())
+        );
         assert!(matches!(
             acquire_socket_owner_lock(&socket),
             Err(DaemonTransportError::AlreadyRunning)
@@ -564,6 +829,110 @@ mod tests {
             .expect("accept task should not panic");
         cleanup_socket_path(&socket, owner);
         let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
+
+    /// One injected change drives one rebind, reported to the observer; a
+    /// later change with the socket present rebinds nothing.
+    #[tokio::test]
+    async fn an_injected_change_rebinds_the_unlinked_socket() {
+        let socket = temp_socket_path("injected-rebind");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(listener).expect("Tokio listener");
+        let (control_tx, _control_rx) = tokio_mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (inject, injected) = tokio_mpsc::channel(1);
+        let (events, mut rebinds) =
+            SocketPathEvents::injected(socket.clone(), injected).observe_rebinds();
+        let accept_task = tokio::spawn(accept_connections_with_events(
+            listener,
+            control_tx,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Ok(events),
+        ));
+
+        fs::remove_file(&socket).expect("unlink live socket");
+        inject.send(()).await.expect("inject the change");
+        // timer: deadline — bounds a broken accept loop; the rebind is signalled.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rebinds.recv())
+            .await
+            .expect("the injected change reaches the accept loop");
+        assert_eq!(outcome, Some(RebindOutcome::Rebound));
+        assert!(
+            fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket())
+        );
+        inject.send(()).await.expect("inject a second change");
+        // timer: deadline — as above.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rebinds.recv())
+            .await
+            .expect("the second change reaches the accept loop");
+        assert_eq!(outcome, Some(RebindOutcome::PathPresent));
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), accept_task)
+            .await
+            .expect("accept loop should stop")
+            .expect("accept task should not panic");
+        cleanup_socket_path(&socket, owner);
+        let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
+
+    /// The accept loop's future is built synchronously, sometimes outside
+    /// any Tokio runtime. The watch must build there, and a change made
+    /// before the reactor registers must still be reported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_vnode_watch_built_outside_a_runtime_reports_an_earlier_change() {
+        let directory = temp_socket_path("outside").with_extension("d");
+        fs::create_dir(&directory).expect("create directory");
+        let entry = directory.join("entry");
+        fs::write(&entry, b"x").expect("create entry");
+        let mut watch = DirectoryVnodeWatch::new(&directory).expect("watch outside a runtime");
+        fs::remove_file(&entry).expect("remove entry before any runtime exists");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let change = runtime.block_on(async {
+            // timer: deadline — bounds a lost kernel event.
+            tokio::time::timeout(Duration::from_secs(5), watch.changed())
+                .await
+                .expect("the queued unlink is reported")
+                .expect("the watch reads its event")
+        });
+        assert_eq!(change, DirectoryChange::Entries);
+        fs::remove_dir(&directory).expect("remove directory");
+    }
+
+    /// The kernel reports an entry removal, then the directory's own removal,
+    /// to the vnode watch.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_directory_vnode_watch_reports_an_unlink_then_the_directory_gone() {
+        let directory = temp_socket_path("vnode").with_extension("d");
+        fs::create_dir(&directory).expect("create directory");
+        let entry = directory.join("entry");
+        fs::write(&entry, b"x").expect("create entry");
+        let mut watch = DirectoryVnodeWatch::new(&directory).expect("watch directory");
+
+        fs::remove_file(&entry).expect("remove entry");
+        // timer: deadline — bounds a missing kernel event.
+        let change = tokio::time::timeout(Duration::from_secs(5), watch.changed())
+            .await
+            .expect("the unlink is reported")
+            .expect("the watch reads its event");
+        assert_eq!(change, DirectoryChange::Entries);
+
+        fs::remove_dir(&directory).expect("remove directory");
+        // timer: deadline — as above.
+        let change = tokio::time::timeout(Duration::from_secs(5), watch.changed())
+            .await
+            .expect("the directory removal is reported")
+            .expect("the watch reads its event");
+        assert_eq!(change, DirectoryChange::DirectoryGone);
     }
 
     async fn assert_degraded_watch_still_accepts(
