@@ -207,7 +207,7 @@ mod tests {
             .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
             .unwrap();
         let completed = completion(&runtime);
-        let HostResult::EntityModelComplete(kind) = completed.result else {
+        let HostResult::EntityModelComplete(kind) = *completed.result else {
             panic!("a stale snapshot step completes");
         };
         assert_eq!(
@@ -257,7 +257,7 @@ mod tests {
             .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
             .unwrap();
         assert!(matches!(
-            completion(&runtime).result,
+            *completion(&runtime).result,
             HostResult::Failed { .. }
         ));
         assert!(runtime.entity_model_poisoned());
@@ -527,7 +527,7 @@ mod tests {
                 .unwrap();
             let completed = completion(&runtime);
             assert!(matches!(
-                (&completed.result, poisoned),
+                (&*completed.result, poisoned),
                 (HostResult::EntityModelComplete(Kind::TakeFanout), false)
                     | (HostResult::Failed { .. }, true)
             ));
@@ -691,7 +691,7 @@ mod tests {
             .unwrap();
         let completed = completion(&runtime);
         assert!(matches!(
-            completed.result,
+            *completed.result,
             HostResult::EntityModelComplete(Kind::StepSnapshot)
         ));
         {
@@ -884,7 +884,7 @@ mod tests {
             .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
             .unwrap();
         let completed = completion(&runtime);
-        assert!(matches!(completed.result, HostResult::Failed { .. }));
+        assert!(matches!(*completed.result, HostResult::Failed { .. }));
         assert!(work.completed(identity(), Kind::TakeFanout).is_none());
         assert_eq!(
             runtime.observe_entity_model(identity(), Kind::TakeFanout),
@@ -989,7 +989,7 @@ mod tests {
             assert!(!runtime.entity_model_readiness().resync);
             assert!(!runtime.take_entity_model_notification());
             assert!(matches!(
-                completed.result,
+                *completed.result,
                 HostResult::EntityModelComplete(Kind::FinishFanout)
             ));
             assert_eq!(
@@ -1041,7 +1041,7 @@ mod tests {
             let completed = completion(&runtime);
             assert_eq!(completed.identity, next);
             assert!(matches!(
-                completed.result,
+                *completed.result,
                 HostResult::EntityModelComplete(Kind::Reclaim)
             ));
             assert!(
@@ -1166,7 +1166,7 @@ mod tests {
                     crate::host_executor::HOST_OPERATION_CAPACITY
                 );
                 if fail {
-                    assert!(matches!(completed.result, HostResult::Failed { .. }));
+                    assert!(matches!(*completed.result, HostResult::Failed { .. }));
                     assert_eq!(
                         detached.observe(&runtime, completed.identity, Kind::CleanupDetached),
                         CausalTransitionStatus::Fault

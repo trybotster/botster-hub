@@ -3625,7 +3625,7 @@ mod tests {
             panic!("the executor must retain the original receipt");
         };
         assert!(matches!(
-            &receipt.result,
+            &*receipt.result,
             crate::host_executor::HostResult::ClientEventCleanup(Ok(_))
         ));
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
@@ -4077,7 +4077,7 @@ mod tests {
                 completion.identity.phase -= 1;
             } else {
                 let crate::host_executor::HostResult::ClientEventCleanup(Ok(done)) =
-                    &mut completion.result
+                    &mut *completion.result
                 else {
                     panic!("the original worker must produce a successful cleanup receipt");
                 };
@@ -4436,7 +4436,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let retained = state.host_completions.values().any(|completion| matches!(
-                    &completion.result,
+                    &*completion.result,
                     crate::host_executor::HostResult::Mutation(crate::host_mutations::HostMutationResult::PackageEffectApplied { cleanup, .. })
                         if !cleanup.event_plane_unloads.is_empty()
                 ));
@@ -4497,7 +4497,7 @@ mod tests {
                 loop {
                     if let Some(completion) = state.host_completions.get_mut(&waiter)
                         && matches!(
-                            completion.result,
+                            *completion.result,
                             crate::host_executor::HostResult::EntityModelComplete(
                                 crate::runtime::entity_model::Kind::CleanupDetached
                             )
@@ -6815,13 +6815,13 @@ return botster.register({
                     {
                         if (before_admission
                             && matches!(
-                                completion.result,
+                                *completion.result,
                                 HostResult::PluginEntity(
                                     crate::plugin_entity::Completion::ProviderPrepared(_)
                                 )
                             ))
                             || matches!(
-                                completion.result,
+                                *completion.result,
                                 HostResult::PluginEntity(
                                     crate::plugin_entity::Completion::ProviderAdmitted(None)
                                 )
@@ -6903,7 +6903,7 @@ return botster.register({
                             daemon.runtime().unwrap().host_executor().poll_completion()
                         {
                             assert!(matches!(
-                                completion.result,
+                                *completion.result,
                                 HostResult::EntityModelComplete(
                                     crate::runtime::entity_model::Kind::SelectProvider
                                 )
@@ -9783,7 +9783,7 @@ return botster.register({tools = {{
                     {
                         assert_eq!(completion.identity.phase, 1);
                         assert!(matches!(
-                            completion.result,
+                            *completion.result,
                             crate::host_executor::HostResult::StatusResponsePrepared(_)
                         ));
                         break completion;

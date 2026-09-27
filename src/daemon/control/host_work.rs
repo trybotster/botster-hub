@@ -1127,13 +1127,14 @@ impl HostMutationContinuation {
                     if let Some(staged) = take_retained_staged(state) {
                         host_runtime.settle_before_staging(staged);
                     }
-                    let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
-                        effect,
-                        runtime: host_runtime,
-                        config: runtime.config().clone(),
-                        packages: daemon.package_registry_view(),
-                        reply: committed.reply,
-                    });
+                    let command =
+                        HostMutationCommand::ApplyPackageEffect(Box::new(HostPackageEffect {
+                            effect,
+                            runtime: host_runtime,
+                            config: runtime.config().clone(),
+                            packages: daemon.package_registry_view(),
+                            reply: committed.reply,
+                        }));
                     return submit_phase(daemon, state, waiter_id, command, permit, next_phase);
                 }
                 release_document(state, waiter_id);
@@ -1160,15 +1161,16 @@ impl HostMutationContinuation {
                         None
                     }
                 };
-                let command =
-                    HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
+                let command = HostMutationCommand::RestorePackageRuntime(Box::new(
+                    HostPackageRuntimeRestore {
                         effect,
                         original,
                         runtime: host_runtime,
                         config: runtime.config().clone(),
                         staged,
                         quarantine: None,
-                    });
+                    },
+                ));
                 submit_phase(daemon, state, waiter_id, command, permit, next_phase)
             }
             HostMutationResult::PackageEffectApplied {
@@ -1577,14 +1579,14 @@ fn submit_package_quarantine(
         keep_staged_with_recovery(state, waiter_id, staged);
         return poll;
     };
-    let command = HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
+    let command = HostMutationCommand::RestorePackageRuntime(Box::new(HostPackageRuntimeRestore {
         effect,
         original,
         runtime: runtime.host_package_runtime(),
         config: runtime.config().clone(),
         staged,
         quarantine: Some(failure),
-    });
+    }));
     let identity = HostJobIdentity {
         waiter_id,
         phase: *next_phase,
@@ -1598,13 +1600,13 @@ fn submit_package_quarantine(
         None => Err(HostSubmissionFailure {
             error: HostSubmitError::PhaseExhausted,
             identity,
-            command,
+            command: Box::new(command),
             permit,
         }),
         Some(_) if refused_for_test => Err(HostSubmissionFailure {
             error: HostSubmitError::Full,
             identity,
-            command,
+            command: Box::new(command),
             permit,
         }),
         Some(later_phase) => runtime
@@ -1638,7 +1640,8 @@ fn retain_unsubmitted_quarantine(
         permit,
         ..
     } = failure;
-    let HostCommand::Mutation(HostMutationCommand::RestorePackageRuntime(restore)) = command else {
+    let HostCommand::Mutation(HostMutationCommand::RestorePackageRuntime(restore)) = *command
+    else {
         unreachable!("the quarantine phase submits a runtime restore");
     };
     let HostPackageRuntimeRestore {
@@ -1647,7 +1650,7 @@ fn retain_unsubmitted_quarantine(
         staged,
         quarantine,
         ..
-    } = restore;
+    } = *restore;
     crate::hub_log::hub_log!(
         "package_quarantine_unsubmitted packages={} error={error:?}",
         effect.package_names().join(",")
@@ -1753,17 +1756,18 @@ fn submit_package_quarantine_record(
             std::time::SystemTime::now(),
         ),
     };
-    let command = HostMutationCommand::RecordPackageQuarantine(HostPackageQuarantineRecord {
-        base_revision,
-        authority: authority.expect("checked above"),
-        state: current_state,
-        packages: daemon.package_registry_view(),
-        data_directory: runtime.config().data_directory.clone(),
-        quarantine,
-        effect: failure.effect,
-        original: failure.original,
-        rollbacks: failure.rollbacks,
-    });
+    let command =
+        HostMutationCommand::RecordPackageQuarantine(Box::new(HostPackageQuarantineRecord {
+            base_revision,
+            authority: authority.expect("checked above"),
+            state: current_state,
+            packages: daemon.package_registry_view(),
+            data_directory: runtime.config().data_directory.clone(),
+            quarantine,
+            effect: failure.effect,
+            original: failure.original,
+            rollbacks: failure.rollbacks,
+        }));
     submit_phase(daemon, state, waiter_id, command, permit, next_phase)
 }
 
@@ -2103,7 +2107,7 @@ fn submit_event_cleanup(
             Some(HostSubmissionFailure {
                 error: HostSubmitError::PhaseExhausted,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             }),
             None,
@@ -2158,7 +2162,7 @@ fn submit_phase(
             HostSubmissionFailure {
                 error: HostSubmitError::PhaseExhausted,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             },
         );
@@ -2169,7 +2173,7 @@ fn submit_phase(
             HostSubmissionFailure {
                 error: HostSubmitError::Stopped,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             },
         );
@@ -3208,7 +3212,7 @@ mod tests {
         let (mut daemon, directory) = recovery_test_daemon();
         let runtime = daemon.runtime().expect("runtime");
         let permit = runtime.host_executor().try_reserve().expect("host slot");
-        let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
+        let command = HostMutationCommand::ApplyPackageEffect(Box::new(HostPackageEffect {
             effect: PackageRuntimeEffect::Disable {
                 package_name: "retained.plugin".to_string(),
             },
@@ -3221,7 +3225,7 @@ mod tests {
                 ),
             )
             .expect("bounded reply"),
-        });
+        }));
         let waiter_id = WaiterId(82);
         let mut state = DaemonControlState::default();
         state.document_owner = Some(waiter_id);
@@ -3245,7 +3249,7 @@ mod tests {
             panic!("the exhausted phase must retain its effect");
         };
         assert!(
-            matches!(&failure.command, HostCommand::Mutation(HostMutationCommand::ApplyPackageEffect(effect)) if matches!(&effect.effect, PackageRuntimeEffect::Disable { package_name } if package_name == "retained.plugin"))
+            matches!(&*failure.command, HostCommand::Mutation(HostMutationCommand::ApplyPackageEffect(effect)) if matches!(&effect.effect, PackageRuntimeEffect::Disable { package_name } if package_name == "retained.plugin"))
         );
         let executor = daemon.runtime().expect("runtime").host_executor();
         let remaining = (0..7)
@@ -3352,7 +3356,7 @@ mod tests {
             }
         };
         assert!(matches!(
-            completion.result,
+            *completion.result,
             HostResult::Mutation(HostMutationResult::PackageRuntimeRestored { ref rollbacks, .. })
                 if rollbacks.len() == 1 && rollbacks[0].step == "restore_admission"
         ));

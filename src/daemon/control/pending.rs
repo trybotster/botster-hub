@@ -910,7 +910,7 @@ pub(crate) fn poll_ready_request_item(
                     daemon,
                     state,
                     job.identity,
-                    job.command,
+                    *job.command,
                     job.permit,
                 );
                 None

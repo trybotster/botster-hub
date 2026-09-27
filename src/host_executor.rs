@@ -283,7 +283,9 @@ impl HostResult {
 #[derive(Debug)]
 pub(crate) struct HostCompletion {
     pub(crate) identity: HostJobIdentity,
-    pub(crate) result: HostResult,
+    /// Boxed: a completion travels through channels and `Err` returns, and
+    /// the largest result is over 1 KB.
+    pub(crate) result: Box<HostResult>,
     permit: HostWorkPermit,
 }
 
@@ -295,7 +297,7 @@ impl HostCompletion {
     ) -> Self {
         Self {
             identity,
-            result,
+            result: Box::new(result),
             permit,
         }
     }
@@ -307,7 +309,7 @@ impl HostCompletion {
         normalize_result_size(&mut result);
         let logical_bytes = result_logical_bytes(&result);
         let charge = permit.into_prepared_charge(logical_bytes);
-        (result, charge)
+        (*result, charge)
     }
 
     /// Retain this operation slot for an off-owner reclamation job.
@@ -322,11 +324,11 @@ impl HostCompletion {
         normalize_result_size(&mut result);
         let logical_bytes = result_logical_bytes(&result);
         let charge = permit.take_prepared_charge(logical_bytes);
-        (result, charge, permit)
+        (*result, charge, permit)
     }
 
     pub(crate) fn into_parts(self) -> (HostJobIdentity, HostResult, HostWorkPermit) {
-        (self.identity, self.result, self.permit)
+        (self.identity, *self.result, self.permit)
     }
 
     #[cfg(test)]
@@ -335,11 +337,7 @@ impl HostCompletion {
         result: HostResult,
         permit: HostWorkPermit,
     ) -> Self {
-        Self {
-            identity,
-            result,
-            permit,
-        }
+        Self::from_parts(identity, result, permit)
     }
 }
 
@@ -394,7 +392,9 @@ pub(crate) enum HostSubmitError {
 pub(crate) struct HostSubmissionFailure {
     pub(crate) error: HostSubmitError,
     pub(crate) identity: HostJobIdentity,
-    pub(crate) command: HostCommand,
+    /// Boxed: the refused command returns through `Err`, and the largest
+    /// command is close to 1 KB.
+    pub(crate) command: Box<HostCommand>,
     pub(crate) permit: HostWorkPermit,
 }
 
@@ -418,7 +418,7 @@ fn dispose_completion_receiver(
 ) -> Result<(), HostCompletionDisposalFailure> {
     loop {
         let (identity, command, permit) = match failed.take() {
-            Some(failed) => (failed.identity, failed.command, failed.permit),
+            Some(failed) => (failed.identity, *failed.command, failed.permit),
             None => match remaining.try_recv() {
                 Ok(completion) => {
                     let (identity, result, permit) = completion.into_parts();
@@ -666,7 +666,7 @@ impl HostWorkPermit {
                 Err(HostSubmissionFailure {
                     error,
                     identity: job.identity,
-                    command: *command,
+                    command,
                     permit: job.permit,
                 })
             }
@@ -904,7 +904,7 @@ impl HostExecutor {
             return Err(HostSubmissionFailure {
                 error: HostSubmitError::WrongExecutor,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             });
         }
@@ -912,7 +912,7 @@ impl HostExecutor {
             return Err(HostSubmissionFailure {
                 error: HostSubmitError::Stopped,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             });
         }
@@ -923,7 +923,7 @@ impl HostExecutor {
             return Err(HostSubmissionFailure {
                 error: HostSubmitError::Stopped,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             });
         }
@@ -967,7 +967,7 @@ impl HostExecutor {
         Err(HostSubmissionFailure {
             error,
             identity,
-            command,
+            command: Box::new(command),
             permit,
         })
     }
@@ -1155,7 +1155,7 @@ fn run_worker(
         });
         let completion = HostCompletion {
             identity,
-            result,
+            result: Box::new(result),
             permit,
         };
         if let Err((failure, completion)) =
@@ -1703,7 +1703,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         failure
             .permit
-            .dispose(failure.identity, failure.command)
+            .dispose(failure.identity, *failure.command)
             .unwrap();
         assert!(
             receiver
@@ -1756,7 +1756,7 @@ mod tests {
         assert_eq!(executor.prepared_bytes(), 2 * HOST_PREPARED_BYTE_CAPACITY);
         assert!(dropped_rx.try_recv().is_err());
         assert!(matches!(
-            failure.failed.command,
+            *failure.failed.command,
             HostCommand::DiscardCompletion(_)
         ));
         executor.close_and_dispose_completions().unwrap();
@@ -2242,7 +2242,7 @@ mod tests {
             assert_eq!(raw_budget.retained_bytes(), 0);
             assert_eq!(executor.outstanding(), 1);
             assert!(matches!(
-                completion.result,
+                *completion.result,
                 HostResult::PluginResponseAbandoned
             ));
             drop(completion);
@@ -2299,7 +2299,7 @@ mod tests {
             assert_eq!(failure.error, expected);
             assert_eq!(failure.identity, identity);
             assert!(
-                matches!(&failure.command, HostCommand::Wait { generation: 73, gate: retained } if Arc::ptr_eq(retained, &gate))
+                matches!(&*failure.command, HostCommand::Wait { generation: 73, gate: retained } if Arc::ptr_eq(retained, &gate))
             );
             assert_eq!(executor.outstanding(), 1);
             assert_eq!(
@@ -2398,7 +2398,7 @@ mod tests {
         };
         assert_eq!(completion.identity, identity);
         assert!(matches!(
-            completion.result,
+            *completion.result,
             HostResult::SessionTypeCatalogReady { generation: 7, .. }
         ));
         let _result = completion.release();
@@ -2489,7 +2489,7 @@ mod tests {
         };
         assert_eq!(completion.identity, identity);
         assert!(matches!(
-            completion.result,
+            *completion.result,
             HostResult::Failed {
                 generation: 12,
                 ref error,

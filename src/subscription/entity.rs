@@ -722,7 +722,7 @@ impl SessionTypeCatalogCache {
             .expect("a matching catalog completion must have a pending build");
         debug_assert_eq!(completion.identity, expected_identity);
         let (result, prepared_charge, reclamation) = if matches!(
-            &completion.result,
+            &*completion.result,
             HostResult::SessionTypeCatalogReady { .. }
         ) {
             let (result, prepared_charge, permit) = completion.release_for_reclamation();
@@ -850,7 +850,7 @@ impl SessionTypeCatalogCache {
         ) {
             Ok(()) => self.waiting_for_capacity = false,
             Err(failure) => {
-                let HostCommand::ReclaimSessionTypeCatalog(reclamation) = failure.command else {
+                let HostCommand::ReclaimSessionTypeCatalog(reclamation) = *failure.command else {
                     unreachable!("catalog reclamation retains its command kind")
                 };
                 let permit = failure.permit;
@@ -3095,7 +3095,7 @@ mod tests {
             assert_eq!(completion.identity, identity);
             if malformed {
                 assert!(matches!(
-                    &completion.result,
+                    &*completion.result,
                     crate::host_executor::HostResult::PluginEntity(
                         crate::plugin_entity::Completion::Reclaimed
                     )
@@ -3433,7 +3433,7 @@ mod tests {
         let duplicate = route_terminal_host_completion(&mut state, duplicate)
             .expect_err("terminal routing must return the duplicate receipt");
         assert_eq!(executor.outstanding(), 2);
-        let HostResult::SessionTypeCatalogReady { entities, .. } = &state
+        let HostResult::SessionTypeCatalogReady { entities, .. } = &*state
             .session_type_catalog
             .completion
             .as_ref()
@@ -3443,7 +3443,7 @@ mod tests {
             panic!("the original catalog result remains");
         };
         assert_eq!(entities["type"]["id"], "first");
-        let HostResult::SessionTypeCatalogReady { entities, .. } = &duplicate.result else {
+        let HostResult::SessionTypeCatalogReady { entities, .. } = &*duplicate.result else {
             panic!("the duplicate catalog result remains");
         };
         assert_eq!(entities["type"]["id"], "second");

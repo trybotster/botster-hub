@@ -146,7 +146,7 @@ impl FamilyWork {
             let handle = self.handle.as_mut().unwrap();
             let status = if self.identity != Some(completion.identity) {
                 CausalTransitionStatus::Fault
-            } else if let HostResult::EntityModelComplete(kind) = completion.result {
+            } else if let HostResult::EntityModelComplete(kind) = *completion.result {
                 match handle {
                     Handle::Live(_) => runtime.observe_entity_model(completion.identity, kind),
                     Handle::Detached(work) => work.observe(runtime, completion.identity, kind),
