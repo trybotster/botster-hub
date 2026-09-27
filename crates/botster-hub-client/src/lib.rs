@@ -2254,6 +2254,12 @@ pub enum DaemonRequest {
     },
     PluginLifecycleStatus,
     PluginMcpListTools,
+    /// Read a plugin's structured log records after `after_seq` (0 reads all).
+    ReadPluginLogs {
+        package_name: String,
+        #[serde(default)]
+        after_seq: u64,
+    },
     PluginMcpCallTool {
         name: String,
         arguments: Value,
@@ -2347,6 +2353,7 @@ impl DaemonRequest {
             Self::PackageEntrypointStatus { .. } => "package_entrypoint_status",
             Self::PluginLifecycleStatus => "plugin_lifecycle_status",
             Self::PluginMcpListTools => "plugin_mcp_list_tools",
+            Self::ReadPluginLogs { .. } => "read_plugin_logs",
             Self::PluginMcpCallTool { .. } => "plugin_mcp_call_tool",
             Self::PluginSurfaceRender { .. } => "plugin_surface_render",
             Self::PluginSurfaceAction { .. } => "plugin_surface_action",
@@ -2421,6 +2428,8 @@ pub struct DaemonResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_surface: Option<DaemonPluginSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_logs: Option<DaemonPluginLogs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_action_result: Option<UiActionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_webrtc_bootstrap: Option<DaemonLocalWebrtcBootstrap>,
@@ -2432,6 +2441,32 @@ pub struct DaemonResponse {
     pub error: Option<DaemonOperatorError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+}
+
+/// One page of a plugin's structured log records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonPluginLogs {
+    pub package_name: String,
+    pub records: Vec<DaemonPluginLogRecord>,
+    /// The sequence the plugin's next record will get.
+    pub next_seq: u64,
+    /// The oldest sequence still retained; earlier records were evicted.
+    pub first_available_seq: u64,
+}
+
+/// One structured plugin log record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonPluginLogRecord {
+    pub seq: u64,
+    /// Unix epoch milliseconds.
+    pub at_ms: u64,
+    /// `debug`, `info`, `warn`, or `error`.
+    pub level: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Value>,
+    /// Records refused by the plugin's rate limit just before this one.
+    pub dropped_before: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2486,6 +2521,7 @@ pub enum DaemonResponseKind {
     PackageDecision,
     PluginLifecycle,
     PluginMcpTools,
+    PluginLogs,
     PluginMcpToolResult,
     PluginSurface,
     PluginActionResult,
@@ -4469,6 +4505,7 @@ mod tests {
             plugin_tools: Vec::new(),
             plugin_tool_result: Value::Null,
             plugin_surface: None,
+            plugin_logs: None,
             plugin_action_result: None,
             local_webrtc_bootstrap: None,
             local_webrtc_answer: None,
@@ -7325,6 +7362,10 @@ mod tests {
             },
             DaemonRequest::PluginLifecycleStatus,
             DaemonRequest::PluginMcpListTools,
+            DaemonRequest::ReadPluginLogs {
+                package_name: "workflow.plugin".to_string(),
+                after_seq: 0,
+            },
             DaemonRequest::PluginMcpCallTool {
                 name: "tool".to_string(),
                 arguments: serde_json::json!({ "value": true }),
@@ -7423,6 +7464,7 @@ mod tests {
             DaemonRequest::PackageEntrypointStatus { .. } => "package_entrypoint_status",
             DaemonRequest::PluginLifecycleStatus => "plugin_lifecycle_status",
             DaemonRequest::PluginMcpListTools => "plugin_mcp_list_tools",
+            DaemonRequest::ReadPluginLogs { .. } => "read_plugin_logs",
             DaemonRequest::PluginMcpCallTool { .. } => "plugin_mcp_call_tool",
             DaemonRequest::PluginSurfaceRender { .. } => "plugin_surface_render",
             DaemonRequest::PluginSurfaceAction { .. } => "plugin_surface_action",
@@ -7467,6 +7509,7 @@ mod tests {
             DaemonResponseKind::PackageDecision,
             DaemonResponseKind::PluginLifecycle,
             DaemonResponseKind::PluginMcpTools,
+            DaemonResponseKind::PluginLogs,
             DaemonResponseKind::PluginMcpToolResult,
             DaemonResponseKind::PluginSurface,
             DaemonResponseKind::PluginActionResult,
@@ -7520,6 +7563,7 @@ mod tests {
             DaemonResponseKind::PackageDecision => "package_decision",
             DaemonResponseKind::PluginLifecycle => "plugin_lifecycle",
             DaemonResponseKind::PluginMcpTools => "plugin_mcp_tools",
+            DaemonResponseKind::PluginLogs => "plugin_logs",
             DaemonResponseKind::PluginMcpToolResult => "plugin_mcp_tool_result",
             DaemonResponseKind::PluginSurface => "plugin_surface",
             DaemonResponseKind::PluginActionResult => "plugin_action_result",
@@ -7884,6 +7928,19 @@ mod tests {
                     )
                     .expect("typed snapshot"),
                 },
+            }),
+            plugin_logs: Some(DaemonPluginLogs {
+                package_name: "workflow.plugin".to_string(),
+                records: vec![DaemonPluginLogRecord {
+                    seq: 3,
+                    at_ms: 1_790_000_000_000,
+                    level: "info".to_string(),
+                    message: "ticket advanced".to_string(),
+                    fields: Some(serde_json::json!({ "ticket_id": "t1" })),
+                    dropped_before: 0,
+                }],
+                next_seq: 4,
+                first_available_seq: 1,
             }),
             plugin_action_result: Some(
                 serde_json::from_value(serde_json::json!({

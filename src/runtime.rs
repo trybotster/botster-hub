@@ -129,6 +129,8 @@ pub struct HubRuntime {
     config: HubConfig,
     startup_materialization_paths: crate::session_types::StartupMaterializationPaths,
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
+    /// Per-plugin structured log records (`botster.log`, `ReadPluginLogs`).
+    plugin_logs: Arc<crate::plugin_logs::PluginLogBook>,
     #[cfg(test)]
     lua_plugin_runtimes:
         std::sync::Arc<Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>>,
@@ -701,6 +703,9 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             startup_materialization_paths,
+            plugin_logs: Arc::new(crate::plugin_logs::PluginLogBook::new(Arc::clone(
+                &lua_memory,
+            ))),
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
@@ -896,6 +901,9 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             startup_materialization_paths,
+            plugin_logs: Arc::new(crate::plugin_logs::PluginLogBook::new(Arc::clone(
+                &lua_memory,
+            ))),
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
@@ -1071,9 +1079,14 @@ impl HubRuntime {
 
     /// Return Host primitives that retain this Hub's shared Lua memory account.
     #[must_use]
+    pub(crate) fn plugin_logs(&self) -> &Arc<crate::plugin_logs::PluginLogBook> {
+        &self.plugin_logs
+    }
+
     pub fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
         LuaPluginHostApi {
             memory: Arc::clone(&self.lua_memory),
+            logs: Arc::clone(&self.plugin_logs),
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
