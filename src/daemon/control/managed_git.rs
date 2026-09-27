@@ -1143,7 +1143,7 @@ impl ManagedSpawnOperation {
             daemon,
             state,
             Phase::PrepareRecord,
-            HostCommand::Mutation(HostMutationCommand::Prepare(command)),
+            HostCommand::Mutation(HostMutationCommand::Prepare(Box::new(command))),
         )
     }
 
@@ -1180,7 +1180,7 @@ impl ManagedSpawnOperation {
             daemon,
             state,
             Phase::PrepareRemoval,
-            HostCommand::Mutation(HostMutationCommand::Prepare(command)),
+            HostCommand::Mutation(HostMutationCommand::Prepare(Box::new(command))),
         )
     }
 

@@ -590,19 +590,19 @@ pub(crate) fn handle(
             packages,
         }
     } else if is_entrypoint_request(&request) {
-        HostMutationCommand::Read(HostRead::Entrypoint {
+        HostMutationCommand::Read(Box::new(HostRead::Entrypoint {
             request,
             config,
             packages,
-        })
+        }))
     } else if is_package_read(&request) {
-        HostMutationCommand::Read(HostRead::Package {
+        HostMutationCommand::Read(Box::new(HostRead::Package {
             request,
             config: config.clone(),
             packages,
-        })
+        }))
     } else if is_package_prepare(&request) {
-        HostMutationCommand::Prepare(HostPrepare::Package {
+        HostMutationCommand::Prepare(Box::new(HostPrepare::Package {
             request,
             base_revision,
             authority: authority
@@ -615,14 +615,14 @@ pub(crate) fn handle(
                 .runtime()
                 .map(crate::HubRuntime::stranded_packages)
                 .unwrap_or_default(),
-        })
+        }))
     } else if is_spawn_target_read(&request) {
-        HostMutationCommand::Read(HostRead::SpawnTarget {
+        HostMutationCommand::Read(Box::new(HostRead::SpawnTarget {
             request,
             state: state_view,
-        })
+        }))
     } else if is_spawn_target_prepare(&request) {
-        HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        HostMutationCommand::Prepare(Box::new(HostPrepare::SpawnTarget {
             request,
             base_revision,
             authority: authority
@@ -631,14 +631,14 @@ pub(crate) fn handle(
             state: state_view,
             packages,
             data_directory,
-        })
+        }))
     } else if is_session_type_read(&request) {
-        HostMutationCommand::Read(HostRead::SessionType {
+        HostMutationCommand::Read(Box::new(HostRead::SessionType {
             request,
             config,
             state: state_view,
             packages,
-        })
+        }))
     } else if is_session_type_prepare(&request) {
         if let Some(root) = repo_session_type_root(&state_view, &request)
             && state.repo_session_type_quarantine.contains(root)
@@ -668,7 +668,7 @@ pub(crate) fn handle(
                 "the repository session-type source is blocked until recovery completes",
             )));
         }
-        HostMutationCommand::Prepare(HostPrepare::SessionType {
+        HostMutationCommand::Prepare(Box::new(HostPrepare::SessionType {
             request,
             base_revision,
             authority: authority.expect("File host mutation retains its state authority"),
@@ -676,7 +676,7 @@ pub(crate) fn handle(
             state: state_view,
             packages,
             data_directory,
-        })
+        }))
     } else {
         return None;
     };
@@ -692,11 +692,13 @@ pub(crate) fn handle(
         waiter_id,
         phase: 1,
     };
-    let observes_session_type_catalog = matches!(
-        &command,
-        HostMutationCommand::Read(HostRead::SessionType { .. })
-            | HostMutationCommand::Prepare(HostPrepare::SessionType { .. })
-    );
+    let observes_session_type_catalog = match &command {
+        HostMutationCommand::Read(read) => matches!(**read, HostRead::SessionType { .. }),
+        HostMutationCommand::Prepare(prepare) => {
+            matches!(**prepare, HostPrepare::SessionType { .. })
+        }
+        _ => false,
+    };
     if let Err(error) =
         runtime
             .host_executor()
@@ -2928,7 +2930,7 @@ mod tests {
             metadata: Default::default(),
         };
         let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
-            HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+            HostMutationCommand::Prepare(Box::new(HostPrepare::SpawnTarget {
                 request,
                 base_revision: revision,
                 authority: daemon
@@ -2939,7 +2941,7 @@ mod tests {
                 state: view,
                 packages: daemon.package_registry_view(),
                 data_directory: directory.clone(),
-            }),
+            })),
             None,
         ) else {
             panic!("spawn target preparation must succeed");
@@ -3010,7 +3012,7 @@ mod tests {
             .expect("package view fits");
         let mut entrypoints = crate::entrypoint_supervisor::EntrypointSupervisor::default();
         let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
-            HostMutationCommand::Prepare(HostPrepare::Package {
+            HostMutationCommand::Prepare(Box::new(HostPrepare::Package {
                 request: DaemonRequest::SetPackageConfiguration {
                     package_name: "retained.plugin".to_string(),
                     values: Default::default(),
@@ -3021,7 +3023,7 @@ mod tests {
                 packages,
                 data_directory: directory.clone(),
                 stranded: Default::default(),
-            }),
+            })),
             Some(&mut entrypoints),
         ) else {
             panic!("package configuration preparation must succeed");

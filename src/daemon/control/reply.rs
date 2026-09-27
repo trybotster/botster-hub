@@ -183,7 +183,9 @@ pub(crate) struct RetainedPluginResult<T> {
 #[derive(Debug)]
 pub(crate) enum ControlReply {
     Typed {
-        response: DaemonTransportResult<DaemonResponse>,
+        /// Boxed: DaemonResponse is about 6 KB, and a reply returns through
+        /// `Err` when its receiver is gone.
+        response: Box<DaemonTransportResult<DaemonResponse>>,
         charge: Option<RetainedControlCharge>,
         delivery: Option<crate::runtime::SpawnDeliveryReceipt>,
     },
@@ -207,7 +209,7 @@ pub(crate) enum RetainedControlCharge {
 impl ControlReply {
     pub(crate) fn plain(response: DaemonTransportResult<DaemonResponse>) -> Self {
         Self::Typed {
-            response,
+            response: Box::new(response),
             charge: None,
             delivery: None,
         }
@@ -218,7 +220,7 @@ impl ControlReply {
     ) -> Self {
         let (response, charge) = response.into_parts();
         Self::Typed {
-            response,
+            response: Box::new(response),
             charge: Some(RetainedControlCharge::Plugin { _charge: charge }),
             delivery: None,
         }
@@ -229,7 +231,7 @@ impl ControlReply {
         charge: crate::host_executor::HostPreparedCharge,
     ) -> Self {
         Self::Typed {
-            response,
+            response: Box::new(response),
             charge: Some(RetainedControlCharge::Host { _charge: charge }),
             delivery: None,
         }
@@ -240,7 +242,7 @@ impl ControlReply {
         delivery: crate::runtime::SpawnDeliveryReceipt,
     ) -> Self {
         Self::Typed {
-            response,
+            response: Box::new(response),
             charge: None,
             delivery: Some(delivery),
         }
@@ -261,7 +263,9 @@ impl ControlReply {
 
     pub(crate) fn kind(&self) -> Option<botster_hub_client::DaemonResponseKind> {
         match self {
-            Self::Typed { response, .. } => response.as_ref().ok().map(|response| response.kind),
+            Self::Typed { response, .. } => {
+                (**response).as_ref().ok().map(|response| response.kind)
+            }
             Self::EncodedPlugin { kind, .. } => Some(*kind),
         }
     }
@@ -281,7 +285,7 @@ impl ControlReply {
                 delivery,
             } => {
                 drop(delivery);
-                (response, charge, None)
+                (*response, charge, None)
             }
             Self::EncodedPlugin {
                 encoded_frame,
