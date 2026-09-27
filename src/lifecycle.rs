@@ -573,9 +573,9 @@ pub struct HubPluginRuntimeBundle {
 /// Hub-owned event subscription metadata for one plugin handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPluginEventHandler {
-    /// Exact owner string passed to `events.on(owner, name, ...)`.
+    /// Exact owner string passed to `botster.events.on({ owner, name }, ...)`.
     pub event_owner: String,
-    /// Exact event name passed to `events.on(...)`.
+    /// Exact event name passed to `botster.events.on(...)`.
     pub event_name: String,
     /// Stable handler address invoked through the core plugin worker.
     pub handler: botster_core::PluginHandlerRef,
