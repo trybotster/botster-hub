@@ -7906,7 +7906,7 @@ return botster.register({
         std::fs::write(
             package_dir.join("plugin.lua"),
             r#"
-events.on("hub", "worktree_created", function()
+botster.events.on({ owner = "hub", name = "worktree_created" }, function()
   local result = botster.entity_publish({
     type = "entity_remove", entity_type = "resync-probe.item", snapshot_seq = 100, id = "item"
   })
@@ -8031,7 +8031,7 @@ return botster.register({ handlers = {{
             package_dir.join("plugin.lua"),
             format!(
                 r#"
-events.on("hub", "worktree_created", function()
+botster.events.on({{ owner = "hub", name = "worktree_created" }}, function()
   for seq = 1, {publications} do
     local result = botster.entity_publish({{
       type = "entity_remove", entity_type = "resync-probe.item", snapshot_seq = seq, id = "item"
