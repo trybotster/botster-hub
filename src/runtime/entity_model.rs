@@ -1270,7 +1270,8 @@ impl Readiness {
 }
 
 pub(crate) enum Operation {
-    AdmitPublication(super::publication::Admission),
+    /// Boxed: an admission is about 1 KB; the other operations are far smaller.
+    AdmitPublication(Box<super::publication::Admission>),
     AdvancePublication(super::publication::Advance),
     DisposePublication(Option<super::PackageEntityMutation>),
     ReleasePublication,

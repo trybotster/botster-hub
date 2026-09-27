@@ -211,7 +211,8 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
-    OrdinarySessionTypeMaterialized(crate::session_types::SpawnHostCompletion),
+    /// Boxed: a charged materialization is over 1 KB.
+    OrdinarySessionTypeMaterialized(Box<crate::session_types::SpawnHostCompletion>),
     CoordinationResponseDelivered,
     ClientEventCleanup(
         Result<
@@ -1218,7 +1219,7 @@ fn execute(
 ) -> HostResult {
     match command {
         HostCommand::MaterializeOrdinarySessionType(work) => {
-            HostResult::OrdinarySessionTypeMaterialized(work.run())
+            HostResult::OrdinarySessionTypeMaterialized(Box::new(work.run()))
         }
         HostCommand::DeliverCoordinationResponse {
             response,

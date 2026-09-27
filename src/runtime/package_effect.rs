@@ -16,7 +16,9 @@ use botster_core::{PluginCapabilityRuntime, PluginCleanupResult, PluginKey, Requ
 #[derive(Default)]
 pub(crate) struct HostPackageCleanup {
     pub(crate) family_epoch: Option<u64>,
-    pub(crate) family_cursor: super::family_cleanup::FamilyCleanupCursor,
+    /// Boxed: the cursor is about 740 bytes and rides in every Host package
+    /// mutation result.
+    pub(crate) family_cursor: Box<super::family_cleanup::FamilyCleanupCursor>,
     pub(crate) last_capability_cleanup: Option<PluginCleanupResult>,
     pub(crate) unloaded_families: Vec<(String, BTreeSet<String>)>,
     pub(crate) event_plane_unloads: VecDeque<crate::package_event_router::OwnerOp>,
@@ -209,7 +211,7 @@ impl HostPackageRuntime {
     pub(crate) fn into_cleanup(self) -> HostPackageCleanup {
         HostPackageCleanup {
             family_epoch: None,
-            family_cursor: super::family_cleanup::FamilyCleanupCursor::default(),
+            family_cursor: Box::default(),
             last_capability_cleanup: self.last_capability_cleanup,
             unloaded_families: self.unloaded_families,
             event_plane_unloads: self.event_plane_unloads,

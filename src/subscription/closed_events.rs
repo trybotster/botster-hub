@@ -222,6 +222,9 @@ pub(crate) fn suppress_webrtc_session_close_events(
 
 /// Owner-side cache of close-event decisions for one close-events pass.
 ///
+/// One registry read: each requested session id with its close decision.
+type CloseDecisionRead = crate::data_plane::driver::CoreTicket<Vec<(String, Option<bool>)>>;
+
 /// Registry lookups run on the Core owner thread. The pass classifies from
 /// the cache, records the session ids it lacks, requests them in one ticket,
 /// and revisits the same cursor once the ticket resolves. The cache empties
@@ -230,7 +233,7 @@ pub(crate) fn suppress_webrtc_session_close_events(
 pub(crate) struct CloseEventDecisions {
     cache: BTreeMap<String, Option<bool>>,
     missing: BTreeSet<String>,
-    read: Option<crate::data_plane::driver::CoreTicket<Vec<(String, Option<bool>)>>>,
+    read: Option<CloseDecisionRead>,
 }
 
 impl CloseEventDecisions {
