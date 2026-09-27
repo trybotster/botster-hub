@@ -397,7 +397,7 @@ local function invalid_body_surface(_arguments)
 end
 
 local function settings_surface(_arguments)
-  local config = botster.capabilities.config.get()
+  local config = botster.capabilities.config.get().value
   local endpoint = config.values.endpoint or {}
   local mode = config.values.mode or {}
   local token = config.values.api_token or {}
@@ -539,7 +539,7 @@ local function package_entity_surface(_arguments)
 end
 
 local function package_entity_snapshot(_arguments)
-  local config = botster.capabilities.config.get()
+  local config = botster.capabilities.config.get().value
   local mode = config.values.mode or {}
   local generation = 1
   if mode.value == "read" then
