@@ -8123,6 +8123,8 @@ return botster.register({ handlers = {} })
         .unwrap();
         let mut state = DaemonControlState::default();
         let mut wakes = TestOwnerWakes::bind(&daemon, &state);
+        // As serve does: start the lifecycle baseline the family snapshot needs.
+        seed_lifecycle_reconciliation(&mut daemon, &mut state);
         if install_notifier {
             daemon
                 .runtime()
@@ -8221,6 +8223,9 @@ return botster.register({ handlers = {} })
             message.contains("owner wakes stopped") || message.contains("hang guard expired"),
             "{message}"
         );
+        // It stalls with a frame admitted and its completion undelivered, not
+        // before the snapshot started.
+        assert!(message.contains("in_flight: Some"), "{message}");
     }
 
     /// Delivers one `worktree_created` event and drives owner turns until its
