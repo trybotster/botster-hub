@@ -10281,10 +10281,13 @@ return botster.register({tools = {{
         state: &DaemonControlState,
     ) -> Vec<botster_hub_client::DaemonQuarantine> {
         let mut rows = Vec::new();
+        let lifecycle = daemon.runtime().map(crate::HubRuntime::plugin_lifecycle);
+        let stranded = lifecycle.map(crate::HubPluginLifecycle::stranded_packages);
         crate::daemon::control::host_work::extend_package_quarantine_rows(
             state,
             daemon.package_registry(),
-            daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
+            lifecycle,
+            stranded.as_ref(),
             &mut rows,
         );
         rows
@@ -10603,9 +10606,10 @@ return botster.register({tools = {{
     }
 
     /// When the quarantine phase cannot be submitted, the package is already
-    /// stranded: it stays loaded but inert, and Status lists it loaded.
+    /// stranded: it stays loaded but inert, and Status lists it loaded. The
+    /// resolve still runs, unloads it, and releases the retained token.
     #[test]
-    fn an_unsubmitted_quarantine_leaves_the_package_loaded_and_inert() {
+    fn an_unsubmitted_quarantine_stays_inert_until_resolve_unloads_it() {
         let name = "unsubmitted.quarantine";
         let root = unique_package_control_dir(name);
         let config = package_control_config(root.join("data"));
@@ -10643,6 +10647,41 @@ return botster.register({tools = {{
             )),
             "{rows:?}"
         );
+        // The refused phase is kept as a package recovery, not a submission
+        // recovery, so Host work (and the resolve) stays admitted.
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Submission { .. }
+            )),
+            "no submission recovery blocks Host work"
+        );
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert!(!plugin_is_loaded(&daemon, name), "resolve unloads it");
+        assert_eq!(package_state(&daemon, name), PackageState::Disabled);
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(
+            state.host_recovery.is_empty(),
+            "the resolve releases the recovery record with its token and permit"
+        );
+        assert!(package_quarantine_rows(&daemon, &state).is_empty());
+        // The staged generation was discarded: a new stage is not refused as
+        // an overlap, so an explicit enable loads the package again.
+        let enabled = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::EnablePackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect("enable after resolve");
+        assert!(enabled.error.is_none(), "{enabled:?}");
+        assert!(plugin_is_loaded(&daemon, name));
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
