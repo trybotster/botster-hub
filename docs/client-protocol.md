@@ -20,7 +20,7 @@ repository.
 
 Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a63d4`. The pipeline implementation commit should be treated as the final protocol revision once merged.
 
-External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, correlated request and response frames, event frames, the Unix container framing, and the WebRTC chunk headers described under "Host-control protocol 10" below.
+External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, correlated request and response frames, event frames, the Unix container framing, and the WebRTC chunk headers described under "Host-control protocol 10" and "Host-control protocol 11" below.
 
 Browser clients should import the checked generated TypeScript protocol artifact
 instead of maintaining handwritten DTO mirrors:
@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 50.
+- conformance fixture revision 51.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
@@ -1658,6 +1658,16 @@ clients that need incremental READY-then-history use
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
+
+## Host-control protocol 11
+
+`PROTOCOL_VERSION` is 11 and `CONFORMANCE_FIXTURE_REVISION` is 51. This is a
+cold cut: a protocol-10 client fails closed at `ensure_compatible()`, with no
+negotiation and no fallback path. Protocol 11 adds the `ReadPluginLogs`
+request and its `PluginLogs` response (see "Plugin Logs"). Revision 51 also
+changes the plugin contract matrix fixture, which now reads the result shape
+of `botster.capabilities.config.get()`. Everything described under protocol
+10 below still applies.
 
 ## Host-control protocol 10
 
