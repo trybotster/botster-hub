@@ -417,6 +417,28 @@ pub(crate) fn mark_event_owner_ready(state: &mut DaemonControlState) {
     mark_background_ready(state, BackgroundWork::EventOwner);
 }
 
+/// Mark every parked request whose lock was released since it parked.
+pub(crate) fn mark_signaled_requests(state: &mut DaemonControlState) {
+    if state.signal_request_waits.is_empty() {
+        return;
+    }
+    let moved: Vec<_> = state
+        .signal_request_waits
+        .iter()
+        .filter(|(_, parked)| parked.moved())
+        .map(|(waiter, _)| *waiter)
+        .collect();
+    for waiter in moved {
+        state.signal_request_waits.remove(&waiter);
+        crate::daemon::control::pending::mark_owner_ready(
+            state,
+            waiter,
+            crate::daemon::owner_schedule::ReadyClass::ControlIngress,
+            crate::daemon::control::pending::READY_SIGNAL,
+        );
+    }
+}
+
 fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     for kind in MaintenanceSliceKind::ALL {
         if state.maintenance.wakes.take(kind) {
@@ -433,6 +455,7 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             .maintenance
             .mark_signaled_waits(runtime.owner_signal());
     }
+    mark_signaled_requests(state);
     if state.entity_capacity_wake.take() {
         state
             .maintenance
@@ -1318,6 +1341,14 @@ fn serve_daemon_inner(
         runtime.install_plugin_completion_notifier(
             control_state.plugin_result_budget.completion_notifier(),
         );
+        // Every lock the owner parks on must ring the one doorbell it sleeps on.
+        assert!(
+            Arc::ptr_eq(
+                control_state.event_plane.owner_signal(),
+                runtime.owner_signal()
+            ),
+            "the client event plane must share the runtime's owner signal"
+        );
     }
     seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
     let mut connection_tasks = vec![transport_runtime.spawn(accept_connections(
@@ -1996,6 +2027,10 @@ pub(crate) struct DaemonControlState {
     pub(crate) entity_capacity_wake: EntitySubscriptionCapacityWake,
     pub(crate) event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     pub(crate) client_events: crate::daemon::client_events::ClientEvents,
+    /// Requests parked on a lock another thread held. The owner marks each
+    /// ready when its lock's key moves (readiness plan 2.2).
+    pub(crate) signal_request_waits:
+        BTreeMap<crate::owner_identity::WaiterId, crate::daemon::owner_signal::Parked>,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
@@ -2272,6 +2307,7 @@ impl Default for DaemonControlState {
             entity_subscriptions: BTreeMap::new(),
             entity_capacity_wake: EntitySubscriptionCapacityWake::default(),
             client_events: crate::daemon::client_events::ClientEvents::default(),
+            signal_request_waits: BTreeMap::new(),
             event_plane: std::sync::Arc::new(
                 crate::subscription::package_events::ClientEventPlane::default(),
             ),
@@ -3289,6 +3325,185 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Admit the cleanup connection with package-event subscriptions negotiated.
+    fn negotiated_event_owner(name: &str) -> (HubDaemon, DaemonControlState, std::path::PathBuf) {
+        let root = unique_package_control_dir(name);
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        state.pending_runtime.admission.host_compatibility.insert(
+            "cleanup-connection".into(),
+            crate::admission::unix_hello::HostCompatibilityRecord {
+                event_reader: None,
+                required_features: vec![
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                ],
+            },
+        );
+        (daemon, state, root)
+    }
+
+    fn second_event_subscription() -> DaemonRequest {
+        DaemonRequest::SubscribeEvents {
+            subscription_id: "second".into(),
+            owner: "cleanup-owner".into(),
+            name: "ready".into(),
+            subjects: Vec::new(),
+        }
+    }
+
+    /// Hold one of the four locks a subscribe takes while `body` runs. The
+    /// handles are owned clones, so `body` may borrow the daemon mutably.
+    fn with_event_lock_held<R>(
+        lock: &str,
+        daemon: &HubDaemon,
+        state: &DaemonControlState,
+    ) -> impl FnOnce(&mut dyn FnMut() -> R) -> R + use<R> {
+        let plane = std::sync::Arc::clone(&state.event_plane);
+        let connection = state.event_plane.connection("cleanup-connection").unwrap();
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        let lock = lock.to_string();
+        move |body| match lock.as_str() {
+            "connections" => plane.test_with_connections_held(body),
+            "slots" => connection.test_with_slots_held(body),
+            "pool" => connection.test_with_pool_held(body),
+            "router" => router.test_with_inner_held(body),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_contended_event_lock_parks_the_subscribe_until_its_holder_releases_it() {
+        use crate::daemon::control::events::{EventAttempt, handle_client_event_request};
+
+        for lock in ["connections", "slots", "pool", "router"] {
+            let (mut daemon, mut state, root) =
+                negotiated_event_owner(&format!("client-event-contended-{lock}"));
+            let request = second_event_subscription();
+            let hold = with_event_lock_held(lock, &daemon, &state);
+            let mut waited = None;
+            hold(&mut || {
+                let attempt = handle_client_event_request(
+                    &mut daemon,
+                    &mut state,
+                    "cleanup-connection",
+                    &request,
+                    None,
+                );
+                let EventAttempt::Wait(parked, pending) = attempt else {
+                    panic!("{lock}: contention must wait, not answer");
+                };
+                assert!(
+                    !parked.moved(),
+                    "{lock}: the failed attempt must not wake itself"
+                );
+                waited = Some((parked, pending));
+            });
+            let (parked, pending) = waited.expect("the attempt ran inside the hold");
+            assert!(
+                parked.moved(),
+                "{lock}: the holder's release wakes the parked request"
+            );
+            let EventAttempt::Done(response) = handle_client_event_request(
+                &mut daemon,
+                &mut state,
+                "cleanup-connection",
+                &request,
+                pending,
+            ) else {
+                panic!("{lock}: the retry after release completes");
+            };
+            assert!(response.error.is_none(), "{lock}: {response:?}");
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_parked_subscribe_request_is_answered_after_the_release_through_the_owner() {
+        let (mut daemon, mut state, root) = negotiated_event_owner("client-event-owner-parked");
+        let connection = state.event_plane.connection("cleanup-connection").unwrap();
+        let mut response = None;
+        connection.test_with_slots_held(|| {
+            response = Some(start_async_control_request(
+                &mut daemon,
+                &mut state,
+                second_event_subscription(),
+                "cleanup-connection",
+                "parked-subscribe",
+            ));
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            }
+            assert_eq!(state.signal_request_waits.len(), 1, "the request parked");
+            assert!(
+                state.owner_ready.is_empty(),
+                "a parked request is not ready"
+            );
+        });
+        let mut response = response.expect("the request started");
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        // The release raised the slots key; one owner pass answers the request
+        // with no other wake.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let answer = loop {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            if let Ok(answer) = response.try_recv() {
+                break answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parked request must be answered"
+            );
+            thread::yield_now();
+        };
+        let answer = answer.expect("a subscribed response");
+        assert!(answer.error.is_none(), "{answer:?}");
+        assert!(state.signal_request_waits.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_poisoned_event_lock_is_a_typed_refusal_not_a_wait() {
+        use crate::daemon::control::events::{EventAttempt, handle_client_event_request};
+
+        for lock in ["connections", "slots", "pool", "router"] {
+            let (mut daemon, mut state, root) =
+                negotiated_event_owner(&format!("client-event-poisoned-{lock}"));
+            let connection = state.event_plane.connection("cleanup-connection").unwrap();
+            match lock {
+                "connections" => state.event_plane.test_poison_lookup(),
+                "slots" => connection.test_poison("connection"),
+                "pool" => connection.test_poison("pool"),
+                "router" => {
+                    let router = daemon.runtime().unwrap().package_event_router().clone();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        router.test_with_inner_held(|| panic!("poison the router"))
+                    }));
+                }
+                _ => unreachable!(),
+            }
+            let EventAttempt::Done(response) = handle_client_event_request(
+                &mut daemon,
+                &mut state,
+                "cleanup-connection",
+                &second_event_subscription(),
+                None,
+            ) else {
+                panic!("{lock}: a poisoned lock must not park the request");
+            };
+            assert!(response.error.is_some(), "{lock}: poison is a refusal");
+            assert!(state.signal_request_waits.is_empty());
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn client_event_cleanup_waiter_exhaustion_refuses_before_subscription_effects() {
         let root = unique_package_control_dir("client-event-waiter-exhaustion");
@@ -3307,7 +3522,7 @@ mod tests {
             },
         );
         state.waiter_ids = crate::owner_identity::WaiterIdSource::with_next(u64::MAX);
-        let response = crate::daemon::control::events::handle_client_event_request(
+        let response = crate::daemon::control::events::test_respond(
             &mut daemon,
             &mut state,
             "exhausted-connection",
@@ -3438,7 +3653,7 @@ mod tests {
                 .test_client_holder_count("cleanup-connection"),
             0
         );
-        let response = crate::daemon::control::events::handle_client_event_request(
+        let response = crate::daemon::control::events::test_respond(
             &mut daemon,
             &mut state,
             "cleanup-connection",
@@ -3452,7 +3667,7 @@ mod tests {
             state.event_plane.test_residency("cleanup-connection"),
             Some((0, 0, 0))
         );
-        let duplicate = crate::daemon::control::events::handle_client_event_request(
+        let duplicate = crate::daemon::control::events::test_respond(
             &mut daemon,
             &mut state,
             "cleanup-connection",
@@ -3537,7 +3752,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
-            let response = crate::daemon::control::events::handle_client_event_request(
+            let response = crate::daemon::control::events::test_respond(
                 &mut daemon,
                 &mut state,
                 "cleanup-connection",
@@ -3829,7 +4044,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
-            let response = crate::daemon::control::events::handle_client_event_request(
+            let response = crate::daemon::control::events::test_respond(
                 &mut daemon,
                 &mut state,
                 "cleanup-connection",
@@ -3840,7 +4055,7 @@ mod tests {
             assert_eq!(response.kind, DaemonResponseKind::EventUnsubscribed);
             assert!(original.is_retired());
             for index in 1..crate::subscription::package_events::MAX_SUBSCRIPTIONS_PER_CONNECTION {
-                let response = crate::daemon::control::events::handle_client_event_request(
+                let response = crate::daemon::control::events::test_respond(
                     &mut daemon,
                     &mut state,
                     "cleanup-connection",
@@ -3858,7 +4073,7 @@ mod tests {
                 crate::subscription::package_events::MAX_SUBSCRIPTIONS_PER_CONNECTION
             );
             for subscription_id in ["cleanup-subscription", "overflow"] {
-                let response = crate::daemon::control::events::handle_client_event_request(
+                let response = crate::daemon::control::events::test_respond(
                     &mut daemon,
                     &mut state,
                     "cleanup-connection",
