@@ -2204,11 +2204,11 @@ fn install_botster_api(
         lua,
         &botster,
         Arc::clone(&host_api.memory),
-        basics::LogSink {
-            book: Arc::clone(&host_api.logs),
-            plugin: plugin_key.0.clone(),
-            generation: log_generation,
-        },
+        basics::LogSink::new(
+            Arc::clone(&host_api.logs),
+            plugin_key.0.clone(),
+            log_generation,
+        ),
     )?;
 
     let capabilities_table = lua.create_table()?;
