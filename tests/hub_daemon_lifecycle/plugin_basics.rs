@@ -372,11 +372,11 @@ fn a_failed_first_load_removes_the_records_its_entrypoint_wrote() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
-/// A reload whose entrypoint logs and then fails removes exactly its own
-/// records; the serving version's records stay, and a later good reload's
-/// records carry a different generation.
+/// A reload whose entrypoint logs and then fails keeps its records beside the
+/// serving version's: they explain the failure. Every load's records carry
+/// their own generation, in one chronological log.
 #[test]
-fn a_failed_reload_removes_only_the_records_its_entrypoint_wrote() {
+fn a_failed_reload_keeps_the_records_its_entrypoint_wrote() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("logs-failed-reload");
     let package_dir = unique_test_dir("logs-failed-reload-package");
@@ -424,7 +424,11 @@ fn a_failed_reload_removes_only_the_records_its_entrypoint_wrote() {
         .iter()
         .map(|record| record.message.as_str())
         .collect();
-    assert_eq!(messages, ["v1 loaded"], "{after_failure:?}");
+    assert_eq!(messages, ["v1 loaded", "v2 loading"], "{after_failure:?}");
+    assert_ne!(
+        after_failure.records[0].generation, after_failure.records[1].generation,
+        "the failed candidate's records carry its own generation"
+    );
 
     write_versioned_package_with(
         &package_dir,
@@ -444,9 +448,15 @@ fn a_failed_reload_removes_only_the_records_its_entrypoint_wrote() {
         .iter()
         .map(|record| (record.message.as_str(), record.generation))
         .collect();
-    assert_eq!(records.len(), 2, "{after_success:?}");
-    assert_eq!((records[0].0, records[1].0), ("v1 loaded", "v3 loaded"));
-    assert_ne!(records[0].1, records[1].1, "each load has its own generation");
+    assert_eq!(records.len(), 3, "{after_success:?}");
+    assert_eq!(
+        [records[0].0, records[1].0, records[2].0],
+        ["v1 loaded", "v2 loading", "v3 loaded"]
+    );
+    assert!(
+        records[0].1 != records[1].1 && records[1].1 != records[2].1 && records[0].1 != records[2].1,
+        "each load has its own generation"
+    );
     drop(connection);
     shutdown_cli_daemon(&data_dir, child);
 }
