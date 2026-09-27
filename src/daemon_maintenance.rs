@@ -1894,9 +1894,39 @@ fn next_session_family_admission(
     state: &mut MaintenanceState,
     budget: &mut HostBridgeBudget,
 ) -> Option<(String, PluginHandlerRef, serde_json::Value)> {
+    let started_after_cursor = state.session_family.admit_after.is_some();
+    match session_family_admission_pass(state, budget) {
+        FamilyAdmissionPass::Admit(admission) => Some(admission),
+        FamilyAdmissionPass::Paused => None,
+        // A pass that began after the round-robin cursor has not looked at
+        // the consumers before it. Wrap once now: nothing else will wake the
+        // owner for a frame that is already queued.
+        FamilyAdmissionPass::ReachedEnd if started_after_cursor => {
+            state.session_family.admit_after = None;
+            match session_family_admission_pass(state, budget) {
+                FamilyAdmissionPass::Admit(admission) => Some(admission),
+                FamilyAdmissionPass::Paused | FamilyAdmissionPass::ReachedEnd => None,
+            }
+        }
+        FamilyAdmissionPass::ReachedEnd => None,
+    }
+}
+
+enum FamilyAdmissionPass {
+    Admit((String, PluginHandlerRef, serde_json::Value)),
+    /// The budget or the page bound stopped the pass; a wake is marked.
+    Paused,
+    /// Every consumer after the cursor was visited without work.
+    ReachedEnd,
+}
+
+fn session_family_admission_pass(
+    state: &mut MaintenanceState,
+    budget: &mut HostBridgeBudget,
+) -> FamilyAdmissionPass {
     let max = budget.remaining_visits();
     if max == 0 {
-        return None;
+        return FamilyAdmissionPass::Paused;
     }
     let keys = consumer_keys_page(
         &state.session_family.consumers,
@@ -1905,12 +1935,12 @@ fn next_session_family_admission(
     );
     if keys.is_empty() {
         state.session_family.admit_after = None;
-        return None;
+        return FamilyAdmissionPass::ReachedEnd;
     }
     for plugin_key in &keys {
         if !budget.take() {
             state.wakes.mark_all();
-            return None;
+            return FamilyAdmissionPass::Paused;
         }
         let Some(peeked) = peek_session_family_payload(state, plugin_key) else {
             continue;
@@ -1921,24 +1951,28 @@ fn next_session_family_admission(
             .unwrap_or(0);
         if !budget.add_bytes(bytes) {
             state.wakes.mark_all();
-            return None;
+            return FamilyAdmissionPass::Paused;
         }
         commit_session_family_payload(state, plugin_key, peeked);
-        let handler = state
+        let Some(handler) = state
             .session_family
             .consumers
             .get(plugin_key)
-            .and_then(|consumer| consumer.handler.clone())?;
+            .and_then(|consumer| consumer.handler.clone())
+        else {
+            return FamilyAdmissionPass::Paused;
+        };
         state.session_family.admit_after = Some(plugin_key.clone());
-        return Some((plugin_key.clone(), handler, payload));
+        return FamilyAdmissionPass::Admit((plugin_key.clone(), handler, payload));
     }
     if keys.len() == max {
         state.session_family.admit_after = keys.last().cloned();
         state.wakes.mark_all();
+        FamilyAdmissionPass::Paused
     } else {
         state.session_family.admit_after = None;
+        FamilyAdmissionPass::ReachedEnd
     }
-    None
 }
 
 enum PeekedFamilyPayload {
@@ -2235,6 +2269,47 @@ mod tests {
                 .replace("lifecycle_baseline_page", "")
                 .contains("lifecycle_baseline(")
         );
+    }
+
+    fn admitting_consumer(state: &mut MaintenanceState, key: &str, pending: &[serde_json::Value]) {
+        state.session_family.touch_consumer(key, |consumer| {
+            consumer.gap = false;
+            consumer.snapshot_complete = true;
+            consumer.handler = Some(PluginHandlerRef {
+                plugin_key: botster_core::PluginKey(key.to_string()),
+                kind: PluginHandlerKind::Event,
+                handler_id: "session_family".to_string(),
+            });
+            consumer.pending = pending.iter().cloned().collect();
+        });
+    }
+
+    /// The live Workspaces loss: the last delta was queued while an earlier
+    /// frame was in flight, and after that frame's completion the admission
+    /// pass started past the only consumer (the round-robin cursor), found
+    /// nothing, and returned without a wake. The pass must wrap at once.
+    #[test]
+    fn a_frame_behind_the_round_robin_cursor_is_admitted_on_the_same_pass() {
+        let delta = serde_json::json!({"type": "entity_upsert", "id": "ended"});
+        let mut single = MaintenanceState::default();
+        admitting_consumer(&mut single, "plugin.one", std::slice::from_ref(&delta));
+        single.session_family.admit_after = Some("plugin.one".to_string());
+        let admitted = next_session_family_admission(&mut single, &mut HostBridgeBudget::new())
+            .expect("the queued delta is admitted without another wake");
+        assert_eq!((admitted.0.as_str(), &admitted.2), ("plugin.one", &delta));
+
+        let mut two = MaintenanceState::default();
+        admitting_consumer(&mut two, "plugin.a", std::slice::from_ref(&delta));
+        admitting_consumer(&mut two, "plugin.b", &[]);
+        two.session_family.admit_after = Some("plugin.a".to_string());
+        let admitted = next_session_family_admission(&mut two, &mut HostBridgeBudget::new())
+            .expect("a consumer before the cursor is reached on the same pass");
+        assert_eq!(admitted.0, "plugin.a");
+
+        let mut idle = MaintenanceState::default();
+        admitting_consumer(&mut idle, "plugin.one", &[]);
+        idle.session_family.admit_after = Some("plugin.one".to_string());
+        assert!(next_session_family_admission(&mut idle, &mut HostBridgeBudget::new()).is_none());
     }
 
     #[test]
