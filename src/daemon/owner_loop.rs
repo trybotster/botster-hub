@@ -649,10 +649,10 @@ impl DaemonControlState {
         let Some(waiter) = self.background_core_waiters.get_mut(&identity.waiter_id) else {
             return false;
         };
-        let Some(expected) = waiter.last_phase.checked_add(1) else {
-            return true;
-        };
-        if identity.phase == expected {
+        // A waiter registers one phase at a time, and a refused admission
+        // retires its phase before the owner collects. A newer phase is the
+        // held ticket's.
+        if identity.phase > waiter.last_phase {
             waiter.last_phase = identity.phase;
             let work = waiter.work;
             mark_background_ready(self, work);
@@ -3637,6 +3637,94 @@ mod tests {
             state.observe_read.is_some(),
             "the read is submitted once there is room"
         );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Each refusal retires a registered phase, so the admitted retry
+    /// completes with a later phase than the owner last saw. The owner must
+    /// still ready the work and consume the result (S4a review of e8cefce0).
+    #[test]
+    fn a_read_refused_twice_completes_through_the_owner() {
+        let root = unique_package_control_dir("refused-twice");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let baseline = BackgroundWork::Maintenance(MaintenanceSliceKind::Baseline);
+        let submit = |daemon: &HubDaemon, state: &mut DaemonControlState, work| {
+            if work == BackgroundWork::PumpObserve {
+                run_pump_observe_phase(daemon, state);
+                return state.observe_read.is_some();
+            }
+            let waiter_id = background_waiter_id(state, work).unwrap();
+            run_maintenance_kind_for_owner(
+                daemon.runtime().unwrap(),
+                &mut state.maintenance,
+                &mut state.maintenance_reads,
+                MaintenanceSliceKind::Baseline,
+                waiter_id,
+            );
+            state.maintenance_reads.in_flight()
+        };
+        state.maintenance.test_start_baseline();
+        for work in [BackgroundWork::PumpObserve, baseline] {
+            for _ in 0..2 {
+                let release = daemon.runtime().unwrap().test_fill_core_request_queue();
+                assert!(!submit(&daemon, &mut state, work), "the full queue refuses");
+                let seen = if work == baseline {
+                    state.maintenance.signal_waits[&MaintenanceSliceKind::Baseline]
+                } else {
+                    state.background_signal_waits[&work]
+                };
+                drop(release);
+                crate::daemon::owner_signal::test_wait_until_moved(
+                    daemon.runtime().unwrap().owner_signal(),
+                    seen,
+                );
+                publish_completion_wakes(&daemon, &mut state);
+            }
+            assert!(submit(&daemon, &mut state, work), "room admits the retry");
+            // timer: deadline — the shared test hang guard; Core answers at once
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(if work == baseline {
+                state
+                    .maintenance_reads
+                    .test_wait_baseline_published(deadline)
+            } else {
+                state
+                    .observe_read
+                    .as_ref()
+                    .unwrap()
+                    .test_wait_published(deadline)
+            });
+            while state.owner_ready.pop_next().is_some() {}
+            let runtime = daemon.runtime().unwrap();
+            // The fill operations completed too; absorb everything, one owner
+            // turn's budget at a time.
+            let mut identities = runtime.take_owner_core_completions(
+                crate::data_plane::driver::CORE_OWNER_COMPLETION_CAPACITY,
+            );
+            while !identities.is_empty() {
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                let consumed = crate::daemon::control::pending::absorb_core_completions(
+                    &mut state,
+                    &identities,
+                    &mut budget,
+                );
+                assert!(consumed > 0);
+                identities.drain(..consumed);
+            }
+            let ready = state
+                .owner_ready
+                .pop_next()
+                .expect("the retry readies its work");
+            assert_eq!(ready.key().waiter_id(), state.background_waiter_ids[&work]);
+            assert!(state.owner_ready.pop_next().is_none(), "no other wake");
+            submit(&daemon, &mut state, work);
+            assert!(
+                state.observe_read.is_none() && !state.maintenance_reads.in_flight(),
+                "the owner consumed the retry's result"
+            );
+        }
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
