@@ -25,10 +25,10 @@ botster-hub-client = { path = "crates/botster-hub-client" }
 botster-hub-installation = { path = "crates/botster-hub-installation" }
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 # Protocol identity and Hub runtime Core share this rev so TerminalFrame stays one crate.
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c" }
-botster-core-daemon = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c" }
-botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c" }
-botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120" }
+botster-core-daemon = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120" }
+botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120" }
 libc = "0.2.177"
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs"] }
 mlua = { version = "=0.11.6", features = ["lua54", "vendored", "serialize", "send"] }
@@ -79,8 +79,8 @@ required-features = ["allocation-oracle"]
 
 [dev-dependencies]
 botster-hub = { path = ".", features = ["test-internals"] }
-botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c", features = ["ghostty-terminal"] }
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c", features = ["libghostty-vt"] }
+botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120", features = ["ghostty-terminal"] }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "8f69957d6a71aa865f1936de248ee7bfed552120", features = ["libghostty-vt"] }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }
 portable-pty = "0.9.0"
 
