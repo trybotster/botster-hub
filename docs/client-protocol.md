@@ -1261,9 +1261,12 @@ records.
 Accepted records are also written to the daemon's standard error with package,
 generation, sequence, level, `dropped_before`, and `unmirrored_before`. A
 separate writer produces these lines, so a slow standard error never delays a
-plugin or a read. `unmirrored_before` counts records that left the ring before
-that writer reached them; they are absent from standard error but were readable
-through `read_plugin_logs` until evicted.
+plugin or a read. `unmirrored_before` counts this package's records that the
+writer never wrote, accumulated since its previous line: records the ring
+evicted before the writer reached them, and records the writer skipped because
+the callback account could not fund its copy (those may still be in the ring
+and readable through `read_plugin_logs`). The next line the writer does write
+for that package reports the count.
 
 ## Many-PTY client attach proof
 
