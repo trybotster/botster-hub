@@ -164,6 +164,8 @@ impl RawUnixClient {
                     return response;
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => frames.push(frame),
+                // Credit messages (S13) are not sent before the Hub consumes credit.
+                DaemonUnixMuxFrame::Credit(_) => {}
                 DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => events.push(event),
                 DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {
                     self.entity_frames.push(entity);
@@ -199,6 +201,7 @@ impl RawUnixClient {
         loop {
             match self.read_frame() {
                 Ok(DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
+                Ok(DaemonUnixMuxFrame::Credit(_)) => {}
                 Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. })) => {
                     panic!("unsolicited mux wait received a control response: {response:?}")
                 }
@@ -220,6 +223,7 @@ impl RawUnixClient {
         while Instant::now() < deadline && !done(frames) {
             match self.read_frame() {
                 Ok(DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
+                Ok(DaemonUnixMuxFrame::Credit(_)) => {}
                 Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. })) => {
                     panic!("unsolicited terminal wait received a control response: {response:?}")
                 }

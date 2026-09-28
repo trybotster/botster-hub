@@ -92,6 +92,8 @@ pub const UNIX_FRAME_LENGTH_PREFIX_BYTES: usize = 4;
 pub const UNIX_CONTAINER_CONTROL: u8 = 1;
 /// Unix container tag for one routed terminal body.
 pub const UNIX_CONTAINER_TERMINAL: u8 = 2;
+/// Unix container tag for one per-route credit message (S13).
+pub const UNIX_CONTAINER_CREDIT: u8 = 3;
 /// Maximum route id length inside a terminal container (UTF-8 bytes).
 pub const MAX_UNIX_TERMINAL_ROUTE_BYTES: usize = 1024;
 /// Fixed terminal container bytes around the route: `u16` route length, `u64`
@@ -541,8 +543,238 @@ pub fn decode_unix_frame<T: for<'de> Deserialize<'de>>(
                 body: payload[epoch_start + 4..].to_vec(),
             }))
         }
+        UNIX_CONTAINER_CREDIT => decode_unix_credit_payload(payload).map(DaemonUnixFrame::Credit),
         _ => Err(DaemonProtocolErrorCode::UnknownContainer),
     }
+}
+
+/// One per-route credit message on a Unix connection (S13).
+///
+/// Payload after the container byte, little-endian like the terminal
+/// container:
+///
+/// ```text
+/// u8      kind
+/// u16 LE  route_len      1..=1024
+/// route   UTF-8, route_len bytes
+/// u64 LE  generation     the route's attachment generation
+/// ...     kind fields:
+///   1 Demand       (Hub → client)  u64 bytes         (one item implied)
+///   2 Grant        (client → Hub)  u32 items, u64 bytes
+///   3 Return       (Hub → client)  u32 items, u64 bytes
+///   4 Closed       (Hub → client)  u64 spent_items, u64 spent_bytes
+///   6 InputCredit  (Hub → client)  u32 items
+/// ```
+///
+/// An unknown kind, a short payload, or trailing bytes is a protocol error.
+/// Which kinds a side accepts is checked where the frame is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonUnixCreditFrame {
+    /// The Hub needs credit for the route's refused head frame.
+    Demand {
+        route: String,
+        generation: u64,
+        bytes: u64,
+    },
+    /// The client grants output credit for one or more whole frames.
+    Grant {
+        route: String,
+        generation: u64,
+        items: u32,
+        bytes: u64,
+    },
+    /// The Hub gives back credit it no longer needs.
+    Return {
+        route: String,
+        generation: u64,
+        items: u32,
+        bytes: u64,
+    },
+    /// The Hub ended the route; the counts are its total spend for the
+    /// generation.
+    Closed {
+        route: String,
+        generation: u64,
+        spent_items: u64,
+        spent_bytes: u64,
+    },
+    /// The Hub returns input credit as Core consumes input frames.
+    InputCredit {
+        route: String,
+        generation: u64,
+        items: u32,
+    },
+}
+
+const CREDIT_KIND_DEMAND: u8 = 1;
+const CREDIT_KIND_GRANT: u8 = 2;
+const CREDIT_KIND_RETURN: u8 = 3;
+const CREDIT_KIND_CLOSED: u8 = 4;
+const CREDIT_KIND_INPUT_CREDIT: u8 = 6;
+
+impl DaemonUnixCreditFrame {
+    /// The route this credit message names.
+    #[must_use]
+    pub fn route(&self) -> &str {
+        match self {
+            Self::Demand { route, .. }
+            | Self::Grant { route, .. }
+            | Self::Return { route, .. }
+            | Self::Closed { route, .. }
+            | Self::InputCredit { route, .. } => route,
+        }
+    }
+
+    /// The attachment generation this credit message names.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Demand { generation, .. }
+            | Self::Grant { generation, .. }
+            | Self::Return { generation, .. }
+            | Self::Closed { generation, .. }
+            | Self::InputCredit { generation, .. } => *generation,
+        }
+    }
+}
+
+/// Encode one credit message as a complete Unix frame (length prefix,
+/// container byte, payload). Returns `None` for an invalid route.
+#[must_use]
+pub fn encode_unix_credit_frame(frame: &DaemonUnixCreditFrame) -> Option<Vec<u8>> {
+    let route = frame.route().as_bytes();
+    if route.is_empty()
+        || route.len() > MAX_UNIX_TERMINAL_ROUTE_BYTES
+        || frame.route().chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(1 + 2 + route.len() + 8 + 16);
+    let kind = match frame {
+        DaemonUnixCreditFrame::Demand { .. } => CREDIT_KIND_DEMAND,
+        DaemonUnixCreditFrame::Grant { .. } => CREDIT_KIND_GRANT,
+        DaemonUnixCreditFrame::Return { .. } => CREDIT_KIND_RETURN,
+        DaemonUnixCreditFrame::Closed { .. } => CREDIT_KIND_CLOSED,
+        DaemonUnixCreditFrame::InputCredit { .. } => CREDIT_KIND_INPUT_CREDIT,
+    };
+    payload.push(kind);
+    payload.extend_from_slice(&(route.len() as u16).to_le_bytes());
+    payload.extend_from_slice(route);
+    payload.extend_from_slice(&frame.generation().to_le_bytes());
+    match frame {
+        DaemonUnixCreditFrame::Demand { bytes, .. } => {
+            payload.extend_from_slice(&bytes.to_le_bytes());
+        }
+        DaemonUnixCreditFrame::Grant { items, bytes, .. }
+        | DaemonUnixCreditFrame::Return { items, bytes, .. } => {
+            payload.extend_from_slice(&items.to_le_bytes());
+            payload.extend_from_slice(&bytes.to_le_bytes());
+        }
+        DaemonUnixCreditFrame::Closed {
+            spent_items,
+            spent_bytes,
+            ..
+        } => {
+            payload.extend_from_slice(&spent_items.to_le_bytes());
+            payload.extend_from_slice(&spent_bytes.to_le_bytes());
+        }
+        DaemonUnixCreditFrame::InputCredit { items, .. } => {
+            payload.extend_from_slice(&items.to_le_bytes());
+        }
+    }
+    let frame_len = 1 + payload.len();
+    let mut bytes = Vec::with_capacity(UNIX_FRAME_LENGTH_PREFIX_BYTES + frame_len);
+    bytes.extend_from_slice(&(frame_len as u32).to_le_bytes());
+    bytes.push(UNIX_CONTAINER_CREDIT);
+    bytes.extend_from_slice(&payload);
+    Some(bytes)
+}
+
+fn decode_unix_credit_payload(
+    payload: &[u8],
+) -> Result<DaemonUnixCreditFrame, DaemonProtocolErrorCode> {
+    let (&kind, rest) = payload
+        .split_first()
+        .ok_or(DaemonProtocolErrorCode::MalformedFrame)?;
+    if rest.len() < 2 {
+        return Err(DaemonProtocolErrorCode::MalformedFrame);
+    }
+    let route_len = usize::from(u16::from_le_bytes([rest[0], rest[1]]));
+    if route_len == 0 || route_len > MAX_UNIX_TERMINAL_ROUTE_BYTES || rest.len() < 2 + route_len {
+        return Err(DaemonProtocolErrorCode::InvalidRoute);
+    }
+    let route = std::str::from_utf8(&rest[2..2 + route_len])
+        .map_err(|_| DaemonProtocolErrorCode::InvalidRoute)?;
+    if route.chars().any(char::is_control) {
+        return Err(DaemonProtocolErrorCode::InvalidRoute);
+    }
+    let route = route.to_string();
+    let fields = &rest[2 + route_len..];
+    let u64_at = |at: usize| -> Option<u64> {
+        fields
+            .get(at..at + 8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+    };
+    let u32_at = |at: usize| -> Option<u32> {
+        fields
+            .get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+    };
+    let generation = u64_at(0).ok_or(DaemonProtocolErrorCode::MalformedFrame)?;
+    let (frame, expected_len) = match kind {
+        CREDIT_KIND_DEMAND => (
+            u64_at(8).map(|bytes| DaemonUnixCreditFrame::Demand {
+                route,
+                generation,
+                bytes,
+            }),
+            16,
+        ),
+        CREDIT_KIND_GRANT | CREDIT_KIND_RETURN => (
+            u32_at(8).zip(u64_at(12)).map(|(items, bytes)| {
+                if kind == CREDIT_KIND_GRANT {
+                    DaemonUnixCreditFrame::Grant {
+                        route,
+                        generation,
+                        items,
+                        bytes,
+                    }
+                } else {
+                    DaemonUnixCreditFrame::Return {
+                        route,
+                        generation,
+                        items,
+                        bytes,
+                    }
+                }
+            }),
+            20,
+        ),
+        CREDIT_KIND_CLOSED => (
+            u64_at(8).zip(u64_at(16)).map(|(spent_items, spent_bytes)| {
+                DaemonUnixCreditFrame::Closed {
+                    route,
+                    generation,
+                    spent_items,
+                    spent_bytes,
+                }
+            }),
+            24,
+        ),
+        CREDIT_KIND_INPUT_CREDIT => (
+            u32_at(8).map(|items| DaemonUnixCreditFrame::InputCredit {
+                route,
+                generation,
+                items,
+            }),
+            12,
+        ),
+        _ => return Err(DaemonProtocolErrorCode::MalformedFrame),
+    };
+    if fields.len() != expected_len {
+        return Err(DaemonProtocolErrorCode::MalformedFrame);
+    }
+    frame.ok_or(DaemonProtocolErrorCode::MalformedFrame)
 }
 
 /// One decoded Unix frame, generic over the control payload type.
@@ -550,6 +782,7 @@ pub fn decode_unix_frame<T: for<'de> Deserialize<'de>>(
 pub enum DaemonUnixFrame<T> {
     Control(T),
     Terminal(DaemonUnixTerminalFrame),
+    Credit(DaemonUnixCreditFrame),
 }
 
 /// Incremental reader for length-prefixed Unix frames.
@@ -634,6 +867,7 @@ impl DaemonUnixFrameReader {
         match decode_unix_frame::<ServerFrame>(&raw) {
             Ok(DaemonUnixFrame::Control(frame)) => Ok(DaemonUnixMuxFrame::Server(frame)),
             Ok(DaemonUnixFrame::Terminal(frame)) => Ok(DaemonUnixMuxFrame::Terminal(frame)),
+            Ok(DaemonUnixFrame::Credit(frame)) => Ok(DaemonUnixMuxFrame::Credit(frame)),
             Err(code) => Err(DaemonTransportError::ProtocolViolation(code)),
         }
     }
@@ -648,6 +882,7 @@ impl DaemonUnixFrameReader {
 pub enum DaemonUnixMuxFrame {
     Server(ServerFrame),
     Terminal(DaemonUnixTerminalFrame),
+    Credit(DaemonUnixCreditFrame),
 }
 
 /// Write one [`ClientFrame`] to the socket.
@@ -764,6 +999,8 @@ pub struct DaemonConnection {
     outstanding: Vec<u64>,
     parked_responses: Vec<(u64, DaemonResponse)>,
     skipped_terminal: Vec<DaemonUnixTerminalFrame>,
+    /// Credit messages (S13) read while waiting for something else.
+    skipped_credit: Vec<DaemonUnixCreditFrame>,
     skipped_events: Vec<DaemonEvent>,
     skipped_entity_frames: Vec<DaemonEntityFrame>,
     required_features: Vec<String>,
@@ -831,6 +1068,7 @@ impl DaemonConnection {
             outstanding: Vec::new(),
             parked_responses: Vec::new(),
             skipped_terminal: Vec::new(),
+            skipped_credit: Vec::new(),
             skipped_events: Vec::new(),
             skipped_entity_frames: Vec::new(),
             required_features,
@@ -928,6 +1166,7 @@ impl DaemonConnection {
                     ));
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
             }
         }
     }
@@ -1132,6 +1371,7 @@ impl DaemonConnection {
                     ));
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
             }
         }
     }
@@ -1163,6 +1403,7 @@ impl DaemonConnection {
         loop {
             match self.read_next_frame()? {
                 DaemonUnixMuxFrame::Terminal(frame) => return Ok(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
                 DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
                     self.skipped_events.push(event);
                 }
@@ -1213,6 +1454,7 @@ impl DaemonConnection {
             }
             match self.read_next_frame() {
                 Ok(DaemonUnixMuxFrame::Terminal(frame)) => break Ok(Some(frame)),
+                Ok(DaemonUnixMuxFrame::Credit(frame)) => self.skipped_credit.push(frame),
                 Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event { event })) => {
                     self.skipped_events.push(event);
                 }
@@ -1280,7 +1522,9 @@ impl DaemonEntitySubscription {
                 DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
                     return Err(DaemonTransportError::ClosedByHub(reason));
                 }
-                DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => {}
+                DaemonUnixMuxFrame::Server(_)
+                | DaemonUnixMuxFrame::Terminal(_)
+                | DaemonUnixMuxFrame::Credit(_) => {}
             }
         }
     }
@@ -1599,9 +1843,11 @@ fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloA
         DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
             Err(DaemonTransportError::ClosedByHub(reason))
         }
-        DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => Err(
-            DaemonTransportError::Protocol("expected a hello ack as the first server frame"),
-        ),
+        DaemonUnixMuxFrame::Server(_)
+        | DaemonUnixMuxFrame::Terminal(_)
+        | DaemonUnixMuxFrame::Credit(_) => Err(DaemonTransportError::Protocol(
+            "expected a hello ack as the first server frame",
+        )),
     }
 }
 
@@ -8435,7 +8681,9 @@ mod tests {
                 assert_eq!(decoded.stream_epoch, 4);
                 assert_eq!(decoded.body, body);
             }
-            DaemonUnixFrame::Control(_) => panic!("terminal container decoded as control"),
+            DaemonUnixFrame::Control(_) | DaemonUnixFrame::Credit(_) => {
+                panic!("terminal container decoded as another container")
+            }
         }
 
         assert!(UnixTerminalContainerHeader::new("", 1, 0, 0).is_none());
@@ -8770,5 +9018,115 @@ mod tests {
             daemon_response_kind_tag(DaemonResponseKind::SessionTypeDefinition),
             "session_type_definition"
         );
+    }
+
+    #[cfg(test)]
+    mod unix_credit_codec_tests {
+        use super::*;
+
+        fn all_kinds() -> Vec<DaemonUnixCreditFrame> {
+            vec![
+                DaemonUnixCreditFrame::Demand {
+                    route: "sub-1".into(),
+                    generation: 7,
+                    bytes: 4096 + 8,
+                },
+                DaemonUnixCreditFrame::Grant {
+                    route: "sub-1".into(),
+                    generation: 7,
+                    items: 3,
+                    bytes: u64::from(u32::MAX) + 5,
+                },
+                DaemonUnixCreditFrame::Return {
+                    route: "r".into(),
+                    generation: u64::MAX,
+                    items: 1,
+                    bytes: 9,
+                },
+                DaemonUnixCreditFrame::Closed {
+                    route: "a/b".into(),
+                    generation: 1,
+                    spent_items: 1 << 40,
+                    spent_bytes: 1 << 50,
+                },
+                DaemonUnixCreditFrame::InputCredit {
+                    route: "sub-2".into(),
+                    generation: 2,
+                    items: 64,
+                },
+            ]
+        }
+
+        #[test]
+        fn every_credit_kind_round_trips_through_the_unix_frame_decoder() {
+            for frame in all_kinds() {
+                let bytes = encode_unix_credit_frame(&frame).expect("encode");
+                let declared = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                assert_eq!(declared, bytes.len() - UNIX_FRAME_LENGTH_PREFIX_BYTES);
+                assert_eq!(bytes[4], UNIX_CONTAINER_CREDIT);
+                let decoded =
+                    decode_unix_frame::<ServerFrame>(&bytes[UNIX_FRAME_LENGTH_PREFIX_BYTES..])
+                        .expect("decode");
+                assert_eq!(decoded, DaemonUnixFrame::Credit(frame));
+            }
+        }
+
+        #[test]
+        fn a_short_long_or_unknown_credit_payload_is_a_protocol_error() {
+            let frame = &all_kinds()[1];
+            let bytes = encode_unix_credit_frame(frame).unwrap();
+            let payload = &bytes[UNIX_FRAME_LENGTH_PREFIX_BYTES..];
+            // Short by one byte.
+            assert_eq!(
+                decode_unix_frame::<ServerFrame>(&payload[..payload.len() - 1]),
+                Err(DaemonProtocolErrorCode::MalformedFrame)
+            );
+            // One trailing byte.
+            let mut long = payload.to_vec();
+            long.push(0);
+            assert_eq!(
+                decode_unix_frame::<ServerFrame>(&long),
+                Err(DaemonProtocolErrorCode::MalformedFrame)
+            );
+            // Unknown kinds, including the unused 5.
+            for kind in [0u8, 5, 7, 255] {
+                let mut unknown = payload.to_vec();
+                unknown[1] = kind;
+                assert_eq!(
+                    decode_unix_frame::<ServerFrame>(&unknown),
+                    Err(DaemonProtocolErrorCode::MalformedFrame),
+                    "kind {kind}"
+                );
+            }
+            // An empty credit payload.
+            assert_eq!(
+                decode_unix_frame::<ServerFrame>(&[UNIX_CONTAINER_CREDIT]),
+                Err(DaemonProtocolErrorCode::MalformedFrame)
+            );
+        }
+
+        #[test]
+        fn a_credit_route_must_be_valid() {
+            let too_long = "r".repeat(MAX_UNIX_TERMINAL_ROUTE_BYTES + 1);
+            for route in [String::new(), too_long, "a\nb".to_string()] {
+                assert_eq!(
+                    encode_unix_credit_frame(&DaemonUnixCreditFrame::InputCredit {
+                        route: route.clone(),
+                        generation: 1,
+                        items: 1,
+                    }),
+                    None,
+                    "route {route:?}"
+                );
+            }
+            let bytes = encode_unix_credit_frame(&all_kinds()[4]).unwrap();
+            let mut zero_len = bytes[UNIX_FRAME_LENGTH_PREFIX_BYTES..].to_vec();
+            zero_len[2] = 0;
+            zero_len[3] = 0;
+            assert_eq!(
+                decode_unix_frame::<ServerFrame>(&zero_len),
+                Err(DaemonProtocolErrorCode::InvalidRoute)
+            );
+        }
     }
 }
