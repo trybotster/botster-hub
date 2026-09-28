@@ -4188,12 +4188,18 @@ impl HubRuntime {
     }
 
     /// Install the owner-loop callback for newly published plugin completions.
+    /// Every engine notification also raises `PluginEngine`, the key a
+    /// refused plugin admission parks on.
     pub fn install_plugin_completion_notifier(
         &self,
         notifier: botster_core::PluginCompletionNotifier,
     ) {
+        let signal = Arc::clone(&self.owner_signal);
         self.plugin_lifecycle()
-            .install_completion_notifier(notifier);
+            .install_completion_notifier(Arc::new(move || {
+                signal.raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+                notifier();
+            }));
     }
 
     /// Event handlers subscribed to the Hub-owned `/session` family.
