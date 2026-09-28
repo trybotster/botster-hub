@@ -36,10 +36,14 @@ pub(crate) enum SignalKey {
     /// The data-plane thread dequeued Core requests while an owner was armed
     /// on a full request queue.
     DataPlaneCapacity,
+    /// Core's plugin engine notifier fired: a completion was published, or a
+    /// release (lock, class slot, completion reservation) may end an armed
+    /// `Backpressured` or `LockBusy` admission (Core C2).
+    PluginEngine,
 }
 
 impl SignalKey {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         match self {
@@ -49,6 +53,7 @@ impl SignalKey {
             Self::ConnectionSlots => 3,
             Self::ConnectionPool => 4,
             Self::DataPlaneCapacity => 5,
+            Self::PluginEngine => 6,
         }
     }
 }
