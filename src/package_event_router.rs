@@ -4372,7 +4372,9 @@ mod tests {
         let ready: BTreeSet<String> = inner
             .consumers
             .iter()
-            .filter(|(_, queue)| !queue.copies.is_empty())
+            .filter(|(consumer, queue)| {
+                !queue.copies.is_empty() && !inner.engine_parked.contains(*consumer)
+            })
             .map(|(consumer, _)| consumer.clone())
             .collect();
         assert_eq!(inner.ready_consumers, ready);
