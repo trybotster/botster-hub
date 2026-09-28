@@ -246,8 +246,10 @@ bad input.
   any others. A failed load with no serving version drops the package's records.
   Accepted records are also written to the Hub log (the daemon's standard
   error) by a separate writer: a slow or blocked standard error never delays
-  the plugin, and records evicted before the writer reached them are reported
-  as `unmirrored_before` on the next line written.
+  the plugin. `unmirrored_before` on the next line written counts the records
+  the writer never wrote since its previous line: those the ring evicted before
+  the writer reached them, and those it skipped because the callback account
+  could not fund a copy (which may still be readable in the ring).
 - `botster.clock.now()` returns Unix epoch milliseconds.
 - `botster.clock.monotonic()` returns milliseconds since the Hub process
   started; it never goes backward.
