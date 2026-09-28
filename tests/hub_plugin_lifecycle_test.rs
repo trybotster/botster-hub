@@ -112,7 +112,10 @@ fn explicit_runtime() -> HubRuntime {
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config).expect("hub runtime starts")
+    let hub = HubRuntime::new(config).expect("hub runtime starts");
+    // Timer tests drain at explicit logical times that start at zero.
+    hub.clock().make_logical(0, 0);
+    hub
 }
 
 fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {

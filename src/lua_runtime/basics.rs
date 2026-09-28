@@ -4,14 +4,14 @@
 
 use std::fmt;
 use std::io;
-use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::result::{self, ErrorKind};
 use super::{AdmissionError, lua_json};
+use crate::hub_clock::HubClock;
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 use crate::plugin_logs::{AppendOutcome, LogLevel, MAX_RECORD_BYTES, PluginLogBook};
 
@@ -30,18 +30,23 @@ pub(super) struct LogSink {
     pub(super) plugin: String,
     /// The VM's log generation (see `plugin_logs`).
     pub(super) generation: u64,
-    /// Monotonic milliseconds for the rate limit. Production always uses
-    /// the Hub's monotonic clock; tests freeze it to prove refusal.
-    rate_clock: fn() -> u64,
+    /// The Hub's clock: the rate limit reads its monotonic time and each
+    /// record its wall time. A test Hub freezes it to prove refusal.
+    clock: HubClock,
 }
 
 impl LogSink {
-    pub(super) fn new(book: Arc<PluginLogBook>, plugin: String, generation: u64) -> Self {
+    pub(super) fn new(
+        book: Arc<PluginLogBook>,
+        plugin: String,
+        generation: u64,
+        clock: HubClock,
+    ) -> Self {
         Self {
             book,
             plugin,
             generation,
-            rate_clock: monotonic_ms,
+            clock,
         }
     }
 }
@@ -53,7 +58,7 @@ pub(super) fn install(
     logs: LogSink,
 ) -> mlua::Result<()> {
     botster.set("json", json_table(lua, Arc::clone(&memory))?)?;
-    botster.set("clock", clock_table(lua)?)?;
+    botster.set("clock", clock_table(lua, logs.clock.clone())?)?;
     botster.set("log", log_table(lua, memory, logs)?)?;
     Ok(())
 }
@@ -72,7 +77,7 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
         let logs = Arc::clone(&sink.book);
         let plugin = sink.plugin.clone();
         let generation = sink.generation;
-        let rate_clock = sink.rate_clock;
+        let clock = sink.clock.clone();
         log.set(
             level.as_str(),
             lua.create_function(move |lua, args: Value| {
@@ -105,8 +110,8 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
                     level,
                     &message,
                     fields_text,
-                    rate_clock(),
-                    wall_ms(),
+                    clock.monotonic_ms(),
+                    clock.wall_ms(),
                 );
                 drop(fields);
                 match outcome {
@@ -141,22 +146,6 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
         )?;
     }
     Ok(log)
-}
-
-fn started() -> Instant {
-    static STARTED: OnceLock<Instant> = OnceLock::new();
-    *STARTED.get_or_init(Instant::now)
-}
-
-fn monotonic_ms() -> u64 {
-    u64::try_from(started().elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-fn wall_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn json_table(lua: &Lua, memory: Arc<LuaMemoryAccount>) -> mlua::Result<Table> {
@@ -397,24 +386,24 @@ impl<'de> Visitor<'de> for LuaKeySeed<'_> {
     }
 }
 
-fn clock_table(lua: &Lua) -> mlua::Result<Table> {
-    started();
+fn clock_table(lua: &Lua, hub_clock: HubClock) -> mlua::Result<Table> {
     let clock = lua.create_table()?;
+    let wall = hub_clock.clone();
     clock.set(
         "now",
-        lua.create_function(|lua, _: Value| {
+        lua.create_function(move |lua, _: Value| {
             result::ok(
                 lua,
-                Value::Integer(i64::try_from(wall_ms()).unwrap_or(i64::MAX)),
+                Value::Integer(i64::try_from(wall.wall_ms()).unwrap_or(i64::MAX)),
             )
         })?,
     )?;
     clock.set(
         "monotonic",
-        lua.create_function(|lua, _: Value| {
+        lua.create_function(move |lua, _: Value| {
             result::ok(
                 lua,
-                Value::Integer(i64::try_from(monotonic_ms()).unwrap_or(i64::MAX)),
+                Value::Integer(i64::try_from(hub_clock.monotonic_ms()).unwrap_or(i64::MAX)),
             )
         })?,
     )?;
@@ -428,13 +417,10 @@ mod tests {
     use mlua::{LuaOptions, StdLib};
 
     fn vm(callback_bytes: usize) -> (Lua, Arc<LuaMemoryAccount>) {
-        vm_with_rate_clock(callback_bytes, monotonic_ms)
+        vm_with_clock(callback_bytes, HubClock::system())
     }
 
-    fn vm_with_rate_clock(
-        callback_bytes: usize,
-        rate_clock: fn() -> u64,
-    ) -> (Lua, Arc<LuaMemoryAccount>) {
+    fn vm_with_clock(callback_bytes: usize, clock: HubClock) -> (Lua, Arc<LuaMemoryAccount>) {
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
             LuaOptions::default(),
@@ -457,7 +443,7 @@ mod tests {
                 book: logs,
                 plugin: "test.plugin".to_string(),
                 generation: 1,
-                rate_clock,
+                clock,
             },
         )
         .unwrap();
@@ -585,26 +571,24 @@ mod tests {
     }
 
     #[test]
-    fn production_log_sinks_rate_limit_on_the_monotonic_clock() {
-        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
-            per_vm_bytes: 1024,
-            total_vm_bytes: 1024,
-            per_callback_bytes: 1024,
-            total_callback_bytes: 1024,
-        })
-        .unwrap();
-        let sink = LogSink::new(Arc::new(PluginLogBook::new(memory)), "p".to_string(), 1);
-        assert!(std::ptr::fn_addr_eq(
-            sink.rate_clock,
-            monotonic_ms as fn() -> u64
-        ));
+    fn botster_clock_reads_the_hub_clock_and_follows_its_advance() {
+        let clock = HubClock::logical(1_700_000_000_000, 40);
+        let (lua, _memory) = vm_with_clock(1024 * 1024, clock.clone());
+        let read = || -> (i64, i64) {
+            lua.load("return botster.clock.now().value, botster.clock.monotonic().value")
+                .eval()
+                .unwrap()
+        };
+        assert_eq!(read(), (1_700_000_000_000, 40));
+        clock.advance(25);
+        assert_eq!(read(), (1_700_000_000_025, 65));
     }
 
     #[test]
     fn log_refuses_past_the_burst_with_a_typed_drop_count_while_time_stands_still() {
         // With the rate clock frozen no tokens refill: exactly the burst is
         // accepted, and every later record is refused and counted.
-        let (lua, _memory) = vm_with_rate_clock(1024 * 1024, || 0);
+        let (lua, _memory) = vm_with_clock(1024 * 1024, HubClock::logical(0, 0));
         lua.load(
             r#"
             local log = botster.log
