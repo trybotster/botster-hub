@@ -45,6 +45,8 @@ toml_edit = { version = "=0.25.12", default-features = false, features = ["parse
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 webrtc = "0.21.0-rc.1"
 bytes = "1.12.0"
+# Locked already through ureq; the MCP HTTP listener parses request heads with it.
+httparse = "=1.10.1"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 async-trait = "0.1.89"
 getrandom = "0.3.4"

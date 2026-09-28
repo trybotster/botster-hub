@@ -193,10 +193,7 @@ pub use lua_runtime::{
 pub use maintenance::{
     SourceUpdateRefusal, installation_identity, software_identity, source_update_refusal,
 };
-pub use mcp::{
-    McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
-    McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
-};
+pub use mcp::{McpCallRequest, McpToolDescriptor, McpToolError, McpToolResult};
 pub use package_event_router::{EventPlaneStatus, PackageEventRouter};
 pub use packages::{
     AvailablePackage, AvailablePackageState, HubEmittedEvent, HubPackageEvents, HubPackageManifest,

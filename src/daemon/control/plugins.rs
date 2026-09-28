@@ -381,6 +381,7 @@ pub(crate) fn handle_runtime(
                 crate::McpCallRequest { name, arguments },
                 request_id,
                 None,
+                observability.caller.clone(),
             ) {
                 Ok(request) => request,
                 Err(error) => return ControlStep::ready(daemon_plugin_tool_error(error)),

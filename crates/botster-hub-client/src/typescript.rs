@@ -363,11 +363,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             ("unsubscribe_events", &[("subscription_id", "string")]),
             ("remove_session", &[("session_id", "string")]),
-            ("whoami", &[("caller_session_id", "string | null")]),
+            ("whoami", &[]),
             (
                 "post_message",
                 &[
-                    ("caller_session_id", "string | null"),
                     ("target_session_id", "string"),
                     ("envelope_id", "string | null"),
                     ("body", "string"),
@@ -375,16 +374,9 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ),
             (
                 "receive_messages",
-                &[
-                    ("caller_session_id", "string"),
-                    ("after", "number | null"),
-                    ("limit", "number"),
-                ],
+                &[("after", "number | null"), ("limit", "number")],
             ),
-            (
-                "ack_message",
-                &[("caller_session_id", "string"), ("envelope_id", "string")],
-            ),
+            ("ack_message", &[("envelope_id", "string")]),
             (
                 "notify_session",
                 &[("session_id", "string"), ("data", "string")],
