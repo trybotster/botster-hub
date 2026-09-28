@@ -1100,6 +1100,18 @@ fn run_journal_pull_slice(
             return;
         }
     };
+    apply_journal_page_result(state, result, woke);
+}
+
+/// Apply one Core journal page read to the projection's input queue.
+///
+/// The journal slice calls this with Core's page. The plugin test kit calls
+/// it with a supplied page, so both share this consumer.
+fn apply_journal_page_result(
+    state: &mut MaintenanceState,
+    result: Result<SessionLifecyclePage, SessionLifecyclePageError>,
+    woke: bool,
+) {
     match result {
         Ok(page) => {
             state.journal_page_reads = state.journal_page_reads.saturating_add(1);
@@ -1201,6 +1213,18 @@ fn run_baseline_slice(
             return;
         }
     };
+    apply_baseline_page_result(runtime, state, result);
+}
+
+/// Apply one Core baseline page read to the projection.
+///
+/// The baseline slice calls this with Core's page. The plugin test kit calls
+/// it with a supplied page, so both share this consumer.
+fn apply_baseline_page_result(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    result: Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>,
+) {
     match result {
         Ok(page) => {
             state.baseline_page_reads = state.baseline_page_reads.saturating_add(1);
