@@ -1192,6 +1192,10 @@ fn daemon_test_guard_sweeps_a_test_owned_orphan_when_the_test_panics() {
         "the sweep must not replace the test's own failure"
     );
     assert_orphan_gone(pid);
+    // Harness taint is process-global: read it under the guard so a sibling
+    // test's guarded taint injection cannot reach this read. Taking the guard
+    // itself fails on taint, and the explicit check keeps the message.
+    let _guard = daemon_test_guard();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1217,6 +1221,10 @@ fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
         "the failure must name the leaked pid {pid}: {message}"
     );
     assert_orphan_gone(pid);
+    // Harness taint is process-global: read it under the guard so a sibling
+    // test's guarded taint injection cannot reach this read. Taking the guard
+    // itself fails on taint, and the explicit check keeps the message.
+    let _guard = daemon_test_guard();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1277,6 +1285,10 @@ fn daemon_test_guard_kills_a_sigterm_resistant_descendant_of_a_test_owned_orphan
     );
     assert_orphan_gone(leader);
     assert_orphan_gone(child);
+    // Harness taint is process-global: read it under the guard so a sibling
+    // test's guarded taint injection cannot reach this read. Taking the guard
+    // itself fails on taint, and the explicit check keeps the message.
+    let _guard = daemon_test_guard();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1417,5 +1429,9 @@ fn daemon_test_guard_leaves_a_foreign_group_leader_and_sibling_of_a_matched_chil
     assert_orphan_gone(matched);
     assert!(leader_alive, "the sweep must not signal the foreign group leader {leader}");
     assert!(sibling_alive, "the sweep must not signal the unrelated sibling {sibling}");
+    // Harness taint is process-global: read it under the guard so a sibling
+    // test's guarded taint injection cannot reach this read. Taking the guard
+    // itself fails on taint, and the explicit check keeps the message.
+    let _guard = daemon_test_guard();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
