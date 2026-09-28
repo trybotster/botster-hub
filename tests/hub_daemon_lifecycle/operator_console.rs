@@ -3,16 +3,7 @@ fn operator_console_output_wait_reports_early_child_exit() {
     let fixture_dir = unique_short_test_dir("console-child-exit");
     fs::create_dir_all(&fixture_dir).expect("create early-exit console fixture directory");
     let fixture = fixture_dir.join("early-exit-console");
-    fs::write(
-        &fixture,
-        "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n",
-    )
-    .expect("write early-exit console fixture");
-    let mut permissions = fs::metadata(&fixture)
-        .expect("read early-exit console fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fixture, permissions).expect("make early-exit console fixture executable");
+    write_warm_executable(&fixture, "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n");
 
     let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
     console.wait_for("console-started");
@@ -35,17 +26,7 @@ fn operator_console_output_checkpoint_reports_early_child_exit() {
     fs::create_dir_all(&fixture_dir)
         .expect("create checkpoint early-exit console fixture directory");
     let fixture = fixture_dir.join("checkpoint-early-exit-console");
-    fs::write(
-        &fixture,
-        "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n",
-    )
-    .expect("write checkpoint early-exit console fixture");
-    let mut permissions = fs::metadata(&fixture)
-        .expect("read checkpoint early-exit console fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fixture, permissions)
-        .expect("make checkpoint early-exit console fixture executable");
+    write_warm_executable(&fixture, "#!/bin/sh\nprintf 'console-started\\n'\nexit 23\n");
 
     let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
     console.wait_for("console-started");
@@ -73,17 +54,7 @@ fn operator_console_output_checkpoint_rejects_stale_identical_output() {
     let fixture_dir = unique_short_test_dir("console-output-checkpoint");
     fs::create_dir_all(&fixture_dir).expect("create output-checkpoint fixture directory");
     let fixture = fixture_dir.join("checkpoint-console");
-    fs::write(
-        &fixture,
-        "#!/bin/sh\nprintf 'repeated-output\\n'; sleep 60\n",
-    )
-    .expect("write output-checkpoint console fixture");
-    let mut permissions = fs::metadata(&fixture)
-        .expect("read output-checkpoint console fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fixture, permissions)
-        .expect("make output-checkpoint console fixture executable");
+    write_warm_executable(&fixture, "#!/bin/sh\nprintf 'repeated-output\\n'; sleep 60\n");
 
     let mut console = OperatorConsolePty::spawn_binary(&fixture, &fixture_dir);
     console.wait_for("repeated-output");
@@ -142,12 +113,7 @@ fn operator_console_readiness_backstop_outlives_policy_and_reports_context() {
     let fixture_dir = unique_short_test_dir("console-readiness-backstop");
     fs::create_dir_all(&fixture_dir).expect("create readiness-backstop fixture directory");
     let fixture = fixture_dir.join("wedged-console");
-    fs::write(&fixture, "#!/bin/sh\nexec sleep 60\n").expect("write readiness-backstop fixture");
-    let mut permissions = fs::metadata(&fixture)
-        .expect("read readiness-backstop fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fixture, permissions).expect("make readiness-backstop fixture executable");
+    write_warm_executable(&fixture, "#!/bin/sh\nexec sleep 60\n");
 
     let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&fixture_dir);
     let diagnostic_pid = std::process::id();
