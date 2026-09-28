@@ -76,7 +76,7 @@ enum BackgroundWork {
 }
 
 /// Three maintenance reads plus pump observation and inventory reconciliation.
-pub(crate) const BACKGROUND_CORE_WORK_CLASSES: usize = 5;
+pub(crate) const BACKGROUND_CORE_WORK_CLASSES: usize = 4;
 
 fn causal_waiter_upper_bound(
     state: &DaemonControlState,
@@ -228,9 +228,9 @@ fn background_waiter_id(
 
 fn maintenance_core_work(kind: MaintenanceSliceKind) -> Option<BackgroundWork> {
     match kind {
-        MaintenanceSliceKind::Observe
-        | MaintenanceSliceKind::JournalPull
-        | MaintenanceSliceKind::Baseline => Some(BackgroundWork::Maintenance(kind)),
+        MaintenanceSliceKind::JournalPull | MaintenanceSliceKind::Baseline => {
+            Some(BackgroundWork::Maintenance(kind))
+        }
         _ => None,
     }
 }
@@ -262,7 +262,6 @@ mod background_core_capacity_tests {
     #[test]
     fn background_core_work_classes_match_reserved_phase_capacity() {
         let maintenance = [
-            MaintenanceSliceKind::Observe,
             MaintenanceSliceKind::JournalPull,
             MaintenanceSliceKind::Baseline,
         ];
@@ -279,7 +278,6 @@ mod background_core_capacity_tests {
             maintenance.len()
         );
         let classes = [
-            BackgroundWork::Maintenance(MaintenanceSliceKind::Observe),
             BackgroundWork::Maintenance(MaintenanceSliceKind::JournalPull),
             BackgroundWork::Maintenance(MaintenanceSliceKind::Baseline),
             BackgroundWork::PumpObserve,
@@ -313,8 +311,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
             ReadyClass::PluginCompletion
         }
         BackgroundWork::Deadline => ReadyClass::Deadline,
-        BackgroundWork::Maintenance(MaintenanceSliceKind::Observe)
-        | BackgroundWork::PumpObserve => ReadyClass::Observe,
+        BackgroundWork::PumpObserve => ReadyClass::Observe,
         BackgroundWork::InventoryReconcile => ReadyClass::InventoryReconcile,
         BackgroundWork::Maintenance(MaintenanceSliceKind::JournalPull) => ReadyClass::JournalPull,
         BackgroundWork::Maintenance(MaintenanceSliceKind::ProjectionApply) => {
@@ -441,7 +438,14 @@ pub(crate) fn mark_signaled_requests(state: &mut DaemonControlState) {
 
 fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     for kind in MaintenanceSliceKind::ALL {
-        if state.maintenance.wakes.take(kind) {
+        let marked = state.maintenance.wakes.take(kind);
+        // A slice with derived readiness runs exactly when its state says so;
+        // a stray mark on it neither runs it nor is needed to run it.
+        let ready = state
+            .maintenance
+            .derived_readiness(kind, &state.maintenance_reads)
+            .unwrap_or(marked);
+        if ready {
             mark_background_ready(state, BackgroundWork::Maintenance(kind));
         }
     }
@@ -1904,7 +1908,24 @@ fn run_pump_observe_phase(
             .lifecycle_counters
             .lifecycle_session_drains
             .saturating_add(1);
-        state.observe_resume = if slice.complete || slice.resync_required.is_some() {
+        if let Some(reason) = slice.resync_required {
+            // The one observe pass owns lifecycle resync: a changed source
+            // or an unavailable pass restarts the baseline projection.
+            state.observe_resume = None;
+            match reason {
+                botster_core_daemon::SessionLifecycleResyncReason::SourceChanged => {
+                    crate::daemon_maintenance::start_baseline_recovery(&mut state.maintenance);
+                }
+                botster_core_daemon::SessionLifecycleResyncReason::ObservePassUnavailable => {
+                    crate::daemon_maintenance::handle_unavailable_observe_pass(
+                        &mut state.maintenance,
+                    );
+                }
+                _ => {}
+            }
+            return BackgroundProgress::Done;
+        }
+        state.observe_resume = if slice.complete {
             None
         } else {
             Some(botster_core_daemon::ObserveLifecycleCursor {
@@ -1912,10 +1933,6 @@ fn run_pump_observe_phase(
                 last_visited: slice.last_visited,
             })
         };
-        if state.maintenance.take_journal_wake() {
-            state.maintenance.note_authoritative_mutation();
-            mark_pump_ready(state);
-        }
         if state.observe_resume.is_some() {
             BackgroundProgress::Runnable
         } else {
@@ -3498,6 +3515,72 @@ mod tests {
         let answer = answer.expect("a subscribed response");
         assert!(answer.error.is_none(), "{answer:?}");
         assert!(state.signal_request_waits.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn resolved_observe(
+        complete: bool,
+        resync: Option<botster_core_daemon::SessionLifecycleResyncReason>,
+    ) -> crate::CoreTicket<
+        Result<
+            botster_core_daemon::ObserveLifecycleSlice,
+            botster_core_daemon::SessionLifecyclePageError,
+        >,
+    > {
+        crate::CoreTicket::resolved(Ok(botster_core_daemon::ObserveLifecycleSlice {
+            pass_id: botster_core_daemon::ObserveLifecyclePassId("pass".into()),
+            last_visited: None,
+            complete,
+            session_errors: Vec::new(),
+            resync_required: resync,
+        }))
+    }
+
+    #[test]
+    fn a_source_change_seen_by_the_one_observe_pass_starts_baseline_recovery() {
+        let root = unique_package_control_dir("observe-source-changed");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.maintenance.projection.replace_complete_baseline(
+            botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            },
+            Vec::new(),
+        );
+        state.observe_read = Some(resolved_observe(
+            false,
+            Some(botster_core_daemon::SessionLifecycleResyncReason::SourceChanged),
+        ));
+        assert!(matches!(
+            run_pump_observe_phase(&daemon, &mut state),
+            BackgroundProgress::Done
+        ));
+        assert!(
+            !state.maintenance.projection.baseline_complete,
+            "a changed source restarts the baseline projection"
+        );
+        assert!(state.observe_resume.is_none());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_observe_pass_leaves_the_journal_pull_its_own_wake() {
+        let root = unique_package_control_dir("observe-journal-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.maintenance.note_journal_advanced();
+        state.observe_read = Some(resolved_observe(true, None));
+        assert!(matches!(
+            run_pump_observe_phase(&daemon, &mut state),
+            BackgroundProgress::Done
+        ));
+        assert!(
+            state.maintenance.journal_wake_pending,
+            "the observe pass must not take the journal pull's wake"
+        );
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
