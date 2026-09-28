@@ -1646,20 +1646,33 @@ fn run_loop(
         } else {
             waited
         };
-        let batch = match waited {
-            WakePumpWait::Wakes(batch) => Some(batch),
-            WakePumpWait::Interrupted => None,
-            WakePumpWait::Stopped => break,
-            _ => None,
+        let Some(batch) = pumped_batch(waited) else {
+            break;
         };
         let now_seconds = current_unix_seconds();
         let mut progress = false;
         let mut terminal_inventory_changed = false;
-        if let Some(batch) = batch
-            && let Ok(outcome) = core_daemon.pump_woken(&batch, now_seconds)
-        {
-            progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
-            terminal_inventory_changed |= outcome.terminal_inventory_changed;
+        let mut journal_advanced = false;
+        if let Some(batch) = batch {
+            match core_daemon.pump_woken(&batch, now_seconds) {
+                Ok(outcome) => {
+                    progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
+                    terminal_inventory_changed |= outcome.terminal_inventory_changed;
+                    journal_advanced = outcome.journal_advanced;
+                }
+                // Core stopped retrying this session's lifecycle commit: a
+                // per-session fault, not a data-plane stop.
+                Err(
+                    error @ botster_core_daemon::CoreDaemonError::LifecycleCommitExhausted {
+                        ..
+                    },
+                ) => {
+                    crate::hub_log::hub_log!("session_lifecycle_commit_exhausted error={error}");
+                }
+                // Retryable: Core re-armed the failing session's wake, and the
+                // next pump reports a withheld journal edge.
+                Err(_) => {}
+            }
         }
         if run_core_requests(core_daemon, &requests, &mut pending_operations) > 0 {
             capacity.released();
@@ -1685,7 +1698,6 @@ fn run_loop(
                 }
             }
         }
-        let journal_advanced = core_daemon.take_journal_advanced_wake();
         progress_latch.publish(
             DataPlaneProgress {
                 progressed: progress,
@@ -1701,6 +1713,18 @@ fn run_loop(
     // An owner armed on a full queue sees the stopped plane on its retry.
     capacity.released();
     publish_completions(core_daemon, &mut pending_operations);
+}
+
+/// The batch one data-plane turn pumps, or `None` once Core stopped. Core
+/// interrupts once per journal edge that no pump reported, so an interrupt
+/// with no wakes still pumps an empty batch: that pump reports the edge.
+fn pumped_batch(waited: WakePumpWait) -> Option<Option<botster_core::TerminalWakeBatch>> {
+    match waited {
+        WakePumpWait::Wakes(batch) => Some(Some(batch)),
+        WakePumpWait::Interrupted => Some(Some(botster_core::TerminalWakeBatch::default())),
+        WakePumpWait::Stopped => None,
+        _ => Some(None),
+    }
 }
 
 /// Run up to one turn of queued Core requests; returns how many it dequeued.
@@ -2010,6 +2034,16 @@ mod tests {
         }
         assert_eq!(phases, vec![1, 2, 3, 4, 5, 6]);
         drop(retirement);
+    }
+
+    #[test]
+    fn an_interrupt_with_no_wakes_still_pumps() {
+        assert_eq!(
+            super::pumped_batch(WakePumpWait::Interrupted),
+            Some(Some(botster_core::TerminalWakeBatch::default())),
+            "the pump reports the journal edge the interrupt stands for"
+        );
+        assert_eq!(super::pumped_batch(WakePumpWait::Stopped), None);
     }
 
     #[test]
