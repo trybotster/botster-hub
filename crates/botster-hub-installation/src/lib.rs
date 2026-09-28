@@ -510,6 +510,53 @@ mod tests {
         );
     }
 
+    /// A forked child that never execs. Dropping it kills and reaps exactly
+    /// that child on every exit path, including a panic in the test body.
+    struct PausedChild(libc::pid_t);
+
+    impl PausedChild {
+        fn fork() -> Self {
+            // SAFETY: the child calls only async-signal-safe `pause` and `_exit`.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+            }
+            Self(pid)
+        }
+    }
+
+    impl Drop for PausedChild {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+            loop {
+                let mut status = 0;
+                let reaped = unsafe { libc::waitpid(self.0, &mut status, 0) };
+                if reaped == self.0 {
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                if reaped == -1 && error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                if std::thread::panicking() {
+                    eprintln!(
+                        "reap forked child {}: waitpid returned {reaped}: {error}",
+                        self.0
+                    );
+                    return;
+                }
+                panic!(
+                    "reap forked child {}: waitpid returned {reaped}: {error}",
+                    self.0
+                );
+            }
+        }
+    }
+
     #[test]
     fn dropping_a_lease_releases_it_while_a_forked_child_shares_its_descriptor() {
         let home = Home::new("lease-fork");
@@ -522,26 +569,15 @@ mod tests {
         };
         // A child forked while the lease is open shares its open file
         // description until exec. This child never execs; it only waits.
-        // SAFETY: the child calls only async-signal-safe `pause` and `_exit`.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
-        if child == 0 {
-            unsafe {
-                libc::pause();
-                libc::_exit(0);
-            }
-        }
-        let reap = || unsafe {
-            libc::kill(child, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(child, &mut status, 0);
-        };
+        let child = PausedChild::fork();
         drop(installer);
-        let reacquired = lease::acquire(&prefix, LeaseMode::Exclusive).expect("installer attempt");
-        reap();
+        let reacquired = lease::acquire(&prefix, LeaseMode::Exclusive);
+        // Reap the child before judging the result, so no outcome leaves it
+        // holding inherited descriptors.
+        drop(child);
         assert!(
-            matches!(reacquired, LeaseOutcome::Acquired(_)),
-            "a dropped lease must be released even while a forked child shares its descriptor"
+            matches!(reacquired, Ok(LeaseOutcome::Acquired(_))),
+            "a dropped lease must be released even while a forked child shares its descriptor: {reacquired:?}"
         );
     }
 
