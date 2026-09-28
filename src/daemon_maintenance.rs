@@ -14,9 +14,9 @@ use botster_core::{
     PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
-    LifecycleBaselineBudget, ObserveLifecycleBudget, SessionLifecycleBaselinePage,
-    SessionLifecycleChange, SessionLifecycleCursor, SessionLifecyclePage,
-    SessionLifecyclePageError, SessionLifecycleResyncReason,
+    LifecycleBaselineBudget, LifecycleBaselineStop, ObserveLifecycleBudget,
+    SessionLifecycleBaselinePage, SessionLifecycleChange, SessionLifecycleCursor,
+    SessionLifecyclePage, SessionLifecyclePageError, SessionLifecycleResyncReason,
 };
 
 use crate::HubRuntime;
@@ -696,7 +696,7 @@ impl MaintenanceState {
         })
     }
 
-    fn fault_lifecycle(&mut self, what: &str) {
+    pub(crate) fn fault_lifecycle(&mut self, what: &str) {
         if !self.lifecycle_faulted {
             self.lifecycle_faulted = true;
             eprintln!("session lifecycle projection stopped: Core returned {what}");
@@ -1217,11 +1217,23 @@ fn run_baseline_slice(
     match result {
         Ok(page) => {
             state.baseline_page_reads = state.baseline_page_reads.saturating_add(1);
-            if let Some(reason) = page.resync_required {
-                handle_resync_reason(state, reason);
-                return;
-            }
-            let complete = page.complete;
+            // Elapsed is a time slice and the budget stops advanced the page:
+            // each leaves the slice ready for its next turn. A stop this Hub
+            // does not know cannot be told from a stuck page, so it faults.
+            let complete = match page.stop {
+                LifecycleBaselineStop::Resync { reason } => {
+                    handle_resync_reason(state, reason);
+                    return;
+                }
+                LifecycleBaselineStop::Complete => true,
+                LifecycleBaselineStop::Elapsed
+                | LifecycleBaselineStop::RowBudget
+                | LifecycleBaselineStop::ByteBudget => false,
+                _ => {
+                    state.fault_lifecycle("an unknown baseline page stop");
+                    return;
+                }
+            };
             let snapshot = page.snapshot_sequence.clone();
             if let Some(recovery) = state.baseline.as_mut() {
                 recovery.snapshot = Some(snapshot.clone());
