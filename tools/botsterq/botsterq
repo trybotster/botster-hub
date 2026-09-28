@@ -30,7 +30,10 @@ mkdir -p "$state/run"
 export TS_SOCKET="$state/queue.sock"
 default_slots=2
 kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
-self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+# Resolve symlinks (~/.local/bin/botsterq links to the installed copy), so the
+# job supervisor next to this script is found.
+self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
+supervisor="$(dirname "$self")/botsterq-job"
 
 usage() {
   sed -n '3,7p' "$0" | sed 's/^# //' >&2
@@ -88,8 +91,8 @@ stop_job() {
   job_paths "$2"
   # Under the job's lock: create the marker and read the pid file. The job
   # publishes its pid and checks the marker under the same lock, so exactly
-  # one of two things holds: the job published first (a group is returned and
-  # stopped here), or the job will see the marker, delete it, and not start.
+  # one holds: the job published first (its supervisor is signalled here), or
+  # the job will see the marker, delete it, and not start.
   group=$(perl -MFcntl=:flock -e '
     my ($lock, $marker, $pidfile) = @ARGV;
     open(my $l, ">>", $lock) or die "botsterq: open job lock: $!\n";
@@ -98,32 +101,27 @@ stop_job() {
     close($m);
     if (open(my $p, "<", $pidfile)) { my $g = <$p>; print $g if defined $g; }
   ' "$joblock" "$marker" "$pidfile" | tr -d ' \n')
-  if ts -r "$id" >/dev/null 2>&1; then
+  if [ -n "$id" ] && ts -r "$id" >/dev/null 2>&1; then
     rm -f "$marker"
     return 0
   fi
   [ -n "$group" ] || return 0
   rm -f "$marker"
-  if group_alive "$group"; then
-    echo "botsterq: stopping job $id (process group $group)" >&2
-    kill -TERM "-$group" 2>/dev/null || true
-    # timer: deadline — the kill grace; the job's end (ts -w) ends it early.
+  # The job's supervisor leads its group: it signals the members, SIGKILLs any
+  # that outlive the grace, and exits only when the group is empty. So the
+  # queue slot is released only after every member is gone, and its end
+  # (ts -w) is the event that the group is empty.
+  echo "botsterq: stopping job ${id:-?} (process group $group)" >&2
+  kill -TERM "$group" 2>/dev/null || true
+  if [ -n "$id" ]; then
     ( ts -w "$id" >/dev/null 2>&1 ) &
-    waiter=$!
-    ( sleep "$kill_grace_seconds"; kill "$waiter" 2>/dev/null ) &
-    timer=$!
-    wait "$waiter" 2>/dev/null || true
-    kill "$timer" 2>/dev/null || true
-    wait "$timer" 2>/dev/null || true
-    if group_alive "$group"; then
-      # A member outlived its leader or ignored SIGTERM.
-      echo "botsterq: job $id group $group outlived SIGTERM; sending SIGKILL" >&2
-      kill -KILL "-$group" 2>/dev/null || true
-    fi
-    if group_alive "$group"; then
-      echo "botsterq: job $id group $group survived SIGKILL" >&2
-      return 1
-    fi
+    wait $! || true
+  fi
+  if group_alive "$group"; then
+    # Only reachable if the supervisor itself was killed.
+    echo "botsterq: job ${id:-?} supervisor is gone but group $group remains; sending SIGKILL" >&2
+    kill -KILL "-$group" 2>/dev/null || true
+    return 1
   fi
   return 0
 }
@@ -200,29 +198,13 @@ admit_locked() {
   # makes the job's id readable. The job publishes its pid, then starts only
   # if it was not cancelled and its `run` process still exists.
   TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
-    sh -c '
-      pidfile=$1 marker=$2 joblock=$3 owner=$4
-      shift 4
-      [ -z "${BOTSTERQ_TEST_BEFORE_PIDFILE:-}" ] || read _ <"$BOTSTERQ_TEST_BEFORE_PIDFILE" || true
-      kill -0 "$owner" 2>/dev/null || exit 130
-      # Under the job lock: a cancel that came first left a marker (consume it
-      # and do not start); otherwise publish this group for any later cancel.
-      perl -MFcntl=:flock -e '"'"'
-        my ($lock, $marker, $pidfile, $group) = @ARGV;
-        open(my $l, ">>", $lock) or exit 2;
-        flock($l, LOCK_EX) or exit 2;
-        if (-e $marker) { unlink $marker; exit 3; }
-        open(my $p, ">", $pidfile) or exit 2;
-        print $p "$group\n";
-        close($p);
-      '"'"' "$joblock" "$marker" "$pidfile" "$$" || exit 130
-      [ -z "${BOTSTERQ_TEST_AFTER_PIDFILE:-}" ] || read _ <"$BOTSTERQ_TEST_AFTER_PIDFILE" || true
-      BOTSTERQ_JOB=$$ exec nice -n 10 "$@"
-    ' botsterq-job "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$@" </dev/null >&3 2>&4 &
+    python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" -- "$@" \
+    </dev/null >&3 2>&4 &
   read _ <"$enqueued" || true
   rm -f "$enqueued"
   id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
   [ -n "$id" ] || { echo "botsterq: enqueued job not found" >&2; exit 1; }
+  [ -z "${BOTSTERQ_TEST_ADMIT_HOLD:-}" ] || read _ <"$BOTSTERQ_TEST_ADMIT_HOLD" || true
   echo "$id"
 }
 
@@ -250,9 +232,10 @@ cmd_run() {
   interrupted() {
     trap - INT TERM HUP
     status=130
-    if [ -n "$id" ]; then
-      stop_job "$id" "$token" || status=1
-    fi
+    # The signal may arrive before the admitted id is stored; the token names
+    # the job either way, so resolve its id and stop it.
+    [ -n "$id" ] || id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
+    stop_job "$id" "$token" || status=1
     rm -f "$state/run/$token.pid" "$state/run/$token.lock" "$state/run/$token.enqueued"
     exit "$status"
   }
