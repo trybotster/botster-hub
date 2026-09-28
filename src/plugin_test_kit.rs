@@ -50,6 +50,10 @@ local function observe(owner, name)
 end
 "#;
 
+/// The logical clock's start: Unix milliseconds, then Hub monotonic time.
+const KIT_CLOCK_WALL_START_MS: u64 = 1_700_000_000_000;
+const KIT_CLOCK_MONOTONIC_START_MS: u64 = 0;
+
 /// How many recent wake kinds a `not_settled` description names.
 const RECENT_WAKES: usize = 8;
 
@@ -198,6 +202,16 @@ pub struct KitHub {
     /// The observer package of each enabled package that declares
     /// plugin-audience events, in enable order.
     observers: Vec<String>,
+    /// The packages that loaded, in enable order. `advance` drains their timers.
+    loaded: Vec<String>,
+}
+
+/// One plugin timer that `KitHub::advance` found due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerFired {
+    pub package: String,
+    pub resource_id: String,
+    pub sequence: u64,
 }
 
 /// One kit-held entity subscription and the frames it has received.
@@ -213,6 +227,13 @@ impl KitHub {
         let config = kit_config(&options.root.join("data"))?;
         let mut daemon =
             HubDaemon::start(config).map_err(|error| KitError::Start(error.to_string()))?;
+        // The kit's Hub runs on a logical clock, so a test never waits on wall
+        // time. It is chosen here, before any plugin loads.
+        if let Some(runtime) = daemon.runtime() {
+            runtime
+                .clock()
+                .make_logical(KIT_CLOCK_WALL_START_MS, KIT_CLOCK_MONOTONIC_START_MS);
+        }
         // Mirror serve: the same wake sources, one owner doorbell, and a
         // plugin result budget whose notifier wakes the owner.
         let (wake_tx, wake_rx) = tokio_mpsc::channel(WAKE_QUEUE);
@@ -272,6 +293,7 @@ impl KitHub {
             recent_wakes: std::collections::VecDeque::new(),
             wake_count: 0,
             observers: Vec::new(),
+            loaded: Vec::new(),
         })
     }
 
@@ -322,6 +344,7 @@ impl KitHub {
             path: path.to_path_buf(),
         })?;
         if response.error.is_none() {
+            self.loaded.push(package_name_of(path)?);
             let observed = observable_events(path)?;
             if !observed.is_empty() {
                 let observer_name = format!("{OBSERVER_PACKAGE}-{}", observed[0].0);
@@ -335,6 +358,46 @@ impl KitHub {
             }
         }
         Ok(response)
+    }
+
+    /// Move the Hub's logical clock forward and return the plugin timers that
+    /// became due, in due order per package. Nothing sleeps.
+    ///
+    /// The Hub does not run Lua timer callbacks yet (gate G2), so a fired
+    /// timer is reported and no plugin code runs.
+    pub fn advance(&mut self, ms: u64) -> Result<Vec<TimerFired>, KitError> {
+        let runtime = self
+            .daemon
+            .runtime_mut()
+            .ok_or_else(|| KitError::Daemon("the daemon has no runtime".to_string()))?;
+        let now_ms = runtime
+            .clock()
+            .advance(ms)
+            .ok_or_else(|| KitError::Daemon("the kit clock is not logical".to_string()))?;
+        let mut fired = Vec::new();
+        for package in &self.loaded {
+            let events = runtime
+                .drain_capability_events_at(&botster_core::PluginKey(package.clone()), now_ms)
+                .map_err(|error| KitError::Daemon(error.to_string()))?;
+            for event in events {
+                if let botster_core::CapabilityRuntimeEvent::TimerFired(event) = event {
+                    fired.push(TimerFired {
+                        package: package.clone(),
+                        resource_id: event.resource.resource_id,
+                        sequence: event.sequence,
+                    });
+                }
+            }
+        }
+        Ok(fired)
+    }
+
+    /// The Hub's logical monotonic time, in milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.daemon
+            .runtime()
+            .map_or(0, |runtime| runtime.clock().monotonic_ms())
     }
 
     /// The MCP tools that plugins publish, as an agent sees them.
@@ -828,6 +891,15 @@ pub fn session_record(
         metadata: Default::default(),
         lifecycle,
     }
+}
+
+fn package_name_of(package: &Path) -> Result<String, KitError> {
+    let manifest_path = package.join(crate::packages::LOCAL_PACKAGE_MANIFEST_FILE);
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|error| KitError::Package(format!("{}: {error}", manifest_path.display())))?;
+    let manifest: crate::packages::HubPackageManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| KitError::Package(format!("{}: {error}", manifest_path.display())))?;
+    Ok(manifest.name)
 }
 
 /// The `(owner, name)` of each event the package declares for plugins.
