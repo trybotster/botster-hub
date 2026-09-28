@@ -614,8 +614,12 @@ enum CoreTicketSlot<T> {
         #[allow(dead_code)] // callback storage lease held until the queued ticket drops
         storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
     },
-    /// Admission refused the operation; there is nothing to wait for.
-    Refused,
+    /// Admission refused the operation because the request queue was full.
+    /// `wait` is the owner's registered wait for room, read before the final
+    /// attempt (readiness plan 2.2); `None` for a refusal that is not about room.
+    Refused {
+        wait: Option<crate::daemon::owner_signal::Seen>,
+    },
 }
 
 #[derive(Debug)]
@@ -771,9 +775,18 @@ impl<T> CoreTicket<T> {
         Self::queued(identity, receiver)
     }
 
-    fn refused() -> Self {
+    fn refused(wait: Option<crate::daemon::owner_signal::Seen>) -> Self {
         Self {
-            slot: CoreTicketSlot::Refused,
+            slot: CoreTicketSlot::Refused { wait },
+        }
+    }
+
+    /// For a ticket refused for lack of queue room, the owner's registered
+    /// wait: it moves when the data-plane thread next dequeues a request.
+    pub(crate) fn refused_wait(&self) -> Option<crate::daemon::owner_signal::Seen> {
+        match &self.slot {
+            CoreTicketSlot::Refused { wait } => *wait,
+            CoreTicketSlot::Queued { .. } => None,
         }
     }
 
@@ -792,7 +805,7 @@ impl<T> CoreTicket<T> {
     /// Non-blocking read; owner-thread use.
     pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
         match &self.slot {
-            CoreTicketSlot::Refused => CoreTicketPoll::Refused,
+            CoreTicketSlot::Refused { .. } => CoreTicketPoll::Refused,
             CoreTicketSlot::Queued {
                 identity,
                 receiver,
@@ -826,7 +839,7 @@ impl<T> CoreTicket<T> {
     /// Bounded blocking read for threads that do not serve the owner loop.
     pub fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
         match self.slot {
-            CoreTicketSlot::Refused => Err(CoreTicketError::Overloaded),
+            CoreTicketSlot::Refused { .. } => Err(CoreTicketError::Overloaded),
             CoreTicketSlot::Queued {
                 identity, receiver, ..
             } => {
@@ -856,7 +869,7 @@ pub(crate) enum CoreAdmission {
     /// The request is queued for the next data-plane turn.
     Queued,
     /// The bounded queue was full; the request was dropped unqueued.
-    Refused,
+    Refused(Option<crate::daemon::owner_signal::Seen>),
     /// The driver stopped accepting requests.
     Stopped,
 }
@@ -866,15 +879,72 @@ pub(crate) enum CoreAdmission {
 fn admit_request(
     requests: &SyncSender<CoreRequest>,
     accepting: &AtomicBool,
+    capacity: &DataPlaneCapacity,
     request: CoreRequest,
 ) -> CoreAdmission {
     if !accepting.load(Ordering::Acquire) {
         return CoreAdmission::Stopped;
     }
-    match requests.try_send(request) {
+    match capacity.try_send(requests, request) {
         Ok(()) => CoreAdmission::Queued,
-        Err(TrySendError::Full(_)) => CoreAdmission::Refused,
-        Err(TrySendError::Disconnected(_)) => CoreAdmission::Stopped,
+        Err((TrySendError::Full(_), wait)) => CoreAdmission::Refused(wait),
+        Err((TrySendError::Disconnected(_), _)) => CoreAdmission::Stopped,
+    }
+}
+
+/// Room in the bounded Core request queue, as an owner wait (readiness plan
+/// S4a). A full queue arms the wait and retries once; the data-plane thread
+/// raises `DataPlaneCapacity` after a dequeue only while armed, so ordinary
+/// pumps ring no owner doorbell.
+#[derive(Clone)]
+pub(crate) struct DataPlaneCapacity {
+    armed: Arc<AtomicBool>,
+    signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
+}
+
+impl DataPlaneCapacity {
+    pub(crate) fn new(signal: Arc<crate::daemon::owner_signal::OwnerSignal>) -> Self {
+        Self {
+            armed: Arc::new(AtomicBool::new(false)),
+            signal,
+        }
+    }
+
+    /// Send, and on a full queue arm and retry once. A refusal that remains
+    /// carries the wait read before that final attempt.
+    #[allow(clippy::result_large_err)]
+    fn try_send(
+        &self,
+        requests: &SyncSender<CoreRequest>,
+        request: CoreRequest,
+    ) -> Result<
+        (),
+        (
+            TrySendError<CoreRequest>,
+            Option<crate::daemon::owner_signal::Seen>,
+        ),
+    > {
+        match requests.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(request)) => {
+                let seen = self
+                    .signal
+                    .seen(crate::daemon::owner_signal::SignalKey::DataPlaneCapacity);
+                self.armed.store(true, Ordering::SeqCst);
+                requests
+                    .try_send(request)
+                    .map_err(|error| (error, Some(seen)))
+            }
+            Err(error) => Err((error, None)),
+        }
+    }
+
+    /// The data-plane thread dequeued requests: wake an armed owner.
+    fn released(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.signal
+                .raise(crate::daemon::owner_signal::SignalKey::DataPlaneCapacity);
+        }
     }
 }
 
@@ -889,6 +959,7 @@ pub(crate) struct CoreDaemonHandle {
     owner_waiting: Arc<AtomicBool>,
     waiter_ids: Arc<WaiterIdSource>,
     completion_wake: Arc<CoreCompletionWake>,
+    capacity: DataPlaneCapacity,
     #[cfg(test)]
     refuse_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -969,8 +1040,8 @@ impl CoreDaemonHandle {
             .is_ok()
         {
             return Some(CoreOperationTicket {
-                begin: CoreTicket::refused(),
-                completion: CoreTicket::refused(),
+                begin: CoreTicket::refused(None),
+                completion: CoreTicket::refused(None),
             });
         }
         None
@@ -1067,7 +1138,7 @@ impl CoreDaemonHandle {
             };
             return CoreSubmission {
                 ticket: ChargedCoreTicket {
-                    ticket: CoreTicket::refused(),
+                    ticket: CoreTicket::refused(None),
                 },
                 rejected: Some(CoreRejectedRequest {
                     request,
@@ -1154,7 +1225,7 @@ impl CoreDaemonHandle {
         F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
     {
         let Some(waiter_id) = self.waiter_ids.next() else {
-            return CoreTicket::refused();
+            return CoreTicket::refused(None);
         };
         let identity = OwnerWorkIdentity::first(waiter_id);
         let (ticket, publisher) =
@@ -1163,10 +1234,10 @@ impl CoreDaemonHandle {
             publisher.publish(operation(daemon));
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
-        match admit_request(&self.requests, &self.accepting, request) {
+        match admit_request(&self.requests, &self.accepting, &self.capacity, request) {
             CoreAdmission::Queued => {}
-            CoreAdmission::Refused => {
-                return CoreTicket::refused();
+            CoreAdmission::Refused(wait) => {
+                return CoreTicket::refused(wait);
             }
             CoreAdmission::Stopped => {
                 return CoreTicket::lost(identity);
@@ -1191,17 +1262,17 @@ impl CoreDaemonHandle {
             .register_phases(waiter_id, 1)
             .and_then(|identities| identities.into_iter().next())
         else {
-            return CoreTicket::refused();
+            return CoreTicket::refused(None);
         };
         let (ticket, publisher) =
             CoreTicket::channel(identity, Arc::clone(&self.completion_wake), true);
         let request = CoreRequest::new(move |daemon, _| publisher.publish(operation(daemon)));
         let _admission = self.admission.lock().expect("Core request admission mutex");
-        match admit_request(&self.requests, &self.accepting, request) {
+        match admit_request(&self.requests, &self.accepting, &self.capacity, request) {
             CoreAdmission::Queued => {}
-            CoreAdmission::Refused => {
+            CoreAdmission::Refused(wait) => {
                 self.completion_wake.retire(identity);
-                return CoreTicket::refused();
+                return CoreTicket::refused(wait);
             }
             CoreAdmission::Stopped => {
                 self.completion_wake.retire(identity);
@@ -1225,8 +1296,8 @@ impl CoreDaemonHandle {
         }
         let Some(waiter_id) = self.waiter_ids.next() else {
             return CoreOperationTicket {
-                begin: CoreTicket::refused(),
-                completion: CoreTicket::refused(),
+                begin: CoreTicket::refused(None),
+                completion: CoreTicket::refused(None),
             };
         };
         let begin_identity = OwnerWorkIdentity::first(waiter_id);
@@ -1249,11 +1320,11 @@ impl CoreDaemonHandle {
             begin_publisher.publish(result);
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
-        match admit_request(&self.requests, &self.accepting, request) {
+        match admit_request(&self.requests, &self.accepting, &self.capacity, request) {
             CoreAdmission::Queued => {}
-            CoreAdmission::Refused => {
+            CoreAdmission::Refused(wait) => {
                 return CoreOperationTicket {
-                    begin: CoreTicket::refused(),
+                    begin: CoreTicket::refused(wait),
                     completion,
                 };
             }
@@ -1289,8 +1360,8 @@ impl CoreDaemonHandle {
         }
         let Some(identities) = self.completion_wake.register_phases(waiter_id, 2) else {
             return CoreOperationTicket {
-                begin: CoreTicket::refused(),
-                completion: CoreTicket::refused(),
+                begin: CoreTicket::refused(None),
+                completion: CoreTicket::refused(None),
             };
         };
         let [begin_identity, completion_identity] = identities.as_slice() else {
@@ -1341,18 +1412,18 @@ impl CoreDaemonHandle {
         let injected_refusal = false;
         let admission = if injected_refusal {
             drop(request);
-            CoreAdmission::Refused
+            CoreAdmission::Refused(None)
         } else {
-            admit_request(&self.requests, &self.accepting, request)
+            admit_request(&self.requests, &self.accepting, &self.capacity, request)
         };
         match admission {
             CoreAdmission::Queued => {}
-            CoreAdmission::Refused => {
+            CoreAdmission::Refused(wait) => {
                 self.completion_wake.retire(begin_identity);
                 self.completion_wake.retire(completion_identity);
                 return CoreOperationTicket {
-                    begin: CoreTicket::refused(),
-                    completion: CoreTicket::refused(),
+                    begin: CoreTicket::refused(wait),
+                    completion: CoreTicket::refused(wait),
                 };
             }
             CoreAdmission::Stopped => {
@@ -1398,7 +1469,10 @@ impl DataPlaneDriver {
     pub(crate) fn start(
         core_config: CoreDaemonConfig,
         close_work: CloseWorkSource,
+        owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     ) -> (Self, CoreDaemonHandle) {
+        let capacity = DataPlaneCapacity::new(owner_signal);
+        let thread_capacity = capacity.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let (request_tx, request_rx) = mpsc::sync_channel(CORE_REQUEST_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1430,6 +1504,7 @@ impl DataPlaneDriver {
                     thread_progress_latch,
                     thread_request_pending,
                     thread_owner_waiting,
+                    thread_capacity,
                 );
                 if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
                     daemon.release_for_restart();
@@ -1448,6 +1523,7 @@ impl DataPlaneDriver {
             owner_waiting,
             waiter_ids,
             completion_wake,
+            capacity,
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1536,6 +1612,7 @@ fn run_loop(
     progress_latch: Arc<DataPlaneProgressLatch>,
     request_pending: Arc<AtomicBool>,
     owner_waiting: Arc<AtomicBool>,
+    capacity: DataPlaneCapacity,
 ) {
     let mut pending_operations = PendingCoreOperations::new();
     loop {
@@ -1568,7 +1645,9 @@ fn run_loop(
             progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
             terminal_inventory_changed |= outcome.terminal_inventory_changed;
         }
-        run_core_requests(core_daemon, &requests, &mut pending_operations);
+        if run_core_requests(core_daemon, &requests, &mut pending_operations) > 0 {
+            capacity.released();
+        }
         publish_completions(core_daemon, &mut pending_operations);
         {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
@@ -1603,17 +1682,23 @@ fn run_loop(
     for request in requests.try_iter().take(CORE_REQUEST_CAPACITY) {
         request.run(core_daemon, &mut pending_operations);
     }
+    // An owner armed on a full queue sees the stopped plane on its retry.
+    capacity.released();
     publish_completions(core_daemon, &mut pending_operations);
 }
 
+/// Run up to one turn of queued Core requests; returns how many it dequeued.
 fn run_core_requests(
     core_daemon: &mut CoreDaemon,
     requests: &Receiver<CoreRequest>,
     pending_operations: &mut PendingCoreOperations,
-) {
+) -> usize {
+    let mut dequeued = 0;
     for request in requests.try_iter().take(CORE_REQUESTS_PER_TURN) {
         request.run(core_daemon, pending_operations);
+        dequeued += 1;
     }
+    dequeued
 }
 
 /// Publish each finished Core operation to its exact registered phase.
@@ -2225,6 +2310,7 @@ mod tests {
             owner_waiting: Arc::new(AtomicBool::new(false)),
             waiter_ids: Arc::new(WaiterIdSource::default()),
             completion_wake: Arc::clone(&completion_wake),
+            capacity: test_capacity(),
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
@@ -2433,6 +2519,7 @@ mod tests {
                 owner_waiting: Arc::new(AtomicBool::new(false)),
                 waiter_ids: Arc::new(WaiterIdSource::default()),
                 completion_wake: Arc::clone(&wake),
+                capacity: test_capacity(),
                 refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
                 refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
                 lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
@@ -2495,23 +2582,54 @@ mod tests {
         check_unregistered_submit_preserves_owner(false, true, false);
     }
 
+    fn test_capacity() -> DataPlaneCapacity {
+        DataPlaneCapacity::new(Arc::default())
+    }
+
+    #[test]
+    fn a_full_queue_arms_room_and_only_an_armed_dequeue_raises_it() {
+        let signal = Arc::new(crate::daemon::owner_signal::OwnerSignal::default());
+        let capacity = DataPlaneCapacity::new(Arc::clone(&signal));
+        let key = crate::daemon::owner_signal::SignalKey::DataPlaneCapacity;
+        let before = signal.seen(key);
+        // A dequeue with no refused owner rings nothing: ordinary pumps are free.
+        capacity.released();
+        assert!(!signal.moved(before));
+        let (requests, receiver) = mpsc::sync_channel::<CoreRequest>(1);
+        assert!(capacity.try_send(&requests, noop_request()).is_ok());
+        let Err((TrySendError::Full(_), Some(wait))) = capacity.try_send(&requests, noop_request())
+        else {
+            panic!("a full queue refuses with a registered wait");
+        };
+        assert!(!signal.moved(wait), "the refused retry raises nothing");
+        assert_eq!(receiver.try_iter().count(), 1);
+        capacity.released();
+        assert!(
+            signal.moved(wait),
+            "the armed dequeue wakes the refused owner"
+        );
+        let after = signal.seen(key);
+        capacity.released();
+        assert!(!signal.moved(after), "the wake is spent with the arm");
+    }
+
     #[test]
     fn full_queue_refuses_without_waiting_and_keeps_queued_work() {
         let (requests, receiver) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
         let accepting = AtomicBool::new(true);
         for _ in 0..CORE_REQUEST_CAPACITY {
             assert_eq!(
-                admit_request(&requests, &accepting, noop_request()),
+                admit_request(&requests, &accepting, &test_capacity(), noop_request()),
                 CoreAdmission::Queued
             );
         }
         // The receiver is never drained: the next admission must refuse at
         // once instead of parking the submitter behind the data plane.
         let started = Instant::now();
-        assert_eq!(
-            admit_request(&requests, &accepting, noop_request()),
-            CoreAdmission::Refused
-        );
+        assert!(matches!(
+            admit_request(&requests, &accepting, &test_capacity(), noop_request()),
+            CoreAdmission::Refused(Some(_))
+        ));
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "refusal must not wait for queue space"
@@ -2520,7 +2638,7 @@ mod tests {
         assert_eq!(receiver.try_iter().count(), CORE_REQUEST_CAPACITY);
         // Space freed by the consumer admits again.
         assert_eq!(
-            admit_request(&requests, &accepting, noop_request()),
+            admit_request(&requests, &accepting, &test_capacity(), noop_request()),
             CoreAdmission::Queued
         );
     }
@@ -2532,7 +2650,7 @@ mod tests {
         let admission = Arc::new(Mutex::new(()));
         for _ in 0..CORE_REQUEST_CAPACITY {
             assert_eq!(
-                admit_request(&requests, &accepting, noop_request()),
+                admit_request(&requests, &accepting, &test_capacity(), noop_request()),
                 CoreAdmission::Queued
             );
         }
@@ -2544,11 +2662,11 @@ mod tests {
             let admission = Arc::clone(&admission);
             std::thread::spawn(move || {
                 let _guard = admission.lock().expect("admission");
-                admit_request(&requests, &accepting, noop_request())
+                admit_request(&requests, &accepting, &test_capacity(), noop_request())
             })
         };
         let refused = submitter.join().expect("submitter thread");
-        assert_eq!(refused, CoreAdmission::Refused);
+        assert!(matches!(refused, CoreAdmission::Refused(Some(_))));
         let started = Instant::now();
         {
             let _guard = admission.lock().expect("admission");
@@ -2559,14 +2677,14 @@ mod tests {
             "stop admission must not wait behind a full queue"
         );
         assert_eq!(
-            admit_request(&requests, &accepting, noop_request()),
+            admit_request(&requests, &accepting, &test_capacity(), noop_request()),
             CoreAdmission::Stopped
         );
     }
 
     #[test]
     fn refused_ticket_resolves_without_a_result() {
-        let mut ticket: CoreTicket<u8> = CoreTicket::refused();
+        let mut ticket: CoreTicket<u8> = CoreTicket::refused(None);
         assert!(matches!(ticket.poll(), CoreTicketPoll::Refused));
         assert_eq!(
             ticket.wait(Duration::from_millis(1)),
