@@ -89,6 +89,7 @@ pub mod process_exit;
 pub mod profile;
 pub(crate) mod recovery;
 pub mod runtime;
+pub mod session_credential;
 mod session_projection;
 pub mod session_types;
 pub(crate) mod shared_view;
