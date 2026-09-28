@@ -54,3 +54,12 @@ fn a_step_does_not_settle_while_a_downstream_handler_runs() {
         serde_json::json!({ "payload": { "items": ["gamma"] } })
     );
 }
+
+/// A hold ends by release or drop. It has no expiry of its own, so a step
+/// whose guard is longer than any internal bound cannot see the hold fail
+/// and settle while the hold still exists.
+#[test]
+fn a_hold_has_no_expiry_of_its_own() {
+    let hold = botster_plugin_test_kit::hold_handler("kit-fixture", "event:kit-fixture:x:1");
+    assert_eq!(hold.expiry(), None);
+}

@@ -1,0 +1,22 @@
+{
+  "name": "kit-fixture-b",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Plugin test kit fixture: a second event producer.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "mcp" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "events": {
+    "emitted": [{
+      "name": "kit-fixture-b.noted",
+      "audience": ["plugins"],
+      "payload_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "key": { "type": "string" } },
+        "required": ["key"]
+      }
+    }]
+  }
+}
