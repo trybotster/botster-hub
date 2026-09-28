@@ -955,10 +955,16 @@ Native tools route through the running daemon, not directly into hub state:
 - `post_message` and `post_envelope` publish a text payload as a core routed
   envelope to one target session. A target that Core does not hold as running
   is refused with `unknown_session`.
-- `receive_messages` and `receive_envelopes` drain only the caller session route
-  from `BOTSTER_SESSION_ID`; they do not accept another session id or agent id.
+- `receive_messages` and `receive_envelopes` return only the caller session's
+  messages, from `BOTSTER_SESSION_ID`; they do not accept another session id or
+  agent id. Delivery is at least once: a message is returned by every receive
+  until it is acknowledged, so a caller that stops after a receive loses
+  nothing. `after` pages past messages already seen.
 - `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
-  envelope.
+  envelope, which removes it. Posting an envelope id that the target still
+  holds changes nothing, so a retried post cannot duplicate a message.
+- Every session the Hub spawns starts without any `BOTSTER_*` name inherited
+  from the process that started the Hub; the Hub then sets its own values.
 - `notify_session` is a guarded-write doorbell attempt. The current native MCP
   surface does not yet gather terminal readiness evidence from attached clients,
   so it reports core's guarded-write decision and can defer instead of injecting

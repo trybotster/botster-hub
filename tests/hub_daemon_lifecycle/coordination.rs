@@ -294,3 +294,192 @@ fn mcp_routed_envelopes_are_not_restart_durable_today() {
         "routed-envelope queues are in memory and empty after a daemon restart"
     );
 }
+
+fn coordination_cli(data_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .args(&args[..2.min(args.len())])
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(&args[2.min(args.len())..])
+        .output()
+        .expect("run botster-hub");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "botster-hub {args:?} failed: {stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// Parse `env | grep '^BOTSTER_' | sort` output into name/value pairs.
+fn botster_environment(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+#[test]
+fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
+    let _guard = daemon_test_guard();
+    // Short absolute paths keep the injected socket path under SUN_LEN.
+    let data_dir = unique_short_test_dir("coord-leak");
+    let root = unique_short_test_dir("coord-leak-root");
+    fs::create_dir_all(&root).expect("create spawn root");
+    // The daemon's own environment carries another session's identity, as it
+    // does when an agent shell starts the Hub.
+    let daemon = start_cli_daemon_with_env(
+        &data_dir,
+        &[
+            ("BOTSTER_SESSION_ID", "leaked-session-id"),
+            ("BOTSTER_SESSION_UUID", "leaked-session-uuid"),
+            ("BOTSTER_CONTEXT_ID", "leaked-context"),
+            ("BOTSTER_MCP_TOKEN", "leaked-token"),
+        ],
+    );
+    let print_environment = "env | grep '^BOTSTER_' | sort";
+
+    // A raw spawn.
+    let raw_fifo = root.join("raw.fifo");
+    make_fifo(&raw_fifo);
+    coordination_spawn(
+        &data_dir,
+        "leak-raw",
+        &format!(
+            "{print_environment} > {}; exec cat",
+            shell_quote(&raw_fifo.display().to_string())
+        ),
+    );
+    let raw = botster_environment(&read_fifo_to_end(&raw_fifo));
+
+    // A session-type spawn.
+    let typed_fifo = root.join("typed.fifo");
+    make_fifo(&typed_fifo);
+    coordination_cli(
+        &data_dir,
+        &[
+            "spawn-targets",
+            "create",
+            "--root",
+            &root.display().to_string(),
+            "--id",
+            "leak-root",
+        ],
+    );
+    let definition = serde_json::json!({
+        "id": "leak-probe",
+        "label": "Leak probe",
+        "role": "botster.agent",
+        "interaction": "interactive",
+        "lifecycle": "task",
+        "execution": { "mode": "shell_command" },
+        "command": format!(
+            "{print_environment} > {}; exec cat",
+            shell_quote(&typed_fifo.display().to_string())
+        ),
+    });
+    coordination_cli(
+        &data_dir,
+        &["session-types", "create", "device", &definition.to_string()],
+    );
+    coordination_cli(
+        &data_dir,
+        &[
+            "session-types",
+            "spawn",
+            "leak-probe",
+            "--session-id",
+            "leak-typed",
+            "--target-id",
+            "leak-root",
+        ],
+    );
+    let typed = botster_environment(&read_fifo_to_end(&typed_fifo));
+
+    for (session_id, environment) in [("leak-raw", &raw), ("leak-typed", &typed)] {
+        assert_eq!(
+            environment.get("BOTSTER_SESSION_ID").map(String::as_str),
+            Some(session_id),
+            "{session_id}: {environment:?}"
+        );
+        for (name, value) in environment {
+            assert!(
+                !value.starts_with("leaked-"),
+                "{session_id} inherited {name}={value}: {environment:?}"
+            );
+        }
+        for name in ["BOTSTER_SESSION_UUID", "BOTSTER_MCP_TOKEN"] {
+            assert!(
+                !environment.contains_key(name),
+                "{session_id} inherited {name}: {environment:?}"
+            );
+        }
+    }
+    // A raw spawn has no context record, so no context id at all.
+    assert!(!raw.contains_key("BOTSTER_CONTEXT_ID"), "{raw:?}");
+    assert!(
+        typed
+            .get("BOTSTER_CONTEXT_ID")
+            .is_some_and(|context| context != "leaked-context"),
+        "{typed:?}"
+    );
+
+    for session_id in ["leak-raw", "leak-typed"] {
+        coordination_shutdown_session(&data_dir, session_id);
+    }
+    shutdown_cli_daemon(&data_dir, daemon);
+}
+
+#[test]
+fn mcp_receive_redelivers_until_ack_and_republish_is_idempotent() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("coordination-at-least-once");
+    let daemon = start_cli_daemon(&data_dir);
+    coordination_spawn(&data_dir, "session-inbox", "exec cat");
+    let post = |envelope_id: &str, body: &str| {
+        coordination_mcp_call(
+            &data_dir,
+            Some("session-sender"),
+            "post_message",
+            serde_json::json!({ "session_id": "session-inbox", "envelope_id": envelope_id, "body": body }),
+        )["structuredContent"]["publish"]["deliveries"][0]
+            .clone()
+    };
+    let receive = || {
+        coordination_mcp_call(&data_dir, Some("session-inbox"), "receive_messages", serde_json::json!({}))
+            ["structuredContent"]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|message| message["envelope_id"].as_str().expect("envelope id").to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let first = post("retry-1", "first");
+    assert_eq!(first["status"], "queued");
+    // Publishing the same id while it is outstanding changes nothing.
+    let retried = post("retry-1", "first again");
+    assert_eq!(retried["cursor"], first["cursor"], "{retried}");
+    post("other-1", "second");
+
+    // Without an ack, every receive returns the same envelopes again.
+    assert_eq!(receive(), ["retry-1", "other-1"]);
+    assert_eq!(receive(), ["retry-1", "other-1"], "unacked envelopes are redelivered");
+
+    let acked = coordination_mcp_call(
+        &data_dir,
+        Some("session-inbox"),
+        "ack_message",
+        serde_json::json!({ "envelope_id": "retry-1" }),
+    );
+    assert_eq!(acked["structuredContent"]["ack"]["status"], "acknowledged");
+    assert_eq!(receive(), ["other-1"], "an acked envelope is not redelivered");
+
+    // After its ack, the same id can be published again.
+    assert_eq!(post("retry-1", "after ack")["status"], "queued");
+    assert_eq!(receive(), ["other-1", "retry-1"]);
+
+    coordination_shutdown_session(&data_dir, "session-inbox");
+    shutdown_cli_daemon(&data_dir, daemon);
+}
