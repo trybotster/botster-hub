@@ -51,6 +51,26 @@ const dryRun = dryRunArg === "1";
 const hashOf = (name) => (name.match(/-([0-9a-f]{16})(?:\.|$)/) || [])[1];
 
 const keep = new Set();
+// Cargo reports a binary or an example by its uplifted, unhashed path
+// (target/debug/<name>, target/debug/examples/<name>), which is a hard link to
+// the hashed artifact. Resolve such a path to its hash through the inode.
+const inodeHash = new Map();
+for (const dir of [join(target, "deps"), join(target, "examples")]) {
+  if (!existsSync(dir)) continue;
+  for (const name of readdirSync(dir)) {
+    const hash = hashOf(name);
+    if (!hash) continue;
+    const stat = statSync(join(dir, name));
+    if (stat.isFile()) inodeHash.set(`${stat.dev}:${stat.ino}`, hash);
+  }
+}
+const hashOfArtifact = (file) => {
+  const direct = hashOf(basename(file)) ?? hashOf(basename(dirname(file)));
+  if (direct) return direct;
+  if (!existsSync(file)) return undefined;
+  const stat = statSync(file);
+  return inodeHash.get(`${stat.dev}:${stat.ino}`);
+};
 const lines = readdirSync(recordsDir)
   .filter((name) => name.endsWith(".json"))
   .flatMap((name) => readFileSync(join(recordsDir, name), "utf8").split("\n"));
@@ -58,14 +78,10 @@ for (const line of lines) {
   if (!line.startsWith("{")) continue;
   const message = JSON.parse(line);
   if (message.reason === "compiler-artifact") {
-    for (const file of message.filenames ?? []) {
-      // A build script's artifact is build/<pkg>-<hash>/build-script-build:
-      // the hash is on its directory, not on the file.
-      const hash = hashOf(basename(file)) ?? hashOf(basename(dirname(file)));
-      if (hash) keep.add(hash);
-    }
-    if (message.executable) {
-      const hash = hashOf(basename(message.executable));
+    // A build script's artifact is build/<pkg>-<hash>/build-script-build: the
+    // hash is on its directory. A bin or example is reported unhashed.
+    for (const file of [...(message.filenames ?? []), message.executable].filter(Boolean)) {
+      const hash = hashOfArtifact(file);
       if (hash) keep.add(hash);
     }
   } else if (message.reason === "build-script-executed" && message.out_dir) {
@@ -112,7 +128,7 @@ const remove = (path) => {
 for (const name of depFiles) {
   if (!retained(hashOf(name))) remove(join(deps, name));
 }
-for (const dir of ["build", ".fingerprint"]) {
+for (const dir of ["build", ".fingerprint", "examples"]) {
   const path = join(target, dir);
   if (!existsSync(path)) continue;
   for (const name of readdirSync(path)) {
