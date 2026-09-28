@@ -820,14 +820,36 @@ impl TestOwnedIdentities {
         }
     }
 
+    /// Waits until no owned process lives, or `grace` passes. Each round takes
+    /// one census, then blocks on exit events for everything it found: the
+    /// exit of each owned process group (which also covers members that fork
+    /// meanwhile) and of each live process outside those groups. The next
+    /// census runs only after those events, and finds descendants born before
+    /// their parents exited. The deadline is the give-up, never the progress.
     fn wait_absent(&mut self, grace: Duration) -> Result<Vec<TestOwnedProcess>, String> {
+        // timer: deadline — the settle or signal grace; exit events end each round.
         let deadline = Instant::now() + grace;
         loop {
             let live = self.census()?;
             if live.is_empty() || Instant::now() >= deadline {
                 return Ok(live);
             }
-            thread::sleep(Duration::from_millis(50));
+            let pgids: Vec<u32> = self.pgids.iter().copied().collect();
+            for pgid in &pgids {
+                let exited =
+                    botster_hub::process_exit::wait_for_process_group_exit(*pgid, deadline)
+                        .map_err(|error| format!("wait for owned group {pgid} to exit: {error}"))?;
+                if !exited {
+                    return self.census();
+                }
+            }
+            for row in live.iter().filter(|row| !pgids.contains(&row.pgid)) {
+                let exited = botster_hub::process_exit::wait_for_pid_exit(row.pid, deadline)
+                    .map_err(|error| format!("wait for owned pid {} to exit: {error}", row.pid))?;
+                if !exited {
+                    return self.census();
+                }
+            }
         }
     }
 }
