@@ -511,6 +511,41 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_lease_releases_it_while_a_forked_child_shares_its_descriptor() {
+        let home = Home::new("lease-fork");
+        let prefix = home.root.join("prefix");
+        fs::create_dir_all(&prefix).expect("create prefix");
+        let LeaseOutcome::Acquired(installer) =
+            lease::acquire(&prefix, LeaseMode::Exclusive).expect("take the exclusive lease")
+        else {
+            panic!("an uncontended exclusive lease must be acquired");
+        };
+        // A child forked while the lease is open shares its open file
+        // description until exec. This child never execs; it only waits.
+        // SAFETY: the child calls only async-signal-safe `pause` and `_exit`.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let reap = || unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        };
+        drop(installer);
+        let reacquired = lease::acquire(&prefix, LeaseMode::Exclusive).expect("installer attempt");
+        reap();
+        assert!(
+            matches!(reacquired, LeaseOutcome::Acquired(_)),
+            "a dropped lease must be released even while a forked child shares its descriptor"
+        );
+    }
+
+    #[test]
     fn a_symlink_at_the_lease_path_is_refused_rather_than_followed() {
         let home = Home::new("lease-symlink");
         let prefix = home.root.join("prefix");
