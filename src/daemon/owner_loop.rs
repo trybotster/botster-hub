@@ -8300,7 +8300,7 @@ return botster.register({
         for _ in 1..crate::host_executor::HOST_OPERATION_CAPACITY {
             host_permits.push(executor.try_reserve().unwrap());
         }
-        runtime.set_test_plugin_admit_backpressure(true);
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
         let mut state = DaemonControlState::default();
         let (frame_tx, _frame_rx) = tokio_mpsc::channel(1);
         let (reply_tx, mut reply) = crate::daemon::control::message::control_reply_channel();

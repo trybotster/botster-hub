@@ -1562,6 +1562,7 @@ impl PackageEventRouter {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_pulled_delivery(
         &self,
         delivery: ReadyDelivery,
