@@ -4190,6 +4190,7 @@ impl HubRuntime {
             return Ok(PluginAdmissionResult::Backpressured {
                 request_id: request.request_id,
                 class,
+                cause: botster_core::PluginBackpressureCause::ClassQueue,
                 reason: "test-forced plugin admission backpressure".to_string(),
                 backpressure: None,
             });
@@ -4218,6 +4219,7 @@ impl HubRuntime {
             return PluginAdmissionResult::Backpressured {
                 request_id: request.request_id,
                 class,
+                cause: botster_core::PluginBackpressureCause::ClassQueue,
                 reason: "test-forced plugin admission backpressure".to_string(),
                 backpressure: None,
             };
