@@ -1952,31 +1952,45 @@ fn run_pump_observe_phase(
             .lifecycle_counters
             .lifecycle_session_drains
             .saturating_add(1);
-        if let Some(reason) = slice.resync_required {
-            // The one observe pass owns lifecycle resync: a changed source
-            // or an unavailable pass restarts the baseline projection.
-            state.observe_resume = None;
-            match reason {
-                botster_core_daemon::SessionLifecycleResyncReason::SourceChanged => {
-                    crate::daemon_maintenance::start_baseline_recovery(&mut state.maintenance);
+        use botster_core_daemon::ObserveLifecycleStop;
+        // Elapsed is a time slice: run it again next turn. The budget stops
+        // visited a session, so they continue at once. A stop this Hub does
+        // not know cannot be told from a stuck pass, so it faults.
+        match slice.stop {
+            ObserveLifecycleStop::Resync { reason } => {
+                // The one observe pass owns lifecycle resync: a changed source
+                // or an unavailable pass restarts the baseline projection.
+                state.observe_resume = None;
+                match reason {
+                    botster_core_daemon::SessionLifecycleResyncReason::SourceChanged => {
+                        crate::daemon_maintenance::start_baseline_recovery(&mut state.maintenance);
+                    }
+                    botster_core_daemon::SessionLifecycleResyncReason::ObservePassUnavailable => {
+                        crate::daemon_maintenance::handle_unavailable_observe_pass(
+                            &mut state.maintenance,
+                        );
+                    }
+                    _ => {}
                 }
-                botster_core_daemon::SessionLifecycleResyncReason::ObservePassUnavailable => {
-                    crate::daemon_maintenance::handle_unavailable_observe_pass(
-                        &mut state.maintenance,
-                    );
-                }
-                _ => {}
+                return BackgroundProgress::Done;
             }
-            return BackgroundProgress::Done;
+            ObserveLifecycleStop::Complete => state.observe_resume = None,
+            ObserveLifecycleStop::Elapsed
+            | ObserveLifecycleStop::SessionBudget
+            | ObserveLifecycleStop::ByteBudget => {
+                state.observe_resume = Some(botster_core_daemon::ObserveLifecycleCursor {
+                    pass_id: slice.pass_id,
+                    last_visited: slice.last_visited,
+                });
+            }
+            _ => {
+                state.observe_resume = None;
+                state
+                    .maintenance
+                    .fault_lifecycle("an unknown observe slice stop");
+                return BackgroundProgress::Done;
+            }
         }
-        state.observe_resume = if slice.complete {
-            None
-        } else {
-            Some(botster_core_daemon::ObserveLifecycleCursor {
-                pass_id: slice.pass_id,
-                last_visited: slice.last_visited,
-            })
-        };
         if state.observe_resume.is_some() {
             BackgroundProgress::Runnable
         } else {
@@ -3537,8 +3551,7 @@ mod tests {
     }
 
     fn resolved_observe(
-        complete: bool,
-        resync: Option<botster_core_daemon::SessionLifecycleResyncReason>,
+        stop: botster_core_daemon::ObserveLifecycleStop,
     ) -> crate::CoreTicket<
         Result<
             botster_core_daemon::ObserveLifecycleSlice,
@@ -3548,10 +3561,37 @@ mod tests {
         crate::CoreTicket::resolved(Ok(botster_core_daemon::ObserveLifecycleSlice {
             pass_id: botster_core_daemon::ObserveLifecyclePassId("pass".into()),
             last_visited: None,
-            complete,
             session_errors: Vec::new(),
-            resync_required: resync,
+            stop,
         }))
+    }
+
+    /// Elapsed is a time slice and the budget stops advanced the pass: each
+    /// resumes the pass at its cursor, and none faults or restarts the baseline.
+    #[test]
+    fn an_observe_slice_that_yields_or_hits_a_budget_resumes_the_pass() {
+        use botster_core_daemon::ObserveLifecycleStop;
+        for stop in [
+            ObserveLifecycleStop::Elapsed,
+            ObserveLifecycleStop::SessionBudget,
+            ObserveLifecycleStop::ByteBudget,
+        ] {
+            let root = unique_package_control_dir("observe-resumes");
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            state.observe_read = Some(resolved_observe(stop.clone()));
+            assert!(
+                matches!(
+                    run_pump_observe_phase(&daemon, &mut state),
+                    BackgroundProgress::Runnable
+                ),
+                "{stop:?} continues the pass"
+            );
+            assert!(state.observe_resume.is_some(), "{stop:?} keeps the cursor");
+            assert!(!state.maintenance.lifecycle_faulted, "{stop:?}");
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -3567,8 +3607,9 @@ mod tests {
             Vec::new(),
         );
         state.observe_read = Some(resolved_observe(
-            false,
-            Some(botster_core_daemon::SessionLifecycleResyncReason::SourceChanged),
+            botster_core_daemon::ObserveLifecycleStop::Resync {
+                reason: botster_core_daemon::SessionLifecycleResyncReason::SourceChanged,
+            },
         ));
         assert!(matches!(
             run_pump_observe_phase(&daemon, &mut state),
@@ -3589,7 +3630,9 @@ mod tests {
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
         state.maintenance.note_journal_advanced();
-        state.observe_read = Some(resolved_observe(true, None));
+        state.observe_read = Some(resolved_observe(
+            botster_core_daemon::ObserveLifecycleStop::Complete,
+        ));
         assert!(matches!(
             run_pump_observe_phase(&daemon, &mut state),
             BackgroundProgress::Done

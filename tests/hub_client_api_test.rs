@@ -14,7 +14,8 @@ use botster_core::{
 };
 use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, LifecycleBaselineBudget,
-    ObserveLifecycleBudget, ObserveLifecycleCursor, ReadinessEvidence,
+    LifecycleBaselineStop, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleStop,
+    ReadinessEvidence,
 };
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore,
@@ -716,7 +717,7 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
         panic!("expected CoreDaemon lifecycle baseline page");
     };
     assert!(page.sessions.is_empty());
-    assert!(page.complete);
+    assert_eq!(page.stop, LifecycleBaselineStop::Complete);
 
     let error = api
         .handle_request(
@@ -784,7 +785,10 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
             .wait(std::time::Duration::from_secs(30))
             .expect("core bridge")
             .expect("observe spawned sessions");
-        if slice.complete || slice.resync_required.is_some() {
+        if matches!(
+            slice.stop,
+            ObserveLifecycleStop::Complete | ObserveLifecycleStop::Resync { .. }
+        ) {
             break;
         }
         resume = Some(ObserveLifecycleCursor {
@@ -809,7 +813,7 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
         panic!("expected a bounded lifecycle baseline page, got {response:?}");
     };
     assert!(
-        !first_page.complete || first_page.sessions.len() < 33,
+        first_page.stop != LifecycleBaselineStop::Complete || first_page.sessions.len() < 33,
         "local API must not present one page as the complete 33-row baseline"
     );
     assert!(first_page.sessions.len() <= 32);
@@ -822,7 +826,7 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
     let mut snapshot = Some(first_page.snapshot_sequence.clone());
     let mut after = first_page.next.clone();
     let mut rows = first_page.sessions.clone();
-    let mut complete = first_page.complete;
+    let mut complete = first_page.stop == LifecycleBaselineStop::Complete;
     for _ in 0..8 {
         if complete {
             break;
@@ -833,7 +837,7 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
             .expect("core bridge")
             .expect("continue baseline pages");
         rows.extend(page.sessions);
-        complete = page.complete;
+        complete = page.stop == LifecycleBaselineStop::Complete;
         snapshot = Some(page.snapshot_sequence);
         after = page.next;
     }
