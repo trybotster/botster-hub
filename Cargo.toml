@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/rtc-0.21.0-rc.1"]
+exclude = ["vendor/rtc-0.21.0-rc.1", "vendor/rtc-sctp-0.21.0-rc.1"]
 members = [
   ".",
   "crates/botster-hub-client",
@@ -92,9 +92,11 @@ loom = "0.7.2"
 [patch."https://github.com/trybotster/botster-hub.git"]
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 
-# Hub runtime builds use the ordered channel close fix documented in this directory.
+# Hub runtime builds use the local rtc and rtc-sctp repairs documented in
+# vendor/README.md.
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
+rtc-sctp = { path = "vendor/rtc-sctp-0.21.0-rc.1" }
 
 # The lifecycle harness verifies the candidate manifest (SHA-256 of the
 # ~110 MB Hub binary) on every IsolatedHub start. Unoptimized sha2 takes
