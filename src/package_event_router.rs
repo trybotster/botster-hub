@@ -491,7 +491,13 @@ struct RouterInner {
     subscription_events_by_plugin: HashMap<String, HashMap<(String, String), usize>>,
     producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
+    /// Consumers with queued copies that no engine refusal has parked; the
+    /// only consumers a pull visits.
     ready_consumers: BTreeSet<String>,
+    /// Consumers whose admission Core refused (`Backpressured`, `LockBusy`).
+    /// They keep their copies but leave the ready set until the owner sees a
+    /// plugin-engine release, so one refused plugin never blocks another.
+    engine_parked: BTreeSet<String>,
     last_ready_consumer: Option<String>,
     #[cfg(test)]
     ready_key_visits: usize,
@@ -677,6 +683,7 @@ impl PackageEventRouter {
                     producer,
                     consumers: HashMap::new(),
                     ready_consumers: BTreeSet::new(),
+                    engine_parked: BTreeSet::new(),
                     last_ready_consumer: None,
                     #[cfg(test)]
                     ready_key_visits: 0,
@@ -1410,7 +1417,7 @@ impl PackageEventRouter {
                     if let Some(queue) = inner.consumers.get_mut(&plugin_key)
                         && queue.copies.is_empty()
                     {
-                        inner.ready_consumers.insert(plugin_key.clone());
+                        inner.mark_ready(&plugin_key);
                     }
                     if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
                         queue.events += 1;
@@ -1455,7 +1462,9 @@ impl PackageEventRouter {
                 });
             }
         }
-        if !ready.is_empty() || !inner.queued_by_producer.is_empty() {
+        // More to pull only while a consumer is still ready: a consumer an
+        // engine refusal parked must not wake the slice that parked it.
+        if !ready.is_empty() || !inner.ready_consumers.is_empty() {
             drop(inner);
             self.raise_delivery();
         }
@@ -1518,6 +1527,46 @@ impl PackageEventRouter {
         &self,
         delivery: ReadyDelivery,
     ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        self.requeue(delivery, false)
+    }
+
+    /// Requeue a copy whose admission Core refused, and park its consumer
+    /// until `unpark_engine_consumers`. Raises nothing: the refused attempt
+    /// must not wake its own slice.
+    pub(crate) fn requeue_engine_refused(
+        &self,
+        delivery: ReadyDelivery,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
+        self.requeue(delivery, true)
+    }
+
+    /// Return every engine-parked consumer to the ready set, raising the
+    /// delivery key when one of them has copies.
+    pub(crate) fn unpark_engine_consumers(&self) -> Result<(), EventPlaneStatus> {
+        let mut inner = lock_inner(&self.inner)?;
+        let mut ready = false;
+        for plugin_key in std::mem::take(&mut inner.engine_parked) {
+            if inner
+                .consumers
+                .get(&plugin_key)
+                .is_some_and(|queue| !queue.copies.is_empty())
+            {
+                inner.ready_consumers.insert(plugin_key);
+                ready = true;
+            }
+        }
+        drop(inner);
+        if ready {
+            self.raise_delivery();
+        }
+        Ok(())
+    }
+
+    fn requeue(
+        &self,
+        delivery: ReadyDelivery,
+        engine_refused: bool,
+    ) -> Result<(), (Box<ReadyDelivery>, EventPlaneStatus)> {
         let mut inner = match lock_inner(&self.inner) {
             Ok(inner) => inner,
             Err(status) => return Err((Box::new(delivery), status)),
@@ -1553,12 +1602,17 @@ impl PackageEventRouter {
             envelope_id: delivery.envelope_id,
             holder: delivery.holder,
         });
-        if was_empty {
-            inner.ready_consumers.insert(plugin_key.clone());
+        if engine_refused {
+            inner.ready_consumers.remove(&plugin_key);
+            inner.engine_parked.insert(plugin_key.clone());
+        } else if was_empty {
+            inner.mark_ready(&plugin_key);
         }
         update_consumer_age(&mut inner, &plugin_key, &self.counters);
         drop(inner);
-        self.raise_delivery();
+        if !engine_refused {
+            self.raise_delivery();
+        }
         Ok(())
     }
 
@@ -1750,6 +1804,14 @@ impl RouterInner {
         // Delivery readiness also depends on the absence of empty buckets.
         if consumers.is_empty() {
             self.queued_by_producer.remove(&holder.owner);
+        }
+    }
+
+    /// A consumer with queued copies becomes ready unless an engine refusal
+    /// parked it.
+    fn mark_ready(&mut self, plugin_key: &str) {
+        if !self.engine_parked.contains(plugin_key) {
+            self.ready_consumers.insert(plugin_key.to_string());
         }
     }
 
@@ -2877,6 +2939,8 @@ fn enqueue_consumer_copy(
             .insert(subscription.plugin_key.clone(), ConsumerQueue::default());
     }
     inner.note_queued_copy(&subscription);
+    let plugin_key = subscription.plugin_key.clone();
+    let became_ready;
     let (front_id, count, bytes, cell, gate) = {
         let consumer = inner
             .consumers
@@ -2884,11 +2948,7 @@ fn enqueue_consumer_copy(
             .expect("consumer queue exists");
         consumer.events += 1;
         consumer.bytes += size;
-        if consumer.copies.is_empty() {
-            inner
-                .ready_consumers
-                .insert(subscription.plugin_key.clone());
-        }
+        became_ready = consumer.copies.is_empty();
         consumer.copies.push_back(QueuedCopy {
             envelope_id,
             holder: subscription,
@@ -2905,6 +2965,9 @@ fn enqueue_consumer_copy(
                 .unwrap_or(0),
         )
     };
+    if became_ready {
+        inner.mark_ready(&plugin_key);
+    }
     let oldest = front_id
         .and_then(|envelope_id| inner.live_envelope(envelope_id))
         .map(|envelope| counters.nanos_of(envelope.enqueued_at))

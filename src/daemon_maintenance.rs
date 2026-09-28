@@ -518,6 +518,12 @@ pub struct MaintenanceState {
     /// Slices parked on a cross-thread signal. The owner marks a slice ready
     /// when its key's epoch moves past the value it read before its attempt.
     pub(crate) signal_waits: BTreeMap<MaintenanceSliceKind, crate::daemon::owner_signal::Seen>,
+    /// The plugin-engine epoch read before the oldest admission that parked a
+    /// consumer in the router. Once it moves, the parked consumers return.
+    engine_parked_seen: Option<crate::daemon::owner_signal::Seen>,
+    /// The engine moved since a consumer parked: the next delivery run
+    /// returns every parked consumer to the router's ready set.
+    engine_unpark_due: bool,
     pub projection: SessionProjection,
     pub pending_changes: VecDeque<SessionLifecycleChange>,
     pub baseline: Option<BaselineRecovery>,
@@ -702,6 +708,13 @@ impl MaintenanceState {
         &mut self,
         signal: &crate::daemon::owner_signal::OwnerSignal,
     ) {
+        if let Some(seen) = self.engine_parked_seen
+            && signal.moved(seen)
+        {
+            self.engine_parked_seen = None;
+            self.engine_unpark_due = true;
+            self.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+        }
         let wakes = &mut self.wakes;
         self.signal_waits.retain(|kind, seen| {
             let moved = signal.moved(*seen);
@@ -1415,12 +1428,14 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     // site marks every slice; readiness is the epoch, not the mark. A router
     // wait blocks retirements and pulls, which both need the router; a wait
     // for new events blocks only the pull, so a queued retirement still runs.
+    // An engine release that unparks consumers is work too, unless the
+    // router lock itself is the wait.
     if let Some(seen) = state
         .signal_waits
         .get(&MaintenanceSliceKind::PackageEventDelivery)
         && !runtime.owner_signal().moved(*seen)
         && (seen.key() == crate::daemon::owner_signal::SignalKey::EventRouter
-            || state.pending_retirements.is_empty())
+            || (state.pending_retirements.is_empty() && !state.engine_unpark_due))
     {
         return;
     }
@@ -1449,7 +1464,11 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     #[cfg(test)]
     run_delivery_test_hook(DeliveryTestPoint::AfterSeen, runtime);
     let router = runtime.package_event_router();
+    let unpark = state.engine_unpark_due;
     let pull = || {
+        if unpark {
+            router.unpark_engine_consumers()?;
+        }
         router.pull_ready_batch(
             EVENT_DELIVERY_MAX_ITEMS,
             EVENT_DELIVERY_MAX_BYTES,
@@ -1478,6 +1497,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             }
         }
     };
+    state.engine_unpark_due = false;
     if batch.is_empty() {
         #[cfg(test)]
         run_delivery_test_hook(DeliveryTestPoint::AfterEmptyPull, runtime);
@@ -1493,8 +1513,6 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         .seen(crate::daemon::owner_signal::SignalKey::PluginEngine);
     #[cfg(test)]
     run_delivery_test_hook(DeliveryTestPoint::AfterEngineSeen, runtime);
-    let batch_len = batch.len();
-    let mut engine_refused = 0;
     for delivery in batch {
         let request_id = package_event_request_id(&delivery);
         // Only the consumer generation the delivery matched may handle it.
@@ -1603,8 +1621,14 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 });
                 #[cfg(test)]
                 run_delivery_test_hook(DeliveryTestPoint::AfterEngineRefusal, runtime);
-                match runtime.package_event_router().requeue_delivery(delivery) {
-                    Ok(()) => engine_refused += 1,
+                // Park only this consumer: other plugins keep delivering.
+                match runtime
+                    .package_event_router()
+                    .requeue_engine_refused(delivery)
+                {
+                    Ok(()) => {
+                        state.engine_parked_seen.get_or_insert(engine_seen);
+                    }
                     Err((delivery, _)) => {
                         let mut flight = event_flight(&delivery, None, request_id.0);
                         if !retire_event_holder(runtime, &mut flight) {
@@ -1629,13 +1653,6 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 }
             }
         }
-    }
-    // A batch the engine refused whole parks until an engine release.
-    if engine_refused == batch_len {
-        state
-            .signal_waits
-            .insert(MaintenanceSliceKind::PackageEventDelivery, engine_seen);
-        return;
     }
     // The batch made progress, so the slice runs again; an empty pull parks it.
     if !state.event_causal_blocked && !state.event_causal_faulted {
@@ -4294,6 +4311,7 @@ return botster.register({})
         runtime
             .owner_signal()
             .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        state.mark_signaled_waits(runtime.owner_signal());
         run_package_event_delivery_slice(&runtime, &mut state);
         let new_scope = resumed + 1;
         assert_eq!(scopes.lease_count(old_scope), Some(1));
@@ -4363,6 +4381,7 @@ return botster.register({})
         runtime
             .owner_signal()
             .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        state.mark_signaled_waits(runtime.owner_signal());
         run_package_event_delivery_slice(&runtime, &mut state);
         let after = runtime.package_event_router().snapshot().expect("after");
         assert_eq!(
@@ -4386,46 +4405,61 @@ return botster.register({})
         (runtime, state, data_directory)
     }
 
-    /// Both engine refusals requeue the copy and park the slice on
-    /// `PluginEngine`: no owner wake, no pull, until an engine release.
+    fn consumer_events(runtime: &HubRuntime, plugin_key: &str) -> usize {
+        let snapshot = runtime.package_event_router().snapshot().unwrap();
+        snapshot
+            .consumer_events
+            .get(plugin_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn engine_epoch(runtime: &HubRuntime) -> crate::daemon::owner_signal::Seen {
+        runtime
+            .owner_signal()
+            .seen(crate::daemon::owner_signal::SignalKey::PluginEngine)
+    }
+
+    /// Both engine refusals requeue the copy and park its consumer, not the
+    /// slice: the slice runs once more, finds nothing ready, and waits on new
+    /// events. Only an engine release returns the consumer.
     #[test]
-    fn an_engine_refused_batch_parks_until_an_engine_release() {
+    fn an_engine_refused_consumer_parks_until_an_engine_release() {
         use crate::runtime::ForcedAdmission;
         for forced in [ForcedAdmission::Backpressured, ForcedAdmission::LockBusy] {
             let (runtime, mut state, data_directory) =
                 engine_refused_delivery("engine-park", forced);
             run_package_event_delivery_slice(&runtime, &mut state);
-            let snapshot = runtime.package_event_router().snapshot().unwrap();
             assert_eq!(
-                snapshot.queued_holders, 1,
+                consumer_events(&runtime, "consumer"),
+                1,
                 "{forced:?} requeues the copy; retiring it makes this 0"
             );
             assert!(state.event_in_flight.is_empty());
+            // The refusal raised nothing; the batch's own progress mark runs
+            // the slice once more, and that pull finds no ready consumer.
+            state.wakes = MaintenanceWakes(0);
+            run_package_event_delivery_slice(&runtime, &mut state);
             state.mark_signaled_waits(runtime.owner_signal());
             assert!(
                 !state.wakes.has_any(),
                 "{forced:?} parks with no owner wake: {state:?}"
             );
-            // A blanket mark while parked must not admit: readiness is the
-            // engine epoch, not the mark.
+            // A blanket mark must not admit: the consumer waits for the engine.
             runtime.set_test_forced_admission(None);
             run_package_event_delivery_slice(&runtime, &mut state);
-            assert!(state.event_in_flight.is_empty(), "the parked slice waits");
+            assert_eq!(consumer_events(&runtime, "consumer"), 1, "still parked");
             runtime
                 .owner_signal()
                 .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
             state.mark_signaled_waits(runtime.owner_signal());
             assert!(
                 state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
-                "the engine release wakes the parked slice"
+                "the engine release wakes the slice"
             );
             run_package_event_delivery_slice(&runtime, &mut state);
             assert_eq!(
-                runtime
-                    .package_event_router()
-                    .snapshot()
-                    .unwrap()
-                    .queued_holders,
+                consumer_events(&runtime, "consumer"),
                 0,
                 "the woken slice takes the requeued copy"
             );
@@ -4436,7 +4470,7 @@ return botster.register({})
 
     /// Core arms its retry wake inside the refused admission, so a release can
     /// land after the slice read the epoch and before its attempt, or after
-    /// the refusal and before the slice parks. Neither is lost.
+    /// the refusal and before the slice records it. Neither is lost.
     #[test]
     fn an_engine_release_during_a_refused_batch_wakes_the_slice() {
         for point in [
@@ -4453,22 +4487,89 @@ return botster.register({})
                     .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
             });
             run_package_event_delivery_slice(&runtime, &mut state);
-            assert_eq!(
-                runtime
-                    .package_event_router()
-                    .snapshot()
-                    .unwrap()
-                    .queued_holders,
-                1
-            );
+            assert_eq!(consumer_events(&runtime, "consumer"), 1);
+            state.wakes = MaintenanceWakes(0);
             state.mark_signaled_waits(runtime.owner_signal());
             assert!(
                 state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
                 "{point:?}: the release wakes the slice with no other wake"
             );
+            runtime.set_test_forced_admission(None);
+            run_package_event_delivery_slice(&runtime, &mut state);
+            assert_eq!(
+                consumer_events(&runtime, "consumer"),
+                0,
+                "{point:?}: the release returned the parked consumer"
+            );
             drop(runtime);
             let _ = std::fs::remove_dir_all(data_directory);
         }
+    }
+
+    /// Plugin A stays refused. An event that arrives later for plugin B is
+    /// delivered on the ingress signal alone, before any engine release.
+    #[test]
+    fn a_refused_plugin_does_not_block_a_later_event_for_another() {
+        let (runtime, data_directory) = event_delivery_runtime("engine-hol-later");
+        subscribe_worktree_consumer(&runtime, "a");
+        runtime.insert_test_event_handler("a", "worktree_created");
+        runtime.set_test_forced_admission_for("a", crate::runtime::ForcedAdmission::Backpressured);
+        let engine = engine_epoch(&runtime);
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        ingress_worktree_created(&runtime);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        state.wakes = MaintenanceWakes(0);
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(!state.wakes.has_any(), "A is parked and the slice waits");
+        subscribe_worktree_consumer(&runtime, "b");
+        runtime.insert_test_event_handler("b", "worktree_created");
+        ingress_worktree_created(&runtime);
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
+            "B's event wakes the slice"
+        );
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(consumer_events(&runtime, "b"), 0, "B's copy is taken");
+        assert_eq!(consumer_events(&runtime, "a"), 2, "A stays parked");
+        assert!(!runtime.owner_signal().moved(engine), "no engine release");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// A full batch of refused copies for A does not hide B's copies queued
+    /// behind them.
+    #[test]
+    fn a_refused_batch_does_not_hide_another_plugin() {
+        let (runtime, data_directory) = event_delivery_runtime("engine-hol-batch");
+        for plugin_key in ["a", "b"] {
+            subscribe_worktree_consumer(&runtime, plugin_key);
+            runtime.insert_test_event_handler(plugin_key, "worktree_created");
+        }
+        runtime.set_test_forced_admission_for("a", crate::runtime::ForcedAdmission::Backpressured);
+        let engine = engine_epoch(&runtime);
+        let events = EVENT_DELIVERY_MAX_ITEMS + 1;
+        for _ in 0..events {
+            ingress_worktree_created(&runtime);
+        }
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(
+            consumer_events(&runtime, "b"),
+            events,
+            "the first batch holds only A's refused copies"
+        );
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(
+            consumer_events(&runtime, "b") < events,
+            "B's copies are pulled while A is parked"
+        );
+        assert_eq!(consumer_events(&runtime, "a"), events);
+        assert!(!runtime.owner_signal().moved(engine), "no engine release");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     /// Core's engine notifier (published completions and every C2 release
