@@ -4459,6 +4459,40 @@ impl HubRuntime {
         drop(old_session);
     }
 
+    /// Retire the context of a session that Core has removed. Both aliases
+    /// (the session id and its context id) go, but only when they hold this
+    /// session's own context: the two share one key space.
+    pub(crate) fn retire_removed_session_context(&self, session_id: &str) {
+        let Ok(mut contexts) = self.session_contexts.lock() else {
+            return;
+        };
+        let Some(entry) = contexts
+            .get(session_id)
+            .filter(|stored| stored.context.session_id.0 == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        let old_session = contexts.remove(session_id);
+        let old_context = if contexts
+            .get(&entry.context.context_id)
+            .is_some_and(|stored| Arc::ptr_eq(stored, &entry))
+        {
+            contexts.remove(&entry.context.context_id)
+        } else {
+            None
+        };
+        if contexts.is_empty() {
+            // Rust 1.97 can retain an empty BTreeMap leaf root after removal.
+            // Destroy that root before either removed entry releases its charge.
+            drop(std::mem::take(&mut *contexts));
+        }
+        drop(contexts);
+        drop(old_context);
+        drop(old_session);
+        drop(entry);
+    }
+
     fn spawn_context_matches(
         &self,
         session_id: &str,

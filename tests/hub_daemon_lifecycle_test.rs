@@ -96,3 +96,4 @@ include!("hub_daemon_lifecycle/sessions_read.rs");
 include!("hub_daemon_lifecycle/harness_isolation.rs");
 include!("hub_daemon_lifecycle/unix_route_smokes.rs");
 include!("hub_daemon_lifecycle/coordination.rs");
+include!("hub_daemon_lifecycle/restart_session.rs");
