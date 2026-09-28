@@ -633,6 +633,35 @@ fn event_flight(
 }
 
 impl MaintenanceState {
+    /// One durable restart record was set or removed for `session_id`. When
+    /// that flips the projected row's `restartable` flag, send the row on the
+    /// same delta and delivery path as a journal change.
+    pub(crate) fn restart_record_changed(&mut self, session_id: &str, present: bool) {
+        if !self.projection.restart_record_changed(session_id, present) {
+            return;
+        }
+        self.queue_restartable_flip(session_id);
+    }
+
+    fn queue_restartable_flip(&mut self, session_id: &str) {
+        let Some(row) = self.projection.rows.get(session_id) else {
+            return;
+        };
+        let frame = serde_json::json!({
+            "type": "entity_upsert",
+            "family": "/session",
+            "snapshot_sequence": self.projection.cursor.as_ref().map_or(0, |cursor| cursor.sequence),
+            "id": session_id,
+            "entity": SessionProjection::project_row(row),
+        });
+        // A baseline in progress delivers the row when it seals.
+        if self.projection.baseline_complete {
+            queue_family_frame(self, frame);
+        }
+        self.projection_dirty = true;
+        self.wakes.mark(MaintenanceSliceKind::SubscriberDelivery);
+    }
+
     /// Queue one family delta for fanout the way a session change does.
     #[cfg(test)]
     pub(crate) fn test_queue_family_delta(&mut self, frame: serde_json::Value) {
@@ -1227,6 +1256,18 @@ fn run_baseline_slice(
                 recovery.snapshot = Some(snapshot.clone());
                 recovery.after = page.next.clone();
             }
+            // The durable record set is read now, so a record committed during
+            // the baseline is derived into the rows as they are ingested.
+            state.projection.sync_restart_ids(
+                runtime
+                    .state_publication()
+                    .snapshot()
+                    .1
+                    .restart_records
+                    .keys()
+                    .cloned()
+                    .collect(),
+            );
             state
                 .projection
                 .ingest_baseline_rows(snapshot.sequence, page.sessions);
@@ -2276,8 +2317,7 @@ fn next_projection_chunk(
         None => Bound::Unbounded,
     };
     for (id, row) in projection.rows.range::<str, _>((start, Bound::Unbounded)) {
-        let item =
-            serde_json::to_value(SessionProjection::project_entity(&row.record)).map_err(|_| ())?;
+        let item = serde_json::to_value(SessionProjection::project_row(row)).map_err(|_| ())?;
         packed.push(item);
         match pack_session_chunk(&packed, 0) {
             Ok((chunk, next)) if next == packed.len() => {
@@ -2309,12 +2349,16 @@ fn next_projection_chunk(
 fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleChange) {
     let frame = match &change.kind {
         botster_core_daemon::SessionLifecycleChangeKind::Upsert { record } => {
-            let entity = SessionProjection::project_entity(record);
+            let id = &record.session.session_id.0;
+            let entity = match state.projection.rows.get(id) {
+                Some(row) => SessionProjection::project_row(row),
+                None => SessionProjection::project_entity(record),
+            };
             serde_json::json!({
                 "type": "entity_upsert",
                 "family": "/session",
                 "snapshot_sequence": change.cursor.sequence,
-                "id": record.session.session_id.0,
+                "id": id,
                 "entity": entity,
             })
         }
@@ -2328,6 +2372,10 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         }
         _ => return,
     };
+    queue_family_frame(state, frame);
+}
+
+fn queue_family_frame(state: &mut MaintenanceState, frame: serde_json::Value) {
     let bytes = serde_json::to_vec(&frame)
         .map(|body| body.len())
         .unwrap_or(0);
@@ -2721,6 +2769,56 @@ mod tests {
         assert!(!wakes.take(MaintenanceSliceKind::Baseline));
         assert!(wakes.take(MaintenanceSliceKind::JournalPull));
         assert!(!wakes.has_any());
+    }
+
+    #[test]
+    fn a_restart_record_commit_queues_one_restartable_delta_only_on_a_flip() {
+        let mut ended = test_record("gone");
+        ended.session.registry_state = botster_core_daemon::RegistrySessionState::Exited;
+        ended.lifecycle = Some(botster_core::SessionLifecycleState::Exited { code: Some(0) });
+        let cursor = botster_core_daemon::SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 4,
+        };
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(cursor, vec![ended]);
+        let mut state = MaintenanceState {
+            projection,
+            ..MaintenanceState::default()
+        };
+        state.session_family.begin_snapshot("plugin.a", 4);
+        {
+            let consumer = state
+                .session_family
+                .consumers
+                .get_mut("plugin.a")
+                .expect("consumer");
+            consumer.snapshot_complete = true;
+            consumer.need_snapshot_chunks = false;
+            consumer.pending.clear();
+        }
+        let pending = |state: &MaintenanceState| state.session_family.pending_fanout.len();
+        state.restart_record_changed("unknown", true);
+        assert_eq!(pending(&state), 0, "no row means no delta");
+        state.restart_record_changed("gone", true);
+        assert_eq!(pending(&state), 1);
+        let job = state.session_family.pending_fanout.front().expect("job");
+        assert_eq!(job.frame["type"], "entity_upsert");
+        assert_eq!(job.frame["id"], "gone");
+        assert_eq!(job.frame["entity"]["restartable"], true);
+        state.restart_record_changed("gone", true);
+        assert_eq!(pending(&state), 1, "no flip, no second delta");
+        state.restart_record_changed("gone", false);
+        assert_eq!(pending(&state), 2);
+        assert_eq!(
+            state
+                .session_family
+                .pending_fanout
+                .back()
+                .expect("job")
+                .frame["entity"]["restartable"],
+            false
+        );
     }
 
     #[test]
@@ -3183,6 +3281,7 @@ mod tests {
                 lifecycle_class: "current",
                 live_ended: false,
                 change_seq: 12,
+                restartable: false,
             },
         );
         assert!(state.projection_caught_up());
@@ -3229,6 +3328,7 @@ mod tests {
                 lifecycle_class: "current",
                 live_ended: false,
                 change_seq: 12,
+                restartable: false,
             },
         );
         retire_projected_spawn_acks(&runtime, &mut state);
@@ -3379,6 +3479,7 @@ mod tests {
                 lifecycle_class: "current",
                 live_ended: false,
                 change_seq: 0,
+                restartable: false,
             },
         );
         handle_resync_reason(
@@ -3516,6 +3617,7 @@ mod tests {
                     lifecycle_class: "current",
                     live_ended: false,
                     change_seq: 0,
+                    restartable: false,
                 },
             );
             state
