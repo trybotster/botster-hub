@@ -496,6 +496,12 @@ pub struct SessionTypeError {
     pub message: String,
 }
 
+fn credential_unavailable(
+    error: crate::session_credential::CredentialUnavailable,
+) -> SessionTypeError {
+    SessionTypeError::new("credential_unavailable", error.to_string())
+}
+
 impl SessionTypeError {
     pub(crate) fn new(kind: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -2025,6 +2031,7 @@ fn materialize_ordinary_charged(
         initial_rows: config.initial_rows,
         initial_cols: config.initial_cols,
         inherited_names: &config.inherited_names,
+        entropy: crate::session_credential::os_entropy,
     })
     .map_err(ChargedMaterializationFailure::Capacity);
     drop(sources);
@@ -2178,7 +2185,7 @@ fn materialize_session_type_from_resolved(
     inject_context_environment(config, &mut environment, &session_id, Some(&context_id));
 
     let row = effective_row;
-    let metadata = session_type_metadata(&row);
+    let mut metadata = session_type_metadata(&row);
     let (executable, arguments) = resolve_execution(config, &command_root, session_type);
     let resolved = ResolvedSessionType {
         session_type: row,
@@ -2190,7 +2197,7 @@ fn materialize_session_type_from_resolved(
         context_id: context_id.clone(),
         context_keys: context.values.keys().cloned().collect(),
     };
-    let spawn_request = SessionSpawnRequest {
+    let mut spawn_request = SessionSpawnRequest {
         request_id: RequestId(format!("session-type-{context_id}")),
         session_id,
         executable: resolved.executable.clone(),
@@ -2205,6 +2212,12 @@ fn materialize_session_type_from_resolved(
         }),
     };
 
+    crate::session_credential::issue(
+        &mut spawn_request,
+        &mut metadata,
+        crate::session_credential::os_entropy,
+    )
+    .map_err(credential_unavailable)?;
     Ok(MaterializedSessionType {
         resolved,
         spawn_request,
@@ -2311,7 +2324,7 @@ pub(crate) fn materialize_managed_session_type(
         &source.root
     };
     let row = effective_row;
-    let metadata = session_type_metadata(&row);
+    let mut metadata = session_type_metadata(&row);
     let (executable, arguments) =
         resolve_execution(materialization_config, command_root, &source.session_type);
     let resolved = ResolvedSessionType {
@@ -2324,7 +2337,7 @@ pub(crate) fn materialize_managed_session_type(
         context_id: context_id.clone(),
         context_keys: context.values.keys().cloned().collect(),
     };
-    let spawn_request = SessionSpawnRequest {
+    let mut spawn_request = SessionSpawnRequest {
         request_id: RequestId(format!("managed-session-type-{context_id}")),
         session_id,
         executable: resolved.executable.clone(),
@@ -2338,6 +2351,12 @@ pub(crate) fn materialize_managed_session_type(
             cols: config.session_defaults.initial_cols,
         }),
     };
+    crate::session_credential::issue(
+        &mut spawn_request,
+        &mut metadata,
+        crate::session_credential::os_entropy,
+    )
+    .map_err(credential_unavailable)?;
     Ok(MaterializedSessionType {
         resolved,
         spawn_request,
@@ -3654,6 +3673,8 @@ struct FinalMaterializationInputs<'a> {
     initial_cols: u16,
     /// Inherited names to unset. Production passes the daemon's snapshot.
     inherited_names: &'a [String],
+    /// Source of the caller credential's secret. Production passes the OS.
+    entropy: crate::session_credential::Entropy,
 }
 
 fn charged_final_materialization(
@@ -3673,6 +3694,7 @@ fn charged_final_materialization(
         initial_rows,
         initial_cols,
         inherited_names,
+        entropy,
     } = inputs;
     let mut cwd_count = CountFormattedBytes(0);
     std::fmt::write(
@@ -3706,6 +3728,9 @@ fn charged_final_materialization(
         .len()
         .checked_mul(std::mem::size_of::<SpawnEnvironmentVariable>())
         .ok_or("output environment vector overflow")?;
+    let credential_bytes =
+        charged_credential_bytes(&prefix.session_id.0, metadata.value.entries.len())
+            .ok_or("output credential size overflow")?;
     let context_key_bytes = context
         .value
         .values
@@ -3735,6 +3760,7 @@ fn charged_final_materialization(
         .and_then(|bytes| bytes.checked_add(environment_nodes))
         .and_then(|bytes| bytes.checked_add(environment_slots))
         .and_then(|bytes| bytes.checked_add(unset_bytes))
+        .and_then(|bytes| bytes.checked_add(credential_bytes))
         .and_then(|bytes| bytes.checked_add(context_key_bytes))
         .and_then(|bytes| bytes.checked_add(context_key_slots))
         .ok_or("output copy size overflow")?;
@@ -3756,7 +3782,7 @@ fn charged_final_materialization(
         _storage: execution_storage,
     } = execution;
     let ChargedSessionTypeMetadata {
-        value: metadata,
+        value: mut metadata,
         _storage: metadata_storage,
     } = metadata;
     let ChargedSessionTypeContext {
@@ -3782,13 +3808,15 @@ fn charged_final_materialization(
     let mut request_id = String::with_capacity(request_id_bytes);
     request_id.push_str("session-type-");
     request_id.push_str(&context_id);
-    let mut variables = Vec::with_capacity(environment.len());
+    // One more slot than the environment: the caller credential's token,
+    // counted in charged_credential_bytes.
+    let mut variables = Vec::with_capacity(environment.len() + 1);
     variables.extend(
         environment
             .into_iter()
             .map(|(name, value)| SpawnEnvironmentVariable { name, value }),
     );
-    let spawn_request = SessionSpawnRequest {
+    let mut spawn_request = SessionSpawnRequest {
         request_id: RequestId(request_id),
         session_id,
         executable: resolved.executable.clone(),
@@ -3805,6 +3833,9 @@ fn charged_final_materialization(
             cols: initial_cols,
         }),
     };
+    // Admitted by the grow above; issued before any reservation exists.
+    crate::session_credential::issue(&mut spawn_request, &mut metadata, entropy)
+        .map_err(|_| "credential entropy unavailable")?;
     let output_copies = parent
         .split_fixed(copy_bytes)
         .expect("the parent admitted the output copies");
@@ -4411,6 +4442,19 @@ fn charged_unset_bytes(names: &[String]) -> Option<usize> {
         .iter()
         .try_fold(0usize, |bytes, name| bytes.checked_add(name.len()))?
         .checked_add(names.len().checked_mul(std::mem::size_of::<String>())?)
+}
+
+/// Retained bytes the caller credential adds to a charged spawn: its strings,
+/// the token's environment slot, and the metadata map's growth by one entry.
+fn charged_credential_bytes(session_id: &str, metadata_entries: usize) -> Option<usize> {
+    let grown = crate::lua_memory::layout::btree_nodes_checked::<String, String>(
+        metadata_entries.checked_add(1)?,
+    )?;
+    let current =
+        crate::lua_memory::layout::btree_nodes_checked::<String, String>(metadata_entries)?;
+    crate::session_credential::credential_string_bytes(session_id)?
+        .checked_add(std::mem::size_of::<SpawnEnvironmentVariable>())?
+        .checked_add(grown.checked_sub(current)?)
 }
 
 /// The admitted copy whose size `charged_unset_bytes` counted.
@@ -5310,7 +5354,13 @@ mod source_selection_tests {
                     let metadata =
                         charged_session_type_metadata(&mut parent, &ordinary.resolved.session_type)
                             .unwrap_or_else(|_| panic!("the charged metadata must fit"));
-                    assert_eq!(metadata.value, ordinary.metadata);
+                    // The ordinary spawn already carries its credential digest;
+                    // the charged path adds it later, in the final step.
+                    let mut ordinary_metadata = ordinary.metadata.clone();
+                    ordinary_metadata
+                        .entries
+                        .remove(crate::session_credential::TOKEN_DIGEST_METADATA_KEY);
+                    assert_eq!(metadata.value, ordinary_metadata);
                     let data_directory =
                         absolute_path(&config.data_directory).display().to_string();
                     let session_directory = absolute_path(&config.data_directory)
@@ -5392,6 +5442,7 @@ mod source_selection_tests {
     fn charged_final_fixture(
         per_callback_bytes: usize,
         inherited_names: &[String],
+        entropy: crate::session_credential::Entropy,
     ) -> (
         std::sync::Arc<LuaMemoryAccount>,
         MaterializedSessionType,
@@ -5483,6 +5534,7 @@ mod source_selection_tests {
             initial_rows: config.session_defaults.initial_rows,
             initial_cols: config.session_defaults.initial_cols,
             inherited_names,
+            entropy,
         });
         (memory, ordinary, charged)
     }
@@ -5490,8 +5542,15 @@ mod source_selection_tests {
     #[test]
     fn charged_final_output_matches_ordinary_and_releases_allowance() {
         let inherited = inherited_botster_names();
-        let (memory, ordinary, charged) = charged_final_fixture(64 * 1024, &inherited);
-        let (materialized, allowance) = charged.unwrap().into_parts();
+        let (memory, mut ordinary, charged) = charged_final_fixture(
+            64 * 1024,
+            &inherited,
+            crate::session_credential::test_entropy::fixed,
+        );
+        let (mut materialized, allowance) = charged.unwrap().into_parts();
+        // The two paths draw different secrets; each carries exactly one.
+        take_credential(&mut ordinary);
+        take_credential(&mut materialized);
         assert_eq!(materialized, ordinary);
         assert_eq!(materialized.spawn_request.environment.unset, inherited);
         assert_eq!(
@@ -5503,14 +5562,114 @@ mod source_selection_tests {
         assert_eq!(memory.usage().1, 0);
     }
 
+    /// Remove a materialization's caller credential after checking that it
+    /// has exactly one token variable and one digest. Never prints either.
+    fn take_credential(materialized: &mut MaterializedSessionType) {
+        let variables = &mut materialized.spawn_request.environment.variables;
+        let before = variables.len();
+        variables.retain(|variable| {
+            variable.name != crate::session_credential::SESSION_TOKEN_ENVIRONMENT
+        });
+        assert!(before - variables.len() == 1, "exactly one token variable");
+        assert!(
+            materialized
+                .metadata
+                .entries
+                .remove(crate::session_credential::TOKEN_DIGEST_METADATA_KEY)
+                .is_some(),
+            "one token digest"
+        );
+    }
+
+    #[test]
+    fn charged_credential_charge_matches_its_retained_bytes() {
+        let (memory, _, charged) = charged_final_fixture(
+            64 * 1024,
+            &[],
+            crate::session_credential::test_entropy::fixed,
+        );
+        let charged = charged.unwrap();
+        let spawn = &charged.materialized.spawn_request;
+        let token = spawn
+            .environment
+            .variables
+            .iter()
+            .find(|variable| variable.name == crate::session_credential::SESSION_TOKEN_ENVIRONMENT)
+            .expect("a token variable");
+        let metadata = &charged.materialized.metadata.entries;
+        let (key, digest) = metadata
+            .get_key_value(crate::session_credential::TOKEN_DIGEST_METADATA_KEY)
+            .expect("a token digest");
+        let entries_before = metadata.len() - 1;
+        let node_growth =
+            crate::lua_memory::layout::btree_nodes_checked::<String, String>(entries_before + 1)
+                .unwrap()
+                - crate::lua_memory::layout::btree_nodes_checked::<String, String>(entries_before)
+                    .unwrap();
+        let retained = token.name.capacity()
+            + token.value.capacity()
+            + key.capacity()
+            + digest.capacity()
+            + std::mem::size_of::<SpawnEnvironmentVariable>()
+            + node_growth;
+        assert_eq!(
+            charged_credential_bytes(&spawn.session_id.0, entries_before),
+            Some(retained)
+        );
+        // The token's slot was reserved with the environment, not grown into.
+        assert_eq!(
+            spawn.environment.variables.capacity(),
+            spawn.environment.variables.len()
+        );
+        drop(charged);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_spawn_refuses_unavailable_entropy_and_releases_its_charge() {
+        let (memory, _, refused) = charged_final_fixture(
+            64 * 1024,
+            &[],
+            crate::session_credential::test_entropy::failing,
+        );
+        assert_eq!(refused.err(), Some("credential entropy unavailable"));
+        assert_eq!(memory.usage().1, 0, "a refused credential leaves no charge");
+    }
+
+    #[test]
+    fn charged_spawn_one_byte_short_of_its_admitted_size_is_refused() {
+        let (memory, _, admitted) = charged_final_fixture(
+            64 * 1024,
+            &[],
+            crate::session_credential::test_entropy::fixed,
+        );
+        let admitted_bytes = memory.usage().1;
+        drop(admitted);
+        let (short_memory, _, refused) = charged_final_fixture(
+            admitted_bytes - 1,
+            &[],
+            crate::session_credential::test_entropy::fixed,
+        );
+        assert_eq!(refused.err(), Some("output copy capacity exhausted"));
+        assert_eq!(short_memory.usage().1, 0);
+    }
+
     #[test]
     fn charged_unset_copy_is_charged_at_its_retained_size() {
         let names = vec![
             "BOTSTER_SYNTHETIC_ONE".to_string(),
             "BOTSTER_SYNTHETIC_TWO_LONGER_NAME".to_string(),
         ];
-        let (without_memory, _, without) = charged_final_fixture(64 * 1024, &[]);
-        let (with_memory, _, with) = charged_final_fixture(64 * 1024, &names);
+        let (without_memory, _, without) = charged_final_fixture(
+            64 * 1024,
+            &[],
+            crate::session_credential::test_entropy::fixed,
+        );
+        let (with_memory, _, with) = charged_final_fixture(
+            64 * 1024,
+            &names,
+            crate::session_credential::test_entropy::fixed,
+        );
         let without = without.unwrap();
         let with = with.unwrap();
         let unset = &with.materialized.spawn_request.environment.unset;
@@ -5531,7 +5690,11 @@ mod source_selection_tests {
     fn charged_unset_names_beyond_the_allowance_are_refused_before_copying() {
         // One inherited name larger than the whole callback allowance.
         let names = vec![format!("BOTSTER_{}", "X".repeat(80 * 1024))];
-        let (memory, _, refused) = charged_final_fixture(64 * 1024, &names);
+        let (memory, _, refused) = charged_final_fixture(
+            64 * 1024,
+            &names,
+            crate::session_credential::test_entropy::fixed,
+        );
         assert_eq!(refused.err(), Some("output copy capacity exhausted"));
         assert_eq!(memory.usage().1, 0, "a refused copy leaves no charge");
     }
