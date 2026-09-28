@@ -2587,7 +2587,7 @@ pub(crate) fn spawn_request(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| ".".to_string()),
         },
-        environment: environment,
+        environment,
         initial_pty_size: Some(botster_core::ResizePayload {
             rows: runtime.config().session_defaults.initial_rows,
             cols: runtime.config().session_defaults.initial_cols,
