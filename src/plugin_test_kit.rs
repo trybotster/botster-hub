@@ -12,7 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub use botster_core::{EnvelopeTarget, RoutedEnvelope, SessionId, SessionLifecycleState};
+pub use botster_core::{
+    EnvelopeCursor, EnvelopeId, EnvelopeTarget, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
+    SessionId, SessionLifecycleState,
+};
+pub use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 pub use botster_core_daemon::{DaemonSession, RegistrySessionState, SessionLifecycleRecord};
 use botster_core_daemon::{
     SessionLifecycleBaselinePage, SessionLifecycleChange, SessionLifecycleChangeKind,
@@ -499,6 +503,44 @@ impl KitHub {
             .map_err(|error| KitError::Daemon(format!("{error:?}")))?
             .map_err(|error| KitError::Daemon(error.to_string()))?;
         Ok(outcome.envelopes)
+    }
+
+    /// Receive routed envelopes as a target does, through Core's own drain.
+    /// Envelopes stay queued until `ack_routed`, so a second read returns
+    /// them again (at-least-once delivery).
+    pub fn receive_routed(
+        &self,
+        target: EnvelopeTarget,
+        after: Option<EnvelopeCursor>,
+        limit: usize,
+    ) -> Result<RoutedEnvelopeDrainOutcome, KitError> {
+        let runtime = self
+            .daemon
+            .runtime()
+            .ok_or_else(|| KitError::Daemon("the daemon has no runtime".to_string()))?;
+        runtime
+            .drain_routed_envelopes(target, after, limit)
+            .wait(self.step_deadline)
+            .map_err(|error| KitError::Daemon(format!("{error:?}")))?
+            .map_err(|error| KitError::Daemon(error.to_string()))
+    }
+
+    /// Acknowledge one routed envelope as its target, through Core. An
+    /// acknowledged envelope leaves the queue.
+    pub fn ack_routed(
+        &self,
+        target: EnvelopeTarget,
+        envelope_id: EnvelopeId,
+    ) -> Result<RoutedEnvelopeDeliveryStateResult, KitError> {
+        let runtime = self
+            .daemon
+            .runtime()
+            .ok_or_else(|| KitError::Daemon("the daemon has no runtime".to_string()))?;
+        runtime
+            .acknowledge_routed_envelope(target, envelope_id)
+            .wait(self.step_deadline)
+            .map_err(|error| KitError::Daemon(format!("{error:?}")))?
+            .map_err(|error| KitError::Daemon(error.to_string()))
     }
 
     /// A tool call as a chosen caller. The Hub has no verified caller for
