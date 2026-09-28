@@ -252,22 +252,35 @@ def main():
         os.setpgid(0, 0)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
 
+    faults = install_test_faults()
     child = subprocess.Popen(["nice", "-n", "10", *command], env=env, preexec_fn=in_child)
     group = child.pid
-    with open(joblock, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        with open(pidfile, "a") as published:
-            published.write(f"{group}\n")
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
-
-    faults = install_test_faults()
+    # The reservation guard starts here: from now on the command may be alive,
+    # so no failure below may end this supervisor before the group is gone.
     try:
+        if "publish" in faults:
+            raise OSError(errno.EIO, "publishing the command group failed (test hook)")
+        with open(joblock, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with open(pidfile, "a") as published:
+                published.write(f"{group}\n")
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
         status, cancelled = supervise(child, group, grace, requested, wakeup_read, faults)
     except Exception as error:
         # Whatever failed, a supervisor exit releases the slot, so it happens
-        # only once the group is proved absent.
-        print(f"botsterq: supervisor error: {error!r}; holding the slot until group {group} is gone",
-              file=sys.stderr, flush=True)
+        # only once the group is proved absent. Cancel delivery must be live
+        # for the hold, and the diagnostic must not be able to skip it.
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
+        except BaseException:
+            pass
+        try:
+            if "diagnostic" in faults:
+                raise BrokenPipeError(errno.EPIPE, "diagnostic write failed (test hook)")
+            print(f"botsterq: supervisor error: {error!r}; holding the slot until group {group} is gone",
+                  file=sys.stderr, flush=True)
+        except BaseException:
+            pass
         status = hold_until_absent(child, group, grace, requested)
         if status is None:
             sys.exit(130)
