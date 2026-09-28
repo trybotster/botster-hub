@@ -8,7 +8,7 @@ export type JsonObject = { [key: string]: JsonValue };
 // Host-control protocol 12 constants. See botster-hub-client/src/lib.rs.
 export const PROTOCOL = "botster-hub-daemon-v1";
 export const PROTOCOL_VERSION = 12;
-export const CONFORMANCE_FIXTURE_REVISION = 52;
+export const CONFORMANCE_FIXTURE_REVISION = 53;
 export const MAX_REQUEST_ID_BYTES = 20;
 export const MAX_OUTSTANDING_REQUESTS = 32;
 export const MAX_CONTROL_REQUEST_BYTES = 1048576;
@@ -343,6 +343,7 @@ export interface DaemonPluginLogs {
   records: DaemonPluginLogRecord[];
   next_seq: number;
   first_available_seq: number;
+  log_id?: string;
 }
 
 export interface DaemonPluginLogRecord {
