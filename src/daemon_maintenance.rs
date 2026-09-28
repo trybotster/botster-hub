@@ -4225,7 +4225,7 @@ return botster.register({})
         subscribe_worktree_consumer(&runtime, "consumer");
         runtime.insert_test_event_handler("consumer", "worktree_created");
         ingress_worktree_created(&runtime);
-        runtime.set_test_plugin_admit_backpressure(true);
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
         let scopes = runtime.causal_scopes();
         for _ in 0..CAUSAL_OWNER_CAPACITY {
             assert_eq!(
@@ -4316,7 +4316,7 @@ return botster.register({})
         subscribe_worktree_consumer(&runtime, "consumer");
         runtime.insert_test_event_handler("consumer", "worktree_created");
         ingress_worktree_created(&runtime);
-        runtime.set_test_plugin_admit_backpressure(true);
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
         let mut state = MaintenanceState::default();
         run_package_event_delivery_slice(&runtime, &mut state);
         assert!(
@@ -4334,7 +4334,7 @@ return botster.register({})
             snapshot.global_in_flight_bytes > 0,
             "requeued occupancy must remain until a later slice admits or expires the copy"
         );
-        runtime.set_test_plugin_admit_backpressure(false);
+        runtime.set_test_forced_admission(None);
         run_package_event_delivery_slice(&runtime, &mut state);
         let after = runtime.package_event_router().snapshot().expect("after");
         assert_eq!(
@@ -4342,6 +4342,90 @@ return botster.register({})
             "a later slice must consume the requeued holder rather than lose it"
         );
         let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// `events.on` subscribes to exact event names, and the delivery slice
+    /// runs every matching handler on the plugin worker.
+    #[test]
+    fn events_on_matches_exact_names_and_runs_each_handler() {
+        let (registry, package_root) = install_lua_event_plugin(
+            "events-on-exact",
+            r#"
+local function received(event) return { received = event.event } end
+botster.events.on({ owner = "hub", name = "worktree_created" }, received)
+botster.events.on({ owner = "hub", name = "worktree_created" }, received)
+botster.events.on({ owner = "hub", name = "worktree_deleted" }, received)
+return botster.register({})
+"#,
+        );
+        let (mut runtime, data_directory) = event_delivery_runtime("events-on-exact");
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        runtime.install_plugin_completion_notifier(std::sync::Arc::new(move || {
+            let _ = published_tx.send(());
+        }));
+        let mut state = MaintenanceState::default();
+        let mut deliver = |name: &str, payload: serde_json::Value| {
+            assert_eq!(
+                runtime
+                    .package_event_router()
+                    .try_ingress("hub", name, &payload, Instant::now())
+                    .as_str(),
+                "accepted"
+            );
+            let before = state.event_in_flight.len();
+            run_package_event_delivery_slice(&runtime, &mut state);
+            let admitted = state.event_in_flight.len() - before;
+            let mut handlers = Vec::new();
+            while handlers.len() < admitted {
+                // timer: deadline — the shared test hang guard; Lua answers at once
+                published_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the worker publishes each handler's completion");
+                let drain = runtime.drain_plugin_completions(usize::MAX, usize::MAX);
+                handlers.extend(drain.completions.into_iter().map(|item| {
+                    let botster_core::PluginInvocationResult::Completed(success) =
+                        item.completion.result
+                    else {
+                        panic!("the handler completes: {:?}", item.completion.result);
+                    };
+                    success.handler.handler_id
+                }));
+            }
+            handlers.sort();
+            handlers
+        };
+        let created = deliver(
+            "worktree_created",
+            serde_json::json!({ "event": "worktree_created", "worktree_id": "wt_1" }),
+        );
+        assert_eq!(
+            created,
+            [
+                "event:hub:worktree_created:1",
+                "event:hub:worktree_created:2"
+            ],
+            "both worktree_created handlers run"
+        );
+        let deleted = deliver(
+            "worktree_deleted",
+            serde_json::json!({ "event": "worktree_deleted", "worktree_id": "wt_1" }),
+        );
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].starts_with("event:hub:worktree_deleted:"));
+        let unmatched = deliver(
+            "worktree_create_failed",
+            serde_json::json!({ "event": "worktree_create_failed" }),
+        );
+        assert!(
+            unmatched.is_empty(),
+            "a subscription matches exact names only"
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+        let _ = std::fs::remove_dir_all(package_root);
     }
 
     /// Park the delivery slice, then run `setup` and return whether the owner

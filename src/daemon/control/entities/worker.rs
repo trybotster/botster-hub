@@ -1439,9 +1439,8 @@ pub(super) fn step(
     }
     match entry.work.stage {
         Stage::PrepareProvider => {
-            let (lifecycle, _) = runtime.plugin_provider_admission();
             let command = Command::PrepareProvider {
-                lifecycle,
+                lifecycle: runtime.plugin_provider_admission().lifecycle,
                 budget: runtime.shared_view_budget(),
                 input: entry
                     .work
@@ -1469,9 +1468,8 @@ pub(super) fn step(
             Step::Again
         }
         Stage::AdmitProvider => {
-            let (lifecycle, force_backpressure) = runtime.plugin_provider_admission();
             let command = Command::AdmitProvider {
-                lifecycle,
+                admission: runtime.plugin_provider_admission(),
                 plan: entry
                     .work
                     .provider_plan
@@ -1483,7 +1481,6 @@ pub(super) fn step(
                     .unwrap()
                     .causal_lease
                     .map(|(scope, _)| scope),
-                force_backpressure,
             };
             submission_step(state, waiter, entry.work.submit(executor, command))
         }
