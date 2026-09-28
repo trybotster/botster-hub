@@ -622,6 +622,12 @@ where
             }
             Ok(UnixInbound::Terminal(frame))
         }
+        // The Hub does not consume credit yet: until the S13 connection
+        // handling lands, a credit container closes the connection exactly as
+        // an unknown container did before it was defined.
+        Ok(DaemonUnixFrame::Credit(_)) => Err(UnixInboundError::Protocol(
+            DaemonProtocolErrorCode::UnknownContainer,
+        )),
         Err(code) => Err(UnixInboundError::Protocol(code)),
     }
 }
@@ -830,7 +836,7 @@ pub(crate) mod mux_write_resume_tests {
     pub(crate) fn terminal_route(frame: &DaemonUnixMuxFrame) -> Option<&str> {
         match frame {
             DaemonUnixMuxFrame::Terminal(frame) => Some(frame.route.as_str()),
-            DaemonUnixMuxFrame::Server(_) => None,
+            DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Credit(_) => None,
         }
     }
 
