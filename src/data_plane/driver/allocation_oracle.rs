@@ -309,6 +309,9 @@ fn admission(scenario: Scenario, mark: Mark) {
     let wake = Arc::new(CoreCompletionWake::new());
     mark(Phase::QueueConstruct, 0);
     let (requests, receiver) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
+    // Admission takes the queue's capacity wait (readiness plan S4a); it is
+    // built with the queue it bounds, so its allocation counts as queue setup.
+    let capacity = DataPlaneCapacity::new(Arc::default());
     if matches!(scenario, Scenario::Refused) {
         for index in 0..CORE_REQUEST_CAPACITY {
             mark(Phase::QueueFill, index);
@@ -328,10 +331,10 @@ fn admission(scenario: Scenario, mark: Mark) {
     });
     let accepting = AtomicBool::new(matches!(scenario, Scenario::Refused));
     mark(Phase::Admission, 0);
-    let outcome = admit_request(&requests, &accepting, request);
+    let outcome = admit_request(&requests, &accepting, &capacity, request);
     assert!(matches!(
         (scenario, outcome),
-        (Scenario::Refused, CoreAdmission::Refused)
+        (Scenario::Refused, CoreAdmission::Refused(_))
             | (
                 Scenario::StoppedOriginal | Scenario::StoppedLegacyOverlap,
                 CoreAdmission::Stopped
