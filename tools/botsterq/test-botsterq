@@ -1,0 +1,160 @@
+#!/bin/sh
+# Regression tests for botsterq, on a private queue (never the machine queue).
+# Usage: tools/botsterq/test-botsterq
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+Q="$here/botsterq"
+work=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/botsterq-test.XXXXXX")" && pwd)
+export BOTSTERQ_HOME="$work/home"
+export BOTSTERQ_KILL_GRACE=2
+failures=0
+pass() { echo "PASS $1"; }
+fail() { echo "FAIL $1: $2"; failures=$((failures + 1)); }
+cleanup() {
+  TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -K >/dev/null 2>&1 || true
+  [ -n "${control:-}" ] && kill "$control" 2>/dev/null
+  rm -rf "$work"
+}
+trap cleanup EXIT
+cd "$work"
+group_members() { ps -axo pgid= | awk -v g="$1" '$1 == g' | wc -l | tr -d ' '; }
+# Wait until a file matching the glob $1 exists (a job's pid file or marker).
+await_file() {
+  i=0
+  until ls $1 >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for the job to publish its file.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
+job_group() { await_file "$BOTSTERQ_HOME/run/*.pid"; cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | head -1; }
+# Wait until the queue shows a job whose label contains $1 in state $2.
+await_state() {
+  i=0
+  until TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | grep -F -- "$1" | grep -q " $2 "; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for the queue to reflect an admission.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
+
+# 1. Exit code, environment, directory, nice, streamed stdout and stderr.
+out=$(FOO=bar "$Q" run --label t1 -- sh -c 'echo "cwd=$(pwd) FOO=$FOO nice=$(ps -o nice= -p $$ | tr -d " ")"; echo err >&2; exit 5' 2>&1)
+code=$?
+[ "$code" = 5 ] && echo "$out" | grep -q "cwd=$work FOO=bar nice=10" && echo "$out" | grep -q '^err$' \
+  && pass "exit code, env, cwd, nice, streamed output" || fail "t1" "code=$code out=$out"
+
+# 2. Slot changes: allowed on an empty queue, refused while a job exists.
+"$Q" slots 1 >/dev/null && [ "$("$Q" slots)" = 1 ] || fail "slots set" "could not set 1"
+"$Q" run --label hold -- sh -c 'sleep 3' >/dev/null 2>&1 &
+holder=$!
+await_state "hold @" running
+if "$Q" slots 2 >/dev/null 2>&1; then fail "slots refuse" "changed while a job ran"; else pass "slots refuse to change while a job runs"; fi
+wait "$holder"
+"$Q" slots 2 >/dev/null && pass "slots change on an empty queue" || fail "slots change" "refused on an empty queue"
+
+# 3. Exclusive reservation equals the slot count, and slots cannot change under it.
+"$Q" run --label ex --exclusive -- sh -c 'sleep 3' >/dev/null 2>&1 &
+exj=$!
+await_state "ex [exclusive] @" running
+if "$Q" slots 3 >/dev/null 2>&1; then fail "exclusive slots" "slots changed under an exclusive job"; else pass "slots cannot change under an exclusive job"; fi
+wait "$exj"
+
+# 4. Cancelling a queued job removes it; the running job continues.
+"$Q" slots 1 >/dev/null
+"$Q" run --label A -- sh -c 'sleep 4; echo A-done' >"$work/A.out" 2>&1 &
+A=$!
+await_state "A @" running
+"$Q" run --label B -- sh -c 'touch "$0/B-ran"' "$work" >/dev/null 2>&1 &
+B=$!
+await_state "B @" queued
+kill -TERM "$B"; wait "$B"; codeB=$?
+wait "$A"; codeA=$?
+[ "$codeB" = 130 ] && [ ! -e "$work/B-ran" ] && [ "$codeA" = 0 ] && grep -q A-done "$work/A.out" \
+  && pass "cancel queued job; running job continues" || fail "cancel queued" "B=$codeB A=$codeA"
+
+# 5. Cancelling a running job whose child ignores SIGTERM after the leader exits.
+sleep 300 & control=$!
+"$Q" run --label R -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>&1 &
+R=$!
+await_state "R @" running
+g=$(job_group)
+kill -TERM "$R"; wait "$R"
+[ -n "$g" ] && [ "$(group_members "$g")" = 0 ] && kill -0 "$control" 2>/dev/null \
+  && pass "cancel escalates to SIGKILL for a TERM-ignoring child; control untouched" \
+  || fail "resistant descendant" "group=$g members=$(group_members "$g")"
+
+# 6. Start race, before the pid file: the job has started but not published
+#    its pid when cancel arrives. It must not run its command.
+mkfifo "$work/before"
+BOTSTERQ_TEST_BEFORE_PIDFILE="$work/before" "$Q" run --label P1 -- sh -c 'touch "$0/P1-ran"' "$work" >/dev/null 2>&1 &
+P1=$!
+await_state "P1 @" running
+kill -TERM "$P1"
+# Release the job only once the cancel has registered, which pins the
+# interleaving: cancel strictly before the job publishes its pid.
+await_file "$BOTSTERQ_HOME/run/*.cancelled"
+printf x >"$work/before"
+wait "$P1"; codeP1=$?
+TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -w >/dev/null 2>&1
+[ ! -e "$work/P1-ran" ] && pass "cancel before pid publication: command never runs (run exit $codeP1)" \
+  || fail "race before pid" "the command ran"
+
+# 7. Start race, after the pid file and before the marker check: cancel sees
+#    the pid and stops the group; the command never runs.
+mkfifo "$work/after"
+BOTSTERQ_TEST_AFTER_PIDFILE="$work/after" "$Q" run --label P2 -- sh -c 'touch "$0/P2-ran"' "$work" >/dev/null 2>&1 &
+P2=$!
+await_state "P2 @" running
+g=$(job_group)
+kill -TERM "$P2"; wait "$P2"
+[ ! -e "$work/P2-ran" ] && [ "$(group_members "$g")" = 0 ] \
+  && pass "cancel after pid publication: group stopped, command never runs" || fail "race after pid" "ran or group alive"
+
+# 8. Exclusive fairness: an ordinary job queued after a queued exclusive job waits for it.
+"$Q" slots 2 >/dev/null
+"$Q" run --label X -- sh -c 'sleep 2; date +%s.%N > "$0/X.end"' "$work" >/dev/null 2>&1 &
+X=$!
+await_state "X @" running
+"$Q" run --label E --exclusive -- sh -c 'date +%s.%N > "$0/E.start"; sleep 1; date +%s.%N > "$0/E.end"' "$work" >/dev/null 2>&1 &
+E=$!
+await_state "E [exclusive] @" queued
+"$Q" run --label Y -- sh -c 'date +%s.%N > "$0/Y.start"' "$work" >/dev/null 2>&1 &
+Y=$!
+wait "$X" "$E" "$Y"
+if [ "$(cat "$work/E.start")" \> "$(cat "$work/X.end")" ] && [ "$(cat "$work/Y.start")" \> "$(cat "$work/E.end")" ]; then
+  pass "exclusive runs alone after X; Y waits for it"
+else
+  fail "exclusive fairness" "X.end=$(cat "$work/X.end") E=$(cat "$work/E.start")..$(cat "$work/E.end") Y=$(cat "$work/Y.start")"
+fi
+
+# 9. Nested run inside a job runs directly (no deadlock at one slot).
+"$Q" slots 1 >/dev/null
+out=$("$Q" run --label outer -- sh -c "$Q run --label inner -- echo inner-ran" 2>&1)
+echo "$out" | grep -q inner-ran && pass "nested run executes directly" || fail "nested" "$out"
+
+# 10. A queued job whose run process was SIGKILLed does not start.
+"$Q" run --label H -- sh -c 'sleep 2' >/dev/null 2>&1 &
+H=$!
+await_state "H @" running
+"$Q" run --label O -- sh -c 'touch "$0/O-ran"' "$work" >/dev/null 2>&1 &
+O=$!
+await_state "O @" queued
+kill -KILL "$O"
+wait "$H"
+TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -w >/dev/null 2>&1
+[ ! -e "$work/O-ran" ] && pass "orphaned queued job does not start" || fail "orphan" "the command ran"
+
+# 11. cancel <id> escalates like run's cancel.
+"$Q" run --label C -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>&1 &
+C=$!
+await_state "C @" running
+id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '/ C @ / && $2 == "running" { print $1 }')
+g=$(job_group)
+"$Q" cancel "$id" >/dev/null 2>&1
+wait "$C" 2>/dev/null
+[ "$(group_members "$g")" = 0 ] && pass "cancel <id> escalates to SIGKILL" || fail "cancel id" "group $g alive"
+
+echo "failures: $failures"
+[ "$failures" = 0 ]
