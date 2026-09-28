@@ -33,10 +33,13 @@ pub(crate) enum SignalKey {
     ConnectionSlots,
     /// A client event connection's residency pool was released while armed.
     ConnectionPool,
+    /// The data-plane thread dequeued Core requests while an owner was armed
+    /// on a full request queue.
+    DataPlaneCapacity,
 }
 
 impl SignalKey {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     const fn index(self) -> usize {
         match self {
@@ -45,6 +48,7 @@ impl SignalKey {
             Self::EventConnections => 2,
             Self::ConnectionSlots => 3,
             Self::ConnectionPool => 4,
+            Self::DataPlaneCapacity => 5,
         }
     }
 }
@@ -260,6 +264,23 @@ impl<T> Drop for SignalingGuard<'_, T> {
         if self.owner.armed.swap(false, Ordering::SeqCst) {
             self.owner.signal.raise(self.owner.key);
         }
+    }
+}
+
+/// Block until `seen`'s key moves, on the doorbell rather than a poll.
+#[cfg(test)]
+pub(crate) fn test_wait_until_moved(signal: &OwnerSignal, seen: Seen) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("test wait runtime");
+    // timer: deadline — the shared test hang guard; each wake is a raise
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !signal.moved(seen) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        runtime
+            .block_on(async { tokio::time::timeout(remaining, signal.rung()).await })
+            .expect("the key is raised before the test deadline");
     }
 }
 
