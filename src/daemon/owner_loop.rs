@@ -1099,6 +1099,8 @@ pub(crate) const TEST_HANG_GUARD: Duration = Duration::from_secs(60);
 pub(crate) struct TestOwnerWakes {
     receiver: tokio_mpsc::Receiver<ControlMessage>,
     blocking: tokio::runtime::Runtime,
+    /// The kind of every wake `wait` received, in order.
+    pub(crate) received: Vec<&'static str>,
 }
 
 #[cfg(test)]
@@ -1111,12 +1113,31 @@ impl TestOwnerWakes {
             runtime.bind_managed_spawn_owner_wake(sender.clone());
         }
         state.plugin_result_budget.bind_owner_wake(sender);
+        Self::from_receiver(receiver)
+    }
+
+    fn from_receiver(receiver: tokio_mpsc::Receiver<ControlMessage>) -> Self {
         Self {
             receiver,
             blocking: tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .expect("test owner wake runtime"),
+            received: Vec::new(),
+        }
+    }
+
+    /// Block until a wake of `kind` arrives, as if only that wake were bound:
+    /// every other wake is recorded and starts no turn. Returns false at
+    /// `deadline`.
+    pub(crate) fn wait_for_kind(&mut self, deadline: Instant, kind: &'static str) -> bool {
+        loop {
+            if !self.wait(deadline) {
+                return false;
+            }
+            if self.received.last() == Some(&kind) {
+                return true;
+            }
         }
     }
 
@@ -1131,7 +1152,16 @@ impl TestOwnerWakes {
             .blocking
             .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await })
         {
-            Ok(Some(_)) => true,
+            Ok(Some(message)) => {
+                self.received.push(match message {
+                    ControlMessage::PluginCompletionPublished => "PluginCompletionPublished",
+                    ControlMessage::CoreCompletionPublished => "CoreCompletionPublished",
+                    ControlMessage::DataPlaneProgress => "DataPlaneProgress",
+                    ControlMessage::HostProgressPublished => "HostProgressPublished",
+                    _ => "other",
+                });
+                true
+            }
             Ok(None) => panic!("the owner wake channel closed"),
             Err(_) => false,
         }
@@ -6845,15 +6875,20 @@ mod tests {
     }
 
     fn unique_package_control_dir(name: &str) -> PathBuf {
+        // Parallel tests can read the same clock value (macOS reports it at
+        // microsecond resolution), so a per-process sequence keeps each
+        // directory, and the daemon state lock inside it, distinct.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         PathBuf::from("target")
             .join("botster-hub-test-data")
             .join("package-control")
             .join(name)
-            .join(nanos.to_string())
+            .join(format!("{nanos}-{sequence}"))
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
@@ -8526,11 +8561,26 @@ return botster.register({{ handlers = {{{{
     /// completion clears the consumer's in-flight slot, driven only by owner
     /// wakes (the plugin completion notifier). With `install_notifier` false
     /// nothing else wakes the owner, so the drive stops at its hang guard.
+    /// Which owner wakes start the session-family drive's turns.
+    #[derive(Clone, Copy, PartialEq)]
+    enum FamilyWakes {
+        All,
+        /// Every wake until the frame is admitted (the data plane's Core
+        /// completion starts the snapshot); after that only the plugin
+        /// completion notifier's wake starts a turn, so no incidental turn
+        /// can drain the frame's completion.
+        NotifierAfterAdmission,
+    }
+
+    /// Returns the kinds of the owner wakes received after the frame was
+    /// admitted (phase 2 of `NotifierAfterAdmission`), or all of them for
+    /// `All`.
     fn drive_session_family_snapshot(
         install_notifier: bool,
         then_delta: bool,
         hang_guard: Duration,
-    ) {
+        family_wakes: FamilyWakes,
+    ) -> Vec<&'static str> {
         let root = unique_package_control_dir("session-family-wake");
         let package_dir = root.join("family-probe");
         write_package_control_manifest(
@@ -8576,28 +8626,79 @@ return botster.register({ handlers = {} })
                     state.plugin_result_budget.completion_notifier(),
                 );
         }
-        drive_owner_until(
-            &mut daemon,
-            &mut state,
-            &mut wakes,
-            hang_guard,
-            |_, state| {
+        let settled = |state: &DaemonControlState| {
+            state
+                .maintenance
+                .session_family
+                .test_consumer_settled("family-probe")
+                == Some(true)
+        };
+        let describe = |_: &HubDaemon, state: &DaemonControlState| {
+            format!(
+                "consumer={}",
                 state
                     .maintenance
                     .session_family
-                    .test_consumer_settled("family-probe")
-                    == Some(true)
-            },
-            |_, state| {
-                format!(
-                    "consumer={}",
-                    state
-                        .maintenance
-                        .session_family
-                        .test_consumer_debug("family-probe")
-                )
-            },
-        );
+                    .test_consumer_debug("family-probe")
+            )
+        };
+        let mut phase_two_start = 0;
+        if family_wakes == FamilyWakes::NotifierAfterAdmission {
+            // Phase 1: every wake, until the frame is admitted and its
+            // completion is pending.
+            drive_owner_until(
+                &mut daemon,
+                &mut state,
+                &mut wakes,
+                hang_guard,
+                |_, state| {
+                    settled(state)
+                        || state
+                            .maintenance
+                            .session_family
+                            .test_consumer_debug("family-probe")
+                            .contains("in_flight: Some")
+                },
+                describe,
+            );
+            assert!(
+                !settled(&state),
+                "phase 1 must stop at admission, not settle"
+            );
+            phase_two_start = wakes.received.len();
+            // Phase 2: a turn runs only after a notifier wake. Within a turn
+            // the ready queue runs to empty and the per-turn publishes stay,
+            // as in production; no turn starts without that wake.
+            let deadline = Instant::now() + hang_guard;
+            loop {
+                while !state.owner_ready.is_empty() {
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    publish_completion_wakes(&daemon, &mut state);
+                    publish_maintenance_wakes(&mut state);
+                }
+                if settled(&state) {
+                    break;
+                }
+                if !wakes.wait_for_kind(deadline, "PluginCompletionPublished") {
+                    panic!(
+                        "owner wakes stopped before the condition held: {}",
+                        describe(&daemon, &state)
+                    );
+                }
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                publish_completion_wakes(&daemon, &mut state);
+                publish_maintenance_wakes(&mut state);
+            }
+        } else {
+            drive_owner_until(
+                &mut daemon,
+                &mut state,
+                &mut wakes,
+                hang_guard,
+                |_, state| settled(state),
+                describe,
+            );
+        }
         if then_delta {
             // The round-robin cursor now points at family-probe, as it did
             // when the live Workspaces "ended" frame was lost.
@@ -8635,11 +8736,12 @@ return botster.register({ handlers = {} })
         }
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
+        wakes.received.split_off(phase_two_start)
     }
 
     #[test]
     fn a_session_family_snapshot_completes_on_the_completion_wake_alone() {
-        drive_session_family_snapshot(true, false, TEST_HANG_GUARD);
+        drive_session_family_snapshot(true, false, TEST_HANG_GUARD, FamilyWakes::All);
     }
 
     /// The live loss, through the owner driver: a delta queued after the
@@ -8647,15 +8749,25 @@ return botster.register({ handlers = {} })
     /// owner wakes alone.
     #[test]
     fn a_delta_after_the_snapshot_is_admitted_on_owner_wakes_alone() {
-        drive_session_family_snapshot(true, true, TEST_HANG_GUARD);
+        drive_session_family_snapshot(true, true, TEST_HANG_GUARD, FamilyWakes::All);
     }
 
     #[test]
     fn without_the_completion_notifier_the_session_family_drive_stops_at_its_guard() {
+        // After the frame is admitted, only the notifier's wake starts a turn,
+        // so no incidental turn (a data-plane, host, or managed-spawn wake)
+        // can drain its completion. With every wake starting turns, one such
+        // turn once settled this drive with no notifier: the incidental-wake
+        // class that S4b deletes.
         // timer: deadline — the ablation expects the drive to stall; a short
         // guard bounds that expected stall.
         let stuck = std::panic::catch_unwind(|| {
-            drive_session_family_snapshot(false, false, Duration::from_secs(3))
+            drive_session_family_snapshot(
+                false,
+                false,
+                Duration::from_secs(3),
+                FamilyWakes::NotifierAfterAdmission,
+            )
         });
         let message = stuck
             .expect_err("no completion notifier must leave the consumer unsettled")
@@ -8669,6 +8781,22 @@ return botster.register({ handlers = {} })
         // It stalls with a frame admitted and its completion undelivered, not
         // before the snapshot started.
         assert!(message.contains("in_flight: Some"), "{message}");
+    }
+
+    #[test]
+    fn the_completion_notifier_alone_settles_the_session_family_drive() {
+        // The positive twin of the ablation above: after admission only the
+        // notifier's wake starts a turn, and the frame still settles.
+        let after_admission = drive_session_family_snapshot(
+            true,
+            false,
+            TEST_HANG_GUARD,
+            FamilyWakes::NotifierAfterAdmission,
+        );
+        assert!(
+            after_admission.contains(&"PluginCompletionPublished"),
+            "the frame settles after the notifier's wake: {after_admission:?}"
+        );
     }
 
     /// Delivers one `worktree_created` event and drives owner turns until its
