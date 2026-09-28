@@ -81,4 +81,11 @@ cargo build --locked -p botster-core-daemon --bin botster-session-worker
 # use this same candidate set. A bare daemon-spawning `cargo test` command must
 # receive BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, and
 # BOTSTER_CANDIDATE_MANIFEST from script/build-dev-artifacts.
-BOTSTER_ENV=test cargo test --workspace "$@"
+# Feature-gated code no test run builds: compile it so it cannot rot. The
+# allocation-oracle targets are approved measurement instruments
+# (script/core-ticket-allocation-oracle); the gate builds them, it does not run them.
+BOTSTER_ENV=test cargo check --locked --tests --features allocation-oracle
+
+# --no-fail-fast runs every test target even after one fails, so a red target
+# cannot hide another; any failure still fails the gate.
+BOTSTER_ENV=test cargo test --workspace --no-fail-fast "$@"
