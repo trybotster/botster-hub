@@ -67,6 +67,7 @@ pub(crate) mod event_plane_counters;
 pub(crate) mod host_disposal;
 pub(crate) mod host_executor;
 pub(crate) mod host_mutations;
+pub mod hub_clock;
 pub(crate) mod hub_log;
 pub mod lifecycle;
 pub(crate) mod lua_memory;

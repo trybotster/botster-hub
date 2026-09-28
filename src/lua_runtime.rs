@@ -684,6 +684,7 @@ fn routed_envelope_bytes(envelope: &RoutedEnvelope) -> Option<usize> {
 struct LuaHostApi {
     configuration: PackageConfigurationView,
     capabilities: SharedHubCapabilityRuntime,
+    clock: crate::hub_clock::HubClock,
     coordination: HubCoordinationBridge,
     entity_publish: HubEntityPublishBridge,
     session_types: SharedSessionTypeSpawner,
@@ -900,6 +901,8 @@ pub struct LuaPluginHostApi {
     pub(crate) memory: Arc<LuaMemoryAccount>,
     pub(crate) logs: Arc<crate::plugin_logs::PluginLogBook>,
     pub capabilities: SharedHubCapabilityRuntime,
+    /// The Hub's clock, shared by every plugin VM.
+    pub clock: crate::hub_clock::HubClock,
     pub coordination: HubCoordinationBridge,
     pub entity_publish: HubEntityPublishBridge,
     pub session_types: SharedSessionTypeSpawner,
@@ -1145,6 +1148,7 @@ mod state_owner_tests {
                 diagnostics: Vec::new(),
             },
             capabilities: api.capabilities,
+            clock: api.clock,
             coordination: api.coordination,
             entity_publish: api.entity_publish,
             session_types: api.session_types,
@@ -1530,6 +1534,7 @@ impl LuaPluginRuntime {
         let host_api = LuaHostApi {
             configuration,
             capabilities: api.capabilities,
+            clock: api.clock,
             coordination: api.coordination,
             entity_publish: api.entity_publish,
             session_types: api.session_types,
@@ -2158,6 +2163,7 @@ fn install_botster_api(
             Arc::clone(&host_api.logs),
             plugin_key.0.clone(),
             log_generation,
+            host_api.clock.clone(),
         ),
     )?;
 

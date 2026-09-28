@@ -483,6 +483,7 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             capabilities: hub.capability_runtime(),
+            clock: hub.clock().clone(),
             coordination: hub.coordination_bridge(),
             entity_publish: hub.entity_publish_bridge(),
             session_types: hub.session_type_spawner(),
