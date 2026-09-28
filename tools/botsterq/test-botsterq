@@ -343,6 +343,8 @@ fault_case "survivor with failed registration" "registration failed" "$held" BOT
 fault_case "survivor with failed wait" "wait failed" "$held" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_AT=wait
 fault_case "survivor with failed kqueue and fallback" "kqueue creation" "$held" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_AT=kqueue,fallback
 fault_case "survivor with a supervisor loop error" "supervisor error" "supervisor error" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_AT=loop
+fault_case "survivor with a failed pid-file publication" "supervisor error" "supervisor error" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_AT=publish
+fault_case "survivor with a failed diagnostic write" "" "" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_AT=loop,diagnostic
 
 # 18. A python3 older than 3.9 is refused before admission: nothing is queued.
 mkdir -p "$work/oldpy"
@@ -358,6 +360,19 @@ after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
 [ "$codeOld" = 127 ] && [ "$before" = "$after" ] && grep -q "3.9 or later" "$work/old.err" \
   && pass "a python3 older than 3.9 is refused before admission (run exit 127)" \
   || fail "old python" "run=$codeOld queued_before=$before after=$after stderr=$(cat "$work/old.err")"
+
+# 19. A suite run leaves no supervisor behind. Jobs still finishing get a
+#     bounded wait; any botsterq-job under this suite's home after that leaked.
+leaked() { ps -axo pid=,command= | grep -F -- "botsterq-job $BOTSTERQ_HOME/" | grep -v grep; }
+i=0
+while [ "$i" -lt 100 ] && [ -n "$(leaked)" ]; do
+  i=$((i + 1))
+  # timer: deadline — bounded wait for the last supervisors to exit.
+  perl -e 'select(undef, undef, undef, 0.1)'
+done
+leaks=$(leaked)
+[ -z "$leaks" ] && pass "no botsterq-job supervisor survives the suite" \
+  || fail "supervisor leak" "$leaks"
 
 echo "failures: $failures"
 [ "$failures" = 0 ]
