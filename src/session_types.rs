@@ -2195,6 +2195,7 @@ fn materialize_session_type_from_resolved(
                 .into_iter()
                 .map(|(name, value)| SpawnEnvironmentVariable { name, value })
                 .collect(),
+            unset: Vec::new(),
         },
         initial_pty_size: Some(ResizePayload {
             rows: config.initial_rows,
@@ -2334,6 +2335,7 @@ pub(crate) fn materialize_managed_session_type(
                 .into_iter()
                 .map(|(name, value)| SpawnEnvironmentVariable { name, value })
                 .collect(),
+            unset: Vec::new(),
         },
         initial_pty_size: Some(ResizePayload {
             rows: config.session_defaults.initial_rows,
@@ -3791,7 +3793,10 @@ fn charged_final_materialization(
         working_directory: SpawnWorkingDirectory {
             path: resolved.working_directory.clone(),
         },
-        environment: SpawnEnvironment { variables },
+        environment: SpawnEnvironment {
+            variables,
+            unset: Vec::new(),
+        },
         initial_pty_size: Some(ResizePayload {
             rows: initial_rows,
             cols: initial_cols,
