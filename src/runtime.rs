@@ -680,8 +680,9 @@ impl HubRuntime {
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
-        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let owner_signal = Arc::<crate::daemon::owner_signal::OwnerSignal>::default();
+        let (close_work, data_plane, core_daemon) =
+            start_data_plane(core_config, Arc::clone(&owner_signal));
         let package_event_router = Arc::new(
             crate::package_event_router::PackageEventRouter::with_owner_signal(
                 config.package_event_plane,
@@ -879,8 +880,9 @@ impl HubRuntime {
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
-        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let owner_signal = Arc::<crate::daemon::owner_signal::OwnerSignal>::default();
+        let (close_work, data_plane, core_daemon) =
+            start_data_plane(core_config, Arc::clone(&owner_signal));
         let package_event_router = Arc::new(
             crate::package_event_router::PackageEventRouter::with_owner_signal(
                 config.package_event_plane,
@@ -1107,6 +1109,35 @@ impl HubRuntime {
 
     pub(crate) fn owner_signal(&self) -> &Arc<crate::daemon::owner_signal::OwnerSignal> {
         &self.owner_signal
+    }
+
+    /// Block the data-plane thread inside one operation, then fill the Core
+    /// request queue until a submission is refused. Dropping the returned
+    /// sender releases the data plane.
+    #[cfg(test)]
+    pub(crate) fn test_fill_core_request_queue(&self) -> std::sync::mpsc::Sender<()> {
+        use crate::owner_identity::WaiterId;
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let _blocker =
+            self.core_daemon
+                .submit_for_owner(WaiterId(u64::MAX - 1), move |_: &mut _| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                });
+        // timer: deadline — the shared test hang guard; the data plane enters at once
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the data plane runs the blocking operation");
+        for index in 0..=crate::data_plane::driver::CORE_REQUEST_CAPACITY as u64 {
+            let ticket: crate::CoreTicket<()> = self
+                .core_daemon
+                .submit_for_owner(WaiterId(u64::MAX - 2 - index), |_: &mut _| {});
+            if ticket.refused_wait().is_some() {
+                return release_tx;
+            }
+        }
+        panic!("the Core request queue must fill while the data plane is blocked");
     }
 
     #[must_use]
@@ -7100,6 +7131,7 @@ pub fn with_test_lifecycle_journal_capacity<R>(capacity: usize, f: impl FnOnce()
 
 fn start_data_plane(
     core_config: CoreDaemonConfig,
+    owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
 ) -> (
     crate::data_plane::CloseWorkSource,
     crate::data_plane::DataPlaneDriver,
@@ -7107,7 +7139,7 @@ fn start_data_plane(
 ) {
     let close_work = crate::data_plane::CloseWorkSource::new();
     let (driver, core_daemon) =
-        crate::data_plane::DataPlaneDriver::start(core_config, close_work.clone());
+        crate::data_plane::DataPlaneDriver::start(core_config, close_work.clone(), owner_signal);
     (close_work, driver, core_daemon)
 }
 
