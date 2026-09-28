@@ -841,7 +841,8 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             &spawn,
         )));
     }
-    // The session no longer ends by itself, so every path ends it here.
+    // The session no longer ends by itself, so every path after the spawn
+    // requests its shutdown here (best effort: the result is ignored).
     let result = smoke_attached_round_trip(config, &session_id, &subscription_id, marker);
     let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
     result
