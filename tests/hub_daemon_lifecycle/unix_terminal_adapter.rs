@@ -1439,6 +1439,91 @@ fn reader_pause_shorter_than_the_deadline_stays_attached() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+/// S13 plan test 1: an idle route on the same connection stays open while a
+/// sibling route floods, past the reader deadline. Credit is per demand, so
+/// the flood cannot strand or stall the idle route.
+#[test]
+fn idle_route_stays_open_while_a_sibling_route_floods() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("irf");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "irf-idle", "irf-idle-sub", "exec cat", &mut envelopes, &mut events);
+    spawn_and_bind(&mut client, "irf-flood", "irf-flood-sub", "yes idle-route-flood", &mut envelopes, &mut events);
+    let bound = Instant::now();
+
+    // timer: deadline — the client reads the flood past D plus slack; an idle route that lost credit would be stalled by then.
+    let window_end = bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5);
+    let flooded = drain_terminal_until(&mut client, window_end, &mut events);
+    assert!(flooded > 0, "the flood route must deliver output");
+    assert!(
+        no_terminal_subscription_closed(&events, "irf-idle", Some("irf-idle-sub"), None),
+        "the idle route must not close while a sibling floods: {events:?}"
+    );
+    assert!(
+        no_terminal_subscription_closed(&events, "irf-flood", Some("irf-flood-sub"), None),
+        "a granting client must keep its flood route open: {events:?}"
+    );
+    assert!(route_is_occupied(&mut sibling, "irf-idle", "irf-idle-sub"), "the idle route must stay attached");
+    assert!(route_is_occupied(&mut sibling, "irf-flood", "irf-flood-sub"), "the flood route must stay attached");
+    drop(client);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), "irf-idle");
+    shutdown_short_lived_session(hub.endpoint(), "irf-flood");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// S13 plan test 10: a client that reads every frame but never grants output
+/// credit leaves its route refused; Core ends the route Stalled at the reader
+/// deadline (core_adapter), and the session survives.
+#[test]
+fn client_that_never_grants_ends_its_route_stalled() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("ngc");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint()).never_grant();
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    let before_attach = Instant::now();
+    spawn_and_bind(&mut client, "ngc-dead", "ngc-sub", "yes never-grants", &mut envelopes, &mut events);
+    let bound = Instant::now();
+
+    // timer: deadline — the observation point before D; the first refusal is at or after `before_attach`.
+    thread::sleep((before_attach + READER_PROGRESS_DEADLINE - Duration::from_secs(2)).saturating_duration_since(Instant::now()));
+    let observed_after = before_attach.elapsed();
+    assert!(
+        observed_after < READER_PROGRESS_DEADLINE,
+        "TIMING-INVALID: observation at {observed_after:?}, not before D; this run is inconclusive"
+    );
+    assert!(
+        route_is_occupied(&mut sibling, "ngc-dead", "ngc-sub"),
+        "a route without credit must stay attached before the reader deadline"
+    );
+
+    // timer: deadline — D plus 5 s slack from the observed Attach response.
+    thread::sleep((bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5)).saturating_duration_since(Instant::now()));
+    assert!(
+        !route_is_occupied(&mut sibling, "ngc-dead", "ngc-sub"),
+        "Core must end a never-granted route by the reader deadline plus slack"
+    );
+    assert!(session_is_listed(&mut sibling, "ngc-dead"), "the stall closes the route, not the session");
+    assert!(
+        wait_for_subscription_closed(&mut client, "ngc-dead", "ngc-sub", &mut envelopes, &mut events),
+        "the client must receive TerminalSubscriptionClosed: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { session_id, reason, .. }
+            if session_id == "ngc-dead" && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+    )));
+    drop(client);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), "ngc-dead");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 #[test]
 fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
