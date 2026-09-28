@@ -65,11 +65,11 @@ fn explicit_config(data_dir: &Path) -> botster_hub::HubConfig {
     .expect("explicit MCP test config should build")
 }
 
-fn start_cli_daemon(data_dir: &Path) -> Child {
+fn start_cli_daemon(data_dir: &Path) -> CliDaemon {
     start_cli_daemon_with_environment(data_dir, &[])
 }
 
-fn start_cli_daemon_with_environment(data_dir: &Path, environment: &[(&str, &Path)]) -> Child {
+fn start_cli_daemon_with_environment(data_dir: &Path, environment: &[(&str, &Path)]) -> CliDaemon {
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -94,7 +94,23 @@ fn start_cli_daemon_with_environment(data_dir: &Path, environment: &[(&str, &Pat
         terminate_daemon_group(&mut child);
         panic!("{error}");
     }
-    child
+    CliDaemon(Some(child))
+}
+
+/// A started test daemon. A test that panics before `shutdown_cli_daemon`
+/// kills and reaps the daemon's process group instead of orphaning it.
+struct CliDaemon(Option<Child>);
+
+impl Drop for CliDaemon {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        // SIGKILL cannot be ignored, so the reap below cannot hang; errors are
+        // ignored because a panic inside drop would abort the test binary.
+        let _ = signal_daemon_group_or_child(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+    }
 }
 
 fn wait_for_status(data_dir: &Path, child: &mut Child) -> Result<(), String> {
@@ -162,7 +178,8 @@ fn signal_daemon_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Resul
     }
 }
 
-fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
+fn shutdown_cli_daemon(data_dir: &Path, mut daemon: CliDaemon) -> Output {
+    let child = daemon.0.take().expect("daemon is still owned");
     let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
