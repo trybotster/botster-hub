@@ -14,9 +14,9 @@ use botster_core::{
     PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
-    LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice,
-    SessionLifecycleBaselinePage, SessionLifecycleChange, SessionLifecycleCursor,
-    SessionLifecyclePage, SessionLifecyclePageError, SessionLifecycleResyncReason,
+    LifecycleBaselineBudget, ObserveLifecycleBudget, SessionLifecycleBaselinePage,
+    SessionLifecycleChange, SessionLifecycleCursor, SessionLifecyclePage,
+    SessionLifecyclePageError, SessionLifecycleResyncReason,
 };
 
 use crate::HubRuntime;
@@ -85,7 +85,6 @@ fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
 /// Round-robin maintenance kinds. One owner turn runs one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaintenanceSliceKind {
-    Observe,
     JournalPull,
     ProjectionApply,
     Baseline,
@@ -97,8 +96,7 @@ pub enum MaintenanceSliceKind {
 }
 
 impl MaintenanceSliceKind {
-    pub const ALL: [Self; 9] = [
-        Self::Observe,
+    pub const ALL: [Self; 8] = [
         Self::JournalPull,
         Self::ProjectionApply,
         Self::Baseline,
@@ -111,7 +109,6 @@ impl MaintenanceSliceKind {
 
     const fn bit(self) -> u16 {
         match self {
-            Self::Observe => 1 << 0,
             Self::JournalPull => 1 << 1,
             Self::ProjectionApply => 1 << 2,
             Self::Baseline => 1 << 3,
@@ -515,7 +512,6 @@ pub struct MaintenanceState {
     /// when its key's epoch moves past the value it read before its attempt.
     pub(crate) signal_waits: BTreeMap<MaintenanceSliceKind, crate::daemon::owner_signal::Seen>,
     pub projection: SessionProjection,
-    pub observe_resume: Option<ObserveLifecycleCursor>,
     pub pending_changes: VecDeque<SessionLifecycleChange>,
     pub baseline: Option<BaselineRecovery>,
     /// Latest journal source watermark observed by a successful pull.
@@ -542,6 +538,10 @@ pub struct MaintenanceState {
     /// A panicking holder poisoned the package event router: event delivery
     /// has stopped for good. It is a fault, never a wait.
     pub(crate) event_router_faulted: bool,
+    /// Core returned a lifecycle page that can never make progress (an item
+    /// larger than the page budget). Lifecycle projection has stopped: a fault
+    /// by the readiness rule that a ready slice must progress, never a retry.
+    pub(crate) lifecycle_faulted: bool,
     /// Core reported a lifecycle-journal advance since the last consumer read it.
     pub journal_wake_pending: bool,
     /// Test-only replacement for `EVENT_INVOCATION_TIMEOUT_MS`, so a test can
@@ -557,7 +557,6 @@ pub struct MaintenanceState {
 /// because tickets are neither clonable nor comparable.
 #[derive(Debug, Default)]
 pub struct MaintenanceCoreReads {
-    observe: Option<CoreTicket<Result<ObserveLifecycleSlice, SessionLifecyclePageError>>>,
     /// Journal page read plus the journal-advanced flag observed when it started.
     journal: Option<(
         CoreTicket<Result<SessionLifecyclePage, SessionLifecyclePageError>>,
@@ -570,7 +569,7 @@ impl MaintenanceCoreReads {
     /// True while any lifecycle read waits on Core.
     #[must_use]
     pub fn in_flight(&self) -> bool {
-        self.observe.is_some() || self.journal.is_some() || self.baseline.is_some()
+        self.journal.is_some() || self.baseline.is_some()
     }
 }
 
@@ -635,6 +634,45 @@ impl MaintenanceState {
         EVENT_INVOCATION_TIMEOUT_MS
     }
 
+    /// Readiness derived from state for the slices that no longer use wake
+    /// bits (readiness plan 2.1.1); `None` for a slice still driven by marks.
+    /// A slice whose Core read is in flight is not ready: the read's
+    /// completion marks it by name.
+    pub(crate) fn derived_readiness(
+        &self,
+        kind: MaintenanceSliceKind,
+        reads: &MaintenanceCoreReads,
+    ) -> Option<bool> {
+        let parked = self.signal_waits.contains_key(&kind);
+        Some(match kind {
+            MaintenanceSliceKind::ProjectionApply => !self.pending_changes.is_empty(),
+            MaintenanceSliceKind::Baseline => {
+                !parked
+                    && !self.lifecycle_faulted
+                    && self.baseline.is_some()
+                    && reads.baseline.is_none()
+            }
+            MaintenanceSliceKind::JournalPull => {
+                !parked
+                    && !self.lifecycle_faulted
+                    && reads.journal.is_none()
+                    && (self.journal_wake_pending
+                        || (!self.journal_caught_up_confirmed
+                            && self.projection.baseline_complete
+                            && self.baseline.is_none()
+                            && self.projection.cursor.is_some()))
+            }
+            _ => return None,
+        })
+    }
+
+    fn fault_lifecycle(&mut self, what: &str) {
+        if !self.lifecycle_faulted {
+            self.lifecycle_faulted = true;
+            eprintln!("session lifecycle projection stopped: Core returned {what}");
+        }
+    }
+
     /// Mark every slice whose signal moved since it parked, and unpark it.
     pub(crate) fn mark_signaled_waits(
         &mut self,
@@ -675,12 +713,9 @@ impl MaintenanceState {
     /// After an authoritative mutation, pull the journal on the next idle turn.
     pub fn note_authoritative_mutation(&mut self) {
         self.journal_caught_up_confirmed = false;
-        self.wakes.mark(MaintenanceSliceKind::JournalPull);
     }
 
     pub fn needs_work(&self) -> bool {
-        // `observe_resume` is continuation state for the next Observe kind.
-        // It must not rearm the whole nine-kind rotation as idle wakes.
         self.wakes.has_any()
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
@@ -773,7 +808,6 @@ fn rewind_journal_cursor_for_omitted_recover(state: &mut MaintenanceState) {
         cursor.sequence = 0;
     }
     state.journal_caught_up_confirmed = false;
-    state.wakes.mark(MaintenanceSliceKind::JournalPull);
 }
 
 fn omitted_row_recover_key(state: &MaintenanceState) -> Option<SessionLifecycleCursor> {
@@ -918,7 +952,6 @@ fn run_maintenance_kind_with_owner(
         state.signal_waits.remove(&kind);
     }
     match kind {
-        MaintenanceSliceKind::Observe => run_observe_slice(runtime, state, reads, waiter_id),
         MaintenanceSliceKind::JournalPull => {
             run_journal_pull_slice(runtime, state, reads, waiter_id)
         }
@@ -963,28 +996,11 @@ pub(crate) fn run_maintenance_kind_to_completion(
     });
 }
 
-fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
-    state.observe_resume = None;
+/// An observe pass that Core could not run starts baseline recovery when the
+/// projection is not already sealed and current.
+pub(crate) fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
     if !state.projection.baseline_complete || state.baseline.is_some() {
         start_baseline_recovery(state);
-    }
-}
-
-/// Apply a successful observe slice to Maintenance scheduling.
-///
-/// An incomplete pass stores [`MaintenanceState::observe_resume`] and leaves
-/// the nine-kind pointer unchanged. A journal-advanced wake prefers
-/// JournalPull. This function is the only incomplete-pass scheduler
-/// transition in production.
-fn apply_observe_pass_result(
-    state: &mut MaintenanceState,
-    complete: bool,
-    journal_advanced: bool,
-    resume: Option<ObserveLifecycleCursor>,
-) {
-    state.observe_resume = if complete { None } else { resume };
-    if journal_advanced {
-        state.wakes.mark(MaintenanceSliceKind::JournalPull);
     }
 }
 
@@ -993,79 +1009,6 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn run_observe_slice(
-    runtime: &HubRuntime,
-    state: &mut MaintenanceState,
-    reads: &mut MaintenanceCoreReads,
-    waiter_id: Option<crate::owner_identity::WaiterId>,
-) {
-    let Some(ticket) = reads.observe.as_mut() else {
-        let resume = state.observe_resume.clone();
-        reads.observe = Some(match waiter_id {
-            Some(waiter_id) => runtime.observe_lifecycle_slice_for_owner(
-                waiter_id,
-                now_seconds(),
-                resume.as_ref(),
-                OBSERVE_SLICE_BUDGET,
-            ),
-            None => runtime.observe_lifecycle_slice(
-                now_seconds(),
-                resume.as_ref(),
-                OBSERVE_SLICE_BUDGET,
-            ),
-        });
-        if reads
-            .observe
-            .as_ref()
-            .is_some_and(|ticket| park_refused_read(state, MaintenanceSliceKind::Observe, ticket))
-        {
-            reads.observe = None;
-        }
-        return;
-    };
-    let result = match ticket.poll() {
-        CoreTicketPoll::Pending => return,
-        // Refused: the single slot is freed and the next slice resubmits.
-        CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
-            reads.observe = None;
-            return;
-        }
-        CoreTicketPoll::Ready(result) => result,
-    };
-    reads.observe = None;
-    match result {
-        Ok(slice) => {
-            if let Some(reason) = slice.resync_required {
-                if matches!(reason, SessionLifecycleResyncReason::SourceChanged) {
-                    state.observe_resume = None;
-                    start_baseline_recovery(state);
-                } else if matches!(reason, SessionLifecycleResyncReason::ObservePassUnavailable) {
-                    handle_unavailable_observe_pass(state);
-                }
-                return;
-            }
-            let journal_advanced = state.take_journal_wake();
-            apply_observe_pass_result(
-                state,
-                slice.complete,
-                journal_advanced,
-                if slice.complete {
-                    None
-                } else {
-                    Some(ObserveLifecycleCursor {
-                        pass_id: slice.pass_id,
-                        last_visited: slice.last_visited,
-                    })
-                },
-            );
-        }
-        Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.wakes.mark_all();
-        }
-        Err(_) => state.wakes.mark_all(),
-    }
 }
 
 /// A read that the full Core request queue refused parks its slice on queue
@@ -1156,17 +1099,18 @@ fn run_journal_pull_slice(
             // pull that sees no wake.
             state.journal_caught_up_confirmed =
                 journal_caught_up_after_pull(received, at_watermark, journal_advanced);
+            if !received && !at_watermark {
+                // More exists but none fit: the first change exceeds the page.
+                state.fault_lifecycle("a journal change larger than its page budget");
+                return;
+            }
             state.pending_changes.extend(page.changes);
             if state.journal_caught_up_confirmed && state.projection_dirty {
                 state.wakes.mark(MaintenanceSliceKind::SubscriberDelivery);
-            } else if journal_advanced && !received {
-                state.wakes.mark(MaintenanceSliceKind::JournalPull);
-            } else if received || !at_watermark || journal_advanced {
-                state.wakes.mark_all();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.wakes.mark_all();
+            state.fault_lifecycle("an empty journal page larger than its budget");
         }
         Err(_) => start_baseline_recovery(state),
     }
@@ -1192,8 +1136,6 @@ fn run_projection_apply_slice(runtime: Option<&HubRuntime>, state: &mut Maintena
     if applied > 0 {
         state.projection_dirty = true;
         state.wakes.mark(MaintenanceSliceKind::SubscriberDelivery);
-    } else if !state.pending_changes.is_empty() {
-        state.wakes.mark_all();
     }
 }
 
@@ -1270,17 +1212,13 @@ fn run_baseline_slice(
                 state.journal_caught_up_confirmed = false;
                 if acknowledged_spawns_missing_from_projection(state) {
                     start_omitted_row_recover(state);
-                } else {
-                    state.wakes.mark(MaintenanceSliceKind::JournalPull);
                 }
                 state.projection_dirty = true;
                 begin_family_snapshots(state, snapshot.sequence);
-            } else {
-                state.wakes.mark_all();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.wakes.mark_all();
+            state.fault_lifecycle("an empty baseline page larger than its budget");
         }
         Err(_) => start_baseline_recovery(state),
     }
@@ -1885,7 +1823,6 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.journal_source_watermark = None;
     state.journal_caught_up_confirmed = false;
     state.omitted_row_recover_at = None;
-    state.observe_resume = None;
     state.session_family.need_gap_pass = true;
     state.session_family.gap_after = None;
     state.session_family.pending_fanout.clear();
@@ -2421,8 +2358,6 @@ pub fn assert_maintenance_source_stays_control_plane(source: &str) {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use botster_core_daemon::ObserveLifecyclePassId;
-
     use super::*;
 
     #[test]
@@ -2712,31 +2647,13 @@ mod tests {
     #[test]
     fn exact_wakes_coalesce_without_clearing_other_kinds() {
         let mut wakes = MaintenanceWakes(0);
-        wakes.mark(MaintenanceSliceKind::Observe);
-        wakes.mark(MaintenanceSliceKind::Observe);
+        wakes.mark(MaintenanceSliceKind::Baseline);
+        wakes.mark(MaintenanceSliceKind::Baseline);
         wakes.mark(MaintenanceSliceKind::JournalPull);
-        assert!(wakes.take(MaintenanceSliceKind::Observe));
-        assert!(!wakes.take(MaintenanceSliceKind::Observe));
+        assert!(wakes.take(MaintenanceSliceKind::Baseline));
+        assert!(!wakes.take(MaintenanceSliceKind::Baseline));
         assert!(wakes.take(MaintenanceSliceKind::JournalPull));
         assert!(!wakes.has_any());
-    }
-
-    fn incomplete_resume() -> ObserveLifecycleCursor {
-        ObserveLifecycleCursor {
-            pass_id: ObserveLifecyclePassId("incomplete".into()),
-            last_visited: None,
-        }
-    }
-
-    #[test]
-    fn incomplete_observe_does_not_invent_an_unrelated_wake() {
-        let mut state = MaintenanceState::default();
-        for kind in MaintenanceSliceKind::ALL {
-            assert!(state.wakes.take(kind));
-        }
-        apply_observe_pass_result(&mut state, false, false, Some(incomplete_resume()));
-        assert!(state.observe_resume.is_some());
-        assert!(!state.wakes.has_any());
     }
 
     #[test]
@@ -3496,13 +3413,13 @@ mod tests {
                     botster_core::CoreSessionMetadata::new(),
                 )
                 .expect("spawn keep session");
-            let mut observe_state = MaintenanceState::default();
+            // Core's observe pass retires the expired session.
             for _ in 0..16 {
-                run_maintenance_kind_to_completion(
-                    &runtime,
-                    &mut observe_state,
-                    MaintenanceSliceKind::Observe,
-                );
+                let _ = runtime
+                    .observe_lifecycle_slice(now_seconds(), None, OBSERVE_SLICE_BUDGET)
+                    // timer: deadline — the shared test hang guard for one Core pass
+                    .wait(Duration::from_secs(10))
+                    .expect("Core observe pass");
             }
             let current = runtime
                 .lifecycle_baseline_page_for_test(None, None, BASELINE_PAGE_BUDGET)
@@ -3800,22 +3717,6 @@ mod tests {
     }
 
     #[test]
-    fn observe_resume_alone_does_not_keep_maintenance_pending() {
-        let mut state = sealed_maintenance(1, Some(1));
-        for kind in MaintenanceSliceKind::ALL {
-            let _ = state.wakes.take(kind);
-        }
-        state.observe_resume = Some(ObserveLifecycleCursor {
-            pass_id: ObserveLifecyclePassId("1".into()),
-            last_visited: None,
-        });
-        assert!(
-            !state.needs_work(),
-            "observe_resume is Observe continuation, not a nine-kind self-wake"
-        );
-    }
-
-    #[test]
     fn sealed_baseline_unavailable_observe_clears_cursor_without_remint_or_spin() {
         let mut state = MaintenanceState::default();
         state
@@ -3824,16 +3725,11 @@ mod tests {
                 source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
                 sequence: 1,
             });
-        state.observe_resume = Some(ObserveLifecycleCursor {
-            pass_id: ObserveLifecyclePassId("1".into()),
-            last_visited: None,
-        });
         state.journal_caught_up_confirmed = true;
         for kind in MaintenanceSliceKind::ALL {
             let _ = state.wakes.take(kind);
         }
         handle_unavailable_observe_pass(&mut state);
-        assert!(state.observe_resume.is_none());
         assert!(state.baseline.is_none());
         assert_eq!(state.baseline_page_reads, 0);
         assert!(
@@ -3846,12 +3742,7 @@ mod tests {
     fn incomplete_baseline_unavailable_observe_starts_recovery() {
         let mut state = MaintenanceState::default();
         assert!(!state.projection.baseline_complete);
-        state.observe_resume = Some(ObserveLifecycleCursor {
-            pass_id: ObserveLifecyclePassId("1".into()),
-            last_visited: None,
-        });
         handle_unavailable_observe_pass(&mut state);
-        assert!(state.observe_resume.is_none());
         assert!(
             state.session_family.need_gap_pass,
             "incomplete baseline must start recovery, which begins with the gap pass"
@@ -4642,24 +4533,28 @@ return botster.register({})
         let mut state = MaintenanceState::default();
         let mut reads = MaintenanceCoreReads::default();
         state.wakes = MaintenanceWakes(0);
+        state.baseline = Some(BaselineRecovery {
+            snapshot: None,
+            after: None,
+        });
         let release = runtime.test_fill_core_request_queue();
         run_maintenance_kind(
             &runtime,
             &mut state,
             &mut reads,
-            MaintenanceSliceKind::Observe,
+            MaintenanceSliceKind::Baseline,
         );
-        assert!(reads.observe.is_none(), "a refused read holds no ticket");
+        assert!(reads.baseline.is_none(), "a refused read holds no ticket");
         let seen = *state
             .signal_waits
-            .get(&MaintenanceSliceKind::Observe)
+            .get(&MaintenanceSliceKind::Baseline)
             .expect("the refused read parked on queue room");
         // A blanket mark while the queue is still full must not resubmit.
         run_maintenance_kind(
             &runtime,
             &mut state,
             &mut reads,
-            MaintenanceSliceKind::Observe,
+            MaintenanceSliceKind::Baseline,
         );
         state.mark_signaled_waits(runtime.owner_signal());
         assert!(
@@ -4670,18 +4565,61 @@ return botster.register({})
         crate::daemon::owner_signal::test_wait_until_moved(runtime.owner_signal(), seen);
         state.mark_signaled_waits(runtime.owner_signal());
         assert!(
-            state.wakes.take(MaintenanceSliceKind::Observe),
+            state.wakes.take(MaintenanceSliceKind::Baseline),
             "the data plane's dequeue wakes the parked read, with no other wake"
         );
         run_maintenance_kind(
             &runtime,
             &mut state,
             &mut reads,
-            MaintenanceSliceKind::Observe,
+            MaintenanceSliceKind::Baseline,
         );
         assert!(
-            reads.observe.is_some(),
+            reads.baseline.is_some(),
             "the read is submitted once there is room"
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_journal_page_that_cannot_progress_is_a_fault_not_a_retry() {
+        let (runtime, data_directory) = event_delivery_runtime("journal-no-progress");
+        let mut state = MaintenanceState::default();
+        let mut reads = MaintenanceCoreReads::default();
+        let cursor = SessionLifecycleCursor {
+            source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+            sequence: 1,
+        };
+        state
+            .projection
+            .replace_complete_baseline(cursor.clone(), Vec::new());
+        // Core had a change after the cursor, but it did not fit the page.
+        reads.journal = Some((
+            crate::CoreTicket::resolved(Ok(SessionLifecyclePage {
+                changes: Vec::new(),
+                next: cursor.clone(),
+                source_watermark: SessionLifecycleCursor {
+                    sequence: 2,
+                    ..cursor
+                },
+                resync_required: None,
+            })),
+            false,
+        ));
+        run_maintenance_kind(
+            &runtime,
+            &mut state,
+            &mut reads,
+            MaintenanceSliceKind::JournalPull,
+        );
+        assert!(
+            state.lifecycle_faulted,
+            "a page that cannot progress is a typed fault"
+        );
+        assert_eq!(
+            state.derived_readiness(MaintenanceSliceKind::JournalPull, &reads),
+            Some(false),
+            "a faulted journal pull is never ready again, so it cannot spin"
         );
         let _ = std::fs::remove_dir_all(data_directory);
     }
