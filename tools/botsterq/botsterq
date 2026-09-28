@@ -11,13 +11,18 @@
 # has run, streams the job's output live, and exits with the job's exit code.
 # The job runs in the caller's directory with the caller's environment, under
 # `nice -n 10`, in its own process group. `--exclusive` makes the job take
-# every slot, so it runs alone (use it for the load-sensitive lifecycle target).
+# every slot, so it runs alone (use it for load-sensitive suites).
 #
-# Ctrl-C, SIGTERM or SIGHUP to `run` cancels its job: a queued job is removed
-# from the queue; a running job's process group gets SIGTERM, then SIGKILL
-# after a grace period. Only that job's group is signalled, never by name.
-# A caller killed with SIGKILL cannot be noticed; its job then runs to the
-# end. `botsterq cancel <id>` (id from `botsterq list`) stops such a job.
+# Admission (enqueueing, and changing the slot count) is serialized by one
+# lock, and `slots N` refuses while any job is queued or running, so an
+# exclusive job's reservation always equals the slot count.
+#
+# Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`):
+# a queued job never starts; a running job's process group gets SIGTERM, and
+# SIGKILL if any member remains when the grace period ends. Only that job's
+# group is signalled, never anything by name. A job whose `run` process is gone
+# when its turn comes does not start. A caller killed with SIGKILL while its job
+# runs cannot be noticed; `botsterq cancel <id>` stops such a job.
 set -eu
 
 state=${BOTSTERQ_HOME:-$HOME/.botsterq}
@@ -25,6 +30,7 @@ mkdir -p "$state/run"
 export TS_SOCKET="$state/queue.sock"
 default_slots=2
 kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
+self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 
 usage() {
   sed -n '3,7p' "$0" | sed 's/^# //' >&2
@@ -40,16 +46,86 @@ configured_slots() {
   if [ -f "$state/slots" ]; then cat "$state/slots"; else echo "$default_slots"; fi
 }
 
-# Start the server with the configured slot count if it is not running yet.
-# TS_SLOTS is read only at server start; `ts -S` changes a running server.
 ensure_server() {
   TS_SLOTS=$(configured_slots) ts -l >/dev/null
-  # A pid file is named <owner pid>-...; drop those whose botsterq is gone.
-  for pidfile in "$state"/run/*.pid; do
-    [ -e "$pidfile" ] || continue
-    owner=$(basename "$pidfile" | cut -d- -f1)
-    kill -0 "$owner" 2>/dev/null || rm -f "$pidfile"
-  done
+}
+
+# Runs "$@" while holding the admission lock (a perl flock; macOS has no
+# flock(1)). The lock is released when the command exits.
+with_admission_lock() {
+  perl -MFcntl=:flock -e '
+    open(my $lock, ">>", shift) or die "botsterq: open lock: $!\n";
+    flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+    exit(system(@ARGV) >> 8);
+  ' "$state/admission.lock" "$@"
+}
+
+active_jobs() {
+  ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' '
+}
+
+# The pid file and cancel marker of job <token>.
+job_paths() {
+  pidfile="$state/run/$1.pid"
+  marker="$state/run/$1.cancelled"
+  joblock="$state/run/$1.lock"
+}
+
+token_of_job() {
+  ts -l | awk -v id="$1" '$1 == id' | sed -n 's/^.* #\([0-9a-f-]*\)\].*$/\1/p'
+}
+
+group_alive() {
+  kill -0 "-$1" 2>/dev/null
+}
+
+# Stop job <id> with token <token>. The marker comes first: a job that has not
+# yet published its pid will see it and not start. A queued job is removed; a
+# running job's group gets TERM, then KILL if any member outlives the grace.
+# Returns 0 when the job cannot start and its group is empty.
+stop_job() {
+  id=$1
+  job_paths "$2"
+  # Under the job's lock: create the marker and read the pid file. The job
+  # publishes its pid and checks the marker under the same lock, so exactly
+  # one of two things holds: the job published first (a group is returned and
+  # stopped here), or the job will see the marker, delete it, and not start.
+  group=$(perl -MFcntl=:flock -e '
+    my ($lock, $marker, $pidfile) = @ARGV;
+    open(my $l, ">>", $lock) or die "botsterq: open job lock: $!\n";
+    flock($l, LOCK_EX) or die "botsterq: job lock: $!\n";
+    open(my $m, ">", $marker) or die "botsterq: marker: $!\n";
+    close($m);
+    if (open(my $p, "<", $pidfile)) { my $g = <$p>; print $g if defined $g; }
+  ' "$joblock" "$marker" "$pidfile" | tr -d ' \n')
+  if ts -r "$id" >/dev/null 2>&1; then
+    rm -f "$marker"
+    return 0
+  fi
+  [ -n "$group" ] || return 0
+  rm -f "$marker"
+  if group_alive "$group"; then
+    echo "botsterq: stopping job $id (process group $group)" >&2
+    kill -TERM "-$group" 2>/dev/null || true
+    # timer: deadline — the kill grace; the job's end (ts -w) ends it early.
+    ( ts -w "$id" >/dev/null 2>&1 ) &
+    waiter=$!
+    ( sleep "$kill_grace_seconds"; kill "$waiter" 2>/dev/null ) &
+    timer=$!
+    wait "$waiter" 2>/dev/null || true
+    kill "$timer" 2>/dev/null || true
+    wait "$timer" 2>/dev/null || true
+    if group_alive "$group"; then
+      # A member outlived its leader or ignored SIGTERM.
+      echo "botsterq: job $id group $group outlived SIGTERM; sending SIGKILL" >&2
+      kill -KILL "-$group" 2>/dev/null || true
+    fi
+    if group_alive "$group"; then
+      echo "botsterq: job $id group $group survived SIGKILL" >&2
+      return 1
+    fi
+  fi
+  return 0
 }
 
 cmd_slots() {
@@ -61,6 +137,15 @@ cmd_slots() {
   case "$1" in
     ''|*[!0-9]*|0) echo "botsterq: slots must be a positive integer" >&2; exit 2 ;;
   esac
+  with_admission_lock "$self" __set-slots "$1"
+}
+
+set_slots_locked() {
+  active=$(active_jobs)
+  if [ "$active" -ne 0 ]; then
+    echo "botsterq: $active job(s) queued or running; change slots when the queue is empty" >&2
+    exit 1
+  fi
   printf '%s\n' "$1" >"$state/slots"
   ts -S "$1"
   echo "botsterq: $1 slots"
@@ -80,19 +165,74 @@ cmd_cancel() {
   [ "$#" -eq 1 ] || usage
   ensure_server
   case $(ts -s "$1" 2>/dev/null) in
-    queued) ts -r "$1" && echo "botsterq: removed queued job $1" ;;
-    running) ts -k "$1" && echo "botsterq: sent SIGTERM to job $1's process group" ;;
+    queued|running) ;;
     *) echo "botsterq: job $1 is not queued or running" >&2; exit 1 ;;
   esac
+  token=$(token_of_job "$1")
+  [ -n "$token" ] || { echo "botsterq: job $1 is not a botsterq job" >&2; exit 1; }
+  stop_job "$1" "$token"
+}
+
+# Under the admission lock: enqueue the job and print its id, or print
+# "wait <id>" when an exclusive job is queued ahead of this ordinary job.
+admit_locked() {
+  token=$1 exclusive=$2 label=$3
+  shift 3
+  if [ "$exclusive" = 1 ]; then
+    slots_needed=$(ts -S)
+    marker_text=" [exclusive]"
+  else
+    slots_needed=1
+    marker_text=
+    # An exclusive job needs every slot at once; task-spooler would keep
+    # filling single free slots from behind it, so ordinary jobs wait for it.
+    queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
+    if [ -n "$queued_exclusive" ]; then
+      echo "wait $queued_exclusive"
+      return
+    fi
+  fi
+  job_paths "$token"
+  enqueued="$state/run/$token.enqueued"
+  rm -f "$enqueued"
+  mkfifo "$enqueued"
+  # TS_ENV runs once ts has enqueued the job: its FIFO write is the event that
+  # makes the job's id readable. The job publishes its pid, then starts only
+  # if it was not cancelled and its `run` process still exists.
+  TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
+    sh -c '
+      pidfile=$1 marker=$2 joblock=$3 owner=$4
+      shift 4
+      [ -z "${BOTSTERQ_TEST_BEFORE_PIDFILE:-}" ] || read _ <"$BOTSTERQ_TEST_BEFORE_PIDFILE" || true
+      kill -0 "$owner" 2>/dev/null || exit 130
+      # Under the job lock: a cancel that came first left a marker (consume it
+      # and do not start); otherwise publish this group for any later cancel.
+      perl -MFcntl=:flock -e '"'"'
+        my ($lock, $marker, $pidfile, $group) = @ARGV;
+        open(my $l, ">>", $lock) or exit 2;
+        flock($l, LOCK_EX) or exit 2;
+        if (-e $marker) { unlink $marker; exit 3; }
+        open(my $p, ">", $pidfile) or exit 2;
+        print $p "$group\n";
+        close($p);
+      '"'"' "$joblock" "$marker" "$pidfile" "$$" || exit 130
+      [ -z "${BOTSTERQ_TEST_AFTER_PIDFILE:-}" ] || read _ <"$BOTSTERQ_TEST_AFTER_PIDFILE" || true
+      BOTSTERQ_JOB=$$ exec nice -n 10 "$@"
+    ' botsterq-job "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$@" </dev/null >&3 2>&4 &
+  read _ <"$enqueued" || true
+  rm -f "$enqueued"
+  id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
+  [ -n "$id" ] || { echo "botsterq: enqueued job not found" >&2; exit 1; }
+  echo "$id"
 }
 
 cmd_run() {
   label=job
-  slots_needed=1
+  exclusive=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --label) [ "$#" -ge 2 ] || usage; label=$2; shift 2 ;;
-      --exclusive) slots_needed=all; shift ;;
+      --exclusive) exclusive=1; shift ;;
       --) shift; break ;;
       *) usage ;;
     esac
@@ -104,59 +244,38 @@ cmd_run() {
     exec "$@"
   fi
   ensure_server
-  exclusive_marker=
-  if [ "$slots_needed" = all ]; then
-    slots_needed=$(ts -S)
-    exclusive_marker=" [exclusive]"
-  else
-    # An exclusive job needs every slot at once. task-spooler fills a free slot
-    # from later in the queue, so ordinary jobs arriving behind a queued
-    # exclusive job could starve it; they wait for it to finish instead.
-    for exclusive_id in $(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1 }'); do
-      echo "botsterq: waiting for exclusive job $exclusive_id before queueing" >&2
-      ts -w "$exclusive_id" >/dev/null 2>&1 || true
-    done
-  fi
-
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
-  pidfile="$state/run/$token.pid"
-  # The label names the job for `list`: text, owner directory, unique token.
-  job_label="$label$exclusive_marker @ $(pwd) #$token"
-
-  # The job records its pid, which is also its process group, then execs.
-  ts -f -n -N "$slots_needed" -L "$job_label" \
-    sh -c 'printf "%s\n" "$$" >"$1"; shift; BOTSTERQ_JOB=$$ exec nice -n 10 "$@"' botsterq-job "$pidfile" "$@" &
-  client=$!
-
-  cancel() {
+  export BOTSTERQ_OWNER=$$
+  id=
+  interrupted() {
     trap - INT TERM HUP
-    if [ -s "$pidfile" ]; then
-      group=$(cat "$pidfile")
-      echo "botsterq: cancelling running job (process group $group)" >&2
-      kill -TERM "-$group" 2>/dev/null || true
-      # timer: deadline — the kill grace; the job's exit ends `wait` first.
-      ( sleep "$kill_grace_seconds"; kill -KILL "-$group" 2>/dev/null ) &
-      grace=$!
-      wait "$client" 2>/dev/null || true
-      kill "$grace" 2>/dev/null || true
-      wait "$grace" 2>/dev/null || true
-    else
-      id=$(ts -l | awk -v token="#$token" 'index($0, token) && $2 == "queued" { print $1 }')
-      if [ -n "$id" ]; then
-        echo "botsterq: removing queued job $id" >&2
-        ts -r "$id" >/dev/null 2>&1 || true
-      fi
-      kill "$client" 2>/dev/null || true
-      wait "$client" 2>/dev/null || true
+    status=130
+    if [ -n "$id" ]; then
+      stop_job "$id" "$token" || status=1
     fi
-    rm -f "$pidfile"
-    exit 130
+    rm -f "$state/run/$token.pid" "$state/run/$token.lock" "$state/run/$token.enqueued"
+    exit "$status"
   }
-  trap cancel INT TERM HUP
-
+  trap interrupted INT TERM HUP
+  # The job's output goes to the caller's stdout and stderr (fds 3 and 4),
+  # not into the command substitution that reads the admitted id.
+  exec 3>&1 4>&2
+  while :; do
+    admitted=$(with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$@")
+    case "$admitted" in
+      "wait "*)
+        echo "botsterq: waiting for exclusive job ${admitted#wait } before queueing" >&2
+        ( ts -w "${admitted#wait }" >/dev/null 2>&1 ) &
+        wait $! || true
+        ;;
+      *) id=$admitted; break ;;
+    esac
+  done
+  ( ts -w "$id" >/dev/null 2>&1 ) &
+  waiter=$!
   status=0
-  wait "$client" || status=$?
-  rm -f "$pidfile"
+  wait "$waiter" || status=$?
+  rm -f "$state/run/$token.pid" "$state/run/$token.lock" "$state/run/$token.enqueued"
   exit "$status"
 }
 
@@ -168,5 +287,7 @@ case "$subcommand" in
   list) cmd_list ;;
   cancel) cmd_cancel "$@" ;;
   slots) cmd_slots "$@" ;;
+  __admit) admit_locked "$@" ;;
+  __set-slots) set_slots_locked "$@" ;;
   *) usage ;;
 esac
