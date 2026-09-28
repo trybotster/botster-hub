@@ -869,6 +869,16 @@ fn run_maintenance_kind_with_owner(
     kind: MaintenanceSliceKind,
     waiter_id: Option<crate::owner_identity::WaiterId>,
 ) {
+    // A slice parked on a cross-thread wait stays parked until its key moves,
+    // whoever marks it. Event delivery keeps its own rule (retirements).
+    if kind != MaintenanceSliceKind::PackageEventDelivery {
+        if let Some(seen) = state.signal_waits.get(&kind)
+            && !runtime.owner_signal().moved(*seen)
+        {
+            return;
+        }
+        state.signal_waits.remove(&kind);
+    }
     match kind {
         MaintenanceSliceKind::Observe => run_observe_slice(runtime, state, reads, waiter_id),
         MaintenanceSliceKind::JournalPull => {
@@ -968,6 +978,13 @@ fn run_observe_slice(
                 OBSERVE_SLICE_BUDGET,
             ),
         });
+        if reads
+            .observe
+            .as_ref()
+            .is_some_and(|ticket| park_refused_read(state, MaintenanceSliceKind::Observe, ticket))
+        {
+            reads.observe = None;
+        }
         return;
     };
     let result = match ticket.poll() {
@@ -1010,6 +1027,23 @@ fn run_observe_slice(
             state.wakes.mark_all();
         }
         Err(_) => state.wakes.mark_all(),
+    }
+}
+
+/// A read that the full Core request queue refused parks its slice on queue
+/// room; the refusal never reaches a completion wake, so nothing else would
+/// run the slice again (readiness plan 1.5 item 7). Returns whether it parked.
+fn park_refused_read<T>(
+    state: &mut MaintenanceState,
+    kind: MaintenanceSliceKind,
+    ticket: &crate::CoreTicket<T>,
+) -> bool {
+    match ticket.refused_wait() {
+        Some(seen) => {
+            state.signal_waits.insert(kind, seen);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1059,6 +1093,11 @@ fn run_journal_pull_slice(
                     JOURNAL_PAGE_MAX_BYTES,
                 ),
             };
+            if park_refused_read(state, MaintenanceSliceKind::JournalPull, &ticket) {
+                // Keep the journal wake that this pull consumed.
+                state.journal_wake_pending |= woke;
+                return;
+            }
             reads.journal = Some((ticket, woke));
             return;
         }
@@ -1157,6 +1196,11 @@ fn run_baseline_slice(
                     BASELINE_PAGE_BUDGET,
                 ),
             });
+            if reads.baseline.as_ref().is_some_and(|ticket| {
+                park_refused_read(state, MaintenanceSliceKind::Baseline, ticket)
+            }) {
+                reads.baseline = None;
+            }
             return;
         }
     };
@@ -4467,6 +4511,90 @@ return botster.register({})
         drop(runtime);
         let _ = std::fs::remove_dir_all(data_directory);
         let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
+    fn a_refused_maintenance_read_parks_until_the_data_plane_dequeues() {
+        let (runtime, data_directory) = event_delivery_runtime("refused-read");
+        let mut state = MaintenanceState::default();
+        let mut reads = MaintenanceCoreReads::default();
+        state.wakes = MaintenanceWakes(0);
+        let release = runtime.test_fill_core_request_queue();
+        run_maintenance_kind(
+            &runtime,
+            &mut state,
+            &mut reads,
+            MaintenanceSliceKind::Observe,
+        );
+        assert!(reads.observe.is_none(), "a refused read holds no ticket");
+        let seen = *state
+            .signal_waits
+            .get(&MaintenanceSliceKind::Observe)
+            .expect("the refused read parked on queue room");
+        // A blanket mark while the queue is still full must not resubmit.
+        run_maintenance_kind(
+            &runtime,
+            &mut state,
+            &mut reads,
+            MaintenanceSliceKind::Observe,
+        );
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            !state.wakes.has_any(),
+            "no wake while the queue is full: {state:?}"
+        );
+        drop(release);
+        crate::daemon::owner_signal::test_wait_until_moved(runtime.owner_signal(), seen);
+        state.mark_signaled_waits(runtime.owner_signal());
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::Observe),
+            "the data plane's dequeue wakes the parked read, with no other wake"
+        );
+        run_maintenance_kind(
+            &runtime,
+            &mut state,
+            &mut reads,
+            MaintenanceSliceKind::Observe,
+        );
+        assert!(
+            reads.observe.is_some(),
+            "the read is submitted once there is room"
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_refused_journal_pull_keeps_the_journal_wake_it_consumed() {
+        let (runtime, data_directory) = event_delivery_runtime("refused-journal");
+        let mut state = MaintenanceState::default();
+        let mut reads = MaintenanceCoreReads::default();
+        state.projection.replace_complete_baseline(
+            SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            },
+            Vec::new(),
+        );
+        state.journal_wake_pending = true;
+        let release = runtime.test_fill_core_request_queue();
+        run_maintenance_kind(
+            &runtime,
+            &mut state,
+            &mut reads,
+            MaintenanceSliceKind::JournalPull,
+        );
+        assert!(reads.journal.is_none());
+        assert!(
+            state
+                .signal_waits
+                .contains_key(&MaintenanceSliceKind::JournalPull)
+        );
+        assert!(
+            state.journal_wake_pending,
+            "the refused pull must not lose the journal wake"
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     #[test]
