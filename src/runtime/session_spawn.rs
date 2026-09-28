@@ -783,7 +783,9 @@ impl SessionTypeSpawnStart {
                                     runtime,
                                     CoreOperation::SpawnReserved {
                                         reservation: reserved,
-                                        request: self.spawn.clone(),
+                                        request: crate::session_credential::credentialed(
+                                            self.spawn.clone(),
+                                        ),
                                     },
                                 );
                                 self.stage = PluginSpawnStage::SpawnReserved;
