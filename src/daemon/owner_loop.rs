@@ -1067,8 +1067,19 @@ pub(crate) fn dispatch_owner_ready_item(
     shutdown
 }
 
+/// Publish owner readiness without dispatching, as the owner does before
+/// it decides to sleep.
+///
+/// Contract (plugin test kit): publish everything that is ready, dispatch
+/// nothing; the owner is idle when `owner_ready` is empty afterwards.
+#[cfg(any(test, feature = "plugin-test-kit"))]
+pub(crate) fn publish_test_readiness(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    publish_completion_wakes(daemon, state);
+    publish_maintenance_wakes(state);
+}
+
 /// Run a bounded test turn with the production wake and dispatch paths.
-#[cfg(test)]
+#[cfg(any(test, feature = "plugin-test-kit"))]
 pub(crate) fn drive_ready_test_turn(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,

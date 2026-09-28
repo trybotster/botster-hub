@@ -224,6 +224,8 @@ pub use profile::{
     host_profile,
 };
 pub use runtime::CoreOperationTracker;
+#[cfg(feature = "plugin-test-kit")]
+pub mod plugin_test_kit;
 #[cfg(feature = "test-internals")]
 pub mod test_internals;
 pub use runtime::{

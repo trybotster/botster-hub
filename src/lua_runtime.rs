@@ -776,15 +776,19 @@ mod event_name_tests {
 pub(crate) static TEST_EVENT_HANDLER_HOLD_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "plugin-test-kit"))]
 #[derive(Default)]
 struct TestPluginInvocationGateState {
+    /// The plugin whose handler the armed gate holds; `None` holds any.
+    plugin_key: Option<String>,
+    /// The handler id the armed gate holds.
+    handler_id: String,
     armed: bool,
     entered: bool,
     released: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "plugin-test-kit"))]
 fn test_plugin_invocation_gate() -> &'static (
     std::sync::Mutex<TestPluginInvocationGateState>,
     std::sync::Condvar,
@@ -803,9 +807,18 @@ fn test_plugin_invocation_gate() -> &'static (
 
 #[cfg(test)]
 pub(crate) fn arm_test_plugin_invocation_gate() {
+    arm_test_plugin_invocation_gate_for(None, "controlled_gate");
+}
+
+/// Arm the gate for the next invocation of `handler_id`, in `plugin_key`
+/// when given.
+#[cfg(any(test, feature = "plugin-test-kit"))]
+pub(crate) fn arm_test_plugin_invocation_gate_for(plugin_key: Option<&str>, handler_id: &str) {
     let (lock, _) = test_plugin_invocation_gate();
     let mut state = lock.lock().expect("plugin invocation gate mutex");
     *state = TestPluginInvocationGateState {
+        plugin_key: plugin_key.map(str::to_string),
+        handler_id: handler_id.to_string(),
         armed: true,
         entered: false,
         released: false,
@@ -822,7 +835,7 @@ pub(crate) fn wait_for_test_plugin_invocation_gate(deadline: Duration) -> bool {
     state.entered
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "plugin-test-kit"))]
 pub(crate) fn release_test_plugin_invocation_gate() {
     let (lock, condition) = test_plugin_invocation_gate();
     let mut state = lock.lock().expect("plugin invocation gate mutex");
@@ -830,14 +843,17 @@ pub(crate) fn release_test_plugin_invocation_gate() {
     condition.notify_all();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "plugin-test-kit"))]
 fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> bool {
-    if request.handler.handler_id != "controlled_gate" {
-        return true;
-    }
     let (lock, condition) = test_plugin_invocation_gate();
     let mut state = lock.lock().expect("plugin invocation gate mutex");
-    if !state.armed {
+    if !state.armed
+        || request.handler.handler_id != state.handler_id
+        || state
+            .plugin_key
+            .as_deref()
+            .is_some_and(|plugin_key| request.handler.plugin_key.0 != plugin_key)
+    {
         return true;
     }
     state.entered = true;
@@ -1832,7 +1848,7 @@ impl PluginRuntime for LuaPluginRuntime {
             );
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "plugin-test-kit"))]
         if !hold_controlled_test_plugin_invocation(&request) {
             return failed(
                 request,
