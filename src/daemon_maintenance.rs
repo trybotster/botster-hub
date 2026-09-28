@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use botster_core::SessionId;
 use botster_core::{
@@ -964,13 +964,6 @@ pub(crate) fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
     if !state.projection.baseline_complete || state.baseline.is_some() {
         start_baseline_recovery(state);
     }
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// A read that the full Core request queue refused parks its slice on queue
@@ -2275,6 +2268,7 @@ pub fn assert_maintenance_source_stays_control_plane(source: &str) {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -3293,7 +3287,14 @@ mod tests {
             // Core's observe pass retires the expired session.
             for _ in 0..16 {
                 let _ = runtime
-                    .observe_lifecycle_slice(now_seconds(), None, OBSERVE_SLICE_BUDGET)
+                    .observe_lifecycle_slice(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        None,
+                        OBSERVE_SLICE_BUDGET,
+                    )
                     // timer: deadline — the shared test hang guard for one Core pass
                     .wait(Duration::from_secs(10))
                     .expect("Core observe pass");
