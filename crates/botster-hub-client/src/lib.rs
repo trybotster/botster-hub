@@ -1296,7 +1296,7 @@ impl DaemonConnection {
         loop {
             // Read directly so the retirement result decides this response's
             // route: return it, park it for its waiter, or discard it.
-            match self.frames.read_frame(&mut self.reader)? {
+            match self.read_socket_frame()? {
                 DaemonUnixMuxFrame::Server(ServerFrame::Response {
                     request_id: id,
                     response,
@@ -1403,12 +1403,20 @@ impl DaemonConnection {
         Ok(frame)
     }
 
-    fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    /// Read one frame from the socket. Every read goes through here, so a
+    /// Hub credit frame always reaches the ledger and its grants go out,
+    /// whatever the caller is waiting for.
+    fn read_socket_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
         let frame = self.frames.read_frame(&mut self.reader)?;
         if let DaemonUnixMuxFrame::Credit(credit) = &frame {
             let grants = self.credit.on_hub_frame(credit);
             self.send_grants(grants)?;
         }
+        Ok(frame)
+    }
+
+    fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+        let frame = self.read_socket_frame()?;
         if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
             && let Some(id) = parse_request_id(request_id)
         {
