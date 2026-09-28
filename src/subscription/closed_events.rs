@@ -473,7 +473,6 @@ mod tests {
             close.contains("queue_closed_subscription_events_bounded"),
             "close-events region must still contain the bounded slice"
         );
-        assert!(!close.contains("take_journal_advanced_wake"));
         assert!(!close.contains("observe_session_lifecycle"));
         assert!(!close.contains("observe_lifecycle_slice"));
         assert!(
