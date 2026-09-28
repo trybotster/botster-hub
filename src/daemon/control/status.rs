@@ -90,6 +90,15 @@ pub(crate) fn handle(
     });
     if shutdown {
         state.shutdown_waiter = Some(waiter_id);
+        // Answer a parked update check when shutdown starts, not when it
+        // finishes: the check's blocking fetch has its own deadline, and the
+        // caller must get the typed daemon_shutdown whichever ends first.
+        // Deliberate: if this shutdown later fails (status_preparation_failed
+        // below), the daemon keeps running and the caller already holds
+        // Unavailable/daemon_shutdown/retry, which is acceptable because the
+        // client retries. The fetch's late completion then finds no parked
+        // reply and sends nothing (`host::hub_update_check_completed`).
+        super::request::finish_shutdown_update_reply(state);
     }
     ControlStep::Pending(super::pending::PendingStep {
         continuation: super::pending::ControlContinuation::Status(Box::new(StatusContinuation {
@@ -1747,6 +1756,11 @@ mod tests {
                 enqueued_at: Instant::now(),
             }
         ));
+        // The parked update check is answered when shutdown starts, before
+        // any owner turn: its own fetch deadline can no longer win the race.
+        let mut update_rx = update_rx;
+        assert_update_reply_is_daemon_shutdown(&mut update_rx);
+        assert!(state.pending_hub_update_reply.is_none());
         assert_eq!(
             daemon.runtime().unwrap().host_executor().outstanding(),
             HOST_OPERATION_CAPACITY
@@ -1859,13 +1873,13 @@ mod tests {
                 .budget
                 .release(owner_permit.expect("fault retains its Owner permit"));
         }
-        let update = update_rx
-            .blocking_recv()
-            .expect("update reply")
-            .expect("update response")
-            .hub_update
-            .expect("update state");
-        assert_eq!(update.reason.as_deref(), Some("daemon_shutdown"));
+        // The finished shutdown sends no second reply, and the fetch's late
+        // completion finds nothing parked.
+        assert!(state.pending_hub_update_reply.is_none());
+        assert!(!super::super::host::hub_update_check_completed(
+            &mut state,
+            late_update_check()
+        ));
         assert!(!crate::daemon::owner_loop::drive_ready_test_turn(
             &mut daemon,
             &mut state
@@ -1879,6 +1893,145 @@ mod tests {
             1
         );
         drop(blockers);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove test state");
+    }
+
+    fn late_update_check() -> botster_hub_client::DaemonHubUpdate {
+        botster_hub_client::DaemonHubUpdate {
+            state: botster_hub_client::DaemonHubUpdateState::Unavailable,
+            current_version: String::new(),
+            available_version: None,
+            build_revision: None,
+            reason: Some("release_source_timeout".to_string()),
+            action: None,
+        }
+    }
+
+    fn assert_update_reply_is_daemon_shutdown(
+        update_rx: &mut crate::daemon::control::message::ControlReplyReceiver,
+    ) {
+        let update = update_rx
+            .try_recv()
+            .expect("the update reply is sent when shutdown starts")
+            .expect("update response")
+            .hub_update
+            .expect("update state");
+        assert_eq!(update.reason.as_deref(), Some("daemon_shutdown"));
+        assert_eq!(update.action.as_deref(), Some("retry"));
+    }
+
+    /// A shutdown can fail after it starts (status preparation fails) and the
+    /// daemon keeps running. The parked update check was already answered
+    /// with Unavailable/daemon_shutdown/retry when shutdown started; the
+    /// failure leaves nothing parked, and the fetch's late completion sends
+    /// no second reply.
+    #[test]
+    fn a_shutdown_that_fails_after_it_starts_leaves_one_update_reply() {
+        let directory = std::env::temp_dir().join(format!(
+            "botster-status-shutdown-failed-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build daemon config");
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("transport runtime");
+        let (control_tx, _control_rx) =
+            tokio::sync::mpsc::channel(crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY);
+        let (reply_tx, _reply_rx) = control_reply_channel();
+        let (update_tx, mut update_rx) = control_reply_channel();
+        state.pending_hub_update_reply = Some(update_tx);
+        assert!(!super::super::request::handle(
+            &mut daemon,
+            &mut state,
+            transport.handle(),
+            control_tx,
+            ControlMessage::Request {
+                request: Box::new(botster_hub_client::DaemonRequest::DaemonShutdown),
+                transport_request_id: Some("1".to_string()),
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client_id: None,
+                enqueued_at: Instant::now(),
+            }
+        ));
+        assert_update_reply_is_daemon_shutdown(&mut update_rx);
+        assert!(state.pending_hub_update_reply.is_none());
+
+        // Drive the admitted shutdown into its failed-preparation branch.
+        let (&waiter_id, entry) = state
+            .pending_requests
+            .iter_mut()
+            .next()
+            .expect("the admitted shutdown is retained");
+        let super::super::pending::ControlContinuation::Status(continuation) =
+            &mut entry.continuation
+        else {
+            panic!("Status continuation");
+        };
+        let mut continuation = std::mem::replace(
+            continuation,
+            Box::new(StatusContinuation {
+                waiter_id,
+                shutdown: true,
+                policy: continuation.policy,
+                ticket: None,
+                input: None,
+                permit: None,
+                prepared: None,
+                phase: 0,
+                entity_cancel_after: None,
+                delivery: None,
+            }),
+        );
+        assert_eq!(state.shutdown_waiter, Some(waiter_id));
+        continuation.phase = 1;
+        continuation.ticket = None;
+        let permit = continuation.permit.take().expect("Status retains its slot");
+        state.host_completions.insert(
+            waiter_id,
+            crate::host_executor::HostCompletion::for_test(
+                HostJobIdentity {
+                    waiter_id,
+                    phase: 1,
+                },
+                crate::host_executor::HostResult::Failed {
+                    generation: 0,
+                    error: crate::host_executor::HostError::new(
+                        "test_status_failure",
+                        "forced status preparation failure",
+                    ),
+                },
+                permit,
+            ),
+        );
+        state.current_waiter_id = Some(waiter_id);
+        let polled = continuation.poll(&mut daemon, &mut state);
+        assert!(
+            matches!(&polled, ControlPoll::Ready(Ok(response))
+                if response.error.as_ref().is_some_and(|error| error.code == "status_preparation_failed")),
+            "the forced failure ends the shutdown with status_preparation_failed"
+        );
+        assert_eq!(state.shutdown_waiter, None, "the daemon keeps running");
+        assert!(state.pending_hub_update_reply.is_none());
+        assert!(!super::super::host::hub_update_check_completed(
+            &mut state,
+            late_update_check()
+        ));
+        state.pending_requests.clear();
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove test state");
     }
