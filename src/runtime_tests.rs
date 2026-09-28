@@ -140,7 +140,10 @@ pub(super) fn family_runtime(name: &str) -> HubRuntime {
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .unwrap();
-    HubRuntime::new(config).unwrap()
+    let runtime = HubRuntime::new(config).unwrap();
+    // Timer tests drain at explicit logical times that start at zero.
+    runtime.clock().make_logical(0, 0);
+    runtime
 }
 
 fn occupy_inflight_and_freeze_remainder(

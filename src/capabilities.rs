@@ -35,6 +35,7 @@ use botster_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::HubConfig;
+use crate::hub_clock::HubClock;
 
 const DEFAULT_FILESYSTEM_SCOPE: &str = "workspace";
 const DEFAULT_CAPABILITY_EVENT_CAPACITY: usize = 256;
@@ -57,6 +58,9 @@ pub struct HubCapabilityRuntime {
     http: HttpCapabilityRuntime,
     websocket: InMemoryWebSocketCapabilityRuntime,
     timers: BTreeMap<CapabilityResourceId, HubTimer>,
+    /// The Hub's clock. A timer is due `delay_ms` after this clock's
+    /// monotonic time at arming.
+    clock: HubClock,
     pending_events: BTreeMap<String, VecDeque<CapabilityRuntimeEvent>>,
     completions_sender: mpsc::Sender<HubCapabilityCompletion>,
     completions_receiver: mpsc::Receiver<HubCapabilityCompletion>,
@@ -187,6 +191,18 @@ impl HubCapabilityRuntime {
     /// Returns an error when the plugin database under the data directory
     /// cannot be opened.
     pub fn from_config(config: &HubConfig) -> Result<Self, CapabilityRuntimeError> {
+        Self::from_config_with_clock(config, HubClock::system())
+    }
+
+    /// Build the runtime with the Hub's clock. Timers arm against it.
+    ///
+    /// # Errors
+    /// Returns an error when the plugin database under the data directory
+    /// cannot be opened.
+    pub fn from_config_with_clock(
+        config: &HubConfig,
+        clock: HubClock,
+    ) -> Result<Self, CapabilityRuntimeError> {
         let plugin_store = Arc::new(KeyedPluginStore::open(
             &config.data_directory.join(PLUGIN_DB_FILE),
         )?);
@@ -237,6 +253,7 @@ impl HubCapabilityRuntime {
             http,
             websocket,
             timers: BTreeMap::new(),
+            clock,
             pending_events: BTreeMap::new(),
             completions_sender,
             completions_receiver,
@@ -512,7 +529,7 @@ impl HubCapabilityRuntime {
             HubTimer {
                 plugin_key: request.plugin_key.clone(),
                 resource: resource.clone(),
-                next_fire_ms: delay_ms,
+                next_fire_ms: self.clock.monotonic_ms().saturating_add(delay_ms),
                 interval_ms,
                 sequence: 0,
             },

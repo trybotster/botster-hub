@@ -168,6 +168,8 @@ pub struct HubRuntime {
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: Option<HubPluginLifecycle>,
+    /// The one clock of this Hub: plugin clocks, log rate limits, and timers.
+    clock: crate::hub_clock::HubClock,
     capability_runtime: SharedHubCapabilityRuntime,
     session_type_spawner: SharedSessionTypeSpawner,
     host_executor: crate::host_executor::HostExecutor,
@@ -752,10 +754,13 @@ impl HubRuntime {
         );
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
+        let clock = crate::hub_clock::HubClock::system();
         Ok(Self {
             capability_runtime: Arc::new(Mutex::new(
-                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
+                HubCapabilityRuntime::from_config_with_clock(&config, clock.clone())
+                    .map_err(HubRuntimeError::Capability)?,
             )),
+            clock,
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
                 &lua_memory,
             ))),
@@ -954,10 +959,13 @@ impl HubRuntime {
         );
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
+        let clock = crate::hub_clock::HubClock::system();
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(
-                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
+                HubCapabilityRuntime::from_config_with_clock(&config, clock.clone())
+                    .map_err(HubRuntimeError::Capability)?,
             )),
+            clock,
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
                 &lua_memory,
             ))),
@@ -1051,6 +1059,12 @@ impl HubRuntime {
         &self,
     ) -> &crate::session_types::StartupMaterializationPaths {
         &self.startup_materialization_paths
+    }
+
+    /// The one clock of this hub. Every plugin VM and the timer runtime read it.
+    #[must_use]
+    pub fn clock(&self) -> &crate::hub_clock::HubClock {
+        &self.clock
     }
 
     /// Return the concrete local capability runtime owned by this hub.
@@ -1159,6 +1173,7 @@ impl HubRuntime {
             memory: Arc::clone(&self.lua_memory),
             logs: Arc::clone(&self.plugin_logs),
             capabilities: self.capability_runtime.clone(),
+            clock: self.clock.clone(),
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
             session_types: self.session_type_spawner.clone(),
