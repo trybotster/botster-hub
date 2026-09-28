@@ -34,11 +34,14 @@ botsterq slots 3         # change it (kept across server restarts)
 - The job runs in the caller's directory with the caller's environment (so
   `RUSTUP_TOOLCHAIN`, `BOTSTER_HUB_BIN` and the other test variables pass through),
   under `nice -n 10`, in its own process group.
-- Ctrl-C, SIGTERM or SIGHUP to `run` cancels the job. A queued job leaves the
-  queue. A running job's process group gets SIGTERM, then SIGKILL after 10 s
-  (`BOTSTERQ_KILL_GRACE`). Only that group is signalled, never anything by name.
-- A caller killed with SIGKILL cannot be noticed, so its job runs to the end. Use
-  `botsterq cancel <id>`.
+- Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`): a
+  queued job never starts. A running job's process group gets SIGTERM, and SIGKILL
+  if any member is still there when the grace period (10 s, `BOTSTERQ_KILL_GRACE`)
+  ends, including a child that ignores SIGTERM after its leader exits. Only that
+  group is signalled, never anything by name.
+- A job whose `run` process is gone when its turn comes does not start. A caller
+  killed with SIGKILL while its job runs cannot be noticed; use `botsterq cancel <id>`.
+- `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
 ## What goes through it
@@ -51,21 +54,37 @@ suites. Light commands (git, `cargo fmt --check`, reading files) run directly.
 
 `--exclusive` makes a job require every slot, so it runs alone: nothing else heavy
 competes with the load-sensitive lifecycle target, and no second lifecycle run can
-overlap it. Ordinary jobs queued after a queued exclusive job wait for it to
-finish before they enter the queue. Without that, task-spooler would keep filling
-single free slots from behind it, and the exclusive job could starve. Use
+overlap it. Ordinary jobs admitted after an exclusive job is queued wait for
+it to finish before they enter the queue (the check and the enqueue are one step
+under the admission lock). Without that, task-spooler would keep filling single
+free slots from behind it, and the exclusive job could starve. Use
 `--exclusive` for `hub_daemon_lifecycle_test`, for the full `./test.sh`, and for
 any run whose result is sensitive to host load.
 
 ## How it works
 
-task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS`
-slots. `run` calls `ts -f -n -N <slots> -L "<label> @ <cwd> #<token>" ...`: `-f`
-keeps the job a child of the caller's `ts` client (caller's environment and
-directory), `-n` streams output instead of storing it, and `-N` is the slot
-count the job takes. The job writes its pid (its own process group) to a pid
-file before it execs the command; cancel uses it to signal exactly that group.
-Waiting uses `wait` and `ts -w`, which are completion events, not polls.
+task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slots.
+
+- Admission is serialized by one lock (`~/.botsterq/admission.lock`, a perl
+  `flock`; macOS has no `flock(1)`). Under it, `run` checks for a queued exclusive
+  job, enqueues with `ts -f -n -N <slots> -L "<label> @ <cwd> #<token>"`, waits for
+  `TS_ENV` to signal the enqueue through a FIFO (an event), and reads the job's id.
+  `slots N` takes the same lock, which is why an exclusive job's reservation always
+  equals the slot count.
+- `-f` keeps the job a child of the caller's `ts` client (caller's environment and
+  directory); `-n` streams output instead of storing it; `ts -w <id>` returns the
+  job's exit code.
+- Start versus cancel: the job publishes its pid (its own process group) and checks
+  for a cancel marker under a per-job lock; a cancel creates the marker and reads
+  the pid under the same lock. Either the job published first (the cancel stops its
+  group) or the cancel came first (the job deletes the marker and does not start).
+- Waiting uses `wait` and `ts -w`, which are completion events, not polls. The only
+  timer is the kill grace, a deadline.
+- `tools/botsterq/test-botsterq` is the regression suite (a private queue): it
+  covers the exit code and environment, slot refusal, exclusive reservations and
+  fairness, cancel of queued and running jobs, a SIGTERM-ignoring child with an
+  untouched control process, both sides of the start/cancel race (pinned with test
+  hooks), nesting, an orphaned queued job, and `cancel <id>`.
 
 ## Stage 2 (design only): a remote Linux backend
 
