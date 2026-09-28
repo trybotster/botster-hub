@@ -4,6 +4,7 @@
 #   botsterq run [--label <text>] [--exclusive] [--deadline <duration>] -- <command...>
 #   botsterq list
 #   botsterq cancel <id>
+#   botsterq audit
 #   botsterq slots [N]
 #
 # Jobs run through task-spooler (`ts`, brew install task-spooler) on a
@@ -203,6 +204,35 @@ cmd_list() {
   done
 }
 
+# Reads the events log (one start and one end line per job) and prints every
+# pair of jobs that ran at the same time when one of them is exclusive. A job
+# without an end line is still running. Exit 1 when an overlap exists.
+cmd_audit() {
+  log="$state/events.log"
+  [ -f "$log" ] || { echo "botsterq: no events yet ($log)"; return 0; }
+  now=$(date +%s)
+  awk -F'\t' -v now="$now" '
+    $1 == "start" { s[$3] = $2; ex[$3] = $5; lab[$3] = $6; order[++n] = $3 }
+    $1 == "end"   { e[$3] = $2 }
+    END {
+      overlaps = 0
+      for (i = 1; i <= n; i++) {
+        a = order[i]; if (ex[a] != 1) continue
+        aend = (a in e) ? e[a] : now
+        for (j = 1; j <= n; j++) {
+          b = order[j]; if (b == a) continue
+          bend = (b in e) ? e[b] : now
+          if (s[b] < aend && s[a] < bend) {
+            printf "OVERLAP exclusive job %s (%s) and job %s (%s)\n", a, lab[a], b, lab[b]
+            overlaps++
+          }
+        }
+      }
+      printf "%d job(s), %d overlap(s) with an exclusive job\n", n, overlaps
+      exit overlaps > 0
+    }' "$log"
+}
+
 cmd_cancel() {
   [ "$#" -eq 1 ] || usage
   ensure_server
@@ -252,6 +282,7 @@ admit_locked() {
   # TS_ENV runs once ts has enqueued the job: its FIFO write is the event that
   # makes the job's id readable. The job publishes its pid, then starts only
   # if it was not cancelled and its `run` process still exists.
+  BOTSTERQ_SLOTS="$slots_needed" BOTSTERQ_EXCLUSIVE="$exclusive" BOTSTERQ_LABEL="$label" \
   TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
     python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" "$deadline" -- "$@" \
     </dev/null >&3 2>&4 &
@@ -345,6 +376,7 @@ case "$subcommand" in
   run) cmd_run "$@" ;;
   list) cmd_list ;;
   cancel) cmd_cancel "$@" ;;
+  audit) cmd_audit ;;
   slots) cmd_slots "$@" ;;
   __admit) admit_locked "$@" ;;
   __set-slots) set_slots_locked "$@" ;;

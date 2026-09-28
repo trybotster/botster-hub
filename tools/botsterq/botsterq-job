@@ -41,6 +41,7 @@ failed census, a failed watch or a process that survives SIGKILL, ends the job.
 - Needs Python 3.9 or later (`botsterq run` checks before admission).
 """
 
+import atexit
 import errno
 import fcntl
 import os
@@ -158,6 +159,21 @@ def recheck_wait(deadline, recheck, wakeup):
         time.sleep(remaining)
 
 
+def log_event(events, kind, token, info):
+    """Append one line to the events log (the command's start or end), so that
+    `botsterq audit` can later prove which jobs ran at the same time. One
+    O_APPEND write per line; a failure to log never affects the job."""
+    try:
+        line = "\t".join([kind, f"{time.time():.3f}", token, *info]).replace("\n", " ") + "\n"
+        fd = os.open(events, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
 def install_test_faults():
     """Test hook: BOTSTERQ_TEST_FAIL_AT names watch boundaries that fail, by
     replacing the real select functions, so the conversion code itself runs:
@@ -252,6 +268,13 @@ def main():
     signal.pthread_sigmask(signal.SIG_BLOCK, cancel_signals)
     if requested["cancel"]:
         sys.exit(130)
+    # Job facts for the events log come from `botsterq run`; the command does
+    # not need them.
+    slots = os.environ.pop("BOTSTERQ_SLOTS", "?")
+    exclusive = os.environ.pop("BOTSTERQ_EXCLUSIVE", "?")
+    label = os.environ.pop("BOTSTERQ_LABEL", "")
+    token = os.path.basename(pidfile).rsplit(".", 1)[0]
+    events = os.path.join(os.path.dirname(os.path.dirname(pidfile)), "events.log")
     env = dict(os.environ, BOTSTERQ_JOB=str(pgid))
     def in_child():
         # A process group of its own (Popen's process_group needs Python 3.11).
@@ -261,6 +284,14 @@ def main():
     faults = install_test_faults()
     child = subprocess.Popen(["nice", "-n", "10", *command], env=env, preexec_fn=in_child)
     group = child.pid
+    try:
+        load = "load=" + "/".join(f"{value:.1f}" for value in os.getloadavg())
+    except OSError:
+        load = "load=?"
+    log_event(events, "start", token, [slots, exclusive, label, load])
+    # The end is logged when the group is gone (every exit path leaves through
+    # sys.exit), which is when the queue slot is released.
+    atexit.register(log_event, events, "end", token, [slots, exclusive, label, ""])
     # The reservation guard starts here: from now on the command may be alive,
     # so no failure below may end this supervisor before the group is gone.
     try:
