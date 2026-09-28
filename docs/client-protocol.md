@@ -1239,7 +1239,9 @@ restarting at 1, when the package loads after an unload or disable, after a
 failed first load, and after a Hub restart. A `log_id` never repeats, even
 across restarts. The client rule is exact: if a page's `log_id` differs from
 the `log_id` your cursor belongs to, discard the cursor and read again from
-`after_seq` 0. Compare `log_id` values only for equality; do not parse them. Each record has:
+`after_seq` 0. Compare `log_id` values only for equality; do not parse them.
+
+Each record has:
 - `seq`;
 - `generation`: the plugin load (VM) that wrote it, so records from different
   loads of one package are distinguishable;
