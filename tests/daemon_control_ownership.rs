@@ -279,6 +279,11 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
         &["SpawnSessionType"],
     ),
     (
+        "src/daemon/control/restart_session.rs",
+        "restart_session",
+        &["RestartSession"],
+    ),
+    (
         "src/daemon/control/host_work.rs",
         "host_work",
         &[
