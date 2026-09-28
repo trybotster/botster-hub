@@ -1086,7 +1086,18 @@ pub(crate) fn handle_runtime(
                 runtime.begin_remove_session_for_owner(waiter_id, &SessionId(session_id.clone()));
             let id = request_id("daemon-session-remove");
             let mut releasing: Option<SessionReservation> = None;
+            let mut recording: Option<(
+                Box<super::restart_records::RecordWrite>,
+                botster_hub_client::DaemonResponse,
+            )> = None;
             ControlStep::pending(move |daemon, state| {
+                if let Some((write, _)) = recording.as_mut() {
+                    if !write.poll(daemon, state, waiter_id, &session_id) {
+                        return ControlPoll::Pending;
+                    }
+                    let (_, response) = recording.take().expect("recording was checked");
+                    return ControlPoll::Ready(Ok(response));
+                }
                 if releasing.is_some() {
                     let released = match poll_spawn_ticket(&mut tracker, daemon) {
                         CoreTicketPoll::Pending => return ControlPoll::Pending,
@@ -1108,7 +1119,14 @@ pub(crate) fn handle_runtime(
                             ),
                         ));
                     }
-                    return ControlPoll::Ready(Ok(response));
+                    return super::restart_records::finish_removed_session(
+                        daemon,
+                        state,
+                        waiter_id,
+                        &session_id,
+                        response,
+                        &mut recording,
+                    );
                 }
                 let completion = match poll_tracker(&mut tracker, daemon, "remove_session", &id.0) {
                     Ok(completion) => completion,
@@ -1142,9 +1160,14 @@ pub(crate) fn handle_runtime(
                             releasing = Some(token);
                             return ControlPoll::Again;
                         }
-                        ControlPoll::Ready(Ok(daemon_response_base(
-                            DaemonResponseKind::SessionRemoved,
-                        )))
+                        super::restart_records::finish_removed_session(
+                            daemon,
+                            state,
+                            waiter_id,
+                            &session_id,
+                            daemon_response_base(DaemonResponseKind::SessionRemoved),
+                            &mut recording,
+                        )
                     }
                     Ok(false) => ControlPoll::Ready(Ok(entity_subscription_error(
                         "session_not_terminal",

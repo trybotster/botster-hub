@@ -13,7 +13,6 @@ use crate::client_api_dto::response::daemon_spawned;
 use crate::client_api_dto::session::{
     daemon_session_from_client, daemon_session_type_from_client, session_type_request_from_daemon,
 };
-use crate::daemon::control::messaging::defer_client_step;
 use crate::daemon::control::pending::ControlStep;
 use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
@@ -238,21 +237,27 @@ pub(crate) fn handle_runtime(
         unreachable!("session-type reads and mutations use the host executor")
     };
     let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+    let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+    let session_type_request =
+        session_type_request_from_daemon(Some(SessionId(session_id.clone())), request);
+    // What a later RestartSession re-spawns from: the caller's inputs, with no
+    // environment values.
+    let record = crate::restart_records::RestartRecord::from_request(
+        &session_type_id,
+        &session_type_request,
+    );
     let step = api.handle_request_for_owner(
         runtime,
         &packages,
         HubClientRequest::SpawnSessionType {
             request_id: request_id("daemon-session-types-spawn"),
             session_type_id,
-            session_type_request: session_type_request_from_daemon(
-                Some(SessionId(session_id)),
-                request,
-            ),
+            session_type_request,
             now_seconds: now,
         },
-        state.current_waiter_id.expect("owner waiter is assigned"),
+        waiter_id,
     );
-    defer_client_step(step, move |body| {
+    super::restart_records::spawn_then_record(step, waiter_id, session_id, record, move |body| {
         let HubClientResponseBody::Spawned(spawned) = body else {
             return Err(DaemonTransportError::UnexpectedResponse);
         };
