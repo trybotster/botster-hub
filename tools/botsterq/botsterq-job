@@ -24,9 +24,16 @@ failed census, a failed watch or a process that survives SIGKILL, ends the job.
   status is the command's, or 130 when cancelled.
 - Waiting uses process-exit events (kqueue NOTE_EXIT on macOS, pidfd on Linux)
   on the members a `ps` census names, plus the command itself until it is
-  reaped. When no event source exists (the census failed, a watch failed, or
-  the group holds only processes the census cannot name, such as zombies not
-  yet reaped), it rechecks absence at a short deadline instead.
+  reaped.
+- Degraded mode, the one exception to waiting on events: when no event source
+  exists (the census or a watch failed at any step, or the group holds only
+  processes the census cannot name, such as zombies not yet reaped), it polls
+  for absence every RECHECK_SECONDS. That is a progress poll, not a give-up
+  deadline: it never ends the job, only notices sooner that the group is gone.
+- An unexpected error in the loop itself still ends the job only when the group
+  is gone: the command runs on, is reaped, a cancel still escalates, and the
+  slot is held meanwhile (the same progress poll).
+- Needs Python 3.9 or later (`botsterq run` checks before admission).
 """
 
 import errno
@@ -38,7 +45,7 @@ import subprocess
 import sys
 import time
 
-# Recheck deadline when no exit event can be watched (see above).
+# Progress-poll interval of the degraded mode (see above).
 RECHECK_SECONDS = 0.1
 
 
@@ -87,12 +94,14 @@ def group_members(pgid):
 def wait_events(pids, deadline, wakeup):
     """Block until one of pids exits, a signal arrives (a byte on the wakeup
     pipe), or deadline passes. A pid that is already gone (or a zombie, which
-    kqueue refuses) returns at once. Any other watch failure raises WatchError."""
-    if os.environ.get("BOTSTERQ_TEST_FAIL_WATCH"):
-        raise WatchError("watch failed (test hook)")
+    kqueue refuses) returns at once. Every other failure, at any step (creating
+    the kqueue or poll object, registering, waiting), raises WatchError."""
     timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
     if hasattr(select, "kqueue"):
-        queue = select.kqueue()
+        try:
+            queue = select.kqueue()
+        except OSError as error:
+            raise WatchError(f"kqueue creation: {error}") from error
         try:
             queue.control([select.kevent(wakeup, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
             for pid in pids:
@@ -102,30 +111,85 @@ def wait_events(pids, deadline, wakeup):
                 except OSError as error:
                     if error.errno == errno.ESRCH:
                         return  # already exited: the caller re-checks
-                    raise WatchError(f"kqueue watch of pid {pid}: {error}") from error
+                    raise
             queue.control(None, 1, timeout)
         except OSError as error:
             raise WatchError(f"kqueue: {error}") from error
         finally:
             queue.close()
         return
-    poller = select.poll()
-    poller.register(wakeup, select.POLLIN)
     fds = []
     try:
+        poller = select.poll()
+        poller.register(wakeup, select.POLLIN)
         for pid in pids:
             try:
                 fd = os.pidfd_open(pid)
             except ProcessLookupError:
                 return
-            except OSError as error:
-                raise WatchError(f"pidfd_open of pid {pid}: {error}") from error
             fds.append(fd)
             poller.register(fd, select.POLLIN)
         poller.poll(None if timeout is None else int(timeout * 1000))
+    except OSError as error:
+        raise WatchError(f"pidfd/poll: {error}") from error
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def recheck_wait(deadline, recheck, wakeup):
+    """Degraded mode, when no exit event can be watched: wait for a signal until
+    the earlier of deadline and recheck, so the caller can poll absence again.
+    This is a progress poll, the one exception to waiting on events; it runs
+    only while the census or the watch is failing, or while the group holds
+    only processes the census cannot name (zombies awaiting their reaper)."""
+    until = recheck if deadline is None else min(deadline, recheck)
+    remaining = max(0.0, until - time.monotonic())
+    try:
+        select.select([wakeup], [], [], remaining)
+    except (OSError, ValueError):
+        # Even select failed: sleep instead (a signal still ends the loop's
+        # next pass through the requested flag).
+        time.sleep(remaining)
+
+
+def install_test_faults():
+    """Test hook: BOTSTERQ_TEST_FAIL_AT names watch boundaries that fail, by
+    replacing the real select functions, so the conversion code itself runs:
+    kqueue (creation), register (adding a filter), wait (the blocking call),
+    fallback (select in the degraded wait), loop (an unexpected error in the
+    supervisor loop)."""
+    faults = set(filter(None, os.environ.get("BOTSTERQ_TEST_FAIL_AT", "").split(",")))
+    real_kqueue = getattr(select, "kqueue", None)
+
+    class FaultyQueue:
+        def __init__(self):
+            self.queue = real_kqueue()
+
+        def control(self, changelist, max_events, timeout=None):
+            if changelist and "register" in faults:
+                raise OSError(errno.EBADF, "registration failed (test hook)")
+            if changelist is None and "wait" in faults:
+                raise OSError(errno.EBADF, "wait failed (test hook)")
+            return self.queue.control(changelist, max_events, timeout)
+
+        def close(self):
+            self.queue.close()
+
+    def failing_kqueue():
+        raise OSError(errno.EMFILE, "too many open files (test hook)")
+
+    def failing_select(*args):
+        raise OSError(errno.EBADF, "select failed (test hook)")
+
+    if real_kqueue is not None:
+        if "kqueue" in faults:
+            select.kqueue = failing_kqueue
+        elif faults & {"register", "wait"}:
+            select.kqueue = FaultyQueue
+    if "fallback" in faults:
+        select.select = failing_select
+    return faults
 
 
 def hold_for_test(name):
@@ -183,12 +247,12 @@ def main():
     if requested["cancel"]:
         sys.exit(130)
     env = dict(os.environ, BOTSTERQ_JOB=str(pgid))
-    child = subprocess.Popen(
-        ["nice", "-n", "10", *command],
-        env=env,
-        process_group=0,
-        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals),
-    )
+    def in_child():
+        # A process group of its own (Popen's process_group needs Python 3.11).
+        os.setpgid(0, 0)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
+
+    child = subprocess.Popen(["nice", "-n", "10", *command], env=env, preexec_fn=in_child)
     group = child.pid
     with open(joblock, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -196,6 +260,26 @@ def main():
             published.write(f"{group}\n")
     signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
 
+    faults = install_test_faults()
+    try:
+        status, cancelled = supervise(child, group, grace, requested, wakeup_read, faults)
+    except Exception as error:
+        # Whatever failed, a supervisor exit releases the slot, so it happens
+        # only once the group is proved absent.
+        print(f"botsterq: supervisor error: {error!r}; holding the slot until group {group} is gone",
+              file=sys.stderr, flush=True)
+        status = hold_until_absent(child, group, grace, requested)
+        if status is None:
+            sys.exit(130)
+        sys.exit(status if status >= 0 else 128 - status)
+    if cancelled:
+        sys.exit(130)
+    sys.exit(status if status >= 0 else 128 - status)
+
+
+def supervise(child, group, grace, requested, wakeup_read, faults):
+    """Run the escalation loop until the kernel reports the group gone.
+    Returns (status, cancelled)."""
     warned = set()
 
     def warn_once(key, text):
@@ -211,6 +295,8 @@ def main():
     phase = None
     deadline = None
     while True:
+        if "loop" in faults:
+            raise RuntimeError("unexpected supervisor error (test hook)")
         if status is None and child.poll() is not None:
             status = child.returncode
         hold_for_test("BOTSTERQ_TEST_AFTER_POLL")
@@ -251,27 +337,40 @@ def main():
             try:
                 wait_events(watch, deadline, wakeup_read)
             except WatchError as error:
-                warn_once("watch", f"{error}; rechecking group {group} at a deadline instead")
-                wait_events_or_recheck(deadline, recheck, wakeup_read)
+                warn_once("watch", f"{error}; polling group {group} for absence instead")
+                recheck_wait(deadline, recheck, wakeup_read)
         else:
             # No event source: the census failed, or the group holds only
             # processes it cannot name (zombies awaiting their reaper).
-            wait_events_or_recheck(deadline, recheck, wakeup_read)
+            recheck_wait(deadline, recheck, wakeup_read)
         try:
             os.read(wakeup_read, 512)
-        except BlockingIOError:
+        except OSError:
             pass
-
-    if cancelled:
-        sys.exit(130)
-    sys.exit(status if status >= 0 else 128 - status)
+    return status, cancelled
 
 
-def wait_events_or_recheck(deadline, recheck, wakeup):
-    """Wait for a signal until the earlier of deadline and recheck."""
-    # timer: deadline — no exit event exists to wait on; recheck absence.
-    until = recheck if deadline is None else min(deadline, recheck)
-    select.select([wakeup], [], [], max(0.0, until - time.monotonic()))
+
+def hold_until_absent(child, group, grace, requested):
+    """Last resort after an unexpected supervisor error: the command keeps
+    running, is reaped when it exits, and a cancel still escalates; the slot is
+    held until the kernel reports the group gone. Waits by the same degraded
+    progress poll. Returns the command's status, or None when cancelled."""
+    kill_at = None
+    while True:
+        try:
+            child.poll()
+            if requested["cancel"] and kill_at is None:
+                signal_group(group, signal.SIGTERM)
+                kill_at = time.monotonic() + grace
+            if kill_at is not None and time.monotonic() >= kill_at:
+                signal_group(group, signal.SIGKILL)
+                kill_at = float("inf")
+            if child.returncode is not None and group_absent(group):
+                return None if requested["cancel"] else child.returncode
+        except Exception:
+            pass  # cannot tell: still present
+        time.sleep(RECHECK_SECONDS)
 
 
 if __name__ == "__main__":
