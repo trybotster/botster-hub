@@ -307,10 +307,26 @@ pub struct SessionFamilyBridge {
     need_gap_pass: bool,
     snapshot_start_after: Option<String>,
     snapshot_start_sequence: Option<u64>,
+    /// Round-robin order over `ready`; it never decides readiness.
     admit_after: Option<String>,
     prune_after: Option<String>,
     need_prune: bool,
     busy_count: u32,
+    /// Consumers that can be admitted now: a handler, nothing in flight, a
+    /// frame to send, and not parked. Only `sync_ready` changes it.
+    ready: BTreeSet<String>,
+    /// Consumers the plugin engine refused (`Backpressured` or `LockBusy`).
+    /// Each keeps its frame and waits for `engine_parked_seen` to move.
+    parked: BTreeSet<String>,
+    /// The plugin-engine epoch read before the oldest refused admission.
+    engine_parked_seen: Option<crate::daemon::owner_signal::Seen>,
+}
+
+/// Whether `consumer` has a frame the owner could admit, ignoring parking.
+fn consumer_admittable(consumer: &SessionFamilyConsumer) -> bool {
+    consumer.handler.is_some()
+        && consumer.in_flight.is_none()
+        && (!consumer.pending.is_empty() || consumer.need_snapshot_chunks)
 }
 
 fn consumer_busy(consumer: &SessionFamilyConsumer) -> bool {
@@ -387,6 +403,7 @@ impl SessionFamilyBridge {
         if let Some(request_id) = request_id {
             self.in_flight_by_request.remove(&request_id.0);
         }
+        self.unpark(plugin_key);
         self.touch_consumer(plugin_key, |consumer| {
             consumer.gap = true;
             consumer.snapshot_complete = false;
@@ -399,6 +416,7 @@ impl SessionFamilyBridge {
     }
 
     fn begin_snapshot(&mut self, plugin_key: &str, sequence: u64) {
+        self.unpark(plugin_key);
         self.touch_consumer(plugin_key, |consumer| {
             consumer.snapshot_sequence = sequence;
             consumer.snapshot_complete = false;
@@ -418,28 +436,29 @@ impl SessionFamilyBridge {
     #[cfg(test)]
     fn queue_snapshot(&mut self, plugin_key: &str, sequence: u64, items: &[serde_json::Value]) {
         self.begin_snapshot(plugin_key, sequence);
-        let consumer = self.consumer_mut(plugin_key);
-        let mut start = 0;
-        while start < items.len() {
-            match pack_session_chunk(items, start) {
-                Ok((chunk, next)) => {
-                    consumer
-                        .pending
-                        .push_back(session_chunk_frame(sequence, &chunk));
-                    start = next;
-                }
-                Err(()) => {
-                    consumer.gap = true;
-                    consumer.need_snapshot_chunks = false;
-                    consumer.pending.clear();
-                    return;
+        self.touch_consumer(plugin_key, |consumer| {
+            let mut start = 0;
+            while start < items.len() {
+                match pack_session_chunk(items, start) {
+                    Ok((chunk, next)) => {
+                        consumer
+                            .pending
+                            .push_back(session_chunk_frame(sequence, &chunk));
+                        start = next;
+                    }
+                    Err(()) => {
+                        consumer.gap = true;
+                        consumer.need_snapshot_chunks = false;
+                        consumer.pending.clear();
+                        return;
+                    }
                 }
             }
-        }
-        consumer.need_snapshot_chunks = false;
-        consumer
-            .pending
-            .push_back(session_end_frame(sequence, true));
+            consumer.need_snapshot_chunks = false;
+            consumer
+                .pending
+                .push_back(session_end_frame(sequence, true));
+        });
     }
 
     fn queue_delta(&mut self, plugin_key: &str, frame: serde_json::Value) -> bool {
@@ -476,7 +495,89 @@ impl SessionFamilyBridge {
         let result = f(self.consumer_mut(plugin_key));
         let now_busy = self.consumers.get(plugin_key).is_some_and(consumer_busy);
         self.adjust_busy(was_busy, now_busy);
+        self.sync_ready(plugin_key);
         result
+    }
+
+    /// Recompute `plugin_key`'s membership in the ready set from its state.
+    fn sync_ready(&mut self, plugin_key: &str) {
+        let ready = !self.parked.contains(plugin_key)
+            && self
+                .consumers
+                .get(plugin_key)
+                .is_some_and(consumer_admittable);
+        if ready {
+            self.ready.insert(plugin_key.to_string());
+        } else {
+            self.ready.remove(plugin_key);
+        }
+    }
+
+    /// Park `plugin_key` on the plugin-engine epoch `seen`, read before the
+    /// refused admission. Its frame stays queued; nothing retries it until the
+    /// epoch moves.
+    fn park(&mut self, plugin_key: &str, seen: crate::daemon::owner_signal::Seen) {
+        self.parked.insert(plugin_key.to_string());
+        self.engine_parked_seen.get_or_insert(seen);
+        self.sync_ready(plugin_key);
+    }
+
+    fn unpark(&mut self, plugin_key: &str) {
+        if self.parked.remove(plugin_key) {
+            self.sync_ready(plugin_key);
+            if self.parked.is_empty() {
+                self.engine_parked_seen = None;
+            }
+        }
+    }
+
+    /// The plugin engine released state after consumers parked: all of them
+    /// may retry once. Returns whether any consumer returned to the ready set.
+    fn unpark_all(&mut self) -> bool {
+        self.engine_parked_seen = None;
+        for plugin_key in std::mem::take(&mut self.parked) {
+            self.sync_ready(&plugin_key);
+        }
+        !self.ready.is_empty()
+    }
+
+    /// The next ready consumer after the round-robin cursor, wrapping once.
+    fn next_ready(&self) -> Option<String> {
+        let after = self.admit_after.as_deref();
+        let start = match after {
+            Some(after) => Bound::Excluded(after),
+            None => Bound::Unbounded,
+        };
+        self.ready
+            .range::<str, _>((start, Bound::Unbounded))
+            .next()
+            .or_else(|| self.ready.iter().next())
+            .cloned()
+    }
+
+    /// Drop a consumer that left the registry.
+    fn remove_consumer(&mut self, plugin_key: &str) -> Option<SessionFamilyConsumer> {
+        self.parked.remove(plugin_key);
+        self.ready.remove(plugin_key);
+        self.consumers.remove(plugin_key)
+    }
+
+    /// Debug check: the ready set equals its definition, recomputed.
+    #[cfg(debug_assertions)]
+    fn assert_ready_set(&self) {
+        let recomputed: BTreeSet<String> = self
+            .consumers
+            .iter()
+            .filter(|(key, consumer)| !self.parked.contains(*key) && consumer_admittable(consumer))
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(self.ready, recomputed, "session-family ready set drifted");
+        assert!(
+            self.parked
+                .iter()
+                .all(|key| self.consumers.contains_key(key)),
+            "a parked session-family consumer left the registry"
+        );
     }
 
     fn touch_existing_consumer(
@@ -493,6 +594,7 @@ impl SessionFamilyBridge {
             consumer_busy(consumer)
         };
         self.adjust_busy(was_busy, now_busy);
+        self.sync_ready(plugin_key);
     }
 
     fn next_request_id(&mut self, plugin_key: &str, sequence: u64) -> RequestId {
@@ -561,6 +663,9 @@ pub struct MaintenanceState {
     /// prove an outcome property without racing the production deadline.
     #[cfg(test)]
     pub(crate) test_event_invocation_timeout_ms: Option<u64>,
+    /// Test only: session-family frames offered to plugin admission.
+    #[cfg(test)]
+    pub(crate) family_admission_attempts: u64,
 }
 
 /// Core lifecycle reads the maintenance slices have in flight.
@@ -714,6 +819,12 @@ impl MaintenanceState {
             self.engine_parked_seen = None;
             self.engine_unpark_due = true;
             self.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+        }
+        if let Some(seen) = self.session_family.engine_parked_seen
+            && signal.moved(seen)
+            && self.session_family.unpark_all()
+        {
+            self.wakes.mark(MaintenanceSliceKind::HostBridge);
         }
         let wakes = &mut self.wakes;
         self.signal_waits.retain(|kind, seen| {
@@ -1285,16 +1396,62 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         state.wakes.mark_all();
         return;
     }
-    let Some((plugin_key, handler, payload)) = next_session_family_admission(state, &mut budget)
-    else {
+    admit_next_session_family_frame(runtime, state, &mut budget);
+    #[cfg(debug_assertions)]
+    state.session_family.assert_ready_set();
+}
+
+/// Admit one frame for the next ready consumer. The ready set promises a
+/// frame, so the only refusals are the plugin engine's, which park the consumer.
+fn admit_next_session_family_frame(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    budget: &mut HostBridgeBudget,
+) {
+    let Some(plugin_key) = state.session_family.next_ready() else {
         return;
     };
+    let peeked = match peek_session_family_payload(state, &plugin_key) {
+        Ok(Some(peeked)) => peeked,
+        Ok(None) => unreachable!("a ready session-family consumer has a frame"),
+        Err(()) => {
+            // One row can never fit a snapshot chunk: a fault, not a retry.
+            state.session_family.mark_gap(&plugin_key);
+            state.fault_lifecycle("a session row larger than one family snapshot chunk");
+            return;
+        }
+    };
+    let payload = peeked.frame().clone();
+    let bytes = serde_json::to_vec(&payload)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    if !budget.add_bytes(bytes) {
+        // Earlier steps of this turn spent the byte budget; a fresh turn fits.
+        state.wakes.mark(MaintenanceSliceKind::HostBridge);
+        return;
+    }
+    let handler = state
+        .session_family
+        .consumers
+        .get(&plugin_key)
+        .and_then(|consumer| consumer.handler.clone())
+        .expect("a ready session-family consumer has a handler");
     let sequence = payload
         .get("snapshot_sequence")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let kind = family_frame_kind(&payload);
     let request_id = state.session_family.next_request_id(&plugin_key, sequence);
+    // Read before the attempt: Core arms its retry wake on a refusal, so any
+    // release after this read moves the epoch.
+    let engine_seen = runtime
+        .owner_signal()
+        .seen(crate::daemon::owner_signal::SignalKey::PluginEngine);
+    #[cfg(test)]
+    {
+        state.family_admission_attempts += 1;
+        run_delivery_test_hook(DeliveryTestPoint::FamilyAfterEngineSeen, runtime);
+    }
     let admission = runtime.try_admit_plugin(
         PluginInvocationClass::Background,
         PluginInvocationRequest {
@@ -1312,8 +1469,10 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             payload: BoundaryJson(payload),
         },
     );
+    state.session_family.admit_after = Some(plugin_key.clone());
     match admission {
         PluginAdmissionResult::Queued { .. } => {
+            commit_session_family_payload(state, &plugin_key, peeked);
             state
                 .session_family
                 .touch_consumer(&plugin_key, |consumer| {
@@ -1328,6 +1487,13 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 .in_flight_by_request
                 .insert(request_id.0, plugin_key);
         }
+        // Contention and capacity both end on a plugin-engine release. The
+        // frame stays queued; only this consumer waits.
+        PluginAdmissionResult::Backpressured { .. } | PluginAdmissionResult::LockBusy { .. } => {
+            #[cfg(test)]
+            run_delivery_test_hook(DeliveryTestPoint::FamilyAfterEngineRefusal, runtime);
+            state.session_family.park(&plugin_key, engine_seen);
+        }
         other => {
             crate::hub_log::hub_log!(
                 "session_family_admission_not_queued plugin={} request_id={} result={other:?}",
@@ -1336,7 +1502,12 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
             );
             state.session_family.mark_gap(&plugin_key);
             start_baseline_recovery(state);
+            return;
         }
+    }
+    // Each run admits one frame: other ready consumers are a continuation.
+    if !state.session_family.ready.is_empty() {
+        state.wakes.mark(MaintenanceSliceKind::HostBridge);
     }
 }
 
@@ -1690,6 +1861,8 @@ pub(crate) enum DeliveryTestPoint {
     AfterEmptyPull,
     AfterEngineSeen,
     AfterEngineRefusal,
+    FamilyAfterEngineSeen,
+    FamilyAfterEngineRefusal,
 }
 
 #[cfg(test)]
@@ -2030,19 +2203,22 @@ fn refresh_session_family_consumers(
         let plugin_key = handler.handler.plugin_key.0.clone();
         state.session_family.refresh_seen.insert(plugin_key.clone());
         let existed = state.session_family.consumers.contains_key(&plugin_key);
-        let consumer = state.session_family.consumer_mut(&plugin_key);
-        consumer.handler = Some(handler.handler);
-        if !existed {
-            consumer.gap = true;
-            if state.projection.baseline_complete {
-                let sequence = state
-                    .projection
-                    .cursor
-                    .as_ref()
-                    .map(|cursor| cursor.sequence)
-                    .unwrap_or(0);
-                state.session_family.begin_snapshot(&plugin_key, sequence);
-            }
+        state
+            .session_family
+            .touch_consumer(&plugin_key, |consumer| {
+                consumer.handler = Some(handler.handler);
+                if !existed {
+                    consumer.gap = true;
+                }
+            });
+        if !existed && state.projection.baseline_complete {
+            let sequence = state
+                .projection
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.sequence)
+                .unwrap_or(0);
+            state.session_family.begin_snapshot(&plugin_key, sequence);
         }
     }
     if more {
@@ -2082,7 +2258,7 @@ fn continue_consumer_prune(state: &mut MaintenanceState, budget: &mut HostBridge
         }
     }
     for plugin_key in drop_keys {
-        let Some(consumer) = state.session_family.consumers.remove(&plugin_key) else {
+        let Some(consumer) = state.session_family.remove_consumer(&plugin_key) else {
             continue;
         };
         if consumer_busy(&consumer) {
@@ -2105,91 +2281,6 @@ fn continue_consumer_prune(state: &mut MaintenanceState, budget: &mut HostBridge
     state.session_family.refresh_seen.clear();
 }
 
-fn next_session_family_admission(
-    state: &mut MaintenanceState,
-    budget: &mut HostBridgeBudget,
-) -> Option<(String, PluginHandlerRef, serde_json::Value)> {
-    let started_after_cursor = state.session_family.admit_after.is_some();
-    match session_family_admission_pass(state, budget) {
-        FamilyAdmissionPass::Admit(admission) => Some(admission),
-        FamilyAdmissionPass::Paused => None,
-        // A pass that began after the round-robin cursor has not looked at
-        // the consumers before it. Wrap once now: nothing else will wake the
-        // owner for a frame that is already queued.
-        FamilyAdmissionPass::ReachedEnd if started_after_cursor => {
-            state.session_family.admit_after = None;
-            match session_family_admission_pass(state, budget) {
-                FamilyAdmissionPass::Admit(admission) => Some(admission),
-                FamilyAdmissionPass::Paused | FamilyAdmissionPass::ReachedEnd => None,
-            }
-        }
-        FamilyAdmissionPass::ReachedEnd => None,
-    }
-}
-
-enum FamilyAdmissionPass {
-    Admit((String, PluginHandlerRef, serde_json::Value)),
-    /// The budget or the page bound stopped the pass; a wake is marked.
-    Paused,
-    /// Every consumer after the cursor was visited without work.
-    ReachedEnd,
-}
-
-fn session_family_admission_pass(
-    state: &mut MaintenanceState,
-    budget: &mut HostBridgeBudget,
-) -> FamilyAdmissionPass {
-    let max = budget.remaining_visits();
-    if max == 0 {
-        return FamilyAdmissionPass::Paused;
-    }
-    let keys = consumer_keys_page(
-        &state.session_family.consumers,
-        state.session_family.admit_after.as_deref(),
-        max,
-    );
-    if keys.is_empty() {
-        state.session_family.admit_after = None;
-        return FamilyAdmissionPass::ReachedEnd;
-    }
-    for plugin_key in &keys {
-        if !budget.take() {
-            state.wakes.mark_all();
-            return FamilyAdmissionPass::Paused;
-        }
-        let Some(peeked) = peek_session_family_payload(state, plugin_key) else {
-            continue;
-        };
-        let payload = peeked.frame().clone();
-        let bytes = serde_json::to_vec(&payload)
-            .map(|body| body.len())
-            .unwrap_or(0);
-        if !budget.add_bytes(bytes) {
-            state.wakes.mark_all();
-            return FamilyAdmissionPass::Paused;
-        }
-        commit_session_family_payload(state, plugin_key, peeked);
-        let Some(handler) = state
-            .session_family
-            .consumers
-            .get(plugin_key)
-            .and_then(|consumer| consumer.handler.clone())
-        else {
-            return FamilyAdmissionPass::Paused;
-        };
-        state.session_family.admit_after = Some(plugin_key.clone());
-        return FamilyAdmissionPass::Admit((plugin_key.clone(), handler, payload));
-    }
-    if keys.len() == max {
-        state.session_family.admit_after = keys.last().cloned();
-        state.wakes.mark_all();
-        FamilyAdmissionPass::Paused
-    } else {
-        state.session_family.admit_after = None;
-        FamilyAdmissionPass::ReachedEnd
-    }
-}
-
 enum PeekedFamilyPayload {
     Queued(serde_json::Value),
     Chunk {
@@ -2207,30 +2298,33 @@ impl PeekedFamilyPayload {
     }
 }
 
+/// The frame `plugin_key` would send next. `Ok(None)` means it has none;
+/// `Err` means the next projection row can never fit one snapshot chunk.
 fn peek_session_family_payload(
     state: &MaintenanceState,
     plugin_key: &str,
-) -> Option<PeekedFamilyPayload> {
-    let consumer = state.session_family.consumers.get(plugin_key)?;
+) -> Result<Option<PeekedFamilyPayload>, ()> {
+    let Some(consumer) = state.session_family.consumers.get(plugin_key) else {
+        return Ok(None);
+    };
     if consumer.in_flight.is_some() || consumer.handler.is_none() {
-        return None;
+        return Ok(None);
     }
     if let Some(payload) = consumer.pending.front() {
-        return Some(PeekedFamilyPayload::Queued(payload.clone()));
+        return Ok(Some(PeekedFamilyPayload::Queued(payload.clone())));
     }
     if !consumer.need_snapshot_chunks {
-        return None;
+        return Ok(None);
     }
-    match next_projection_chunk(&state.projection, consumer.snapshot_after.as_deref()) {
-        Ok(Some((chunk, last_id))) => Some(PeekedFamilyPayload::Chunk {
+    match next_projection_chunk(&state.projection, consumer.snapshot_after.as_deref())? {
+        Some((chunk, last_id)) => Ok(Some(PeekedFamilyPayload::Chunk {
             frame: session_chunk_frame(consumer.snapshot_sequence, &chunk),
             last_id,
-        }),
-        Ok(None) => Some(PeekedFamilyPayload::End(session_end_frame(
+        })),
+        None => Ok(Some(PeekedFamilyPayload::End(session_end_frame(
             consumer.snapshot_sequence,
             true,
-        ))),
-        Err(()) => None,
+        )))),
     }
 }
 
@@ -2271,7 +2365,7 @@ fn next_session_family_payload(
     state: &mut MaintenanceState,
     plugin_key: &str,
 ) -> Option<serde_json::Value> {
-    let peeked = peek_session_family_payload(state, plugin_key)?;
+    let peeked = peek_session_family_payload(state, plugin_key).ok()??;
     let payload = peeked.frame().clone();
     commit_session_family_payload(state, plugin_key, peeked);
     Some(payload)
@@ -2486,32 +2580,203 @@ mod tests {
         });
     }
 
-    /// The live Workspaces loss: the last delta was queued while an earlier
-    /// frame was in flight, and after that frame's completion the admission
-    /// pass started past the only consumer (the round-robin cursor), found
-    /// nothing, and returned without a wake. The pass must wrap at once.
+    fn family_delta() -> serde_json::Value {
+        serde_json::json!({"type": "entity_upsert", "id": "ended"})
+    }
+
+    /// The live Workspaces loss (b870bca3): the last delta was queued while an
+    /// earlier frame was in flight, and after that frame's completion the
+    /// admission pass started past the only consumer (the round-robin cursor)
+    /// and found nothing. Readiness comes from the ready set, so the cursor
+    /// only orders the work.
     #[test]
-    fn a_frame_behind_the_round_robin_cursor_is_admitted_on_the_same_pass() {
-        let delta = serde_json::json!({"type": "entity_upsert", "id": "ended"});
+    fn a_frame_behind_the_round_robin_cursor_is_ready_with_no_other_wake() {
+        let delta = family_delta();
         let mut single = MaintenanceState::default();
         admitting_consumer(&mut single, "plugin.one", std::slice::from_ref(&delta));
         single.session_family.admit_after = Some("plugin.one".to_string());
-        let admitted = next_session_family_admission(&mut single, &mut HostBridgeBudget::new())
-            .expect("the queued delta is admitted without another wake");
-        assert_eq!((admitted.0.as_str(), &admitted.2), ("plugin.one", &delta));
+        assert_eq!(
+            single.session_family.next_ready().as_deref(),
+            Some("plugin.one"),
+            "the cursor wraps to the only ready consumer"
+        );
 
         let mut two = MaintenanceState::default();
         admitting_consumer(&mut two, "plugin.a", std::slice::from_ref(&delta));
         admitting_consumer(&mut two, "plugin.b", &[]);
         two.session_family.admit_after = Some("plugin.a".to_string());
-        let admitted = next_session_family_admission(&mut two, &mut HostBridgeBudget::new())
-            .expect("a consumer before the cursor is reached on the same pass");
-        assert_eq!(admitted.0, "plugin.a");
+        assert_eq!(
+            two.session_family.next_ready().as_deref(),
+            Some("plugin.a"),
+            "a consumer before the cursor is reached"
+        );
 
         let mut idle = MaintenanceState::default();
         admitting_consumer(&mut idle, "plugin.one", &[]);
         idle.session_family.admit_after = Some("plugin.one".to_string());
-        assert!(next_session_family_admission(&mut idle, &mut HostBridgeBudget::new()).is_none());
+        assert!(idle.session_family.next_ready().is_none());
+    }
+
+    /// The same shape through the slice: the frame behind the cursor is offered
+    /// to admission on the first run, with no wake but the one that ran it.
+    #[test]
+    fn the_slice_admits_a_frame_behind_the_cursor_on_its_first_run() {
+        let (runtime, data_directory) = event_delivery_runtime("family-behind-cursor");
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+        let mut state = family_state(&runtime, &["plugin.one"]);
+        state.session_family.admit_after = Some("plugin.one".to_string());
+        run_host_bridge_slice(&runtime, &mut state);
+        assert_eq!(state.family_admission_attempts, 1);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// A state with one consumer per key, each holding a delta, and the
+    /// matching handler registered so the refresh keeps it.
+    fn family_state(runtime: &HubRuntime, keys: &[&str]) -> MaintenanceState {
+        let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
+        for key in keys {
+            runtime.insert_test_event_handler(key, "session_family");
+            admitting_consumer(&mut state, key, &[family_delta()]);
+        }
+        state
+    }
+
+    /// Contention and capacity never open a gap or start a baseline: the frame
+    /// stays queued and its consumer waits for the engine.
+    #[test]
+    fn a_refused_family_frame_parks_its_consumer_with_no_gap() {
+        use crate::runtime::ForcedAdmission;
+        for forced in [ForcedAdmission::Backpressured, ForcedAdmission::LockBusy] {
+            let (runtime, data_directory) = event_delivery_runtime("family-refused");
+            runtime.set_test_forced_admission(Some(forced));
+            let mut state = family_state(&runtime, &["plugin.one"]);
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, 1, "{forced:?}");
+            let consumer = &state.session_family.consumers["plugin.one"];
+            assert!(!consumer.gap, "{forced:?} opened a gap");
+            assert!(
+                consumer.snapshot_complete,
+                "{forced:?} dropped the snapshot"
+            );
+            assert_eq!(consumer.pending.len(), 1, "{forced:?} lost the frame");
+            assert!(state.baseline.is_none() && !state.session_family.need_gap_pass);
+            assert!(state.session_family.ready.is_empty());
+            assert!(
+                !state.wakes.has_any(),
+                "{forced:?} parks with no owner wake: {state:?}"
+            );
+            // A blanket mark must not retry: the consumer waits for the engine.
+            state.wakes.mark_all();
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, 1, "{forced:?} spun");
+            state.wakes = MaintenanceWakes(0);
+            runtime
+                .owner_signal()
+                .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+            state.mark_signaled_waits(runtime.owner_signal());
+            assert!(
+                state.wakes.take(MaintenanceSliceKind::HostBridge),
+                "{forced:?}: the engine release wakes the slice"
+            );
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, 2, "{forced:?}: one retry");
+            drop(runtime);
+            let _ = std::fs::remove_dir_all(data_directory);
+        }
+    }
+
+    /// Core arms its retry wake inside the refused admission, so a release can
+    /// land after the slice read the epoch and before its attempt, or after
+    /// the refusal and before the consumer parks. Neither is lost.
+    #[test]
+    fn an_engine_release_during_a_refused_family_frame_wakes_the_slice() {
+        for point in [
+            DeliveryTestPoint::FamilyAfterEngineSeen,
+            DeliveryTestPoint::FamilyAfterEngineRefusal,
+        ] {
+            let (runtime, data_directory) = event_delivery_runtime("family-interleave");
+            runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+            let mut state = family_state(&runtime, &["plugin.one"]);
+            set_delivery_test_hook(point, |runtime| {
+                runtime
+                    .owner_signal()
+                    .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+            });
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, 1);
+            state.mark_signaled_waits(runtime.owner_signal());
+            assert!(
+                state.wakes.take(MaintenanceSliceKind::HostBridge),
+                "{point:?}: the release wakes the slice with no other wake"
+            );
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, 2, "{point:?}");
+            drop(runtime);
+            let _ = std::fs::remove_dir_all(data_directory);
+        }
+    }
+
+    /// A refused consumer waits alone. Each ready consumer costs one run, and
+    /// once every one is parked the slice stops asking for turns.
+    #[test]
+    fn family_consumers_park_one_run_each_then_the_slice_goes_idle() {
+        let (runtime, data_directory) = event_delivery_runtime("family-many");
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+        let mut state = family_state(&runtime, &["plugin.a", "plugin.b", "plugin.c"]);
+        for expected in 1..=3 {
+            assert!(
+                expected == 1 || state.wakes.take(MaintenanceSliceKind::HostBridge),
+                "a ready consumer keeps the slice marked"
+            );
+            run_host_bridge_slice(&runtime, &mut state);
+            assert_eq!(state.family_admission_attempts, expected);
+        }
+        assert!(!state.wakes.has_any(), "every consumer is parked");
+        assert!(state.session_family.ready.is_empty());
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// The ready set equals its definition after every mutator.
+    #[test]
+    fn the_family_ready_set_matches_its_definition_after_each_mutation() {
+        let seen = crate::daemon::owner_signal::OwnerSignal::default()
+            .seen(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        let mut state = MaintenanceState::default();
+        let check = |state: &MaintenanceState, step: &str| {
+            let recomputed: BTreeSet<String> = state
+                .session_family
+                .consumers
+                .iter()
+                .filter(|(key, consumer)| {
+                    !state.session_family.parked.contains(*key) && consumer_admittable(consumer)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            assert_eq!(state.session_family.ready, recomputed, "{step}");
+        };
+        admitting_consumer(&mut state, "plugin.one", &[family_delta()]);
+        admitting_consumer(&mut state, "plugin.two", &[]);
+        check(&state, "seeded");
+        assert!(
+            state
+                .session_family
+                .queue_delta("plugin.two", family_delta())
+        );
+        check(&state, "delta queued");
+        state.session_family.park("plugin.one", seen);
+        check(&state, "parked");
+        assert!(!state.session_family.ready.contains("plugin.one"));
+        assert!(state.session_family.unpark_all());
+        check(&state, "unparked");
+        state.session_family.begin_snapshot("plugin.two", 4);
+        check(&state, "snapshot begun");
+        state.session_family.mark_gap("plugin.one");
+        check(&state, "gap");
+        assert!(state.session_family.remove_consumer("plugin.two").is_some());
+        check(&state, "removed");
     }
 
     #[test]
@@ -2546,34 +2811,32 @@ mod tests {
         };
         state
             .session_family
-            .consumers
-            .get_mut("plugin.one")
-            .expect("consumer")
-            .handler = Some(PluginHandlerRef {
-            plugin_key: botster_core::PluginKey("plugin.one".to_string()),
-            kind: PluginHandlerKind::Event,
-            handler_id: "session_family".to_string(),
-        });
-        let first =
-            next_session_family_admission(&mut state, &mut HostBridgeBudget::new()).expect("begin");
+            .touch_consumer("plugin.one", |consumer| {
+                consumer.handler = Some(PluginHandlerRef {
+                    plugin_key: botster_core::PluginKey("plugin.one".to_string()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: "session_family".to_string(),
+                });
+            });
+        let first = next_session_family_payload(&mut state, "plugin.one").expect("begin");
         assert_eq!(
-            first.2.get("type"),
+            first.get("type"),
             Some(&serde_json::json!("snapshot_begin"))
         );
         state
             .session_family
-            .consumers
-            .get_mut("plugin.one")
-            .unwrap()
-            .in_flight = Some(InFlightSessionFamily {
-            request_id: RequestId("session-family-plugin.one-7".to_string()),
-            snapshot_sequence: 7,
-            kind: FamilyFrameKind::Begin,
-        });
+            .touch_consumer("plugin.one", |consumer| {
+                consumer.in_flight = Some(InFlightSessionFamily {
+                    request_id: RequestId("session-family-plugin.one-7".to_string()),
+                    snapshot_sequence: 7,
+                    kind: FamilyFrameKind::Begin,
+                });
+            });
         assert!(
-            next_session_family_admission(&mut state, &mut HostBridgeBudget::new()).is_none(),
+            state.session_family.next_ready().is_none(),
             "must not admit the next frame while one is in flight"
         );
+        assert!(next_session_family_payload(&mut state, "plugin.one").is_none());
     }
 
     #[test]
@@ -3044,40 +3307,37 @@ mod tests {
 
     #[test]
     fn admission_preserves_payload_when_byte_budget_rejects() {
+        let (runtime, data_directory) = event_delivery_runtime("family-byte-budget");
         let mut state = MaintenanceState::default();
+        state.wakes = MaintenanceWakes(0);
         state.session_family.begin_snapshot("plugin.one", 1);
         state
             .session_family
-            .consumers
-            .get_mut("plugin.one")
-            .expect("consumer")
-            .handler = Some(PluginHandlerRef {
-            plugin_key: botster_core::PluginKey("plugin.one".to_string()),
-            kind: PluginHandlerKind::Event,
-            handler_id: "session_family".to_string(),
-        });
-        let pending_before = state
-            .session_family
-            .consumers
-            .get("plugin.one")
-            .expect("consumer")
-            .pending
-            .clone();
+            .touch_consumer("plugin.one", |consumer| {
+                consumer.handler = Some(PluginHandlerRef {
+                    plugin_key: botster_core::PluginKey("plugin.one".to_string()),
+                    kind: PluginHandlerKind::Event,
+                    handler_id: "session_family".to_string(),
+                });
+            });
+        let pending_before = state.session_family.consumers["plugin.one"].pending.clone();
         let mut budget = HostBridgeBudget {
             started: Instant::now(),
             visits: 0,
             bytes: HOST_BRIDGE_MAX_BYTES,
         };
-        assert!(next_session_family_admission(&mut state, &mut budget).is_none());
+        admit_next_session_family_frame(&runtime, &mut state, &mut budget);
+        assert_eq!(state.family_admission_attempts, 0);
         assert_eq!(
-            state
-                .session_family
-                .consumers
-                .get("plugin.one")
-                .expect("consumer")
-                .pending,
+            state.session_family.consumers["plugin.one"].pending,
             pending_before
         );
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::HostBridge),
+            "a spent byte budget continues on the next turn"
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     #[test]
