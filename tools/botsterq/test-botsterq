@@ -361,7 +361,41 @@ after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
   && pass "a python3 older than 3.9 is refused before admission (run exit 127)" \
   || fail "old python" "run=$codeOld queued_before=$before after=$after stderr=$(cat "$work/old.err")"
 
-# 19. A suite run leaves no supervisor behind. Jobs still finishing get a
+# 19. Deadline. A hung command is stopped at expiry like a cancel: "deadline
+#     expired", exit 124, no group member left, and the successor runs after
+#     cleanup. An exclusive job has a default deadline (BOTSTERQ_EXCLUSIVE_DEADLINE
+#     stands in for the 45 minutes); an ordinary job has none; a job that ends
+#     first keeps its own status; a bad value is refused before admission.
+"$Q" slots 1 >/dev/null
+"$Q" run --label DL --deadline 3s -- sh -c 'trap "" TERM; touch "$0/DL-ready"; while :; do sleep 1; done' "$work" >/dev/null 2>"$work/DL.err" &
+DL=$!
+await_file "$work/DL-ready"
+g=$(job_group)
+"$Q" run --label DLnext -- sh -c 'ps -axo pgid= | awk -v g="$1" "\$1 == g" | wc -l | tr -d " " > "$0/DLnext.seen"' "$work" "$g" >/dev/null 2>&1 &
+DLN=$!
+await_state "DLnext @" queued
+started=$(date +%s)
+wait "$DL"; codeDL=$?
+elapsed=$(( $(date +%s) - started ))
+wait "$DLN"
+[ "$codeDL" = 124 ] && grep -q "deadline expired" "$work/DL.err" && [ "$(group_members "$g")" = 0 ] \
+  && [ "$(cat "$work/DLnext.seen" 2>/dev/null)" = 0 ] && [ "$elapsed" -le $((3 + BOTSTERQ_KILL_GRACE + 5)) ] \
+  && pass "a hung command is stopped at its deadline (run exit 124, ${elapsed}s after the start of the wait); the successor runs after cleanup" \
+  || fail "deadline" "run=$codeDL elapsed=${elapsed}s members=$(group_members "$g") next-saw=$(cat "$work/DLnext.seen" 2>/dev/null) stderr=$(cat "$work/DL.err")"
+BOTSTERQ_EXCLUSIVE_DEADLINE=3 "$Q" run --label DLX --exclusive -- sh -c 'sleep 600' >/dev/null 2>"$work/DLX.err"; codeDLX=$?
+[ "$codeDLX" = 124 ] && grep -q "deadline expired" "$work/DLX.err" \
+  && pass "an exclusive job gets the default deadline (run exit 124)" \
+  || fail "exclusive default deadline" "run=$codeDLX stderr=$(cat "$work/DLX.err")"
+BOTSTERQ_EXCLUSIVE_DEADLINE=2 "$Q" run --label DLO -- sh -c 'sleep 5' >/dev/null 2>&1; codeDLO=$?
+[ "$codeDLO" = 0 ] && pass "an ordinary job has no default deadline" || fail "ordinary job" "run=$codeDLO"
+BOTSTERQ_EXCLUSIVE_DEADLINE=2 "$Q" run --label DLS --exclusive --deadline 60s -- sh -c 'sleep 4; exit 7' >/dev/null 2>&1; codeDLS=$?
+[ "$codeDLS" = 7 ] && pass "an explicit deadline replaces the exclusive default, and a job that ends first keeps its status (7)" || fail "explicit deadline" "run=$codeDLS"
+before=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
+"$Q" run --label DLB --deadline 0 -- true >/dev/null 2>"$work/DLB.err"; codeDLB=$?
+after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
+[ "$codeDLB" = 2 ] && [ "$before" = "$after" ] && pass "a bad deadline is refused before admission (run exit 2)" || fail "bad deadline" "run=$codeDLB before=$before after=$after"
+
+# 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.
 leaked() { ps -axo pid=,command= | grep -F -- "botsterq-job $BOTSTERQ_HOME/" | grep -v grep; }
 i=0
