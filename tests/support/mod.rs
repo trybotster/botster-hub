@@ -1,3 +1,5 @@
+pub mod owned_processes;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
