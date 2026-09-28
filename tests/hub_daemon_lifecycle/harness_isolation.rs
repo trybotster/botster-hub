@@ -1296,7 +1296,9 @@ struct SweepOnDrop;
 
 impl Drop for SweepOnDrop {
     fn drop(&mut self) {
-        sweep_test_owned_processes();
+        report_sweep(sweep_test_owned_processes(), |error| {
+            record_harness_taint(error.to_string())
+        });
     }
 }
 
@@ -1311,7 +1313,9 @@ fn test_owned_sweep_census_failure_fails_and_taints_without_replacing_a_panic() 
         let passing = thread::spawn(move || {
             set_test_owned_census_program(program);
             register_test_owned_dir(Path::new("/tmp/bh-census-error-passing"));
-            sweep_test_owned_processes();
+            report_sweep(sweep_test_owned_processes(), |error| {
+            record_harness_taint(error.to_string())
+        });
         })
         .join();
         let message = passing
