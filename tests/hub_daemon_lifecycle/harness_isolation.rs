@@ -1224,10 +1224,14 @@ fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
 /// child that ignores SIGTERM and whose own command line does not name `dir`.
 /// Returns (leader pid, child pid).
 fn spawn_orphan_group_with_resistant_child(dir: &Path) -> (u32, u32) {
+    // The leader reports the pids only after the child has exec'd: Perl marks
+    // the pipe close-on-exec, so EOF on it means exec replaced the child's
+    // command line. Reading the child's argv earlier races the exec.
     const LEADER: &str = concat!(
-        "setpgrp(0, 0); my $c = fork(); ",
-        "if ($c == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "setpgrp(0, 0); pipe(my $r, my $w); my $c = fork(); ",
+        "if ($c == 0) { close($r); open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
         "$SIG{TERM} = 'IGNORE'; exec('sleep', '300'); } ",
+        "close($w); my $eof = <$r>; ",
         "print \"$$ $c\\n\"; close(STDOUT); close(STDERR); sleep 300;"
     );
     let output = Command::new("sh")
@@ -1341,12 +1345,14 @@ fn test_owned_sweep_census_failure_fails_and_taints_without_replacing_a_panic() 
 /// unrelated sibling, both in the leader's group, like an external supervisor.
 /// Returns (leader, matched child, sibling).
 fn spawn_foreign_group_with_matched_child(dir: &Path) -> (u32, u32, u32) {
+    // As above: EOF on the close-on-exec pipe means both children exec'd.
     const LEADER: &str = concat!(
-        "setpgrp(0, 0); ",
-        "my $m = fork(); if ($m == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "setpgrp(0, 0); pipe(my $r, my $w); ",
+        "my $m = fork(); if ($m == 0) { close($r); open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
         "exec('perl', '-e', 'sleep 300', $ENV{BH_SWEEP_DIR}); } ",
-        "my $s = fork(); if ($s == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "my $s = fork(); if ($s == 0) { close($r); open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
         "exec('sleep', '300'); } ",
+        "close($w); my $eof = <$r>; ",
         "print \"$$ $m $s\\n\"; close(STDOUT); close(STDERR); sleep 300;"
     );
     let output = Command::new("sh")
