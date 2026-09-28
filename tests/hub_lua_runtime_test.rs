@@ -2193,14 +2193,16 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
         })
         .expect("ack native envelope through Lua coordination");
     assert_eq!(lua_ack_native["state"]["status"], "acknowledged");
-    assert_eq!(
+    // Core retires an acknowledged envelope's delivery record (at-least-once
+    // routing bounds outstanding envelopes), so the Lua ack is visible in
+    // CoreDaemon as a record that is gone.
+    assert!(
         hub.routed_envelope_delivery_state(&native_target, &native_envelope_id)
             .wait(std::time::Duration::from_secs(30))
             .expect("core bridge")
             .state
-            .expect("CoreDaemon should record Lua ack")
-            .status,
-        EnvelopeDeliveryStatus::Acknowledged
+            .is_none(),
+        "CoreDaemon must retire the envelope the Lua ack acknowledged"
     );
 
     let lua_target = EnvelopeTarget::Session {
@@ -2236,14 +2238,14 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
             .status,
         EnvelopeDeliveryStatus::Acknowledged
     );
-    assert_eq!(
+    // Retired after the native ack, as above.
+    assert!(
         hub.routed_envelope_delivery_state(&lua_target, &lua_envelope_id)
             .wait(std::time::Duration::from_secs(30))
             .expect("core bridge")
             .state
-            .expect("CoreDaemon should record Lua delivery")
-            .status,
-        EnvelopeDeliveryStatus::Acknowledged
+            .is_none(),
+        "CoreDaemon must retire the envelope the native ack acknowledged"
     );
 }
 
