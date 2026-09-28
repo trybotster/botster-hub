@@ -2050,6 +2050,10 @@ pub enum DaemonRequest {
         #[serde(default)]
         request: DaemonSessionTypeRequest,
     },
+    /// Start an ended session-type session again under the same session id.
+    RestartSession {
+        session_id: String,
+    },
     ReadSessionContext {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2275,6 +2279,7 @@ impl DaemonRequest {
             Self::DeleteSessionType { .. } => "delete_session_type",
             Self::ResolveSessionType { .. } => "resolve_session_type",
             Self::SpawnSessionType { .. } => "spawn_session_type",
+            Self::RestartSession { .. } => "restart_session",
             Self::ReadSessionContext { .. } => "read_session_context",
             Self::ListSpawnTargets => "list_spawn_targets",
             Self::ShowSpawnTarget { .. } => "show_spawn_target",
@@ -6990,6 +6995,9 @@ mod tests {
                 session_id: "session".to_string(),
                 request: DaemonSessionTypeRequest::default(),
             },
+            DaemonRequest::RestartSession {
+                session_id: "session".to_string(),
+            },
             DaemonRequest::ReadSessionContext {
                 session_id: "session".to_string(),
                 context_id: Some("ctx-session".to_string()),
@@ -7195,6 +7203,7 @@ mod tests {
             DaemonRequest::DeleteSessionType { .. } => "delete_session_type",
             DaemonRequest::ResolveSessionType { .. } => "resolve_session_type",
             DaemonRequest::SpawnSessionType { .. } => "spawn_session_type",
+            DaemonRequest::RestartSession { .. } => "restart_session",
             DaemonRequest::ReadSessionContext { .. } => "read_session_context",
             DaemonRequest::ListSpawnTargets => "list_spawn_targets",
             DaemonRequest::ShowSpawnTarget { .. } => "show_spawn_target",
