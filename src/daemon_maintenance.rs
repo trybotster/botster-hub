@@ -1415,9 +1415,13 @@ fn admit_next_session_family_frame(
         Ok(Some(peeked)) => peeked,
         Ok(None) => unreachable!("a ready session-family consumer has a frame"),
         Err(()) => {
-            // One row can never fit a snapshot chunk: a fault, not a retry.
+            // One row can never fit a snapshot chunk: a fault, not a retry. The
+            // projection stops, so this consumer's snapshot never completes and
+            // stays gapped. Other ready consumers still send what they hold.
             state.session_family.mark_gap(&plugin_key);
+            state.session_family.admit_after = Some(plugin_key);
             state.fault_lifecycle("a session row larger than one family snapshot chunk");
+            continue_if_family_consumers_ready(state);
             return;
         }
     };
@@ -1505,7 +1509,11 @@ fn admit_next_session_family_frame(
             return;
         }
     }
-    // Each run admits one frame: other ready consumers are a continuation.
+    continue_if_family_consumers_ready(state);
+}
+
+/// Each run handles one consumer: the others that are ready are a continuation.
+fn continue_if_family_consumers_ready(state: &mut MaintenanceState) {
     if !state.session_family.ready.is_empty() {
         state.wakes.mark(MaintenanceSliceKind::HostBridge);
     }
@@ -2735,6 +2743,49 @@ mod tests {
         }
         assert!(!state.wakes.has_any(), "every consumer is parked");
         assert!(state.session_family.ready.is_empty());
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    /// A row that can never fit a snapshot chunk faults the projection and
+    /// gaps that consumer. Another ready consumer still sends its frame: the
+    /// slice marks itself for it, with no external wake.
+    #[test]
+    fn an_unpackable_row_faults_one_consumer_and_keeps_the_others_scheduled() {
+        let (runtime, data_directory) = event_delivery_runtime("family-oversized-row");
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+        let mut state = family_state(&runtime, &["plugin.b"]);
+        let mut huge = test_record("huge");
+        huge.lifecycle = Some(botster_core::SessionLifecycleState::Failed {
+            reason: "x".repeat(SESSION_CHUNK_MAX_BYTES),
+        });
+        state.projection.replace_complete_baseline(
+            botster_core_daemon::SessionLifecycleCursor {
+                source_id: botster_core_daemon::SessionLifecycleSourceId("s".into()),
+                sequence: 1,
+            },
+            vec![huge],
+        );
+        runtime.insert_test_event_handler("plugin.a", "session_family");
+        admitting_consumer(&mut state, "plugin.a", &[]);
+        state
+            .session_family
+            .touch_consumer("plugin.a", |consumer| consumer.need_snapshot_chunks = true);
+        assert_eq!(
+            state.session_family.next_ready().as_deref(),
+            Some("plugin.a")
+        );
+        run_host_bridge_slice(&runtime, &mut state);
+        assert!(state.lifecycle_faulted, "the projection stops");
+        assert!(state.session_family.consumers["plugin.a"].gap);
+        assert!(!state.session_family.ready.contains("plugin.a"));
+        assert!(
+            state.wakes.take(MaintenanceSliceKind::HostBridge),
+            "plugin.b is still ready: the slice marks itself for it"
+        );
+        assert_eq!(state.family_admission_attempts, 0);
+        run_host_bridge_slice(&runtime, &mut state);
+        assert_eq!(state.family_admission_attempts, 1, "plugin.b was offered");
         drop(runtime);
         let _ = std::fs::remove_dir_all(data_directory);
     }
