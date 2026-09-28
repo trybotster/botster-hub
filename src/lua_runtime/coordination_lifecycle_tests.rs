@@ -618,7 +618,16 @@ fn abandonment(admitted: bool) {
         .unwrap();
     // Receive is at-least-once: the admitted drain delivered abandon-0 to a
     // caller that never got it, so it stays until acked and drains again.
-    assert_eq!(remaining.envelopes.len(), 2);
+    // Exactly both envelopes, once each, in publish order: a count alone
+    // would not exclude a duplicate standing in for a lost envelope.
+    assert_eq!(
+        remaining
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["abandon-0", "abandon-1"]
+    );
     assert!(state.coordination_capacity_waiters.is_empty());
     assert_eq!(state.budget.outstanding(), 0);
     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
