@@ -508,6 +508,13 @@ impl SessionFamilyBridge {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceState {
     pub wakes: MaintenanceWakes,
+    /// Test only: hold the CompletionDrain slice (and its bit take in
+    /// publish_completion_wakes), for the session-family notifier control.
+    #[cfg(test)]
+    pub(crate) hold_completion_drain: bool,
+    /// Test only: plugin completions drained by the CompletionDrain slice.
+    #[cfg(test)]
+    pub(crate) drained_completions: usize,
     /// Slices parked on a cross-thread signal. The owner marks a slice ready
     /// when its key's epoch moves past the value it read before its attempt.
     pub(crate) signal_waits: BTreeMap<MaintenanceSliceKind, crate::daemon::owner_signal::Seen>,
@@ -1713,9 +1720,21 @@ fn run_completion_drain_slice_with_owner_routes(
     mut entities: Option<&mut crate::daemon::control::entities::PluginEntityState>,
     result_budget: &crate::daemon::control::reply::RetainedPluginResultBudget,
 ) -> CompletionDrainProgress {
+    // Test hold (session-family notifier control): return before any work.
+    #[cfg(test)]
+    if state.hold_completion_drain {
+        return CompletionDrainProgress {
+            item_count: 0,
+            has_remaining: false,
+        };
+    }
     flush_pending_event_retirements(runtime, state);
     let drain = runtime
         .drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, result_budget.available_bytes());
+    #[cfg(test)]
+    {
+        state.drained_completions += drain.item_count;
+    }
     let progress = CompletionDrainProgress {
         item_count: drain.item_count,
         has_remaining: drain.has_remaining,
