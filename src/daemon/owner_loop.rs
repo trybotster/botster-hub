@@ -566,7 +566,12 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             mark_background_ready(state, BackgroundWork::OrdinarySpawn);
         }
     }
-    let completed = state.plugin_result_budget.take_completion_notification();
+    // Test hold (session-family notifier control): leave the bit untaken.
+    #[cfg(test)]
+    let held = state.maintenance.hold_completion_drain;
+    #[cfg(not(test))]
+    let held = false;
+    let completed = !held && state.plugin_result_budget.take_completion_notification();
     let released = state.plugin_result_budget.take_release_notification();
     if completed || released {
         mark_background_ready(
@@ -8644,50 +8649,110 @@ return botster.register({ handlers = {} })
         };
         let mut phase_two_start = 0;
         if family_wakes == FamilyWakes::NotifierAfterAdmission {
-            // Phase 1: every wake, until the frame is admitted and its
-            // completion is pending.
+            // Phase 1: every wake, with the completion drain held, until the
+            // frame is admitted. While held, the CompletionDrain slice returns
+            // before any work, and publish_completion_wakes leaves the
+            // completion bit untaken, so the frame cannot settle here and the
+            // notifier's permit survives into phase 2.
+            state.maintenance.hold_completion_drain = true;
             drive_owner_until(
                 &mut daemon,
                 &mut state,
                 &mut wakes,
                 hang_guard,
                 |_, state| {
-                    settled(state)
-                        || state
-                            .maintenance
-                            .session_family
-                            .test_consumer_debug("family-probe")
-                            .contains("in_flight: Some")
+                    state
+                        .maintenance
+                        .session_family
+                        .test_consumer_debug("family-probe")
+                        .contains("in_flight: Some")
                 },
                 describe,
             );
-            assert!(
-                !settled(&state),
-                "phase 1 must stop at admission, not settle"
-            );
+            assert!(!settled(&state), "the held drain cannot settle phase 1");
+            let drained_at_admission = state.maintenance.drained_completions;
+            // A notifier wake received from here on counts for phase 2, even
+            // one received while the drain is still held.
             phase_two_start = wakes.received.len();
-            // Phase 2: a turn runs only after a notifier wake. Within a turn
-            // the ready queue runs to empty and the per-turn publishes stay,
-            // as in production; no turn starts without that wake.
-            let deadline = Instant::now() + hang_guard;
-            loop {
+            let admission_index = phase_two_start;
+            if install_notifier {
+                // Force the admission-to-observation window: the completion is
+                // published (its notifier wake arrived), then one ordinary turn
+                // runs, as an incidental wake would. The held drain must not
+                // consume it.
+                if !wakes.wait_for_kind(Instant::now() + hang_guard, "PluginCompletionPublished") {
+                    panic!(
+                        "the completion was never published: {}",
+                        describe(&daemon, &state)
+                    );
+                }
+                // An incidental trigger can also mark every maintenance slice
+                // (mark_all, as baseline recovery does); the held slice must
+                // still not drain.
+                state.maintenance.wakes.mark_all();
+                publish_maintenance_wakes(&mut state);
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                publish_completion_wakes(&daemon, &mut state);
+                publish_maintenance_wakes(&mut state);
                 while !state.owner_ready.is_empty() {
                     assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                     publish_completion_wakes(&daemon, &mut state);
                     publish_maintenance_wakes(&mut state);
                 }
+                assert!(
+                    !settled(&state)
+                        && state.maintenance.drained_completions == drained_at_admission,
+                    "a turn after the completion is published must not drain it while held: {}",
+                    describe(&daemon, &state)
+                );
+            }
+            state.maintenance.hold_completion_drain = false;
+            // Phase 2: a turn runs only after a notifier wake. Within a turn
+            // the ready queue runs to empty and the per-turn publishes stay,
+            // as in production; no turn starts without that wake.
+            let deadline = Instant::now() + hang_guard;
+            let mut seen = admission_index;
+            let mut first_wake = true;
+            loop {
+                let recorded = wakes.received[seen..]
+                    .iter()
+                    .position(|kind| *kind == "PluginCompletionPublished");
+                match recorded {
+                    Some(offset) => seen += offset + 1,
+                    None => {
+                        if !wakes.wait_for_kind(deadline, "PluginCompletionPublished") {
+                            panic!(
+                                "owner wakes stopped before the condition held: {}",
+                                describe(&daemon, &state)
+                            );
+                        }
+                        seen = wakes.received.len();
+                    }
+                }
+                if first_wake {
+                    assert_eq!(
+                        state.maintenance.drained_completions, drained_at_admission,
+                        "no turn may drain a completion before the first notifier wake after \
+                         admission"
+                    );
+                    first_wake = false;
+                }
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the hang guard expired before the condition held: {}",
+                        describe(&daemon, &state)
+                    );
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    publish_completion_wakes(&daemon, &mut state);
+                    publish_maintenance_wakes(&mut state);
+                    if settled(&state) || state.owner_ready.is_empty() {
+                        break;
+                    }
+                }
                 if settled(&state) {
                     break;
                 }
-                if !wakes.wait_for_kind(deadline, "PluginCompletionPublished") {
-                    panic!(
-                        "owner wakes stopped before the condition held: {}",
-                        describe(&daemon, &state)
-                    );
-                }
-                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
-                publish_completion_wakes(&daemon, &mut state);
-                publish_maintenance_wakes(&mut state);
             }
         } else {
             drive_owner_until(
