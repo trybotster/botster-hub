@@ -230,6 +230,11 @@ cmd_run() {
   if [ -n "${BOTSTERQ_JOB:-}" ]; then
     exec "$@"
   fi
+  # The job supervisor runs under this PATH's python3; it needs 3.9 or later.
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null || {
+    echo "botsterq: the job supervisor needs python3 3.9 or later on PATH (found: $(python3 --version 2>&1 || echo none))" >&2
+    exit 127
+  }
   ensure_server
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
   export BOTSTERQ_OWNER=$$
