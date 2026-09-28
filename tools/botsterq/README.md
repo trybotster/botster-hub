@@ -9,13 +9,14 @@ coordination between writers.
 ```sh
 brew install task-spooler
 mkdir -p ~/.local/share/botsterq
-cp tools/botsterq/botsterq tools/botsterq/README.md ~/.local/share/botsterq/   # from a botster-hub checkout
+cp tools/botsterq/botsterq tools/botsterq/botsterq-job tools/botsterq/README.md ~/.local/share/botsterq/   # from a botster-hub checkout
 ln -sf ~/.local/share/botsterq/botsterq ~/.local/bin/botsterq
 ```
 
 Install a copy, not a link into a worktree, so removing a worktree cannot break it.
 
-`~/.local/bin` must be on `PATH`. State (socket, slot count, pid files) lives in
+`~/.local/bin` must be on `PATH`, and `python3` (3.9 or later) must be available for the job
+supervisor. State (socket, slot count, pid files) lives in
 `~/.botsterq` (override with `BOTSTERQ_HOME`).
 
 ## Use
@@ -35,10 +36,14 @@ botsterq slots 3         # change it (kept across server restarts)
   `RUSTUP_TOOLCHAIN`, `BOTSTER_HUB_BIN` and the other test variables pass through),
   under `nice -n 10`, in its own process group.
 - Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`): a
-  queued job never starts. A running job's process group gets SIGTERM, and SIGKILL
-  if any member is still there when the grace period (10 s, `BOTSTERQ_KILL_GRACE`)
-  ends, including a child that ignores SIGTERM after its leader exits. Only that
-  group is signalled, never anything by name.
+  queued job never starts. A running job's group gets SIGTERM, and SIGKILL for any
+  member still there when the grace period (10 s, `BOTSTERQ_KILL_GRACE`) ends,
+  including a child that ignores SIGTERM after its leader exits. The queue slot is
+  released only when the whole group is gone, so the next job never starts beside
+  the remains of a cancelled one. `run` exits 130 after a cancel.
+- A job that exits while leaving other processes in its group gets them stopped the
+  same way (grace, SIGTERM, SIGKILL), with a warning naming them; `run` keeps the
+  command's own status.
 - A job whose `run` process is gone when its turn comes does not start. A caller
   killed with SIGKILL while its job runs cannot be noticed; use `botsterq cancel <id>`.
 - `slots N` refuses while any job is queued or running.
@@ -74,17 +79,27 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
 - `-f` keeps the job a child of the caller's `ts` client (caller's environment and
   directory); `-n` streams output instead of storing it; `ts -w <id>` returns the
   job's exit code.
-- Start versus cancel: the job publishes its pid (its own process group) and checks
-  for a cancel marker under a per-job lock; a cancel creates the marker and reads
-  the pid under the same lock. Either the job published first (the cancel stops its
-  group) or the cancel came first (the job deletes the marker and does not start).
-- Waiting uses `wait` and `ts -w`, which are completion events, not polls. The only
-  timer is the kill grace, a deadline.
+- Each job runs under `botsterq-job`, a small Python supervisor that leads the job's
+  process group. It publishes its pid (the group id) and checks for a cancel marker
+  under a per-job lock; a cancel creates the marker and reads the pid under the same
+  lock, so either the job published first (the cancel signals the supervisor) or the
+  cancel came first (the job deletes the marker and does not start). A job whose
+  `run` is gone does not start. The supervisor runs the command as a child, and on
+  SIGTERM signals the group, then SIGKILLs what outlives the grace. It exits only
+  when the group is empty, waiting on exit events (kqueue NOTE_EXIT on macOS, pidfd
+  on Linux) and re-enumerating members after each round so a process forked
+  meanwhile is included. Its exit, observed with `ts -w`, is the event that the job
+  and its group are gone.
+- A cancel that arrives while `run` is still inside admission resolves the job by its
+  token, so a job that already started is stopped too.
+- Waiting uses `wait`, `ts -w` and process-exit events, never polls. The only timer is
+  the kill grace, a deadline.
 - `tools/botsterq/test-botsterq` is the regression suite (a private queue): it
   covers the exit code and environment, slot refusal, exclusive reservations and
   fairness, cancel of queued and running jobs, a SIGTERM-ignoring child with an
-  untouched control process, both sides of the start/cancel race (pinned with test
-  hooks), nesting, an orphaned queued job, and `cancel <id>`.
+  untouched control process, both sides of the start/cancel race and a cancel during
+  admission (pinned with test hooks), slot release only after the cancelled group is
+  empty, leftover processes, nesting, an orphaned queued job, and `cancel <id>`.
 
 ## Stage 2 (design only): a remote Linux backend
 
