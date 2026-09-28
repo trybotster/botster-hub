@@ -28,7 +28,18 @@ await_file() {
     perl -e 'select(undef, undef, undef, 0.05)'
   done
 }
-job_group() { await_file "$BOTSTERQ_HOME/run/*.pid"; cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | head -1; }
+# The pid file's first line is the supervisor's pid; its second, written once
+# the command has started, is the command's process group.
+supervisor_group() { await_file "$BOTSTERQ_HOME/run/*.pid"; cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | head -1; }
+job_group() {
+  i=0
+  until [ "$(cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | wc -l | tr -d ' ')" -ge 2 ]; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for the job to publish its command group.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+  cat "$BOTSTERQ_HOME"/run/*.pid | sed -n 2p
+}
 # Wait until the queue shows a job whose label contains $1 in state $2.
 await_state() {
   i=0
@@ -107,7 +118,7 @@ mkfifo "$work/after"
 BOTSTERQ_TEST_AFTER_PIDFILE="$work/after" "$Q" run --label P2 -- sh -c 'touch "$0/P2-ran"' "$work" >/dev/null 2>&1 &
 P2=$!
 await_state "P2 @" running
-g=$(job_group)
+g=$(supervisor_group)
 kill -TERM "$P2"; wait "$P2"
 [ ! -e "$work/P2-ran" ] && [ "$(group_members "$g")" = 0 ] \
   && pass "cancel after pid publication: group stopped, command never runs" || fail "race after pid" "ran or group alive"
@@ -192,7 +203,7 @@ wait "$N"
 #     after the grace and warns, and the group is empty when run returns.
 "$Q" run --label L -- sh -c 'sleep 60 & exit 0' >/dev/null 2>"$work/L.err"; codeL=$?
 g=$(grep -o 'running: \[[0-9]*' "$work/L.err" | tr -dc 0-9)
-[ "$codeL" = 0 ] && grep -q "left 1 process" "$work/L.err" && [ -z "$(ps -axo pid= | awk -v p="$g" '$1 == p')" ] \
+[ "$codeL" = 0 ] && grep -q "left process(es) running: \[[0-9]*\]" "$work/L.err" && [ -z "$(ps -axo pid= | awk -v p="$g" '$1 == p')" ] \
   && pass "leftover process is stopped and reported; run keeps the command's status" \
   || fail "leftover" "run=$codeL stderr=$(cat "$work/L.err")"
 # 14b. The same, in the order the census cannot see: the command has already
@@ -215,7 +226,7 @@ echo go >"$work/L2.hold"
 wait "$L2"; codeL2=$?
 elapsed=$(( $(date +%s) - started ))
 left=$(cat "$work/L2.left")
-[ "$codeL2" = 0 ] && grep -q "left 1 process" "$work/L2.err" && [ "$elapsed" -le $((BOTSTERQ_KILL_GRACE + 5)) ] \
+[ "$codeL2" = 0 ] && grep -q "left process(es) running: \[[0-9]*\]" "$work/L2.err" && [ "$elapsed" -le $((BOTSTERQ_KILL_GRACE + 5)) ] \
   && [ -z "$(ps -axo pid= | awk -v p="$left" '$1 == p')" ] \
   && pass "an exited command's leftover is reported even when the command exits first (${elapsed}s)" \
   || { fail "leftover after exit" "run=$codeL2 elapsed=${elapsed}s stderr=$(cat "$work/L2.err")"; kill "$left" 2>/dev/null; }
@@ -255,7 +266,7 @@ wait "$N2"
 mkfifo "$work/spawn"
 BOTSTERQ_TEST_BEFORE_SPAWN="$work/spawn" "$Q" run --label S -- sh -c 'touch "$0/S-ran"' "$work" >/dev/null 2>"$work/S.err" &
 S=$!
-g=$(job_group)
+g=$(supervisor_group)
 kill -TERM "$S"
 # `run` prints "stopping job" once it has signalled the supervisor (which is
 # held before spawning); only then is the hold released.
@@ -271,6 +282,60 @@ wait "$S"; codeS=$?
 [ "$codeS" = 130 ] && [ ! -e "$work/S-ran" ] && [ "$(group_members "$g")" = 0 ] \
   && pass "cancel before the command starts: it never starts (run exit 130)" \
   || fail "cancel before spawn" "run=$codeS ran=$( [ -e "$work/S-ran" ] && echo yes || echo no) stderr=$(cat "$work/S.err")"
+
+# 17. Absence unproved keeps the slot. A job's command ignores SIGTERM and
+#     BOTSTERQ_TEST_NO_SIGKILL stands in for a process that survives SIGKILL;
+#     the variants also fail the ps census or the exit watch. A successor
+#     queued at 1 slot must stay queued while the survivor lives, and start
+#     only after the test kills the survivor (by its pid), seeing no member.
+await_text() {
+  i=0
+  until grep -q -- "$2" "$1" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for a supervisor warning.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
+fault_case() {
+  name=$1 expect=$2
+  shift 2
+  env "$@" "$Q" run --label "$name" -- \
+    perl -e '$SIG{TERM} = "IGNORE"; open(my $f, ">", shift) or die; print $f "$$\n"; close $f; sleep 600' \
+    "$work/$name.survivor" >/dev/null 2>"$work/$name.err" &
+  runner=$!
+  await_file "$work/$name.survivor"
+  survivor=$(cat "$work/$name.survivor")
+  # The group comes from the survivor itself, not the pid file: a supervisor
+  # that failed would take its pid file with it.
+  g=$(ps -o pgid= -p "$survivor" | tr -d ' ')
+  "$Q" run --label "$name-next" -- sh -c 'ps -axo pgid= | awk -v g="$1" "\$1 == g" | wc -l | tr -d " " > "$0/next.seen"' \
+    "$work" "$g" >/dev/null 2>&1 &
+  next=$!
+  await_state "$name-next @" queued
+  kill -TERM "$runner"
+  await_text "$work/$name.err" "survived SIGKILL"
+  # The successor must not start while the survivor lives: watch for it for
+  # longer than the grace. Expected to time out.
+  i=0 started_early=no
+  while [ "$i" -lt 60 ]; do
+    TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | grep -F -- "$name-next @" | grep -q " running " && { started_early=yes; break; }
+    i=$((i + 1))
+    # timer: deadline — a negative window: the successor must stay queued.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+  alive_before=$(kill -0 "$survivor" 2>/dev/null && echo yes || echo no)
+  kill -KILL "$survivor" 2>/dev/null
+  wait "$runner"; code=$?
+  wait "$next"
+  seen=$(cat "$work/next.seen" 2>/dev/null); rm -f "$work/next.seen"
+  [ "$code" = 130 ] && [ "$started_early" = no ] && [ "$alive_before" = yes ] && [ "$seen" = 0 ] \
+    && { [ -z "$expect" ] || grep -q -- "$expect" "$work/$name.err"; } \
+    && pass "$name: the slot stays held while a SIGKILL survivor lives (run exit 130)" \
+    || fail "$name" "run=$code started_early=$started_early survivor_alive=$alive_before next_saw=$seen stderr=$(cat "$work/$name.err")"
+}
+fault_case "survivor" "" BOTSTERQ_TEST_NO_SIGKILL=1
+fault_case "survivor with failed census" "census failed" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_CENSUS=1
+fault_case "survivor with failed watch" "watch failed" BOTSTERQ_TEST_NO_SIGKILL=1 BOTSTERQ_TEST_FAIL_WATCH=1
 
 echo "failures: $failures"
 [ "$failures" = 0 ]

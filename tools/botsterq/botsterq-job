@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""botsterq job supervisor: runs one queued command and leads its process group.
+"""botsterq job supervisor: runs one queued command and holds its queue slot
+until every process of the command's process group is gone.
 
 Usage: botsterq-job <pidfile> <marker> <joblock> <owner-pid> <grace-seconds> -- <command...>
 
-task-spooler starts this as the job, in a new process group that this process
-leads. It exits only when every other member of that group is gone, so the
-queue slot is never released while any of the job's processes still run.
+task-spooler starts this as the job and releases the slot when it exits, so it
+exits only once the command's group is proved absent: killpg(group, 0) fails
+with ESRCH. That is the kernel's answer, zombies included (macOS answers EPERM
+for a group of zombies only, which counts as present). Nothing else, not a
+failed census, a failed watch or a process that survives SIGKILL, ends the job.
 
 - Start: under the job lock it either consumes a cancel marker (and exits 130
-  without running anything) or publishes its pid, which is the group id. A job
+  without running anything) or publishes its pid for a later cancel. A job
   whose `botsterq run` process is gone does not start.
-- Run: the command runs as a child in this group, under `nice -n 10`.
-- Cancel: SIGTERM (or SIGINT, SIGHUP) to this process sends SIGTERM to every
-  other group member, and SIGKILL to any member left when the grace ends.
-- End: after the command exits (or after cancelling), it waits on process-exit
-  events (kqueue NOTE_EXIT on macOS, pidfd on Linux) until the group is empty,
-  re-enumerating members after each round so a process forked meanwhile is
-  still waited for. It then exits with the command's status, or 130 when
-  cancelled.
+- Run: the command runs as a child under `nice -n 10`, in a new process group
+  of its own (the command's pid), so the group holds only the command and what
+  it starts. After the start, the pid file's second line is that group.
+- Cancel: SIGTERM (or SIGINT, SIGHUP) to this process sends SIGTERM to the
+  command's group, and SIGKILL when the grace ends.
+- End: after the command exits (or after a cancel), leftovers get the grace,
+  then SIGTERM, then SIGKILL, and then as long as they take: a process that
+  survives SIGKILL keeps the slot, with a warning, until it is gone. The exit
+  status is the command's, or 130 when cancelled.
+- Waiting uses process-exit events (kqueue NOTE_EXIT on macOS, pidfd on Linux)
+  on the members a `ps` census names, plus the command itself until it is
+  reaped. When no event source exists (the census failed, a watch failed, or
+  the group holds only processes the census cannot name, such as zombies not
+  yet reaped), it rechecks absence at a short deadline instead.
 """
 
+import errno
 import fcntl
 import os
 import select
@@ -28,42 +38,76 @@ import subprocess
 import sys
 import time
 
+# Recheck deadline when no exit event can be watched (see above).
+RECHECK_SECONDS = 0.1
+
+
+class WatchError(Exception):
+    """An exit watch failed for a reason other than the process being gone."""
+
+
+def group_absent(pgid):
+    """True only when the kernel reports no process in group pgid."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False  # only zombies are left (macOS): still present
+    return False
+
+
+def signal_group(pgid, signum):
+    if signum == signal.SIGKILL and os.environ.get("BOTSTERQ_TEST_NO_SIGKILL"):
+        return  # test hook: stands in for a process that survives SIGKILL
+    try:
+        os.killpg(pgid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass  # gone, or only zombies left
+
 
 def group_members(pgid):
-    """Live processes in group pgid other than this one and the census's own
-    `ps` (which runs in this group), zombies excluded."""
-    census = subprocess.Popen(["ps", "-axo", "pid=,pgid=,stat="], stdout=subprocess.PIPE, text=True)
-    out, _ = census.communicate()
+    """Live processes in group pgid, zombies excluded. Raises when ps fails."""
+    if os.environ.get("BOTSTERQ_TEST_FAIL_CENSUS"):
+        raise RuntimeError("ps census failed (test hook)")
+    census = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], stdout=subprocess.PIPE, text=True)
     if census.returncode != 0:
         raise RuntimeError(f"ps census exited {census.returncode}")
     members = []
-    for line in out.splitlines():
+    for line in census.stdout.splitlines():
         parts = line.split()
         if len(parts) < 3:
             continue
         pid, group, stat = int(parts[0]), int(parts[1]), parts[2]
-        if group == pgid and pid not in (os.getpid(), census.pid) and "Z" not in stat:
+        if group == pgid and "Z" not in stat:
             members.append(pid)
     return members
 
 
 def wait_events(pids, deadline, wakeup):
     """Block until one of pids exits, a signal arrives (a byte on the wakeup
-    pipe), or deadline passes. Events only: kqueue NOTE_EXIT on macOS, pidfd on
-    Linux. A pid that is already gone returns at once."""
+    pipe), or deadline passes. A pid that is already gone (or a zombie, which
+    kqueue refuses) returns at once. Any other watch failure raises WatchError."""
+    if os.environ.get("BOTSTERQ_TEST_FAIL_WATCH"):
+        raise WatchError("watch failed (test hook)")
     timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
     if hasattr(select, "kqueue"):
         queue = select.kqueue()
-        queue.control([select.kevent(wakeup, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
-        for pid in pids:
-            try:
-                queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
-                                             fflags=select.KQ_NOTE_EXIT)], 0, 0)
-            except OSError:
-                queue.close()
-                return  # already exited (or a zombie): the caller re-checks
-        queue.control(None, 1, timeout)
-        queue.close()
+        try:
+            queue.control([select.kevent(wakeup, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
+            for pid in pids:
+                try:
+                    queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                                                 fflags=select.KQ_NOTE_EXIT)], 0, 0)
+                except OSError as error:
+                    if error.errno == errno.ESRCH:
+                        return  # already exited: the caller re-checks
+                    raise WatchError(f"kqueue watch of pid {pid}: {error}") from error
+            queue.control(None, 1, timeout)
+        except OSError as error:
+            raise WatchError(f"kqueue: {error}") from error
+        finally:
+            queue.close()
         return
     poller = select.poll()
     poller.register(wakeup, select.POLLIN)
@@ -74,12 +118,21 @@ def wait_events(pids, deadline, wakeup):
                 fd = os.pidfd_open(pid)
             except ProcessLookupError:
                 return
+            except OSError as error:
+                raise WatchError(f"pidfd_open of pid {pid}: {error}") from error
             fds.append(fd)
             poller.register(fd, select.POLLIN)
         poller.poll(None if timeout is None else int(timeout * 1000))
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def hold_for_test(name):
+    hold = os.environ.pop(name, None)
+    if hold:
+        with open(hold) as fifo:
+            fifo.read(1)
 
 
 def main():
@@ -90,16 +143,13 @@ def main():
     grace = float(grace)
     pgid = os.getpgrp()
 
-    hold = os.environ.get("BOTSTERQ_TEST_BEFORE_PIDFILE")
-    if hold:
-        with open(hold) as fifo:
-            fifo.read(1)
+    hold_for_test("BOTSTERQ_TEST_BEFORE_PIDFILE")
     try:
         os.kill(int(owner), 0)
     except ProcessLookupError:
         sys.exit(130)  # its `botsterq run` is gone: do not start
     # Under the job lock: a cancel that came first left a marker (consume it and
-    # do not start); otherwise publish this group for any later cancel.
+    # do not start); otherwise publish this process for any later cancel.
     with open(joblock, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if os.path.exists(marker):
@@ -107,10 +157,7 @@ def main():
             sys.exit(130)
         with open(pidfile, "w") as published:
             published.write(f"{pgid}\n")
-    hold = os.environ.get("BOTSTERQ_TEST_AFTER_PIDFILE")
-    if hold:
-        with open(hold) as fifo:
-            fifo.read(1)
+    hold_for_test("BOTSTERQ_TEST_AFTER_PIDFILE")
 
     # Signals only set state and wake the event wait (set_wakeup_fd); the loop
     # below reacts, so a signal during a wait recomputes its deadline.
@@ -126,14 +173,12 @@ def main():
     cancel_signals = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     for signum in cancel_signals:
         signal.signal(signum, on_cancel)
-    hold = os.environ.get("BOTSTERQ_TEST_BEFORE_SPAWN")
-    if hold:
-        with open(hold) as fifo:
-            fifo.read(1)
+    hold_for_test("BOTSTERQ_TEST_BEFORE_SPAWN")
 
     # Start the command with cancel signals blocked, so a cancel either comes
     # before the check below (the command never starts) or is handled after the
-    # child exists. The child unblocks them before it execs.
+    # child exists. The child unblocks them before it execs. Popen returns only
+    # after the exec, so the child's own group exists from here on.
     signal.pthread_sigmask(signal.SIG_BLOCK, cancel_signals)
     if requested["cancel"]:
         sys.exit(130)
@@ -141,56 +186,77 @@ def main():
     child = subprocess.Popen(
         ["nice", "-n", "10", *command],
         env=env,
+        process_group=0,
         preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals),
     )
+    group = child.pid
+    with open(joblock, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(pidfile, "a") as published:
+            published.write(f"{group}\n")
     signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
 
-    def signal_all(signum):
-        for pid in group_members(pgid):
-            try:
-                os.kill(pid, signum)
-            except ProcessLookupError:
-                pass
+    warned = set()
+
+    def warn_once(key, text):
+        if key not in warned:
+            warned.add(key)
+            print(f"botsterq: {text}", file=sys.stderr, flush=True)
 
     status = None
     cancelled = False
     # Escalation after a cancel, or after the command leaves processes behind:
-    # "wait" (grace for leftovers to exit), then "term", then "kill".
+    # "wait" (grace for leftovers to exit), then "term", then "kill", then
+    # "held" (survivors of SIGKILL keep the slot until they are gone).
     phase = None
     deadline = None
     while True:
         if status is None and child.poll() is not None:
             status = child.returncode
-        hold = os.environ.pop("BOTSTERQ_TEST_AFTER_POLL", None)
-        if hold:
-            with open(hold) as fifo:
-                fifo.read(1)
+        hold_for_test("BOTSTERQ_TEST_AFTER_POLL")
         if requested["cancel"] and not cancelled:
             cancelled = True
-            signal_all(signal.SIGTERM)
+            signal_group(group, signal.SIGTERM)
             phase, deadline = "term", time.monotonic() + grace
-        members = group_members(pgid)
-        if not members and status is not None:
+        # While the command is unreaped its group exists, so only after that is
+        # absence possible.
+        if status is not None and group_absent(group):
             break
-        if status is not None and phase is None and members:
+        if status is not None and phase is None:
             phase, deadline = "wait", time.monotonic() + grace
+        try:
+            members = group_members(group)
+        except Exception as error:
+            members = None
+            warn_once("census", f"{error}; holding the slot until group {group} is gone")
         if deadline is not None and time.monotonic() >= deadline:
+            shown = "unknown (no census)" if members is None else members
             if phase == "wait":
-                print(f"botsterq: the job left {len(members)} process(es) running: {members}; stopping them",
-                      file=sys.stderr)
-                signal_all(signal.SIGTERM)
+                warn_once("left", f"the job left process(es) running: {shown}; stopping them")
+                signal_group(group, signal.SIGTERM)
                 phase, deadline = "term", time.monotonic() + grace
             elif phase == "term":
-                signal_all(signal.SIGKILL)
+                signal_group(group, signal.SIGKILL)
                 phase, deadline = "kill", time.monotonic() + grace
             else:
-                print(f"botsterq: process(es) {members} survived SIGKILL", file=sys.stderr)
-                sys.exit(137)
+                warn_once("held", f"process(es) {shown} survived SIGKILL; holding the slot until they are gone")
+                phase, deadline = "held", None
             continue
         # The census omits zombies, so an exited but unreaped command is not a
-        # member; wait on it too, or its exit would not end the wait when other
-        # members (processes it left behind) are still running.
-        wait_events(members if status is not None else [*members, child.pid], deadline, wakeup_read)
+        # member; watch it too, or its exit would not end the wait while other
+        # members (processes it left behind) run.
+        watch = None if members is None else (members if status is not None else [*members, child.pid])
+        recheck = time.monotonic() + RECHECK_SECONDS
+        if watch:
+            try:
+                wait_events(watch, deadline, wakeup_read)
+            except WatchError as error:
+                warn_once("watch", f"{error}; rechecking group {group} at a deadline instead")
+                wait_events_or_recheck(deadline, recheck, wakeup_read)
+        else:
+            # No event source: the census failed, or the group holds only
+            # processes it cannot name (zombies awaiting their reaper).
+            wait_events_or_recheck(deadline, recheck, wakeup_read)
         try:
             os.read(wakeup_read, 512)
         except BlockingIOError:
@@ -199,6 +265,13 @@ def main():
     if cancelled:
         sys.exit(130)
     sys.exit(status if status >= 0 else 128 - status)
+
+
+def wait_events_or_recheck(deadline, recheck, wakeup):
+    """Wait for a signal until the earlier of deadline and recheck."""
+    # timer: deadline — no exit event exists to wait on; recheck absence.
+    until = recheck if deadline is None else min(deadline, recheck)
+    select.select([wakeup], [], [], max(0.0, until - time.monotonic()))
 
 
 if __name__ == "__main__":
