@@ -26,6 +26,7 @@ botsterq run --label "hub lib" -- cargo test --locked -p botster-hub --lib
 botsterq run --label "hub lifecycle" --exclusive -- ./test.sh --locked --test hub_daemon_lifecycle_test
 botsterq run --label "hub tests" --exclusive --deadline 20m -- ./test.sh --locked   # shorter hang guard
 botsterq list            # queued and running jobs: id, state, enqueue time, label @ owner dir
+botsterq audit           # jobs that overlapped an exclusive job (from the events log)
 botsterq cancel <id>     # remove a queued job, or SIGTERM a running job's process group
 botsterq slots           # show how many jobs run at once (default 2)
 botsterq slots 3         # change it (kept across server restarts)
@@ -58,6 +59,15 @@ botsterq slots 3         # change it (kept across server restarts)
   ordinary job has none. It is a hang guard, not a budget: it exists so one hung job
   cannot hold the queue for hours. It does not apply after an unexpected supervisor
   error, when the supervisor only holds the slot until the group is gone.
+- Admission is in arrival order. An ordinary job that meets a queued exclusive job
+  waits for it while holding the admission lock, so no job that arrives later can be
+  queued ahead of it. `botsterq slots N` refuses at once while that wait holds the lock,
+  and cancelling a waiting `run` ends it at once.
+- `botsterq audit` reads `~/.botsterq/events.log` (an append-only file: the supervisor
+  writes a `start` line, with the host load average, and an `end` line, when the
+  command's group is gone, for every job) and prints each job that ran at the same time
+  as an exclusive job; it exits 1 if there is one. Use it to answer whether an exclusive
+  job really ran alone. The log has no rotation.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 

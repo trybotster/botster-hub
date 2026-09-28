@@ -192,6 +192,24 @@ wait "$G1" "$G2" "$G3"
   && pass "cancelling a waiting run exits 130 at once; slots refuses without blocking; the job behind it runs" \
   || fail "cancel while waiting" "slots=$slots_code (${slots_elapsed}s: $slots_out) cancel=$codeGO (${cancel_elapsed}s) GO.ran=$([ -e "$work/GO.ran" ] && echo yes || echo no) G3.ran=$([ -e "$work/G3.ran" ] && echo yes || echo no) err=$(cat "$work/GO.err")"
 
+# 8d. The events log and audit: a run writes one start line (with the host load
+#     average) and one end line; audit reports no overlap for jobs that ran one
+#     after the other, and reports an overlap in a log that has one.
+"$Q" slots 2 >/dev/null
+rm -f "$BOTSTERQ_HOME/events.log"
+"$Q" run --label AE --exclusive -- true >/dev/null 2>&1
+"$Q" run --label AO -- true >/dev/null 2>&1
+starts=$(grep -c "^start" "$BOTSTERQ_HOME/events.log"); ends=$(grep -c "^end" "$BOTSTERQ_HOME/events.log")
+"$Q" audit >"$work/audit.out" 2>&1; codeAudit=$?
+[ "$starts" = 2 ] && [ "$ends" = 2 ] && [ "$codeAudit" = 0 ] && grep -q "load=" "$BOTSTERQ_HOME/events.log" && grep -q "0 overlap" "$work/audit.out" \
+  && pass "events log has a start and an end per job, with the load average; audit finds no overlap" \
+  || fail "events log" "starts=$starts ends=$ends audit=$codeAudit out=$(cat "$work/audit.out")"
+printf 'start\t100.0\tT1\t2\t1\tX\tload=1/1/1\nstart\t105.0\tT2\t1\t0\tY\tload=1/1/1\nend\t110.0\tT2\t1\t0\tY\t\nend\t120.0\tT1\t2\t1\tX\t\nstart\t130.0\tT3\t1\t0\tZ\tload=1/1/1\nend\t140.0\tT3\t1\t0\tZ\t\n' >"$BOTSTERQ_HOME/events.log"
+"$Q" audit >"$work/audit.out" 2>&1; codeAudit=$?
+[ "$codeAudit" = 1 ] && grep -q "OVERLAP exclusive job T1 (X) and job T2 (Y)" "$work/audit.out" && grep -q "1 overlap" "$work/audit.out" && ! grep -q "T3" "$work/audit.out" \
+  && pass "audit reports the job that overlapped an exclusive job, and only that one (exit 1)" \
+  || fail "audit overlap" "audit=$codeAudit out=$(cat "$work/audit.out")"
+
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null
 out=$("$Q" run --label outer -- sh -c "$Q run --label inner -- echo inner-ran" 2>&1)
