@@ -2167,7 +2167,7 @@ fn materialize_session_type_from_resolved(
         request.context,
         &session_type.context,
     );
-    inject_context_environment(config, &mut environment, &session_id, &context_id);
+    inject_context_environment(config, &mut environment, &session_id, Some(&context_id));
 
     let row = effective_row;
     let metadata = session_type_metadata(&row);
@@ -2300,7 +2300,7 @@ pub(crate) fn materialize_managed_session_type(
         materialization_config,
         &mut environment,
         &session_id,
-        &context_id,
+        Some(&context_id),
     );
     let command_root = if source.rank == SessionTypeSourceRank::Repo {
         &managed_root
@@ -3434,7 +3434,7 @@ fn charged_inject_context_environment(
     paths: MaterializationPathText<'_>,
 ) -> Result<crate::lua_memory::LuaCallbackCharge, &'static str> {
     const KEYS: [&str; 5] = [
-        "BOTSTER_SESSION_ID",
+        SESSION_ID_ENVIRONMENT,
         "BOTSTER_CONTEXT_ID",
         "BOTSTER_HUB_DATA_DIR",
         "BOTSTER_HUB_SOCKET",
@@ -4361,14 +4361,33 @@ fn valid_environment_name(name: &str) -> bool {
         && !name.as_bytes()[0].is_ascii_digit()
 }
 
+/// Environment name that carries a session's own id into its process.
+/// `mcp-serve` and `context` read the caller identity from it.
+pub const SESSION_ID_ENVIRONMENT: &str = "BOTSTER_SESSION_ID";
+
+/// Spawn environment for a session started without a session type.
+#[must_use]
+pub fn raw_session_environment(config: &HubConfig, session_id: &SessionId) -> SpawnEnvironment {
+    let mut environment = BTreeMap::new();
+    inject_context_environment(config.into(), &mut environment, session_id, None);
+    SpawnEnvironment {
+        variables: environment
+            .into_iter()
+            .map(|(name, value)| SpawnEnvironmentVariable { name, value })
+            .collect(),
+    }
+}
+
 fn inject_context_environment(
     config: MaterializationConfigView<'_>,
     environment: &mut BTreeMap<String, String>,
     session_id: &SessionId,
-    context_id: &str,
+    context_id: Option<&str>,
 ) {
-    environment.insert("BOTSTER_SESSION_ID".to_string(), session_id.0.clone());
-    environment.insert("BOTSTER_CONTEXT_ID".to_string(), context_id.to_string());
+    environment.insert(SESSION_ID_ENVIRONMENT.to_string(), session_id.0.clone());
+    if let Some(context_id) = context_id {
+        environment.insert("BOTSTER_CONTEXT_ID".to_string(), context_id.to_string());
+    }
     environment.insert(
         "BOTSTER_HUB_DATA_DIR".to_string(),
         absolute_path(config.data_directory).display().to_string(),

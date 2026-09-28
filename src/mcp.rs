@@ -231,7 +231,7 @@ impl NativeHubToolProvider {
     pub fn new(config: HubConfig) -> Self {
         Self {
             config,
-            caller_session_id: std::env::var("BOTSTER_SESSION_UUID").ok(),
+            caller_session_id: std::env::var(crate::session_types::SESSION_ID_ENVIRONMENT).ok(),
         }
     }
 }
@@ -362,7 +362,7 @@ impl McpToolProvider for NativeHubToolProvider {
                 let Some(caller_session_id) = self.caller_session_id.clone() else {
                     return Err(McpToolError::new(
                         "identity_unavailable",
-                        "receive_messages requires BOTSTER_SESSION_UUID so the caller inbox is known",
+                        "receive_messages requires BOTSTER_SESSION_ID so the caller inbox is known",
                     ));
                 };
                 let after = optional_u64(&call.arguments, "after")?;
@@ -384,7 +384,7 @@ impl McpToolProvider for NativeHubToolProvider {
                 let Some(caller_session_id) = self.caller_session_id.clone() else {
                     return Err(McpToolError::new(
                         "identity_unavailable",
-                        "ack_message requires BOTSTER_SESSION_UUID so the caller inbox is known",
+                        "ack_message requires BOTSTER_SESSION_ID so the caller inbox is known",
                     ));
                 };
                 let envelope_id = required_string(&call.arguments, "envelope_id")?;

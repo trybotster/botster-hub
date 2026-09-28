@@ -95,3 +95,4 @@ include!("hub_daemon_lifecycle/plugin_grants.rs");
 include!("hub_daemon_lifecycle/plugin_basics.rs");
 include!("hub_daemon_lifecycle/harness_isolation.rs");
 include!("hub_daemon_lifecycle/unix_route_smokes.rs");
+include!("hub_daemon_lifecycle/coordination.rs");

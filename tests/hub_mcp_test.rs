@@ -223,7 +223,11 @@ fn run_mcp_serve_with_session(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(caller_session_id.map(|value| ("BOTSTER_SESSION_UUID", value)))
+        .env_remove(botster_hub::session_types::SESSION_ID_ENVIRONMENT)
+        .envs(
+            caller_session_id
+                .map(|value| (botster_hub::session_types::SESSION_ID_ENVIRONMENT, value)),
+        )
         .spawn()
         .expect("spawn botster-hub mcp-serve");
 
@@ -551,13 +555,13 @@ fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
 }
 
 #[test]
-fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
+fn mcp_native_coordination_tools_refuse_an_unknown_session() {
     let _guard = mcp_daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-round-trip");
+    let data_dir = unique_test_dir("coordination-unknown-session");
     let _ = fs::remove_dir_all(&data_dir);
     let daemon = start_cli_daemon(&data_dir);
 
-    let post = run_mcp_serve_with_session(
+    let output = run_mcp_serve_with_session(
         &data_dir,
         Some("session-alpha"),
         &[
@@ -572,8 +576,11 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "whoami",
-                    "arguments": {}
+                    "name": "post_message",
+                    "arguments": {
+                        "session_id": "missing-session",
+                        "body": "nobody reads this"
+                    }
                 }
             }),
             json!({
@@ -581,44 +588,17 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "post_message",
+                    "name": "notify_session",
                     "arguments": {
-                        "session_id": "session-beta",
-                        "envelope_id": "mcp-envelope-1",
-                        "body": "hello beta"
-                    }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_message",
-                    "arguments": {
-                        "session_id": "session-slow",
-                        "envelope_id": "mcp-slow-1",
-                        "body": "slow one"
-                    }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_message",
-                    "arguments": {
-                        "session_id": "session-slow",
-                        "envelope_id": "mcp-slow-2",
-                        "body": "slow two"
+                        "session_id": "missing-session",
+                        "message": "doorbell"
                     }
                 }
             }),
         ],
     );
-    let post_messages = parse_mcp_output(post, "post");
-    let native_tool_names = post_messages[1]["result"]["tools"]
+    let messages = parse_mcp_output(output, "unknown session");
+    let native_tool_names = messages[1]["result"]["tools"]
         .as_array()
         .expect("tools array")
         .iter()
@@ -640,135 +620,13 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
             "{native_name} should be listed exactly once by the native MCP provider"
         );
     }
+    assert_eq!(messages[2]["result"]["isError"], true);
     assert_eq!(
-        post_messages[2]["result"]["structuredContent"]["identity"]["caller_session_id"],
-        "session-alpha"
-    );
-    assert_eq!(
-        post_messages[3]["result"]["structuredContent"]["publish"]["deliveries"][0]["envelope_id"],
-        "mcp-envelope-1"
-    );
-    assert_eq!(
-        post_messages[3]["result"]["structuredContent"]["publish"]["deliveries"][0]["status"],
-        "queued"
-    );
-
-    let receive = run_mcp_serve_with_session(
-        &data_dir,
-        Some("session-beta"),
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "receive_messages",
-                    "arguments": {}
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "ack_message",
-                    "arguments": {
-                        "envelope_id": "mcp-envelope-1"
-                    }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {
-                    "name": "receive_messages",
-                    "arguments": {
-                        "after": 1
-                    }
-                }
-            }),
-        ],
-    );
-    let receive_messages = parse_mcp_output(receive, "receive");
-    assert_eq!(
-        receive_messages[1]["result"]["structuredContent"]["messages"][0]["envelope_id"],
-        "mcp-envelope-1"
-    );
-    assert_eq!(
-        receive_messages[1]["result"]["structuredContent"]["messages"][0]["body"],
-        "hello beta"
+        messages[2]["result"]["structuredContent"]["error"]["code"], "unknown_session",
+        "post_message to a missing session is a typed refusal"
     );
     assert!(
-        receive_messages[1]["result"]["structuredContent"]["next_cursor"]
-            .as_u64()
-            .is_some(),
-        "receive response should include next cursor"
-    );
-    assert_eq!(
-        receive_messages[2]["result"]["structuredContent"]["ack"]["status"],
-        "acknowledged"
-    );
-    assert_eq!(
-        receive_messages[3]["result"]["structuredContent"]["messages"]
-            .as_array()
-            .expect("messages array")
-            .len(),
-        0,
-        "after-cursor drain should not redeliver the already observed envelope"
-    );
-
-    let slow_receive = run_mcp_serve_with_session(
-        &data_dir,
-        Some("session-slow"),
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "receive_messages",
-                    "arguments": {
-                        "limit": 2
-                    }
-                }
-            }),
-        ],
-    );
-    let slow_messages = parse_mcp_output(slow_receive, "slow receive");
-    assert_eq!(
-        slow_messages[1]["result"]["structuredContent"]["messages"]
-            .as_array()
-            .expect("slow messages array")
-            .len(),
-        2,
-        "session-slow backlog should remain independent from session-beta cursor and ack"
-    );
-
-    let notify = run_mcp_serve_with_session(
-        &data_dir,
-        Some("session-alpha"),
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "notify_session",
-                    "arguments": {
-                        "session_id": "missing-session",
-                        "message": "doorbell"
-                    }
-                }
-            }),
-        ],
-    );
-    let notify_messages = parse_mcp_output(notify, "notify");
-    assert!(
-        notify_messages[1]["result"]["structuredContent"]["notify"]["decision"]
+        messages[3]["result"]["structuredContent"]["notify"]["decision"]
             .as_str()
             .expect("notify decision")
             .contains("unknown session"),
@@ -779,70 +637,6 @@ fn mcp_native_coordination_tools_route_messages_through_daemon_envelopes() {
     assert!(
         String::from_utf8_lossy(&daemon_output.stdout).contains("event=stopped"),
         "daemon should shut down cleanly"
-    );
-}
-
-#[test]
-fn mcp_routed_envelopes_are_not_restart_durable_today() {
-    let _guard = mcp_daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-restart-loss");
-    let _ = fs::remove_dir_all(&data_dir);
-    let daemon = start_cli_daemon(&data_dir);
-
-    let post = run_mcp_serve_with_session(
-        &data_dir,
-        Some("session-alpha"),
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_message",
-                    "arguments": {
-                        "session_id": "session-restart",
-                        "envelope_id": "mcp-restart-1",
-                        "body": "lost after restart"
-                    }
-                }
-            }),
-        ],
-    );
-    let post_messages = parse_mcp_output(post, "restart post");
-    assert_eq!(
-        post_messages[1]["result"]["structuredContent"]["publish"]["deliveries"][0]["status"],
-        "queued"
-    );
-    shutdown_cli_daemon(&data_dir, daemon);
-
-    let restarted = start_cli_daemon(&data_dir);
-    let receive = run_mcp_serve_with_session(
-        &data_dir,
-        Some("session-restart"),
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "receive_messages",
-                    "arguments": {}
-                }
-            }),
-        ],
-    );
-    let receive_messages = parse_mcp_output(receive, "restart receive");
-    shutdown_cli_daemon(&data_dir, restarted);
-
-    assert_eq!(
-        receive_messages[1]["result"]["structuredContent"]["messages"]
-            .as_array()
-            .expect("messages array")
-            .len(),
-        0,
-        "routed-envelope queues are in-memory and should be empty after daemon restart"
     );
 }
 
