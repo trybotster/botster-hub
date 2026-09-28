@@ -1,7 +1,7 @@
 #!/bin/sh
 # botsterq: a machine-wide queue for heavy work (cargo builds, test suites).
 #
-#   botsterq run [--label <text>] [--exclusive] -- <command...>
+#   botsterq run [--label <text>] [--exclusive] [--deadline <duration>] -- <command...>
 #   botsterq list
 #   botsterq cancel <id>
 #   botsterq slots [N]
@@ -12,6 +12,13 @@
 # The job runs in the caller's directory with the caller's environment, under
 # `nice -n 10`, in its own process group. `--exclusive` makes the job take
 # every slot, so it runs alone (use it for load-sensitive suites).
+#
+# Deadline: `--deadline <duration>` (seconds, or a number with s, m or h) bounds
+# a job's run time from its start; queue wait is not counted. At expiry the job
+# prints "deadline expired", its group is stopped like a cancel, and `run`
+# exits 124. An `--exclusive` job has a 45 minute deadline unless it passes its
+# own; an ordinary job has none. A deadline is a hang guard for a job that would
+# otherwise hold the queue.
 #
 # Admission (enqueueing, and changing the slot count) is serialized by one
 # lock, and `slots N` refuses while any job is queued or running, so an
@@ -30,6 +37,7 @@ mkdir -p "$state/run"
 export TS_SOCKET="$state/queue.sock"
 default_slots=2
 kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
+exclusive_deadline_seconds=${BOTSTERQ_EXCLUSIVE_DEADLINE:-2700}
 # Resolve symlinks (~/.local/bin/botsterq links to the installed copy), so the
 # job supervisor next to this script is found.
 self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
@@ -131,6 +139,21 @@ stop_job() {
   return 0
 }
 
+# Prints <duration> (N, Ns, Nm or Nh) as whole seconds, or fails.
+duration_seconds() {
+  case "$1" in
+    ''|*[!0-9smh]*|*[smh]*[0-9]*|*[smh][smh]*) return 1 ;;
+  esac
+  number=${1%[smh]}
+  case "$number" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$number" -gt 0 ] || return 1
+  case "$1" in
+    *m) echo $((number * 60)) ;;
+    *h) echo $((number * 3600)) ;;
+    *) echo "$number" ;;
+  esac
+}
+
 cmd_slots() {
   ensure_server
   if [ "$#" -eq 0 ]; then
@@ -179,8 +202,8 @@ cmd_cancel() {
 # Under the admission lock: enqueue the job and print its id, or print
 # "wait <id>" when an exclusive job is queued ahead of this ordinary job.
 admit_locked() {
-  token=$1 exclusive=$2 label=$3
-  shift 3
+  token=$1 exclusive=$2 label=$3 deadline=$4
+  shift 4
   if [ "$exclusive" = 1 ]; then
     slots_needed=$(ts -S)
     marker_text=" [exclusive]"
@@ -203,7 +226,7 @@ admit_locked() {
   # makes the job's id readable. The job publishes its pid, then starts only
   # if it was not cancelled and its `run` process still exists.
   TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
-    python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" -- "$@" \
+    python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" "$deadline" -- "$@" \
     </dev/null >&3 2>&4 &
   read _ <"$enqueued" || true
   rm -f "$enqueued"
@@ -216,15 +239,24 @@ admit_locked() {
 cmd_run() {
   label=job
   exclusive=0
+  deadline=
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --label) [ "$#" -ge 2 ] || usage; label=$2; shift 2 ;;
       --exclusive) exclusive=1; shift ;;
+      --deadline)
+        [ "$#" -ge 2 ] || usage
+        deadline=$(duration_seconds "$2") || { echo "botsterq: --deadline needs a positive number of seconds, or a number with s, m or h" >&2; exit 2; }
+        shift 2 ;;
       --) shift; break ;;
       *) usage ;;
     esac
   done
   [ "$#" -ge 1 ] || usage
+  # An exclusive job that names no deadline gets the default; an ordinary job none (0).
+  if [ -z "$deadline" ]; then
+    if [ "$exclusive" = 1 ]; then deadline=$exclusive_deadline_seconds; else deadline=0; fi
+  fi
   # Inside a botsterq job, run directly: queueing would wait for a slot this
   # job's own parent holds, which deadlocks when the slots are full.
   if [ -n "${BOTSTERQ_JOB:-}" ]; then
@@ -254,7 +286,7 @@ cmd_run() {
   # not into the command substitution that reads the admitted id.
   exec 3>&1 4>&2
   while :; do
-    admitted=$(with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$@")
+    admitted=$(with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$deadline" "$@")
     case "$admitted" in
       "wait "*)
         echo "botsterq: waiting for exclusive job ${admitted#wait } before queueing" >&2
