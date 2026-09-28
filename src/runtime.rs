@@ -5822,6 +5822,7 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::MissingWorkerPath => "missing_worker_path",
         CoreDaemonError::Shutdown => "shutdown",
         CoreDaemonError::WakePump(_) => "wake_pump",
+        CoreDaemonError::LifecycleCommitExhausted { .. } => "lifecycle_commit_exhausted",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
