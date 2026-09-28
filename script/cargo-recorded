@@ -1,0 +1,28 @@
+#!/bin/sh
+# Run one cargo build shape and record the artifacts Cargo reports for it.
+#
+# Usage: script/cargo-recorded <shape-name> <cargo arguments...>
+#
+# Status lines and diagnostics still reach stderr as usual
+# (--message-format=json-render-diagnostics renders them there). Cargo's JSON
+# artifact messages, which list fresh artifacts too, go to
+# target/.gate-artifacts/<shape-name>.json, replacing that shape's previous
+# record. script/prune-target keeps exactly the artifacts these records name.
+# Only build-only commands belong here: `cargo test` must pass --no-run, since
+# a running test binary writes to stdout.
+set -eu
+
+[ "$#" -ge 2 ] || { echo "usage: script/cargo-recorded <shape-name> <cargo arguments...>" >&2; exit 2; }
+shape=$1
+shift
+case "$shape" in
+  *[!A-Za-z0-9_-]*) echo "cargo-recorded: shape name must be [A-Za-z0-9_-]: $shape" >&2; exit 2 ;;
+esac
+
+records="${CARGO_TARGET_DIR:-target}/.gate-artifacts"
+mkdir -p "$records"
+partial="$records/$shape.json.partial"
+# Replace the record only after cargo succeeds, so a failed build keeps the
+# previous shape's record.
+cargo "$@" --message-format=json-render-diagnostics >"$partial"
+mv "$partial" "$records/$shape.json"

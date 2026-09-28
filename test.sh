@@ -30,7 +30,7 @@ fi
 # A supplied candidate usually predates the adapter, so build it from this
 # checkout and run an immutable copy, as the test library is built here too.
 if [ -z "${BOTSTER_HUB_CLIENT_ADAPTER_BIN:-}" ]; then
-  cargo build --locked -p botster-hub-client --example harness_control
+  script/cargo-recorded harness-control build --locked -p botster-hub-client --example harness_control
   cp "${CARGO_TARGET_DIR:-target}/debug/examples/harness_control" "$candidate_dir/harness_control"
   BOTSTER_HUB_CLIENT_ADAPTER_BIN="$candidate_dir/harness_control"
 fi
@@ -70,7 +70,10 @@ cat "$BOTSTER_CANDIDATE_MANIFEST"
 # Library tests find the session worker beside their executable in
 # target/debug (src/runtime.rs). `--workspace` does not build it because it
 # belongs to the pinned Core dependency, so build it from that pin here.
-cargo build --locked -p botster-core-daemon --bin botster-session-worker
+script/cargo-recorded session-worker build --locked -p botster-core-daemon --bin botster-session-worker
+# The managed-install lifecycle proof builds these installer binaries in this
+# target; building them here records them and makes that in-test build fresh.
+script/cargo-recorded installer build --locked -p botster-hub-installer --bin botster-hub-installer --bin botster-hub-release-tool
 
 # --workspace is load-bearing. The root package `botster-hub` is itself a
 # workspace member and no `default-members` is declared, so a bare `cargo test`
@@ -81,4 +84,13 @@ cargo build --locked -p botster-core-daemon --bin botster-session-worker
 # use this same candidate set. A bare daemon-spawning `cargo test` command must
 # receive BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, and
 # BOTSTER_CANDIDATE_MANIFEST from script/build-dev-artifacts.
+# Build first, recording the test artifacts, then run; the run compiles nothing.
+# The record name carries the arguments, so a targeted run (`--test X`) adds a
+# record instead of replacing the full-workspace one.
+test_shape="workspace-tests-$(printf '%s\n' "$@" | cksum | cut -d' ' -f1)"
+BOTSTER_ENV=test script/cargo-recorded "$test_shape" test --workspace --no-run "$@"
 BOTSTER_ENV=test cargo test --workspace "$@"
+
+# Only a successful gate reaches this line: set -e stops a failed gate above,
+# so nothing is pruned and the failing build's artifacts stay.
+script/prune-target

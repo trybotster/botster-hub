@@ -1,21 +1,20 @@
 #!/bin/sh
 # Remove stale build artifacts from target/debug while keeping everything the
-# gate's own cargo command shapes use.
+# gate's own cargo build shapes use.
 #
 # Cargo keeps one hashed copy of every artifact for each distinct invocation
 # shape (command, package selection, features, profile, toolchain) and never
 # removes old ones, so a long-lived worktree grows to many times one build.
-# This script asks Cargo which artifacts the gate shapes use: it re-runs each
-# shape with --message-format=json (tests with --no-run) and keeps every hash
-# that Cargo reports, including fresh artifacts. Everything else under
-# target/debug/deps, target/debug/build and target/debug/.fingerprint is
-# removed, except check-only metadata (a .rmeta with no .rlib, from clippy or
-# check), which is small and serves writers' clippy runs.
+# Every gate build runs through script/cargo-recorded, which saves the JSON
+# artifact messages Cargo prints for that shape (fresh artifacts included) to
+# target/.gate-artifacts/. This script keeps every artifact hash those records
+# name and removes everything else under target/debug/deps, target/debug/build
+# and target/debug/.fingerprint, except check-only metadata (a .rmeta with no
+# .rlib, from clippy or check), which is small and serves writers' clippy runs.
 #
-# It never compiles to decide what to keep: if any shape is not fresh (Cargo
-# reports "fresh": false), the script prunes nothing and exits 3. Run it right
-# after a successful gate, when every shape is fresh. test.sh does that; on a
-# failed gate it prunes nothing, so the evidence stays.
+# It never runs cargo, so it never compiles. With no records it prunes nothing
+# and exits 3. test.sh runs it as its last step, which only a successful gate
+# reaches; a failed gate prunes nothing, so the evidence stays.
 #
 # Not touched: target/managed-install-proof (one shape, rebuilt in place by
 # its test), and anything outside target/debug. target/debug/incremental is
@@ -37,38 +36,28 @@ cd "$root"
 target=target/debug
 [ -d "$target/deps" ] || { echo "prune-target: no $target/deps; nothing to prune"; exit 0; }
 
-messages=$(mktemp "${TMPDIR:-/tmp}/prune-target.XXXXXX")
-trap 'rm -f "$messages"' EXIT HUP INT TERM
-
-hub_revision=$(git rev-parse HEAD)
-# The gate's shapes: script/build-dev-artifacts, test.sh, and the installer
-# build that the managed-install lifecycle test runs in this target.
-{
-  BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked --message-format=json -p botster-hub --bin botster-hub
-  cargo build --locked --message-format=json -p botster-core-daemon --bin botster-session-worker
-  BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked --message-format=json -p botster-hub-client --example harness_control
-  cargo build --locked --message-format=json -p botster-hub-installer --bin botster-hub-installer --bin botster-hub-release-tool
-  BOTSTER_ENV=test cargo test --locked --message-format=json --workspace --no-run
-} >"$messages" 2>/dev/null || {
-  echo "prune-target: a gate shape failed to build; pruning nothing" >&2
+records="$target/../.gate-artifacts"
+if ! ls "$records"/*.json >/dev/null 2>&1; then
+  echo "prune-target: no recorded gate artifacts under $records; pruning nothing" >&2
   exit 3
-}
+fi
 
-node --input-type=module - "$messages" "$target" "$dry_run" <<'NODE'
+node --input-type=module - "$records" "$target" "$dry_run" <<'NODE'
 import { readFileSync, readdirSync, statSync, rmSync, existsSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 
-const [messagesPath, target, dryRunArg] = process.argv.slice(2);
+const [recordsDir, target, dryRunArg] = process.argv.slice(2);
 const dryRun = dryRunArg === "1";
 const hashOf = (name) => (name.match(/-([0-9a-f]{16})(?:\.|$)/) || [])[1];
 
 const keep = new Set();
-let stale = 0;
-for (const line of readFileSync(messagesPath, "utf8").split("\n")) {
+const lines = readdirSync(recordsDir)
+  .filter((name) => name.endsWith(".json"))
+  .flatMap((name) => readFileSync(join(recordsDir, name), "utf8").split("\n"));
+for (const line of lines) {
   if (!line.startsWith("{")) continue;
   const message = JSON.parse(line);
   if (message.reason === "compiler-artifact") {
-    if (message.fresh === false) stale += 1;
     for (const file of message.filenames ?? []) {
       // A build script's artifact is build/<pkg>-<hash>/build-script-build:
       // the hash is on its directory, not on the file.
@@ -83,10 +72,6 @@ for (const line of readFileSync(messagesPath, "utf8").split("\n")) {
     const hash = hashOf(basename(join(message.out_dir, "..")));
     if (hash) keep.add(hash);
   }
-}
-if (stale > 0) {
-  console.error(`prune-target: ${stale} artifact(s) were not fresh; run it right after a successful gate. Pruning nothing.`);
-  process.exit(3);
 }
 if (keep.size === 0) {
   console.error("prune-target: cargo reported no artifacts; pruning nothing.");
