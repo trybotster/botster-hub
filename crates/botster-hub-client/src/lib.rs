@@ -676,6 +676,9 @@ pub struct UnixOutputCredit {
     charged_bytes: u64,
     demands: std::collections::VecDeque<(String, u64, u64)>,
     routes: BTreeMap<(String, u64), RouteGrants>,
+    /// Route generations the Hub attached on this connection and has not
+    /// yet closed. A `DEMAND` for any other generation is ignored.
+    admitted: std::collections::BTreeSet<(String, u64)>,
 }
 
 impl UnixOutputCredit {
@@ -687,6 +690,20 @@ impl UnixOutputCredit {
             charged_bytes: 0,
             demands: std::collections::VecDeque::new(),
             routes: BTreeMap::new(),
+            admitted: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// The Hub answered an `Attach` with this route generation: later
+    /// demands for it are legitimate.
+    pub fn admit(&mut self, route: &str, generation: u64) {
+        self.admitted.insert((route.to_string(), generation));
+    }
+
+    /// Admit the route generation an `Attach` response names, if any.
+    pub fn on_response(&mut self, response: &DaemonResponse) {
+        if let Some(attach) = &response.terminal_attach {
+            self.admit(&attach.subscription_id, attach.generation);
         }
     }
 
@@ -704,7 +721,11 @@ impl UnixOutputCredit {
                 generation,
                 bytes,
             } => {
-                self.demands.push_back((route.clone(), *generation, *bytes));
+                // A demand for a generation the client never attached, or
+                // one already closed, is stale or unsolicited: no grant.
+                if self.admitted.contains(&(route.clone(), *generation)) {
+                    self.demands.push_back((route.clone(), *generation, *bytes));
+                }
             }
             DaemonUnixCreditFrame::Return {
                 route,
@@ -724,6 +745,7 @@ impl UnixOutputCredit {
                 ..
             } => {
                 let key = (route.clone(), *generation);
+                self.admitted.remove(&key);
                 if let Some(grants) = self.routes.remove(&key) {
                     self.release(
                         grants
@@ -1408,9 +1430,15 @@ impl DaemonConnection {
     /// whatever the caller is waiting for.
     fn read_socket_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
         let frame = self.frames.read_frame(&mut self.reader)?;
-        if let DaemonUnixMuxFrame::Credit(credit) = &frame {
-            let grants = self.credit.on_hub_frame(credit);
-            self.send_grants(grants)?;
+        match &frame {
+            DaemonUnixMuxFrame::Credit(credit) => {
+                let grants = self.credit.on_hub_frame(credit);
+                self.send_grants(grants)?;
+            }
+            DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. }) => {
+                self.credit.on_response(response);
+            }
+            _ => {}
         }
         Ok(frame)
     }
@@ -9401,6 +9429,15 @@ mod tests {
 mod unix_output_credit_tests {
     use super::*;
 
+    /// A ledger with routes `a`, `b`, and `c` attached at generation 1.
+    fn admitted_credit(mode: UnixCreditMode, budget: u64) -> UnixOutputCredit {
+        let mut credit = UnixOutputCredit::new(mode, budget);
+        for route in ["a", "b", "c"] {
+            credit.admit(route, 1);
+        }
+        credit
+    }
+
     fn demand(route: &str, generation: u64, bytes: u64) -> DaemonUnixCreditFrame {
         DaemonUnixCreditFrame::Demand {
             route: route.to_string(),
@@ -9429,7 +9466,7 @@ mod unix_output_credit_tests {
 
     #[test]
     fn demands_are_granted_whole_and_in_order_within_the_budget() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 100);
         assert_eq!(
             credit.on_hub_frame(&demand("a", 1, 60)),
             vec![grant("a", 1, 60)]
@@ -9448,7 +9485,7 @@ mod unix_output_credit_tests {
 
     #[test]
     fn a_return_releases_the_returned_credit() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 100);
         let _ = credit.on_hub_frame(&demand("a", 1, 80));
         let _ = credit.on_hub_frame(&DaemonUnixCreditFrame::Return {
             route: "a".to_string(),
@@ -9463,7 +9500,7 @@ mod unix_output_credit_tests {
     /// releases it, and another route's demand then fits.
     #[test]
     fn closed_releases_a_grant_that_crossed_the_close() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 100);
         assert_eq!(
             credit.on_hub_frame(&demand("a", 1, 70)),
             vec![grant("a", 1, 70)]
@@ -9481,7 +9518,7 @@ mod unix_output_credit_tests {
     /// until the caller consumes it.
     #[test]
     fn closed_keeps_written_frames_charged_until_consumed() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 100);
         let _ = credit.on_hub_frame(&demand("a", 1, 30));
         let _ = credit.on_hub_frame(&demand("a", 1, 20));
         assert_eq!(credit.charged_bytes(), 50);
@@ -9497,7 +9534,7 @@ mod unix_output_credit_tests {
 
     #[test]
     fn closed_drops_the_generations_waiting_demands() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 10);
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 10);
         let _ = credit.on_hub_frame(&demand("a", 1, 10));
         assert!(credit.on_hub_frame(&demand("a", 1, 10)).is_empty());
         let _ = credit.on_hub_frame(&closed("a", 1, 0));
@@ -9505,9 +9542,37 @@ mod unix_output_credit_tests {
         assert_eq!(credit.charged_bytes(), 0);
     }
 
+    /// Plan test 7: a demand for a generation the client never attached, or
+    /// one already closed, gets no grant and no ledger entry.
+    #[test]
+    fn a_demand_for_an_unknown_or_retired_generation_is_ignored() {
+        let mut credit = admitted_credit(UnixCreditMode::Auto, 100);
+        assert!(credit.on_hub_frame(&demand("ghost", 1, 10)).is_empty());
+        assert!(credit.on_hub_frame(&demand("a", 2, 10)).is_empty());
+        assert!(credit.pending_demands().is_empty());
+        assert_eq!(credit.charged_bytes(), 0);
+        let _ = credit.on_hub_frame(&closed("a", 1, 0));
+        assert!(credit.on_hub_frame(&demand("a", 1, 10)).is_empty());
+        assert!(credit.pending_demands().is_empty());
+        assert_eq!(credit.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn an_attach_response_admits_its_generation() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let mut response = crate::tests::empty_test_response(DaemonResponseKind::TerminalAttached);
+        response.terminal_attach = Some(DaemonTerminalAttach::new("r", "r-sub", 3, 64));
+        credit.on_response(&response);
+        assert!(credit.on_hub_frame(&demand("r", 3, 10)).is_empty());
+        assert_eq!(
+            credit.on_hub_frame(&demand("r-sub", 3, 10)),
+            vec![grant("r-sub", 3, 10)]
+        );
+    }
+
     #[test]
     fn manual_mode_grants_nothing_itself() {
-        let mut credit = UnixOutputCredit::new(UnixCreditMode::Manual, 100);
+        let mut credit = admitted_credit(UnixCreditMode::Manual, 100);
         assert!(credit.on_hub_frame(&demand("a", 1, 10)).is_empty());
         assert_eq!(credit.pending_demands(), vec![("a".to_string(), 1, 10)]);
         credit.record_grant("a", 1, 10);
@@ -9524,6 +9589,7 @@ mod unix_output_credit_tests {
             .expect("bound server reads");
         let mut connection =
             DaemonConnection::from_hello_complete_stream(client, Vec::new()).expect("connection");
+        connection.credit.admit("route", 1);
         let id = connection
             .submit(&DaemonRequest::Status)
             .expect("submit status");

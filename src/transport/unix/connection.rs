@@ -960,7 +960,14 @@ enum InputCredit {
 /// ingress, or input before the route's `TerminalAttached` response is on
 /// the socket, exceeds the client's credit.
 fn store_credited_input(handle: &UnixTerminalAdapterHandle, bytes: Vec<u8>) -> InputCredit {
-    if !handle.is_attach_written() {
+    if !handle.is_attach_written()
+        || !handle.reserve_input_credit(
+            u32::try_from(
+                botster_core::contract::terminal_adapter::MIN_ADAPTER_INGRESS_BUFFER_FRAMES,
+            )
+            .expect("the ingress capacity fits u32"),
+        )
+    {
         return InputCredit::Exceeded;
     }
     match handle.try_push_ingress(bytes) {
