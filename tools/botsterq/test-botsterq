@@ -195,6 +195,71 @@ g=$(grep -o 'running: \[[0-9]*' "$work/L.err" | tr -dc 0-9)
 [ "$codeL" = 0 ] && grep -q "left 1 process" "$work/L.err" && [ -z "$(ps -axo pid= | awk -v p="$g" '$1 == p')" ] \
   && pass "leftover process is stopped and reported; run keeps the command's status" \
   || fail "leftover" "run=$codeL stderr=$(cat "$work/L.err")"
+# 14b. The same, in the order the census cannot see: the command has already
+#      exited (a zombie, not a member) when the supervisor first waits, and its
+#      leftover is still running. Its exit must still end the wait.
+mkfifo "$work/L2.hold"
+BOTSTERQ_TEST_AFTER_POLL="$work/L2.hold" "$Q" run --label L2 -- \
+  sh -c 'sleep 60 & echo $! > "$0/L2.left"; exit 0' "$work" >/dev/null 2>"$work/L2.err" &
+L2=$!
+await_file "$work/L2.left"
+g=$(job_group)
+i=0
+until ps -axo pgid=,stat= | awk -v g="$g" '$1 == g && $2 ~ /Z/' | grep -q .; do
+  i=$((i + 1)); [ "$i" -gt 200 ] && break
+  # timer: deadline — test-side wait for the command to become a zombie.
+  perl -e 'select(undef, undef, undef, 0.05)'
+done
+started=$(date +%s)
+echo go >"$work/L2.hold"
+wait "$L2"; codeL2=$?
+elapsed=$(( $(date +%s) - started ))
+left=$(cat "$work/L2.left")
+[ "$codeL2" = 0 ] && grep -q "left 1 process" "$work/L2.err" && [ "$elapsed" -le $((BOTSTERQ_KILL_GRACE + 5)) ] \
+  && [ -z "$(ps -axo pid= | awk -v p="$left" '$1 == p')" ] \
+  && pass "an exited command's leftover is reported even when the command exits first (${elapsed}s)" \
+  || { fail "leftover after exit" "run=$codeL2 elapsed=${elapsed}s stderr=$(cat "$work/L2.err")"; kill "$left" 2>/dev/null; }
+
+# 15. The direct command itself ignores SIGTERM: cancel must escalate to
+#     SIGKILL at the grace deadline (bounded), with the documented statuses.
+"$Q" slots 1 >/dev/null
+"$Q" run --label T -- sh -c 'trap "" TERM; touch "$0/T-ready"; while :; do sleep 1; done' "$work" >/dev/null 2>"$work/T.err" &
+T=$!
+await_file "$work/T-ready"
+g=$(job_group)
+started=$(date +%s)
+kill -TERM "$T"; wait "$T"; codeT=$?
+elapsed=$(( $(date +%s) - started ))
+[ "$codeT" = 130 ] && [ "$(group_members "$g")" = 0 ] && [ "$elapsed" -le $((BOTSTERQ_KILL_GRACE + 5)) ] \
+  && pass "a TERM-ignoring direct command is SIGKILLed at the deadline (${elapsed}s, run exit 130)" \
+  || fail "TERM-ignoring command" "run=$codeT elapsed=${elapsed}s group=$g members=$(group_members "$g") stderr=$(cat "$work/T.err")"
+"$Q" run --label T2 -- sh -c 'trap "" TERM; touch "$0/T2-ready"; while :; do sleep 1; done' "$work" >/dev/null 2>&1 &
+T2=$!
+await_file "$work/T2-ready"
+g=$(job_group)
+id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[T2 @ ") && $2 == "running" { print $1 }')
+"$Q" cancel "$id" >"$work/T2.cancel" 2>&1; codeT2=$?
+wait "$T2"; runT2=$?
+[ "$codeT2" = 0 ] && [ "$runT2" = 130 ] && [ "$(group_members "$g")" = 0 ] \
+  && pass "cancel <id> of a TERM-ignoring direct command (cancel 0, run 130)" \
+  || fail "cancel TERM-ignoring" "cancel=$codeT2 run=$runT2 members=$(group_members "$g") out=$(cat "$work/T2.cancel")"
+
+# 16. Cancel after the supervisor installed its handlers but before it starts
+#     the command: the command must never start.
+mkfifo "$work/spawn"
+BOTSTERQ_TEST_BEFORE_SPAWN="$work/spawn" "$Q" run --label S -- sh -c 'touch "$0/S-ran"' "$work" >/dev/null 2>"$work/S.err" &
+S=$!
+g=$(job_group)
+kill -TERM "$S"
+# `run` prints "stopping job" once it has signalled the supervisor (which is
+# held before spawning); only then is the hold released.
+await_file "$work/S.err"
+until grep -q "stopping job" "$work/S.err" 2>/dev/null; do perl -e 'select(undef,undef,undef,0.05)'; done
+printf x >"$work/spawn"
+wait "$S"; codeS=$?
+[ "$codeS" = 130 ] && [ ! -e "$work/S-ran" ] && [ "$(group_members "$g")" = 0 ] \
+  && pass "cancel before the command starts: it never starts (run exit 130)" \
+  || fail "cancel before spawn" "run=$codeS ran=$( [ -e "$work/S-ran" ] && echo yes || echo no) stderr=$(cat "$work/S.err")"
 
 echo "failures: $failures"
 [ "$failures" = 0 ]

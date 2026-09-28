@@ -47,51 +47,39 @@ def group_members(pgid):
     return members
 
 
-def wait_exits(pids, deadline):
-    """Block on exit events for pids until all have exited or deadline passes.
-
-    Returns True when all exited. A pid that is already gone counts as exited.
-    """
-    if not pids:
-        return True
+def wait_events(pids, deadline, wakeup):
+    """Block until one of pids exits, a signal arrives (a byte on the wakeup
+    pipe), or deadline passes. Events only: kqueue NOTE_EXIT on macOS, pidfd on
+    Linux. A pid that is already gone returns at once."""
+    timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
     if hasattr(select, "kqueue"):
         queue = select.kqueue()
-        pending = set()
+        queue.control([select.kevent(wakeup, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
         for pid in pids:
-            event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
             try:
-                queue.control([event], 0, 0)
-                pending.add(pid)
+                queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                                             fflags=select.KQ_NOTE_EXIT)], 0, 0)
             except OSError:
-                pass  # already exited (or a zombie, which kqueue refuses)
-        while pending:
-            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if timeout == 0.0:
-                return False
-            for event in queue.control(None, len(pending), timeout):
-                pending.discard(event.ident)
-            if deadline is not None and pending and time.monotonic() >= deadline:
-                return False
-        return True
-    # Linux: a pidfd becomes readable when its process exits.
-    fds = {}
-    for pid in pids:
-        try:
-            fds[os.pidfd_open(pid)] = pid
-        except ProcessLookupError:
-            pass
+                queue.close()
+                return  # already exited (or a zombie): the caller re-checks
+        queue.control(None, 1, timeout)
+        queue.close()
+        return
     poller = select.poll()
-    for fd in fds:
-        poller.register(fd, select.POLLIN)
-    while fds:
-        timeout = None if deadline is None else max(0, int((deadline - time.monotonic()) * 1000))
-        if timeout == 0:
-            return False
-        for fd, _ in poller.poll(timeout):
-            poller.unregister(fd)
+    poller.register(wakeup, select.POLLIN)
+    fds = []
+    try:
+        for pid in pids:
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            fds.append(fd)
+            poller.register(fd, select.POLLIN)
+        poller.poll(None if timeout is None else int(timeout * 1000))
+    finally:
+        for fd in fds:
             os.close(fd)
-            fds.pop(fd, None)
-    return True
 
 
 def main():
@@ -124,35 +112,39 @@ def main():
         with open(hold) as fifo:
             fifo.read(1)
 
-    cancelled = False
-    kill_at = None
+    # Signals only set state and wake the event wait (set_wakeup_fd); the loop
+    # below reacts, so a signal during a wait recomputes its deadline.
+    wakeup_read, wakeup_write = os.pipe()
+    os.set_blocking(wakeup_write, False)
+    os.set_blocking(wakeup_read, False)
+    signal.set_wakeup_fd(wakeup_write)
+    requested = {"cancel": False}
 
     def on_cancel(signum, frame):
-        nonlocal cancelled, kill_at
-        if not cancelled:
-            cancelled = True
-            kill_at = time.monotonic() + grace
-            for pid in group_members(pgid):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+        requested["cancel"] = True
 
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    cancel_signals = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+    for signum in cancel_signals:
         signal.signal(signum, on_cancel)
+    hold = os.environ.get("BOTSTERQ_TEST_BEFORE_SPAWN")
+    if hold:
+        with open(hold) as fifo:
+            fifo.read(1)
 
+    # Start the command with cancel signals blocked, so a cancel either comes
+    # before the check below (the command never starts) or is handled after the
+    # child exists. The child unblocks them before it execs.
+    signal.pthread_sigmask(signal.SIG_BLOCK, cancel_signals)
+    if requested["cancel"]:
+        sys.exit(130)
     env = dict(os.environ, BOTSTERQ_JOB=str(pgid))
-    child = subprocess.Popen(["nice", "-n", "10", *command], env=env)
-    status = None
-    while status is None:
-        try:
-            status = child.wait()
-        except InterruptedError:
-            continue
+    child = subprocess.Popen(
+        ["nice", "-n", "10", *command],
+        env=env,
+        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals),
+    )
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
 
-    # The command is done. Anything still in the group is a leftover: it gets the
-    # grace period to exit, then SIGTERM, then SIGKILL, each followed by waiting
-    # on exit events, re-enumerated so a process forked meanwhile is included.
     def signal_all(signum):
         for pid in group_members(pgid):
             try:
@@ -160,27 +152,49 @@ def main():
             except ProcessLookupError:
                 pass
 
-    if not cancelled:
-        members = group_members(pgid)
-        if members and not wait_exits(members, time.monotonic() + grace):
-            left = group_members(pgid)
-            print(f"botsterq: the job left {len(left)} process(es) running: {left}; stopping them", file=sys.stderr)
+    status = None
+    cancelled = False
+    # Escalation after a cancel, or after the command leaves processes behind:
+    # "wait" (grace for leftovers to exit), then "term", then "kill".
+    phase = None
+    deadline = None
+    while True:
+        if status is None and child.poll() is not None:
+            status = child.returncode
+        hold = os.environ.pop("BOTSTERQ_TEST_AFTER_POLL", None)
+        if hold:
+            with open(hold) as fifo:
+                fifo.read(1)
+        if requested["cancel"] and not cancelled:
+            cancelled = True
             signal_all(signal.SIGTERM)
-        kill_at = time.monotonic() + grace
-    for signum in (None, signal.SIGKILL):
-        while True:
-            members = group_members(pgid)
-            if not members or not wait_exits(members, kill_at):
-                break
-        if not group_members(pgid):
+            phase, deadline = "term", time.monotonic() + grace
+        members = group_members(pgid)
+        if not members and status is not None:
             break
-        if signum is None:
-            signal_all(signal.SIGKILL)
-            kill_at = time.monotonic() + grace
-    survivors = group_members(pgid)
-    if survivors:
-        print(f"botsterq: process(es) {survivors} survived SIGKILL", file=sys.stderr)
-        sys.exit(137)
+        if status is not None and phase is None and members:
+            phase, deadline = "wait", time.monotonic() + grace
+        if deadline is not None and time.monotonic() >= deadline:
+            if phase == "wait":
+                print(f"botsterq: the job left {len(members)} process(es) running: {members}; stopping them",
+                      file=sys.stderr)
+                signal_all(signal.SIGTERM)
+                phase, deadline = "term", time.monotonic() + grace
+            elif phase == "term":
+                signal_all(signal.SIGKILL)
+                phase, deadline = "kill", time.monotonic() + grace
+            else:
+                print(f"botsterq: process(es) {members} survived SIGKILL", file=sys.stderr)
+                sys.exit(137)
+            continue
+        # The census omits zombies, so an exited but unreaped command is not a
+        # member; wait on it too, or its exit would not end the wait when other
+        # members (processes it left behind) are still running.
+        wait_events(members if status is not None else [*members, child.pid], deadline, wakeup_read)
+        try:
+            os.read(wakeup_read, 512)
+        except BlockingIOError:
+            pass
 
     if cancelled:
         sys.exit(130)
