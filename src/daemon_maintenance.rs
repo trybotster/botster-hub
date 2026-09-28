@@ -661,11 +661,25 @@ pub struct MaintenanceState {
     pub journal_wake_pending: bool,
     /// Test-only replacement for `EVENT_INVOCATION_TIMEOUT_MS`, so a test can
     /// prove an outcome property without racing the production deadline.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "plugin-test-kit"))]
     pub(crate) test_event_invocation_timeout_ms: Option<u64>,
     /// Test only: session-family frames offered to plugin admission.
     #[cfg(test)]
     pub(crate) family_admission_attempts: u64,
+    /// Where lifecycle pages come from. Chosen at construction.
+    #[cfg(feature = "plugin-test-kit")]
+    lifecycle_source: LifecycleSource,
+}
+
+/// Where the lifecycle consumers get their pages.
+#[cfg(feature = "plugin-test-kit")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LifecycleSource {
+    /// The Baseline and JournalPull slices read Core.
+    #[default]
+    Core,
+    /// The plugin test kit supplies pages; the Core read slices never run.
+    Supplied,
 }
 
 /// Core lifecycle reads the maintenance slices have in flight.
@@ -754,7 +768,7 @@ impl MaintenanceState {
     }
 
     fn event_invocation_timeout_ms(&self) -> u64 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "plugin-test-kit"))]
         if let Some(timeout_ms) = self.test_event_invocation_timeout_ms {
             return timeout_ms;
         }
@@ -781,6 +795,11 @@ impl MaintenanceState {
         let parked = self.signal_waits.contains_key(&kind);
         Some(match kind {
             MaintenanceSliceKind::ProjectionApply => !self.pending_changes.is_empty(),
+            MaintenanceSliceKind::Baseline | MaintenanceSliceKind::JournalPull
+                if self.lifecycle_supplied() =>
+            {
+                false
+            }
             MaintenanceSliceKind::Baseline => {
                 !parked
                     && !self.lifecycle_faulted
@@ -799,6 +818,27 @@ impl MaintenanceState {
             }
             _ => return None,
         })
+    }
+
+    /// Plugin test kit: a state whose lifecycle pages the kit supplies.
+    #[cfg(feature = "plugin-test-kit")]
+    pub(crate) fn with_supplied_lifecycle() -> Self {
+        Self {
+            lifecycle_source: LifecycleSource::Supplied,
+            ..Self::default()
+        }
+    }
+
+    /// True when the plugin test kit supplies lifecycle pages.
+    fn lifecycle_supplied(&self) -> bool {
+        #[cfg(feature = "plugin-test-kit")]
+        {
+            self.lifecycle_source == LifecycleSource::Supplied
+        }
+        #[cfg(not(feature = "plugin-test-kit"))]
+        {
+            false
+        }
     }
 
     pub(crate) fn fault_lifecycle(&mut self, what: &str) {
@@ -1267,6 +1307,29 @@ fn apply_journal_page_result(
         }
         Err(_) => start_baseline_recovery(state),
     }
+}
+
+/// Plugin test kit: apply one supplied baseline page result through the
+/// baseline consumer. The state must come from `with_supplied_lifecycle`.
+#[cfg(feature = "plugin-test-kit")]
+pub(crate) fn supply_baseline_page(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    result: Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>,
+) {
+    debug_assert!(state.lifecycle_supplied());
+    apply_baseline_page_result(runtime, state, result);
+}
+
+/// Plugin test kit: apply one supplied journal page result through the
+/// journal consumer. The state must come from `with_supplied_lifecycle`.
+#[cfg(feature = "plugin-test-kit")]
+pub(crate) fn supply_journal_page(
+    state: &mut MaintenanceState,
+    result: Result<SessionLifecyclePage, SessionLifecyclePageError>,
+) {
+    debug_assert!(state.lifecycle_supplied());
+    apply_journal_page_result(state, result, false);
 }
 
 fn run_projection_apply_slice(runtime: Option<&HubRuntime>, state: &mut MaintenanceState) {

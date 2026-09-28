@@ -1,0 +1,12 @@
+//! Test Botster Lua plugins against the real Hub plugin runtime.
+//!
+//! The kit loads a plugin package into a real Hub daemon that runs without
+//! transports, drives it one settled step at a time, and reads its outputs.
+//! See the README for the spec API and the example test.
+
+pub use botster_hub::plugin_test_kit::{
+    DEFAULT_STEP_DEADLINE, DaemonPluginLogs, DaemonSession, EnvelopeTarget, HandlerHold, KitError,
+    KitHub, KitOptions, OBSERVER_PACKAGE, RegistrySessionState, RoutedEnvelope, SessionId,
+    SessionLifecycleRecord, SessionLifecycleState, hold_handler, session_record,
+};
+pub use botster_hub_client::{DaemonRequest, DaemonResponse};

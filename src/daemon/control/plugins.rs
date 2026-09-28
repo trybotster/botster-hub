@@ -127,7 +127,7 @@ impl PluginControlState {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "plugin-test-kit"))]
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }

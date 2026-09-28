@@ -184,7 +184,7 @@ impl OwnerBudget {
     }
 
     /// Permits held by connections, peers, pending requests, and obligations.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "plugin-test-kit"))]
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding
     }

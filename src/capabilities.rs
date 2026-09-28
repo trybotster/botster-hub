@@ -299,6 +299,19 @@ impl HubCapabilityRuntime {
         self.timers.len()
     }
 
+    /// Plugin test kit: every plugin_db record of one plugin, in key order.
+    #[cfg(feature = "plugin-test-kit")]
+    pub(crate) fn kit_plugin_records(
+        &self,
+        plugin_key: &PluginKey,
+    ) -> Result<Vec<PluginStoreRecord>, CapabilityRuntimeError> {
+        Ok(self
+            .plugin_store
+            .kit_records(plugin_key)?
+            .into_values()
+            .collect())
+    }
+
     /// Drain due timer events using a deterministic logical millisecond clock.
     pub fn drain_events_at(
         &mut self,
@@ -1165,6 +1178,18 @@ impl KeyedPluginStore {
                 None => return Ok(records),
             }
         }
+    }
+
+    /// Plugin test kit: every record of one plugin, read under the store
+    /// lock through the production namespace and owner checks.
+    #[cfg(feature = "plugin-test-kit")]
+    fn kit_records(
+        &self,
+        plugin_key: &PluginKey,
+    ) -> Result<BTreeMap<PluginStoreKey, PluginStoreRecord>, CapabilityRuntimeError> {
+        let _guard = self.lock.lock().expect("plugin store lock poisoned");
+        let namespace = Self::namespace(plugin_key)?;
+        self.read_records(plugin_key, &namespace)
     }
 
     fn write_record(

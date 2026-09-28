@@ -6,6 +6,7 @@ members = [
   "crates/botster-hub-installation",
   "crates/botster-hub-installer",
   "crates/botster-hub-test-support",
+  "crates/botster-plugin-test-kit",
   "crates/botster-ui-contract",
 ]
 
@@ -54,6 +55,10 @@ notify = "8.2.0"
 # Enabled for this crate's own integration tests through the self
 # dev-dependency below; production builds never carry it.
 test-internals = []
+# The plugin test kit: the real daemon driven by a test thread, without
+# transports. Used by crates/botster-plugin-test-kit; production builds never
+# carry it.
+plugin-test-kit = []
 
 [dev-dependencies]
 botster-hub = { path = ".", features = ["test-internals"] }
