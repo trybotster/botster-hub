@@ -88,6 +88,7 @@ pub(crate) mod plugin_response;
 pub mod process_exit;
 pub mod profile;
 pub(crate) mod recovery;
+pub(crate) mod restart_records;
 pub(crate) mod routed_endpoint;
 pub mod runtime;
 pub mod session_credential;
