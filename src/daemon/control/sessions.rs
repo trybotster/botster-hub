@@ -3619,6 +3619,7 @@ return botster.register({
                 },
                 botster_core::RequestId(format!("plugin-spawn-{session_id}")),
                 None,
+                None,
             )
             .expect("prepare spawn tool");
         let capacity_hold = hold_remaining_capacity.then(|| {

@@ -2009,22 +2009,20 @@ pub enum DaemonRequest {
     RemoveSession {
         session_id: String,
     },
-    Whoami {
-        caller_session_id: Option<String>,
-    },
+    /// The requester's identity. A socket client is the operator; a session
+    /// reaches the same request over HTTP MCP with its bearer token, and the
+    /// daemon derives the caller from that token. No request names a caller.
+    Whoami,
     PostMessage {
-        caller_session_id: Option<String>,
         target_session_id: String,
         envelope_id: Option<String>,
         body: String,
     },
     ReceiveMessages {
-        caller_session_id: String,
         after: Option<u64>,
         limit: usize,
     },
     AckMessage {
-        caller_session_id: String,
         envelope_id: String,
     },
     NotifySession {
@@ -7255,22 +7253,17 @@ mod tests {
             DaemonRequest::RemoveSession {
                 session_id: "session".to_string(),
             },
-            DaemonRequest::Whoami {
-                caller_session_id: Some("caller".to_string()),
-            },
+            DaemonRequest::Whoami,
             DaemonRequest::PostMessage {
-                caller_session_id: Some("caller".to_string()),
                 target_session_id: "target".to_string(),
                 envelope_id: Some("envelope".to_string()),
                 body: "hello".to_string(),
             },
             DaemonRequest::ReceiveMessages {
-                caller_session_id: "caller".to_string(),
                 after: Some(1),
                 limit: 10,
             },
             DaemonRequest::AckMessage {
-                caller_session_id: "caller".to_string(),
                 envelope_id: "envelope".to_string(),
             },
             DaemonRequest::NotifySession {

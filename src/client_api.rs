@@ -2620,7 +2620,12 @@ pub(crate) fn credentialed_raw_spawn(
 > {
     let mut request = spawn_request(runtime, request_id, session_id, command);
     let mut metadata = client_session_metadata();
-    crate::session_credential::issue(&mut request, &mut metadata, entropy)?;
+    crate::session_credential::issue(
+        &mut request,
+        &mut metadata,
+        runtime.config().mcp_url.as_deref(),
+        entropy,
+    )?;
     Ok(botster_core_daemon::SpawnSessionRequest { request, metadata })
 }
 

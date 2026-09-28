@@ -44,6 +44,20 @@ pub(crate) fn handle(
     control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
+    handle_as(daemon, state, transport_handle, control_tx, message, None)
+}
+
+/// Admit one request that runs as `caller`: `None` for the operator (every
+/// socket and WebRTC client), `Some` for a session whose token the owner
+/// verified in this turn.
+pub(crate) fn handle_as(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_handle: &tokio::runtime::Handle,
+    control_tx: ControlSender,
+    message: ControlMessage,
+    caller: Option<botster_core::SessionId>,
+) -> bool {
     let ControlMessage::Request {
         request,
         transport_request_id,
@@ -136,12 +150,14 @@ pub(crate) fn handle(
             client_id: None,
             grant_id: None,
             transport_request_id,
+            caller,
         }
     } else {
         DaemonObservability {
             client_id: client_id.clone(),
             grant_id: grant_id.clone(),
             transport_request_id,
+            caller,
         }
     };
     let must_finish = request_must_finish(&request);

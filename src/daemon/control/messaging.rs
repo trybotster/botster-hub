@@ -24,6 +24,16 @@ use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::{HubClientRequest, HubClientResponseBody};
 
+/// The operator has no inbox: receiving and acknowledging are for a session
+/// that proved its identity with its bearer token.
+fn caller_required(operation: &'static str) -> DaemonResponse {
+    crate::daemon::control::operator_refusal(
+        "caller_required",
+        operation,
+        "this request needs a session caller; the operator socket has no inbox",
+    )
+}
+
 pub(crate) const MESSAGE_CONTENT_TYPE: &str = "application/vnd.botster.coordination.message+text";
 
 /// Defer one client API step until its Core result lands, then map the body.
@@ -67,28 +77,34 @@ pub(crate) fn handle_runtime(
             .unwrap_or_else(|| super::runtime_client_id(&request)),
     );
     let packages = daemon.package_registry().clone();
+    let caller = observability.caller.clone();
     let Some(runtime) = daemon.runtime_mut() else {
         return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     };
 
     match request {
-        DaemonRequest::Whoami { caller_session_id } => ControlStep::ready(daemon_coordination(
+        DaemonRequest::Whoami => ControlStep::ready(daemon_coordination(
             DaemonResponseKind::Identity,
-            daemon_coordination_identity(DaemonIdentity {
-                client_id: "botster-hub-daemon-socket".to_string(),
-                role: "local_operator".to_string(),
-                identity_source: if caller_session_id.is_some() {
-                    crate::session_types::SESSION_ID_ENVIRONMENT.to_string()
-                } else {
-                    "local_operator".to_string()
+            daemon_coordination_identity(match caller {
+                Some(session_id) => DaemonIdentity {
+                    client_id: format!("http-mcp:{}", session_id.0),
+                    role: "session".to_string(),
+                    identity_source: "caller_token".to_string(),
+                    caller_session_id: Some(session_id.0),
+                    host_id: status.host_id.clone(),
+                    host_display_name: status.host_display_name.clone(),
                 },
-                caller_session_id,
-                host_id: status.host_id.clone(),
-                host_display_name: status.host_display_name.clone(),
+                None => DaemonIdentity {
+                    client_id: "botster-hub-daemon-socket".to_string(),
+                    role: "local_operator".to_string(),
+                    identity_source: "local_operator".to_string(),
+                    caller_session_id: None,
+                    host_id: status.host_id.clone(),
+                    host_display_name: status.host_display_name.clone(),
+                },
             }),
         )),
         DaemonRequest::PostMessage {
-            caller_session_id,
             target_session_id,
             envelope_id,
             body,
@@ -100,9 +116,9 @@ pub(crate) fn handle_runtime(
                         .unwrap_or_else(|| format!("hub-message-{}-{now}", target_session_id)),
                 ),
                 EndpointId(
-                    caller_session_id
-                        .map(|session_id| format!("session:{session_id}"))
-                        .unwrap_or_else(|| "botster-hub-mcp".to_string()),
+                    caller
+                        .map(|session_id| format!("session:{}", session_id.0))
+                        .unwrap_or_else(|| "operator".to_string()),
                 ),
                 vec![EnvelopeTarget::Session {
                     session_id: SessionId(target_session_id),
@@ -133,18 +149,17 @@ pub(crate) fn handle_runtime(
                 ))
             })
         }
-        DaemonRequest::ReceiveMessages {
-            caller_session_id,
-            after,
-            limit,
-        } => {
+        DaemonRequest::ReceiveMessages { after, limit } => {
+            let Some(caller_session_id) = caller else {
+                return ControlStep::ready(caller_required("receive_messages"));
+            };
             let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::DrainRoutedEnvelopes {
                     request_id: request_id("daemon-mcp-receive-messages"),
                     target: EnvelopeTarget::Session {
-                        session_id: SessionId(caller_session_id),
+                        session_id: caller_session_id,
                     },
                     after: after.map(EnvelopeCursor),
                     limit: limit.clamp(1, 128),
@@ -161,17 +176,17 @@ pub(crate) fn handle_runtime(
                 ))
             })
         }
-        DaemonRequest::AckMessage {
-            caller_session_id,
-            envelope_id,
-        } => {
+        DaemonRequest::AckMessage { envelope_id } => {
+            let Some(caller_session_id) = caller else {
+                return ControlStep::ready(caller_required("ack_message"));
+            };
             let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::AcknowledgeRoutedEnvelope {
                     request_id: request_id("daemon-mcp-ack-message"),
                     target: EnvelopeTarget::Session {
-                        session_id: SessionId(caller_session_id),
+                        session_id: caller_session_id,
                     },
                     envelope_id: EnvelopeId(envelope_id),
                 },

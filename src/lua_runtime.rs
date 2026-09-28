@@ -1896,7 +1896,15 @@ impl PluginRuntime for LuaPluginRuntime {
                 request.context.origin.as_deref(),
                 Some(PACKAGE_EVENT_INVOCATION_ORIGIN | SESSION_FAMILY_INVOCATION_ORIGIN)
             );
-        let outcome = match function.call::<Value>(payload) {
+        // An MCP tool called by a session also gets `request.caller`, as a
+        // second argument, so a handler that takes only its arguments keeps
+        // working. The caller is the session the bearer token proved.
+        let call_result = match mcp_tool_caller_table(lua, &request) {
+            Ok(Some(caller_request)) => function.call::<Value>((payload, caller_request)),
+            Ok(None) => function.call::<Value>(payload),
+            Err(error) => Err(error),
+        };
+        let outcome = match call_result {
             Ok(_) if acknowledge_event => {
                 PluginInvocationResult::Completed(PluginInvocationSuccess {
                     request_id: request.request_id,
@@ -1939,6 +1947,25 @@ impl PluginRuntime for LuaPluginRuntime {
             let _ = state.lua().globals().set("__botster_handlers", handlers);
         }
     }
+}
+
+/// `{ caller = { session_id = "<session>" } }` for an MCP tool call made by
+/// a session, `None` for every other invocation.
+fn mcp_tool_caller_table(
+    lua: &Lua,
+    request: &PluginInvocationRequest,
+) -> mlua::Result<Option<Table>> {
+    if request.handler.kind != PluginHandlerKind::McpTool {
+        return Ok(None);
+    }
+    let Some(session_id) = request.context.session_id.as_ref() else {
+        return Ok(None);
+    };
+    let caller = lua.create_table()?;
+    caller.set("session_id", session_id.0.as_str())?;
+    let table = lua.create_table()?;
+    table.set("caller", caller)?;
+    Ok(Some(table))
 }
 
 struct LoadedLuaPlugin {

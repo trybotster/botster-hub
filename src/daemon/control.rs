@@ -1,5 +1,6 @@
 //! Control-plane dispatchers.
 
+pub(crate) mod caller;
 pub(crate) mod connection;
 pub(crate) mod coordination;
 pub(crate) mod entities;
@@ -22,7 +23,7 @@ pub(crate) mod sessions;
 pub(crate) mod status;
 pub(crate) mod webrtc;
 
-use botster_core::RequestId;
+use botster_core::{RequestId, SessionId};
 use botster_hub_client::{
     DaemonDiagnostic, DaemonOperatorError, DaemonQuarantineTarget, DaemonRequest, DaemonResponse,
     DaemonResponseKind,
@@ -42,6 +43,9 @@ pub(crate) struct DaemonObservability {
     pub(crate) client_id: Option<String>,
     pub(crate) grant_id: Option<String>,
     pub(crate) transport_request_id: Option<String>,
+    /// The session this request runs as. `None` is the operator. Only the
+    /// owner sets it, and only after verifying a session's bearer token.
+    pub(crate) caller: Option<SessionId>,
 }
 
 pub(crate) fn request_id(value: &str) -> RequestId {
@@ -68,6 +72,26 @@ pub(crate) fn attach_bind_operator_error(code: &'static str, message: &str) -> D
         operation: "attach".to_string(),
         message: message.to_string(),
         diagnostics: vec![DaemonDiagnostic::action_failure("attach", message)],
+    });
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
+    response
+}
+
+/// A refusal that names its operation, for requests that are not attaches.
+pub(crate) fn operator_refusal(
+    code: &'static str,
+    operation: &'static str,
+    message: &str,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: format!("daemon-{operation}"),
+        operation: operation.to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(operation, message)],
     });
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
@@ -110,6 +134,9 @@ pub(crate) fn dispatch_control_message(
         }
         message @ ControlMessage::Request { .. } => {
             request::handle(daemon, state, transport_handle, control_tx, message)
+        }
+        message @ ControlMessage::CallerRequest { .. } => {
+            caller::handle(daemon, state, transport_handle, control_tx, message)
         }
         ControlMessage::HubUpdateCheckCompleted { update } => {
             host::hub_update_check_completed(state, update)
