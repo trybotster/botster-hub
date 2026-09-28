@@ -263,3 +263,59 @@ fn published_entities_reach_a_client_subscription() {
     let text = serde_json::to_string(&frames).expect("frames encode");
     assert!(text.contains("\"first\""), "{text}");
 }
+
+/// The kit's Hub runs on a logical clock. A timer that a plugin arms after
+/// the clock has moved is due one delay after arming. `advance` reports it
+/// and no wall time passes.
+#[test]
+fn a_timer_armed_after_advance_fires_one_delay_later() {
+    let mut kit = start("timer-relative");
+    let response = kit
+        .enable_package(&fixture("kit-fixture-timer"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(kit.advance(5_000).expect("advance").is_empty());
+
+    let armed = kit
+        .call_tool(
+            "kit-fixture-timer.arm",
+            serde_json::json!({ "delay_ms": 1_000 }),
+        )
+        .expect("arm settles");
+    assert!(armed.error.is_none(), "{armed:?}");
+
+    assert_eq!(kit.advance(999).expect("advance"), []);
+    let fired = kit.advance(1).expect("advance");
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].package, "kit-fixture-timer");
+    assert_eq!(kit.now_ms(), 6_000);
+}
+
+/// `botster.clock` inside a handler reads the logical clock.
+#[test]
+fn botster_clock_inside_a_handler_returns_the_logical_time() {
+    let mut kit = start("clock-in-handler");
+    let response = kit
+        .enable_package(&fixture("kit-fixture-timer"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    let read = |kit: &mut KitHub| {
+        let response = kit
+            .call_tool("kit-fixture-timer.clock", serde_json::json!({}))
+            .expect("call settles");
+        assert!(response.error.is_none(), "{response:?}");
+        response.plugin_tool_result
+    };
+    let before = read(&mut kit);
+    kit.advance(250).expect("advance");
+    let after = read(&mut kit);
+    assert_eq!(
+        after["monotonic"].as_u64().unwrap() - before["monotonic"].as_u64().unwrap(),
+        250
+    );
+    assert_eq!(
+        after["now"].as_u64().unwrap() - before["now"].as_u64().unwrap(),
+        250
+    );
+    assert_eq!(after["now"], 1_700_000_000_250u64);
+}
