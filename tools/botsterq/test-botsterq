@@ -28,6 +28,14 @@ await_file() {
     perl -e 'select(undef, undef, undef, 0.05)'
   done
 }
+await_text() {
+  i=0
+  until grep -q -- "$2" "$1" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for a supervisor warning.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
 # The pid file's first line is the supervisor's pid; its second, written once
 # the command has started, is the command's process group.
 supervisor_group() { await_file "$BOTSTERQ_HOME/run/*.pid"; cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | head -1; }
@@ -139,6 +147,50 @@ if [ "$(cat "$work/E.start")" \> "$(cat "$work/X.end")" ] && [ "$(cat "$work/Y.s
 else
   fail "exclusive fairness" "X.end=$(cat "$work/X.end") E=$(cat "$work/E.start")..$(cat "$work/E.end") Y=$(cat "$work/Y.start")"
 fi
+
+# 8b. Arrival order. An ordinary job that waits for a queued exclusive job keeps
+#     its place: an exclusive job that arrives after it must not run before it.
+"$Q" slots 2 >/dev/null
+"$Q" run --label F1 --exclusive -- sh -c 'sleep 3' >/dev/null 2>&1 &
+F1=$!
+await_state "F1 [exclusive] @" running
+"$Q" run --label F2 --exclusive -- sh -c 'date +%s.%N > "$0/F2.start"; sleep 1' "$work" >/dev/null 2>&1 &
+F2=$!
+await_state "F2 [exclusive] @" queued
+"$Q" run --label FO -- sh -c 'date +%s.%N > "$0/FO.start"; sleep 1' "$work" >/dev/null 2>"$work/FO.err" &
+FO=$!
+await_text "$work/FO.err" "waiting for exclusive job"
+"$Q" run --label F3 --exclusive -- sh -c 'date +%s.%N > "$0/F3.start"' "$work" >/dev/null 2>&1 &
+F3=$!
+wait "$F1" "$F2" "$FO" "$F3"
+if [ "$(cat "$work/F2.start")" \< "$(cat "$work/FO.start")" ] && [ "$(cat "$work/FO.start")" \< "$(cat "$work/F3.start")" ]; then
+  pass "arrival order: a waiting ordinary job runs before an exclusive job that arrived after it"
+else
+  fail "arrival order" "F2=$(cat "$work/F2.start") FO=$(cat "$work/FO.start") F3=$(cat "$work/F3.start")"
+fi
+# 8c. Cancelling a run that waits for an exclusive job ends it at once and lets
+#     the jobs behind it proceed; `slots` does not block on the waiting run.
+"$Q" run --label G1 --exclusive -- sh -c 'sleep 6' >/dev/null 2>&1 &
+G1=$!
+await_state "G1 [exclusive] @" running
+"$Q" run --label G2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+G2=$!
+await_state "G2 [exclusive] @" queued
+"$Q" run --label GO -- sh -c 'touch "$0/GO.ran"' "$work" >/dev/null 2>"$work/GO.err" &
+GO=$!
+await_text "$work/GO.err" "waiting for exclusive job"
+"$Q" run --label G3 -- sh -c 'touch "$0/G3.ran"' "$work" >/dev/null 2>&1 &
+G3=$!
+started=$(date +%s)
+slots_out=$("$Q" slots 3 2>&1); slots_code=$?
+slots_elapsed=$(( $(date +%s) - started ))
+cancel_started=$(date +%s)
+kill -TERM "$GO"; wait "$GO"; codeGO=$?
+cancel_elapsed=$(( $(date +%s) - cancel_started ))
+wait "$G1" "$G2" "$G3"
+[ "$slots_code" = 1 ] && [ "$slots_elapsed" -le 2 ] && [ "$codeGO" = 130 ] && [ "$cancel_elapsed" -le 2 ] && [ ! -e "$work/GO.ran" ] && [ -e "$work/G3.ran" ] \
+  && pass "cancelling a waiting run exits 130 at once; slots refuses without blocking; the job behind it runs" \
+  || fail "cancel while waiting" "slots=$slots_code (${slots_elapsed}s: $slots_out) cancel=$codeGO (${cancel_elapsed}s) GO.ran=$([ -e "$work/GO.ran" ] && echo yes || echo no) G3.ran=$([ -e "$work/G3.ran" ] && echo yes || echo no) err=$(cat "$work/GO.err")"
 
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null
@@ -288,14 +340,6 @@ wait "$S"; codeS=$?
 #     the variants also fail the ps census or the exit watch. A successor
 #     queued at 1 slot must stay queued while the survivor lives, and start
 #     only after the test kills the survivor (by its pid), seeing no member.
-await_text() {
-  i=0
-  until grep -q -- "$2" "$1" 2>/dev/null; do
-    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
-    # timer: deadline — test-side wait for a supervisor warning.
-    perl -e 'select(undef, undef, undef, 0.05)'
-  done
-}
 fault_case() {
   name=$1 expect=$2 ready=$3
   shift 3
