@@ -725,6 +725,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("session_id", "string"),
             ("subscription_id", "string"),
             ("generation", "number"),
+            ("input_credit_items", "number"),
         ],
     );
     emit_interface(

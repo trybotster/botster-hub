@@ -2904,6 +2904,10 @@ pub struct DaemonTerminalAttach {
     pub subscription_id: String,
     /// Core-minted route generation at attach.
     pub generation: u64,
+    /// Input frames the client may send on this route before the Hub returns
+    /// credit (S13): the route's adapter ingress capacity. Input sent beyond
+    /// it, or before this response, closes the connection.
+    pub input_credit_items: u32,
 }
 
 impl DaemonTerminalAttach {
@@ -2912,11 +2916,13 @@ impl DaemonTerminalAttach {
         session_id: impl Into<String>,
         subscription_id: impl Into<String>,
         generation: u64,
+        input_credit_items: u32,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             subscription_id: subscription_id.into(),
             generation,
+            input_credit_items,
         }
     }
 }
@@ -8008,7 +8014,7 @@ mod tests {
             mode_flags: Some(DaemonModeFlags::new(
                 "session", false, true, false, 9, false, false, false, 24, 80, None,
             )),
-            terminal_attach: Some(DaemonTerminalAttach::new("session", "subscription", 1)),
+            terminal_attach: Some(DaemonTerminalAttach::new("session", "subscription", 1, 64)),
             terminal_reservation: Some(DaemonTerminalReservation::new(
                 "session",
                 "subscription",

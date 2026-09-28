@@ -295,6 +295,7 @@ export interface DaemonTerminalAttach {
   session_id: string;
   subscription_id: string;
   generation: number;
+  input_credit_items: number;
 }
 
 export interface DaemonTerminalReservation {

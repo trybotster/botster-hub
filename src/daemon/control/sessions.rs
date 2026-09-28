@@ -1914,10 +1914,16 @@ fn handle_attach(
                 }
                 state.budget.release(permit);
                 let mut response = daemon_response_base(DaemonResponseKind::TerminalAttached);
+                // S13: the route's initial input window is its adapter ingress
+                // capacity; later input credit returns as Core consumes input.
                 response.terminal_attach = Some(DaemonTerminalAttach::new(
                     session_id.clone(),
                     subscription_id.clone(),
                     generation.0,
+                    u32::try_from(
+                        botster_core::contract::terminal_adapter::MIN_ADAPTER_INGRESS_BUFFER_FRAMES,
+                    )
+                    .expect("the ingress capacity fits u32"),
                 ));
                 ControlPoll::Ready(Ok(response))
             }
