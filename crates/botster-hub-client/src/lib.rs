@@ -5066,7 +5066,7 @@ mod tests {
         }
     }
 
-    fn empty_test_response(kind: DaemonResponseKind) -> DaemonResponse {
+    pub(crate) fn empty_test_response(kind: DaemonResponseKind) -> DaemonResponse {
         DaemonResponse {
             kind,
             status: None,
@@ -9394,5 +9394,160 @@ mod tests {
                 Err(DaemonProtocolErrorCode::InvalidRoute)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unix_output_credit_tests {
+    use super::*;
+
+    fn demand(route: &str, generation: u64, bytes: u64) -> DaemonUnixCreditFrame {
+        DaemonUnixCreditFrame::Demand {
+            route: route.to_string(),
+            generation,
+            bytes,
+        }
+    }
+
+    fn grant(route: &str, generation: u64, bytes: u64) -> DaemonUnixCreditFrame {
+        DaemonUnixCreditFrame::Grant {
+            route: route.to_string(),
+            generation,
+            items: 1,
+            bytes,
+        }
+    }
+
+    fn closed(route: &str, generation: u64, spent_bytes: u64) -> DaemonUnixCreditFrame {
+        DaemonUnixCreditFrame::Closed {
+            route: route.to_string(),
+            generation,
+            spent_items: u64::from(spent_bytes > 0),
+            spent_bytes,
+        }
+    }
+
+    #[test]
+    fn demands_are_granted_whole_and_in_order_within_the_budget() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        assert_eq!(
+            credit.on_hub_frame(&demand("a", 1, 60)),
+            vec![grant("a", 1, 60)]
+        );
+        // The next demand does not fit; a smaller one behind it waits too.
+        assert!(credit.on_hub_frame(&demand("b", 1, 50)).is_empty());
+        assert!(credit.on_hub_frame(&demand("c", 1, 10)).is_empty());
+        assert_eq!(credit.charged_bytes(), 60);
+        // Consuming A's frame frees the head demand first.
+        assert_eq!(
+            credit.consumed(60),
+            vec![grant("b", 1, 50), grant("c", 1, 10)]
+        );
+        assert_eq!(credit.charged_bytes(), 60);
+    }
+
+    #[test]
+    fn a_return_releases_the_returned_credit() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let _ = credit.on_hub_frame(&demand("a", 1, 80));
+        let _ = credit.on_hub_frame(&DaemonUnixCreditFrame::Return {
+            route: "a".to_string(),
+            generation: 1,
+            items: 1,
+            bytes: 80,
+        });
+        assert_eq!(credit.charged_bytes(), 0);
+    }
+
+    /// Plan test 4: a grant crosses the Hub's close. At CLOSED the client
+    /// releases it, and another route's demand then fits.
+    #[test]
+    fn closed_releases_a_grant_that_crossed_the_close() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        assert_eq!(
+            credit.on_hub_frame(&demand("a", 1, 70)),
+            vec![grant("a", 1, 70)]
+        );
+        assert!(credit.on_hub_frame(&demand("b", 1, 70)).is_empty());
+        // The Hub closed A before the grant arrived: it spent nothing.
+        assert_eq!(
+            credit.on_hub_frame(&closed("a", 1, 0)),
+            vec![grant("b", 1, 70)]
+        );
+        assert_eq!(credit.charged_bytes(), 70);
+    }
+
+    /// CLOSED releases only unspent credit: a written frame stays charged
+    /// until the caller consumes it.
+    #[test]
+    fn closed_keeps_written_frames_charged_until_consumed() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 100);
+        let _ = credit.on_hub_frame(&demand("a", 1, 30));
+        let _ = credit.on_hub_frame(&demand("a", 1, 20));
+        assert_eq!(credit.charged_bytes(), 50);
+        let _ = credit.on_hub_frame(&closed("a", 1, 30));
+        assert_eq!(
+            credit.charged_bytes(),
+            30,
+            "the unspent 20 returns at CLOSED"
+        );
+        let _ = credit.consumed(30);
+        assert_eq!(credit.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn closed_drops_the_generations_waiting_demands() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Auto, 10);
+        let _ = credit.on_hub_frame(&demand("a", 1, 10));
+        assert!(credit.on_hub_frame(&demand("a", 1, 10)).is_empty());
+        let _ = credit.on_hub_frame(&closed("a", 1, 0));
+        assert!(credit.pending_demands().is_empty());
+        assert_eq!(credit.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn manual_mode_grants_nothing_itself() {
+        let mut credit = UnixOutputCredit::new(UnixCreditMode::Manual, 100);
+        assert!(credit.on_hub_frame(&demand("a", 1, 10)).is_empty());
+        assert_eq!(credit.pending_demands(), vec![("a".to_string(), 1, 10)]);
+        credit.record_grant("a", 1, 10);
+        assert_eq!(credit.charged_bytes(), 10);
+    }
+
+    /// A DEMAND that arrives while the client waits for a response is
+    /// granted: every socket read applies Hub credit frames.
+    #[test]
+    fn a_demand_read_while_waiting_for_a_response_is_granted() {
+        let (mut server, client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound server reads");
+        let mut connection =
+            DaemonConnection::from_hello_complete_stream(client, Vec::new()).expect("connection");
+        let id = connection
+            .submit(&DaemonRequest::Status)
+            .expect("submit status");
+        server
+            .write_all(&encode_unix_credit_frame(&demand("route", 1, 42)).expect("encode demand"))
+            .expect("write demand");
+        write_server_frame(
+            &mut server,
+            &ServerFrame::Response {
+                request_id: id.to_string(),
+                response: crate::tests::empty_test_response(DaemonResponseKind::Status),
+            },
+        )
+        .expect("write response");
+        connection.wait_response(id).expect("status response");
+
+        let mut frames = DaemonUnixFrameReader::new();
+        let _request = frames
+            .read_raw_frame(&mut server, MAX_UNIX_FRAME_BYTES)
+            .expect("read the status request");
+        let granted = frames
+            .read_raw_frame(&mut server, MAX_UNIX_FRAME_BYTES)
+            .expect("read the grant");
+        let expected = encode_unix_credit_frame(&grant("route", 1, 42)).expect("encode grant");
+        assert_eq!(granted, expected[UNIX_FRAME_LENGTH_PREFIX_BYTES..].to_vec());
     }
 }

@@ -72,8 +72,10 @@ impl AdapterCredit {
             .get_or_insert_with(|| (frame.route.as_str().to_string(), frame.generation))
     }
 
+    /// Settlement empties the outbox, and nothing queues after it, so a
+    /// settled route never has output.
     fn has_output(&self) -> bool {
-        self.attach_written && !self.settled && (!self.outbox.is_empty() || self.input_credit > 0)
+        self.attach_written && (!self.outbox.is_empty() || self.input_credit > 0)
     }
 }
 
@@ -180,6 +182,8 @@ impl UnixTerminalAdapterInner {
         let ingress = self.slot.try_read();
         if matches!(ingress, TerminalIngress::Frame(_))
             && let Some(mut credit) = self.lock_credit()
+            // A close can settle the route between Core's read and this
+            // lock; nothing may follow CLOSED.
             && !credit.settled
         {
             // S13: Core removed one input frame, so its credit returns.
@@ -1159,14 +1163,73 @@ mod tests {
             );
 
             assert_eq!(route.mux.queue_closed_subscription_events(|_| true), 0);
-            route.handle.grant(1, bytes);
+            // The data-plane close path reports the same route end again.
             assert!(
-                route.mux.take_credit_frames().is_empty(),
-                "a retired grant is ignored"
+                route
+                    .mux
+                    .inner
+                    .closed_events
+                    .report_route_end(None, "s", "sub", 1)
             );
             assert!(
                 route.mux.pop_pending_close().is_none(),
                 "CLOSED is sent once"
+            );
+        }
+
+        /// Plan test 7: a grant for a settled generation is ignored, even
+        /// when the route closed with a refused head still recorded.
+        #[test]
+        fn a_grant_after_settlement_sends_nothing() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "refused");
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| true);
+            assert!(matches!(
+                close_lane(&route.mux).last(),
+                Some(UnixCloseLaneItem::Credit(
+                    DaemonUnixCreditFrame::Closed { .. }
+                ))
+            ));
+            route.handle.grant(1, 1);
+            assert!(
+                route.mux.take_credit_frames().is_empty(),
+                "no credit frame follows CLOSED"
+            );
+        }
+
+        /// No RETURN follows CLOSED: CLOSED already settles the pool.
+        #[test]
+        fn a_head_withdrawn_after_settlement_returns_nothing() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "pooled");
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
+            route.handle.grant(1, frame_bytes(&frame) - 1);
+            let _ = route.mux.take_credit_frames();
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| true);
+            let _ = close_lane(&route.mux);
+            route.adapter.head_withdrawn();
+            assert!(route.mux.take_credit_frames().is_empty());
+        }
+
+        /// Spend counts written frames: a frame the slot accepted and the
+        /// close dropped unwritten settles as unspent credit.
+        #[test]
+        fn an_accepted_frame_dropped_at_close_is_not_spent() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "dropped");
+            route.handle.grant(1, frame_bytes(&frame));
+            assert_eq!(route.adapter.try_write(&frame), Ok(()));
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| true);
+            let lane = close_lane(&route.mux);
+            assert_eq!(
+                lane.last().map(|item| format!("{item:?}")),
+                Some(format!("{:?}", closed_frame(0, 0)))
             );
         }
 
