@@ -4392,7 +4392,14 @@ fn session_spawn_environment(variables: BTreeMap<String, String>) -> SpawnEnviro
 /// inherits the worker's environment, which is this daemon's. `unset` takes
 /// strings, so a name that is not UTF-8 cannot be removed and is skipped.
 fn inherited_botster_names() -> Vec<String> {
-    std::env::vars_os()
+    botster_names(std::env::vars_os())
+}
+
+fn botster_names(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<String> {
+    environment
+        .into_iter()
         .filter_map(|(name, _)| name.into_string().ok())
         .filter(|name| name.starts_with(BOTSTER_ENVIRONMENT_PREFIX))
         .collect()
@@ -5447,12 +5454,48 @@ mod source_selection_tests {
         let (materialized, allowance) = charged.into_parts();
         assert_eq!(materialized, ordinary);
         assert_eq!(
+            materialized.spawn_request.environment.unset,
+            inherited_botster_names()
+        );
+        assert_eq!(
             materialized.resolved.environment["BOTSTER_SESSION_ID"],
             "charged-explicit"
         );
         drop(materialized);
         drop(allowance);
         assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn spawns_unset_exactly_the_inherited_botster_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let names = botster_names([
+            (
+                OsString::from("BOTSTER_SESSION_UUID"),
+                OsString::from("leaked"),
+            ),
+            (
+                OsString::from("BOTSTER_MCP_TOKEN"),
+                OsString::from("leaked"),
+            ),
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("NOT_BOTSTER_X"), OsString::from("kept")),
+            (OsString::from("botster_lowercase"), OsString::from("kept")),
+            (
+                OsString::from_vec(b"BOTSTER_\xff".to_vec()),
+                OsString::from("skipped"),
+            ),
+        ]);
+        assert_eq!(names, ["BOTSTER_SESSION_UUID", "BOTSTER_MCP_TOKEN"]);
+
+        let spawn = session_spawn_environment(BTreeMap::from([(
+            SESSION_ID_ENVIRONMENT.to_string(),
+            "own-session".to_string(),
+        )]));
+        assert_eq!(spawn.unset, inherited_botster_names());
+        assert_eq!(spawn.variables.len(), 1);
     }
 
     #[test]
