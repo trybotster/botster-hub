@@ -447,6 +447,7 @@ enum OwnerRequestKind {
         session_id: String,
     },
     SpawnSessionType,
+    RestartSession,
     Attach,
     Detach,
     ShutdownSession {
@@ -466,6 +467,7 @@ impl OwnerRequestCompletion {
                 None,
             ),
             DaemonRequest::SpawnSessionType { .. } => (OwnerRequestKind::SpawnSessionType, None),
+            DaemonRequest::RestartSession { .. } => (OwnerRequestKind::RestartSession, None),
             DaemonRequest::Attach {
                 session_id,
                 subscription_id,
@@ -537,6 +539,7 @@ impl OwnerRequestCompletion {
         match self.kind {
             OwnerRequestKind::Spawn { .. }
             | OwnerRequestKind::SpawnSessionType
+            | OwnerRequestKind::RestartSession
             | OwnerRequestKind::Attach => succeeded,
             OwnerRequestKind::Detach
             | OwnerRequestKind::ShutdownSession { .. }

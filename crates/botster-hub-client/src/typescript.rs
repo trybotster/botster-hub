@@ -453,6 +453,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("request", "DaemonSessionTypeRequest"),
                 ],
             ),
+            ("restart_session", &[("session_id", "string")]),
             (
                 "read_session_context",
                 &[
