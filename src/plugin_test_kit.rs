@@ -28,7 +28,9 @@ use crate::daemon::owner_loop::{
     DaemonControlState, drive_ready_test_turn, publish_test_readiness,
 };
 
-/// The package the kit generates to observe emitted events as a consumer.
+/// The name prefix of the packages the kit generates to observe emitted
+/// events as a consumer. Each observed package gets its own observer,
+/// named `<prefix>-<package>`, because the Hub installs a package once.
 pub const OBSERVER_PACKAGE: &str = "botster-plugin-test-kit-observer";
 
 /// The plugin_db key under which the observer appends observed events.
@@ -193,6 +195,9 @@ pub struct KitHub {
     /// The kinds of the latest wakes, for a `not_settled` description.
     recent_wakes: std::collections::VecDeque<&'static str>,
     wake_count: u64,
+    /// The observer package of each enabled package that declares
+    /// plugin-audience events, in enable order.
+    observers: Vec<String>,
 }
 
 /// One kit-held entity subscription and the frames it has received.
@@ -266,6 +271,7 @@ impl KitHub {
             entity_subscriptions: Vec::new(),
             recent_wakes: std::collections::VecDeque::new(),
             wake_count: 0,
+            observers: Vec::new(),
         })
     }
 
@@ -309,7 +315,8 @@ impl KitHub {
     ///
     /// When the package declares events for the `plugins` audience and
     /// loads, the kit also enables its observer package, which subscribes
-    /// to each of them through the real event router.
+    /// to each of them through the real event router. Each package has its
+    /// own observer, so enabling another package keeps every earlier one.
     pub fn enable_package(&mut self, path: &Path) -> Result<DaemonResponse, KitError> {
         let response = self.request(DaemonRequest::EnablePackageLocalPath {
             path: path.to_path_buf(),
@@ -317,12 +324,14 @@ impl KitHub {
         if response.error.is_none() {
             let observed = observable_events(path)?;
             if !observed.is_empty() {
-                let observer = write_observer_package(&self.root, &observed)?;
+                let observer_name = format!("{OBSERVER_PACKAGE}-{}", observed[0].0);
+                let observer = write_observer_package(&self.root, &observer_name, &observed)?;
                 let enabled =
                     self.request(DaemonRequest::EnablePackageLocalPath { path: observer })?;
                 if let Some(error) = enabled.error {
                     return Err(KitError::Observer(format!("{error:?}")));
                 }
+                self.observers.push(observer_name);
             }
         }
         Ok(response)
@@ -443,16 +452,24 @@ impl KitHub {
         })
     }
 
-    /// Events delivered to the kit observer, in delivery order. Each item is
-    /// `{ owner, name, payload }`.
+    /// Events delivered to the kit observers. Each item is
+    /// `{ owner, name, payload }`. Events are in delivery order within one
+    /// producer package; producers appear in the order they were enabled.
     pub fn emitted_events(&self) -> Result<Vec<serde_json::Value>, KitError> {
-        let records = self.plugin_db(OBSERVER_PACKAGE)?;
-        Ok(records
-            .get(OBSERVED_EVENTS_KEY)
-            .and_then(|payload| payload.get("items"))
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        let mut events = Vec::new();
+        for observer in &self.observers {
+            let records = self.plugin_db(observer)?;
+            events.extend(
+                records
+                    .get(OBSERVED_EVENTS_KEY)
+                    .and_then(|payload| payload.get("items"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        Ok(events)
     }
 
     /// Call one plugin MCP tool, as `botster mcp-serve` does.
@@ -739,6 +756,13 @@ pub struct HandlerHold {
 impl HandlerHold {
     /// Let the held invocation run.
     pub fn release(self) {}
+
+    /// How long the hold waits before it fails the invocation. It is `None`:
+    /// only a release lets the handler run.
+    #[must_use]
+    pub fn expiry(&self) -> Option<Duration> {
+        crate::lua_runtime::test_plugin_invocation_gate_deadline()
+    }
 }
 
 impl Drop for HandlerHold {
@@ -758,7 +782,13 @@ pub fn hold_handler(package_name: &str, handler_id: &str) -> HandlerHold {
     let exclusive = EXCLUSIVE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::lua_runtime::arm_test_plugin_invocation_gate_for(Some(package_name), handler_id);
+    crate::lua_runtime::arm_test_plugin_invocation_gate_for(
+        Some(package_name),
+        handler_id,
+        // Only a release runs the handler. The step deadline bounds a step
+        // that waits on the hold; the hold cannot expire into a settle.
+        None,
+    );
     HandlerHold {
         _exclusive: exclusive,
     }
@@ -818,18 +848,22 @@ fn observable_events(package: &Path) -> Result<Vec<(String, String)>, KitError> 
 
 /// Write the observer package under the kit root. It subscribes to each
 /// observed event and appends `{ owner, name, payload }` to its plugin_db.
-fn write_observer_package(root: &Path, events: &[(String, String)]) -> Result<PathBuf, KitError> {
-    let directory = root.join(OBSERVER_PACKAGE);
+fn write_observer_package(
+    root: &Path,
+    name: &str,
+    events: &[(String, String)],
+) -> Result<PathBuf, KitError> {
+    let directory = root.join(name);
     std::fs::create_dir_all(&directory)
         .map_err(|error| KitError::Package(format!("{}: {error}", directory.display())))?;
     let manifest = serde_json::json!({
-        "name": OBSERVER_PACKAGE,
+        "name": name,
         "version": "1.0.0",
         "kind": "plugin",
         "botster": ">=0.1.0",
         "description": "Plugin test kit observer: records delivered events.",
         "source": { "type": "path", "path": "." },
-        "capabilities": [{ "surface": "plugin_db", "scope": OBSERVER_PACKAGE }],
+        "capabilities": [{ "surface": "plugin_db", "scope": name }],
         "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
     });
     let mut lua = String::from(OBSERVER_LUA_PRELUDE);
