@@ -78,7 +78,7 @@ pub(crate) fn handle_runtime(
                 client_id: "botster-hub-daemon-socket".to_string(),
                 role: "local_operator".to_string(),
                 identity_source: if caller_session_id.is_some() {
-                    "BOTSTER_SESSION_UUID".to_string()
+                    crate::session_types::SESSION_ID_ENVIRONMENT.to_string()
                 } else {
                     "local_operator".to_string()
                 },

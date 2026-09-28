@@ -1713,7 +1713,7 @@ fn required_arg(
 }
 
 fn operator_context(args: Vec<String>) -> Result<(), OperatorError> {
-    let session_id = env::var("BOTSTER_SESSION_ID").ok();
+    let session_id = env::var(botster_hub::session_types::SESSION_ID_ENVIRONMENT).ok();
     let context_id = env::var("BOTSTER_CONTEXT_ID").ok();
     let mut data_directory = None;
     let mut requested_session_id = session_id;

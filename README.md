@@ -950,11 +950,13 @@ Native tools route through the running daemon, not directly into hub state:
 - `hub.sessions.list` returns sanitized session ids and lifecycle labels through
   the same daemon/client path.
 - `whoami` reports the local MCP identity available to native tools. When
-  `BOTSTER_SESSION_UUID` is present it is reported as the caller session.
+  `BOTSTER_SESSION_ID` is present it is reported as the caller session. The Hub
+  sets `BOTSTER_SESSION_ID` in every session it spawns, raw or session-type.
 - `post_message` and `post_envelope` publish a text payload as a core routed
-  envelope to one target session.
+  envelope to one target session. A target that Core does not hold as running
+  is refused with `unknown_session`.
 - `receive_messages` and `receive_envelopes` drain only the caller session route
-  from `BOTSTER_SESSION_UUID`; they do not accept another session id or agent id.
+  from `BOTSTER_SESSION_ID`; they do not accept another session id or agent id.
 - `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
   envelope.
 - `notify_session` is a guarded-write doorbell attempt. The current native MCP
