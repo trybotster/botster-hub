@@ -486,12 +486,24 @@ impl HubClientApi {
                 command,
                 ..
             } => {
-                let request = spawn_request(runtime, request_id.clone(), session_id, command);
+                let Ok(spawn) = credentialed_raw_spawn(
+                    runtime,
+                    request_id.clone(),
+                    session_id,
+                    command,
+                    crate::session_credential::os_entropy,
+                ) else {
+                    return Err(HubClientError::Runtime {
+                        request_id,
+                        operation,
+                        kind: HubClientRuntimeErrorKind::SpawnFailed,
+                    });
+                };
                 let tracker = match owner_waiter_id {
                     Some(waiter_id) => {
-                        runtime.begin_spawn_for_owner(waiter_id, request, client_session_metadata())
+                        runtime.begin_spawn_for_owner(waiter_id, spawn.request, spawn.metadata)
                     }
-                    None => runtime.begin_spawn(request, client_session_metadata()),
+                    None => runtime.begin_spawn(spawn.request, spawn.metadata),
                 };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
@@ -2593,6 +2605,23 @@ pub(crate) fn spawn_request(
             cols: runtime.config().session_defaults.initial_cols,
         }),
     }
+}
+
+/// A raw client spawn with its caller credential issued.
+pub(crate) fn credentialed_raw_spawn(
+    runtime: &HubRuntime,
+    request_id: RequestId,
+    session_id: SessionId,
+    command: String,
+    entropy: crate::session_credential::Entropy,
+) -> Result<
+    botster_core_daemon::SpawnSessionRequest,
+    crate::session_credential::CredentialUnavailable,
+> {
+    let mut request = spawn_request(runtime, request_id, session_id, command);
+    let mut metadata = client_session_metadata();
+    crate::session_credential::issue(&mut request, &mut metadata, entropy)?;
+    Ok(botster_core_daemon::SpawnSessionRequest { request, metadata })
 }
 
 pub(crate) fn client_session_metadata() -> CoreSessionMetadata {

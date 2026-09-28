@@ -10,9 +10,7 @@ use botster_core::{
     TerminalSubscriptionGeneration,
 };
 use botster_core_daemon::operation::ReservedSpawnResult;
-use botster_core_daemon::{
-    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, SpawnSessionRequest,
-};
+use botster_core_daemon::{CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError};
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
     DaemonReadScreen, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
@@ -24,7 +22,6 @@ use crate::admission::reservations::{ReserveError, now_seconds};
 use crate::admission::unix_hello::{
     UnixTerminalAdmission, WebrtcTerminalAdmission, terminal_compatibility_attach_error,
 };
-use crate::client_api::{client_session_metadata, spawn_request};
 use crate::client_api_dto::response::{
     daemon_events, daemon_response_base, daemon_session_cleanup, daemon_session_context,
     daemon_spawned, daemon_terminal_reservation, daemon_unknown_session_cleanup,
@@ -406,6 +403,19 @@ fn session_record_capacity_error(
     response
 }
 
+fn session_credential_error(
+    request_id: &str,
+    error: crate::session_credential::CredentialUnavailable,
+) -> DaemonResponse {
+    let mut response = core_operator_error("spawn", request_id, &CoreDaemonError::Shutdown);
+    set_spawn_error(
+        &mut response,
+        Some("credential_unavailable"),
+        error.to_string(),
+    );
+    response
+}
+
 fn retain_explicit_reservation(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -519,9 +529,15 @@ fn handle_daemon_spawn(
     let runtime = daemon.runtime().expect("runtime checked above");
     let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
     let id = request_id("daemon-sessions-spawn");
-    let spawn = SpawnSessionRequest {
-        request: spawn_request(runtime, id.clone(), SessionId(session_id.clone()), command),
-        metadata: client_session_metadata(),
+    let spawn = match crate::client_api::credentialed_raw_spawn(
+        runtime,
+        id.clone(),
+        SessionId(session_id.clone()),
+        command,
+        crate::session_credential::os_entropy,
+    ) {
+        Ok(spawn) => spawn,
+        Err(error) => return ControlStep::ready(session_credential_error(&id.0, error)),
     };
     enum Stage {
         RetryRetained,
@@ -2076,6 +2092,7 @@ mod tests {
     use crate::daemon::control::managed_git::accept_one;
     use crate::daemon::owner_loop::{drive_ready_test_turn, publish_completion_wakes};
     use crate::host_executor::TestHostGate;
+    use botster_core_daemon::SpawnSessionRequest;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
