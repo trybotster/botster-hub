@@ -1446,6 +1446,77 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
     assert_eq!(result["mutation_methods"]["delete"], false);
 }
 
+fn install_hub_identity_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create hub identity package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "hub.identity",
+      description = "Read the Hub identity.",
+      handler = "identity",
+      call = function()
+        return botster.hub.identity()
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write hub identity plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "hub-identity.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write hub identity package manifest");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install hub identity package")
+        .expect("install hub identity package");
+    policy
+        .enable("hub-identity.plugin", "enable hub identity package")
+        .expect("enable hub identity package");
+    policy.registry().clone()
+}
+
+#[test]
+fn a_lua_plugin_reads_the_hub_identity_without_a_grant() {
+    let registry = install_hub_identity_registry("hub-identity");
+    let mut hub = explicit_runtime("hub-identity");
+    hub.load_lua_plugin_package(&registry, "hub-identity.plugin")
+        .expect("load hub identity plugin");
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "hub.identity".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("call hub identity tool");
+    let state = hub.state();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["value"]["hub_id"], state.host.id.as_str());
+    assert_eq!(
+        result["value"]["display_name"],
+        state.host.display_name.as_str()
+    );
+}
+
 #[test]
 fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
     let registry = install_worktree_reader_registry("worktree-reader");
