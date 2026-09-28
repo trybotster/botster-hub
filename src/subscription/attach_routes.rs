@@ -1344,6 +1344,7 @@ mod tests {
             0,
             encode_output(b"sibling-live").expect("output frame"),
         );
+        sibling.grant_unbounded_for_test();
         sibling.write_opaque_frame(&output);
         assert!(
             sibling.snapshot_active().is_some(),

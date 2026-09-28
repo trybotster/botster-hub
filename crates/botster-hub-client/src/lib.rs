@@ -4,7 +4,7 @@
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
 //!
-//! # Host-control protocol 12
+//! # Host-control protocol 13
 //!
 //! Every frame on the Unix socket is one length-prefixed container:
 //!
@@ -55,12 +55,12 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
-pub const PROTOCOL_VERSION: u16 = 12;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 52;
+pub const PROTOCOL_VERSION: u16 = 13;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
 /// Protocol 10 is a cold cut: the floor equals the current revision.
-pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 52;
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Maximum byte length of a `request_id`: a canonical positive decimal `u64`, no leading zeros.
 pub const MAX_REQUEST_ID_BYTES: usize = 20;
 /// Outstanding (unanswered) control requests one connection may hold.
@@ -278,6 +278,9 @@ pub enum DaemonProtocolErrorCode {
     InvalidRoute,
     /// A terminal input body that failed the fixed header check.
     InvalidInputHeader,
+    /// Terminal input beyond the route's input credit, or before its
+    /// `TerminalAttached` response (S13).
+    InputCreditExceeded,
 }
 
 impl DaemonProtocolErrorCode {
@@ -293,6 +296,7 @@ impl DaemonProtocolErrorCode {
             Self::HandshakeOrder => "handshake_order",
             Self::InvalidRoute => "invalid_route",
             Self::InvalidInputHeader => "invalid_input_header",
+            Self::InputCreditExceeded => "input_credit_exceeded",
         }
     }
 }
@@ -5565,16 +5569,16 @@ mod tests {
         );
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
         let mut old_revision = previous.clone();
-        old_revision.conformance_fixture_revision = 51;
+        old_revision.conformance_fixture_revision = 52;
         let error = ensure_compatible(&requirement, &old_revision)
-            .expect_err("event requirement rejects revision 51");
+            .expect_err("event requirement rejects revision 52");
         assert!(
             error
                 .diagnostic
                 .contains("unsupported conformance fixture revision")
         );
         let error = ensure_compatible(&requirement, &previous)
-            .expect_err("event requirement rejects the missing feature at revision 52");
+            .expect_err("event requirement rejects the missing feature at revision 53");
         assert!(
             error
                 .diagnostic
@@ -5855,28 +5859,28 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twelve_rejects_protocol_eleven_and_pins_the_conformance_floor() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
+    fn protocol_thirteen_rejects_protocol_twelve_and_pins_the_conformance_floor() {
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
-        let protocol_eleven = DaemonCompatibilityRequirement {
-            protocol_version: 11,
-            minimum_conformance_fixture_revision: 51,
+        let protocol_twelve = DaemonCompatibilityRequirement {
+            protocol_version: 12,
+            minimum_conformance_fixture_revision: 52,
             ..DaemonCompatibilityRequirement::current()
         };
-        let error = ensure_compatible(&protocol_eleven, &DaemonCompatibility::current())
-            .expect_err("protocol-11 client must fail closed against protocol 12");
-        assert!(error.diagnostic.contains("unsupported protocol version 12"));
+        let error = ensure_compatible(&protocol_twelve, &DaemonCompatibility::current())
+            .expect_err("protocol-12 client must fail closed against protocol 13");
+        assert!(error.diagnostic.contains("unsupported protocol version 13"));
 
-        let hub_at_fifty_one = DaemonCompatibility {
-            conformance_fixture_revision: 51,
+        let hub_at_fifty_two = DaemonCompatibility {
+            conformance_fixture_revision: 52,
             ..DaemonCompatibility::current()
         };
         ensure_compatible(
             &DaemonCompatibilityRequirement::current(),
-            &hub_at_fifty_one,
+            &hub_at_fifty_two,
         )
-        .expect_err("a protocol-12 client rejects a revision-51 Hub");
+        .expect_err("a protocol-13 client rejects a revision-52 Hub");
     }
 
     #[test]
@@ -5918,7 +5922,7 @@ mod tests {
                 "| { frame: \"response\"; request_id: string; response: DaemonResponse }"
             )
         );
-        assert!(generated.contains("export const PROTOCOL_VERSION = 12;"));
+        assert!(generated.contains("export const PROTOCOL_VERSION = 13;"));
         assert!(generated.contains("export const MAX_OUTSTANDING_REQUESTS = 32;"));
     }
 
@@ -6523,9 +6527,9 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
     }
 
     #[test]
@@ -8898,9 +8902,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twelve_and_conformance_fifty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
+    fn protocol_thirteen_and_conformance_fifty_three_define_the_cold_cut_boundary() {
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -8953,7 +8957,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 12);
+        assert_eq!(stale.compatibility.protocol_version, 13);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -8963,9 +8967,9 @@ mod tests {
         // `ensure_compatible` compares protocol version with exact equality and
         // conformance revision with a floor. Protocol 11 is a cold cut, so the
         // default floor equals the current revision.
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -9007,12 +9011,12 @@ mod tests {
             "the default client requirement excludes optional capabilities",
         );
 
-        let pinned_at_fifty_two = DaemonCompatibilityRequirement {
-            minimum_conformance_fixture_revision: 52,
+        let pinned_at_fifty_three = DaemonCompatibilityRequirement {
+            minimum_conformance_fixture_revision: 53,
             ..DaemonCompatibilityRequirement::current()
         };
-        ensure_compatible(&pinned_at_fifty_two, &DaemonCompatibility::current())
-            .expect("a protocol-12 client pinned at conformance 52 accepts a revision-52 Hub");
+        ensure_compatible(&pinned_at_fifty_three, &DaemonCompatibility::current())
+            .expect("a protocol-13 client pinned at conformance 53 accepts a revision-53 Hub");
 
         assert_eq!(
             daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {

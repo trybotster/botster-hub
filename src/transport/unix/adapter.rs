@@ -5,14 +5,14 @@
 //! inspects the shared `TerminalBody` beyond its length. `close` and `Drop`
 //! return without waiting on socket I/O or a writer lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::data_plane::CloseWorkSource;
 use crate::subscription::closed_events::{
-    ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle,
+    ClosedEventLedger, ClosedEventRoute, ClosedEventSliceProgress, ClosedHandle, ClosedLedgerItem,
 };
 use crate::transport::shared::adapter_slot::AdapterSlot;
 use crate::transport::shared::wake::AdapterWake;
@@ -20,7 +20,9 @@ use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
 use botster_core::contract::terminal_wake::{TerminalWakeSink, WakingTerminalAdapter};
-use botster_hub_client::DaemonEvent;
+use botster_hub_client::{DaemonEvent, DaemonUnixCreditFrame};
+
+use super::credit::{CreditCheck, RouteCredit};
 use botster_terminal_protocol::RoutedTerminalFrame;
 
 /// One-slot Unix adapter bound to an admitted control connection.
@@ -37,16 +39,68 @@ pub(crate) struct UnixTerminalAdapterHandle {
 struct UnixTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     deferred: AtomicBool,
+    /// S13 output and input credit. Core's `try_write` holds this lock across
+    /// the credit check and the slot write, so a grant cannot land between
+    /// the recorded need and the final check.
+    credit: Mutex<AdapterCredit>,
+    /// A credit need is recorded. Mirrored under the credit lock, so
+    /// `pressure()` reads it without that lock.
+    credit_short: AtomicBool,
+}
+
+/// One route generation's credit, and the credit frames it owes the client.
+#[derive(Default)]
+struct AdapterCredit {
+    output: RouteCredit,
+    /// The wire route (the subscription id) and generation. Set at
+    /// registration, or from the first offered frame when Core offers one
+    /// before the route is registered.
+    route: Option<(String, u64)>,
+    /// The route's `TerminalAttached` response is on the socket. Credit
+    /// frames wait for it, so the client knows the route first.
+    attach_written: bool,
+    outbox: VecDeque<DaemonUnixCreditFrame>,
+    /// Input frames Core removed from ingress, not yet returned.
+    input_credit: u32,
+    /// `CLOSED` was taken. Later grants are ignored and nothing more is sent.
+    settled: bool,
+}
+
+impl AdapterCredit {
+    fn route_or<'a>(&'a mut self, frame: &RoutedTerminalFrame) -> &'a (String, u64) {
+        self.route
+            .get_or_insert_with(|| (frame.route.as_str().to_string(), frame.generation))
+    }
+
+    fn has_output(&self) -> bool {
+        self.attach_written && !self.settled && (!self.outbox.is_empty() || self.input_credit > 0)
+    }
 }
 
 impl UnixTerminalAdapterInner {
     fn new() -> Self {
+        Self::with_slot(AdapterSlot::with_wake_and_close_work(
+            AdapterWake::new(),
+            Arc::new(AtomicBool::new(false)),
+        ))
+    }
+
+    fn with_slot(slot: AdapterSlot<AdapterWake>) -> Self {
         Self {
-            slot: AdapterSlot::with_wake_and_close_work(
-                AdapterWake::new(),
-                Arc::new(AtomicBool::new(false)),
-            ),
+            slot,
             deferred: AtomicBool::new(false),
+            credit: Mutex::new(AdapterCredit::default()),
+            credit_short: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_credit(&self) -> Option<std::sync::MutexGuard<'_, AdapterCredit>> {
+        match self.credit.lock() {
+            Ok(credit) => Some(credit),
+            Err(_) => {
+                self.slot.close();
+                None
+            }
         }
     }
 
@@ -74,15 +128,123 @@ impl UnixTerminalAdapterInner {
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
-        self.slot.pressure()
+        match self.slot.pressure() {
+            TerminalAdapterPressure::Ready if self.credit_short.load(Ordering::SeqCst) => {
+                TerminalAdapterPressure::WouldBlock
+            }
+            pressure => pressure,
+        }
     }
 
+    /// Write one frame when the route's credit covers it. Otherwise record
+    /// the need, demand it once, and refuse with `WouldBlock`, which debits
+    /// nothing. A later covering grant raises the Writable wake.
     fn try_write(&self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        self.slot.try_write(frame)
+        if self.slot.is_closed() {
+            return Err(TerminalAdapterWriteError::Closed);
+        }
+        let Some(mut credit) = self.lock_credit() else {
+            return Err(TerminalAdapterWriteError::Closed);
+        };
+        let bytes = frame_credit_bytes(frame);
+        match credit.output.check(bytes) {
+            CreditCheck::Covered => {
+                let written = self.slot.try_write(frame);
+                if written.is_ok() {
+                    credit.output.commit(bytes);
+                    self.credit_short.store(false, Ordering::SeqCst);
+                }
+                written
+            }
+            CreditCheck::Short { demand } => {
+                self.credit_short.store(true, Ordering::SeqCst);
+                if let Some(demand) = demand {
+                    let (route, generation) = credit.route_or(frame).clone();
+                    credit.outbox.push_back(DaemonUnixCreditFrame::Demand {
+                        route,
+                        generation,
+                        bytes: demand,
+                    });
+                    let ready = credit.has_output();
+                    drop(credit);
+                    if ready {
+                        self.slot.wake_transport();
+                    }
+                }
+                Err(TerminalAdapterWriteError::WouldBlock)
+            }
+        }
     }
 
     fn try_read(&self) -> TerminalIngress {
-        self.slot.try_read()
+        let ingress = self.slot.try_read();
+        if matches!(ingress, TerminalIngress::Frame(_))
+            && let Some(mut credit) = self.lock_credit()
+            && !credit.settled
+        {
+            // S13: Core removed one input frame, so its credit returns.
+            credit.input_credit = credit.input_credit.saturating_add(1);
+            let ready = credit.has_output();
+            drop(credit);
+            if ready {
+                self.slot.wake_transport();
+            }
+        }
+        ingress
+    }
+
+    /// Core dropped the refused head. Its need is void, and the pool goes
+    /// back to the client so an idle route holds no credit.
+    fn head_withdrawn(&self) {
+        let Some(mut credit) = self.lock_credit() else {
+            return;
+        };
+        self.credit_short.store(false, Ordering::SeqCst);
+        let returned = credit.output.withdraw_head();
+        if let (Some(returned), Some((route, generation))) = (returned, credit.route.clone())
+            && !credit.settled
+        {
+            credit.outbox.push_back(DaemonUnixCreditFrame::Return {
+                route,
+                generation,
+                items: returned.items,
+                bytes: returned.bytes,
+            });
+        }
+        let ready = credit.has_output();
+        drop(credit);
+        if ready {
+            self.slot.wake_transport();
+        }
+    }
+
+    /// Apply a client grant for this route generation. A settled route
+    /// ignores it; `CLOSED` settlement already covers it.
+    fn grant(&self, items: u32, bytes: u64) {
+        let Some(mut credit) = self.lock_credit() else {
+            return;
+        };
+        if credit.settled {
+            return;
+        }
+        let outcome = credit.output.grant(items, bytes);
+        if let (Some(demand), Some((route, generation))) = (outcome.demand, credit.route.clone()) {
+            credit.outbox.push_back(DaemonUnixCreditFrame::Demand {
+                route,
+                generation,
+                bytes: demand,
+            });
+        }
+        if outcome.wake {
+            self.credit_short.store(false, Ordering::SeqCst);
+        }
+        let ready = credit.has_output();
+        drop(credit);
+        if outcome.wake {
+            self.slot.notify_writable();
+        } else if ready {
+            self.slot.wake_transport();
+        }
     }
 
     fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
@@ -104,6 +266,12 @@ impl UnixTerminalAdapterInner {
     fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         self.slot.complete_active()
     }
+}
+
+/// The credit one frame costs: one item plus `body.len()`, its 8-byte
+/// header included, the unit the client's budget charges.
+fn frame_credit_bytes(frame: &RoutedTerminalFrame) -> u64 {
+    u64::try_from(frame.frame.len()).unwrap_or(u64::MAX)
 }
 
 impl UnixTerminalAdapter {
@@ -131,10 +299,9 @@ impl UnixTerminalAdapter {
         wake: AdapterWake,
         close_work: Arc<AtomicBool>,
     ) -> (Self, UnixTerminalAdapterHandle) {
-        let inner = Arc::new(UnixTerminalAdapterInner {
-            slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
-            deferred: AtomicBool::new(false),
-        });
+        let inner = Arc::new(UnixTerminalAdapterInner::with_slot(
+            AdapterSlot::with_wake_and_close_work(wake, close_work),
+        ));
         (
             Self {
                 inner: Arc::clone(&inner),
@@ -185,6 +352,10 @@ impl TerminalAdapter for UnixTerminalAdapter {
     fn try_read(&mut self) -> TerminalIngress {
         self.inner.try_read()
     }
+
+    fn head_withdrawn(&mut self) {
+        self.inner.head_withdrawn();
+    }
 }
 
 impl WakingTerminalAdapter for UnixTerminalAdapter {
@@ -223,7 +394,7 @@ impl UnixConnectionMux {
                 wake: AdapterWake::new(),
                 dying: AtomicBool::new(false),
                 routes: Mutex::new(BTreeMap::new()),
-                closed_events: ClosedEventLedger::default(),
+                closed_events: ClosedEventLedger::with_credit_settlement(),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
                 close_source: Mutex::new(None),
             }),
@@ -271,6 +442,7 @@ impl UnixConnectionMux {
             if self.inner.dying.load(Ordering::SeqCst) {
                 return false;
             }
+            handle.bind_route(&subscription_id, generation);
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
                 key,
@@ -439,12 +611,64 @@ impl UnixConnectionMux {
         self.inner.closed_events.has_pending_event()
     }
 
+    /// The next close event, skipping credit settlements.
+    #[cfg(test)]
     pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
-        self.inner.closed_events.pop_pending_event()
+        loop {
+            match self.inner.closed_events.pop_pending_item()? {
+                ClosedLedgerItem::Event(event) => return Some(event),
+                ClosedLedgerItem::SettleCredit { .. } => {}
+            }
+        }
+    }
+
+    /// The next close-lane frame in order: a close event, or a route's
+    /// `CLOSED`. A route settles once, so a second report yields nothing.
+    pub(crate) fn pop_pending_close(&self) -> Option<UnixCloseLaneItem> {
+        loop {
+            match self.inner.closed_events.pop_pending_item()? {
+                ClosedLedgerItem::Event(event) => return Some(UnixCloseLaneItem::Event(event)),
+                ClosedLedgerItem::SettleCredit {
+                    session_id,
+                    subscription_id,
+                    generation,
+                } => {
+                    let handle = self.inner.routes.lock().ok().and_then(|routes| {
+                        routes
+                            .get(&(session_id, subscription_id.clone(), generation))
+                            .map(|route| route.handle.clone())
+                    });
+                    if let Some(closed) =
+                        handle.and_then(|handle| handle.settle(&subscription_id, generation))
+                    {
+                        return Some(UnixCloseLaneItem::Credit(closed));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queued credit frames of every route whose attach is on the socket.
+    pub(crate) fn take_credit_frames(&self) -> Vec<DaemonUnixCreditFrame> {
+        let mut frames = Vec::new();
+        if let Ok(routes) = self.inner.routes.lock() {
+            for route in routes.values() {
+                route.handle.take_credit_frames(&mut frames);
+            }
+        }
+        frames
+    }
+
+    fn has_credit_frames(&self) -> bool {
+        self.inner.routes.lock().is_ok_and(|routes| {
+            routes
+                .values()
+                .any(|route| route.handle.has_credit_frames())
+        })
     }
 
     pub(crate) fn has_unsent_mux_writes(&self) -> bool {
-        self.has_pending_event() || self.has_occupied_adapter_slot()
+        self.has_pending_event() || self.has_occupied_adapter_slot() || self.has_credit_frames()
     }
 
     fn has_occupied_adapter_slot(&self) -> bool {
@@ -522,7 +746,110 @@ impl UnixConnectionMux {
     }
 }
 
+/// One frame on the Unix close lane.
+#[derive(Debug)]
+pub(crate) enum UnixCloseLaneItem {
+    Event(DaemonEvent),
+    Credit(DaemonUnixCreditFrame),
+}
+
 impl UnixTerminalAdapterHandle {
+    fn bind_route(&self, subscription_id: &str, generation: u64) {
+        if let Some(mut credit) = self.inner.lock_credit() {
+            credit.route = Some((subscription_id.to_string(), generation));
+        }
+    }
+
+    /// Apply a client `GRANT` for this route generation.
+    pub(crate) fn grant(&self, items: u32, bytes: u64) {
+        self.inner.grant(items, bytes);
+    }
+
+    /// The route's `TerminalAttached` response is fully on the socket; its
+    /// held credit frames may follow.
+    pub(crate) fn mark_attach_written(&self) {
+        let Some(mut credit) = self.inner.lock_credit() else {
+            return;
+        };
+        credit.attach_written = true;
+        let ready = credit.has_output();
+        drop(credit);
+        if ready {
+            self.inner.slot.wake_transport();
+        }
+    }
+
+    pub(crate) fn is_attach_written(&self) -> bool {
+        self.inner
+            .credit
+            .lock()
+            .is_ok_and(|credit| credit.attach_written)
+    }
+
+    fn has_credit_frames(&self) -> bool {
+        self.inner
+            .credit
+            .lock()
+            .is_ok_and(|credit| credit.has_output())
+    }
+
+    /// Move this route's queued credit frames to `frames`, the returned
+    /// input credit coalesced into one `INPUT_CREDIT`.
+    fn take_credit_frames(&self, frames: &mut Vec<DaemonUnixCreditFrame>) {
+        let Some(mut credit) = self.inner.lock_credit() else {
+            return;
+        };
+        if !credit.has_output() {
+            return;
+        }
+        frames.extend(credit.outbox.drain(..));
+        if credit.input_credit > 0
+            && let Some((route, generation)) = credit.route.clone()
+        {
+            frames.push(DaemonUnixCreditFrame::InputCredit {
+                route,
+                generation,
+                items: std::mem::take(&mut credit.input_credit),
+            });
+        }
+    }
+
+    /// Count one terminal frame of `body_len` bytes fully on the socket.
+    pub(crate) fn record_written(&self, body_len: usize) {
+        if let Some(mut credit) = self.inner.lock_credit() {
+            credit
+                .output
+                .record_written(u64::try_from(body_len).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Take this generation's `CLOSED`, once. Queued credit frames are
+    /// dropped: `CLOSED` settles everything they carried, and it must be the
+    /// route's last frame.
+    fn settle(&self, subscription_id: &str, generation: u64) -> Option<DaemonUnixCreditFrame> {
+        let mut credit = self.inner.lock_credit()?;
+        if credit.settled {
+            return None;
+        }
+        credit.settled = true;
+        credit.outbox.clear();
+        credit.input_credit = 0;
+        let (spent_items, spent_bytes) = credit.output.spent();
+        Some(DaemonUnixCreditFrame::Closed {
+            route: subscription_id.to_string(),
+            generation,
+            spent_items,
+            spent_bytes,
+        })
+    }
+
+    /// Grant this route more credit than any test writes, as a client with
+    /// a large budget does.
+    #[cfg(test)]
+    pub(crate) fn grant_unbounded_for_test(&self) {
+        self.inner.grant(u32::MAX, u64::from(u32::MAX));
+    }
+
     pub(crate) fn close(&self) {
         self.inner.close();
     }
@@ -580,16 +907,6 @@ impl UnixTerminalAdapterHandle {
         self.inner.slot.try_push_ingress(bytes)
     }
 
-    /// Resolves once Core removes a frame or the route closes.
-    pub(crate) async fn ingress_room(&self) {
-        self.inner.slot.ingress_room().await;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_ingress_full_observer(&self, observer: std::sync::mpsc::Sender<()>) {
-        self.inner.slot.set_ingress_full_observer(observer);
-    }
-
     #[cfg(test)]
     pub(crate) fn mark_ingress_lost(&self) {
         self.inner.slot.mark_ingress_lost();
@@ -638,6 +955,277 @@ mod tests {
         assert!(mux.route_handle("s", "late", 2).is_none());
     }
 
+    mod credit_tests {
+        use super::*;
+        use botster_core::contract::terminal_wake::TerminalWakeSource;
+        use botster_core::{SessionId, SubscriptionId, TerminalSubscriptionGeneration};
+        use std::time::Duration;
+
+        struct CreditedRoute {
+            mux: UnixConnectionMux,
+            adapter: UnixTerminalAdapter,
+            handle: UnixTerminalAdapterHandle,
+            wakes: TerminalWakeSource,
+        }
+
+        /// Route "sub" at generation 1 of session "s", Core's wake sink bound.
+        fn credited_route(attach_written: bool) -> CreditedRoute {
+            let mux = UnixConnectionMux::new();
+            let (mut adapter, handle) = mux.create_adapter();
+            assert!(mux.register("s".to_string(), "sub".to_string(), 1, handle.clone()));
+            let wakes = TerminalWakeSource::new();
+            adapter.set_wake_sink(wakes.bind_route(
+                SessionId("s".into()),
+                SubscriptionId("sub".into()),
+                TerminalSubscriptionGeneration(1),
+            ));
+            if attach_written {
+                handle.mark_attach_written();
+            }
+            CreditedRoute {
+                mux,
+                adapter,
+                handle,
+                wakes,
+            }
+        }
+
+        /// Core Writable wakes raised so far. Every wake here is raised
+        /// synchronously, so a zero timeout drains all of them.
+        fn core_wakes(wakes: &TerminalWakeSource) -> usize {
+            wakes.wait_wakes(Duration::ZERO).adapter_routes.len()
+        }
+
+        fn frame_bytes(frame: &RoutedTerminalFrame) -> u64 {
+            u64::try_from(frame.frame.len()).expect("frame length fits u64")
+        }
+
+        fn demand(bytes: u64) -> DaemonUnixCreditFrame {
+            DaemonUnixCreditFrame::Demand {
+                route: "sub".to_string(),
+                generation: 1,
+                bytes,
+            }
+        }
+
+        #[test]
+        fn a_refused_head_demands_its_bytes_once_and_reads_as_would_block() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "head");
+            assert_eq!(
+                route.adapter.try_write(&frame),
+                Err(TerminalAdapterWriteError::WouldBlock)
+            );
+            assert_eq!(
+                route.adapter.pressure(),
+                TerminalAdapterPressure::WouldBlock
+            );
+            assert!(
+                route.handle.snapshot_active().is_none(),
+                "a refusal debits nothing"
+            );
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![demand(frame_bytes(&frame))]
+            );
+            assert_eq!(
+                route.adapter.try_write(&frame),
+                Err(TerminalAdapterWriteError::WouldBlock)
+            );
+            assert!(
+                route.mux.take_credit_frames().is_empty(),
+                "a route has at most one outstanding demand"
+            );
+        }
+
+        #[test]
+        fn a_demand_waits_for_the_attach_response() {
+            let mut route = credited_route(false);
+            let frame = output_frame("sub", "early");
+            assert_eq!(
+                route.adapter.try_write(&frame),
+                Err(TerminalAdapterWriteError::WouldBlock)
+            );
+            assert!(!route.mux.has_unsent_mux_writes());
+            assert!(route.mux.take_credit_frames().is_empty());
+            route.handle.mark_attach_written();
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![demand(frame_bytes(&frame))]
+            );
+        }
+
+        /// Plan test 8: a short grant raises nothing and demands the
+        /// shortfall; the covering grant raises exactly one Writable wake.
+        #[test]
+        fn only_a_grant_that_covers_the_need_wakes_core_and_it_wakes_once() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "need");
+            let bytes = frame_bytes(&frame);
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
+            let _ = core_wakes(&route.wakes);
+
+            route.handle.grant(1, bytes - 1);
+            assert_eq!(core_wakes(&route.wakes), 0, "a short grant raises nothing");
+            assert_eq!(route.mux.take_credit_frames(), vec![demand(1)]);
+            assert_eq!(
+                route.adapter.pressure(),
+                TerminalAdapterPressure::WouldBlock
+            );
+
+            route.handle.grant(1, 1);
+            assert_eq!(core_wakes(&route.wakes), 1, "the covering grant wakes Core");
+            assert_eq!(core_wakes(&route.wakes), 0, "and wakes it once");
+            assert_eq!(route.adapter.pressure(), TerminalAdapterPressure::Ready);
+            assert_eq!(route.adapter.try_write(&frame), Ok(()));
+            assert!(route.mux.take_credit_frames().is_empty());
+        }
+
+        /// Plan test 8: credit granted before the adapter's check is used
+        /// with no demand and no wake.
+        #[test]
+        fn credit_granted_before_the_check_is_used() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "ready");
+            let _ = core_wakes(&route.wakes);
+            route.handle.grant(1, frame_bytes(&frame));
+            assert_eq!(
+                core_wakes(&route.wakes),
+                0,
+                "a grant with no need raises nothing"
+            );
+            assert_eq!(route.adapter.try_write(&frame), Ok(()));
+            assert!(route.mux.take_credit_frames().is_empty());
+        }
+
+        /// Plan test 5: Core drops a head that a grant covered, and the pool
+        /// returns in one RETURN.
+        #[test]
+        fn a_withdrawn_head_returns_its_granted_credit() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "dropped");
+            let bytes = frame_bytes(&frame);
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
+            route.handle.grant(1, bytes);
+            route.adapter.head_withdrawn();
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![DaemonUnixCreditFrame::Return {
+                    route: "sub".to_string(),
+                    generation: 1,
+                    items: 1,
+                    bytes,
+                }]
+            );
+            assert_eq!(route.adapter.pressure(), TerminalAdapterPressure::Ready);
+        }
+
+        fn closed_frame(spent_items: u64, spent_bytes: u64) -> UnixCloseLaneItem {
+            UnixCloseLaneItem::Credit(DaemonUnixCreditFrame::Closed {
+                route: "sub".to_string(),
+                generation: 1,
+                spent_items,
+                spent_bytes,
+            })
+        }
+
+        fn close_lane(mux: &UnixConnectionMux) -> Vec<UnixCloseLaneItem> {
+            std::iter::from_fn(|| mux.pop_pending_close()).collect()
+        }
+
+        /// CLOSED follows the close event, carries the written spend, and is
+        /// sent once per generation. Plan test 7: a later grant is ignored.
+        #[test]
+        fn closed_follows_the_close_event_once_and_retires_the_generation() {
+            let mut route = credited_route(true);
+            let frame = output_frame("sub", "written");
+            let bytes = frame_bytes(&frame);
+            route.handle.grant(1, bytes);
+            assert_eq!(route.adapter.try_write(&frame), Ok(()));
+            route.handle.record_written(frame.frame.len());
+            route.handle.close();
+            assert_eq!(route.mux.queue_closed_subscription_events(|_| true), 1);
+            let lane = close_lane(&route.mux);
+            assert_eq!(lane.len(), 2, "{lane:?}");
+            assert!(matches!(
+                &lane[0],
+                UnixCloseLaneItem::Event(DaemonEvent::TerminalSubscriptionClosed { .. })
+            ));
+            assert_eq!(
+                format!("{:?}", lane[1]),
+                format!("{:?}", closed_frame(1, bytes))
+            );
+
+            assert_eq!(route.mux.queue_closed_subscription_events(|_| true), 0);
+            route.handle.grant(1, bytes);
+            assert!(
+                route.mux.take_credit_frames().is_empty(),
+                "a retired grant is ignored"
+            );
+            assert!(
+                route.mux.pop_pending_close().is_none(),
+                "CLOSED is sent once"
+            );
+        }
+
+        #[test]
+        fn a_suppressed_close_event_still_settles_credit() {
+            let route = credited_route(true);
+            route.mux.suppress_generation("s", "sub", 1);
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| true);
+            let lane = close_lane(&route.mux);
+            assert_eq!(
+                lane.iter()
+                    .map(|item| format!("{item:?}"))
+                    .collect::<Vec<_>>(),
+                vec![format!("{:?}", closed_frame(0, 0))],
+            );
+        }
+
+        #[test]
+        fn a_route_of_an_ended_session_settles_without_an_event() {
+            let route = credited_route(true);
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| false);
+            let lane = close_lane(&route.mux);
+            assert_eq!(
+                lane.iter()
+                    .map(|item| format!("{item:?}"))
+                    .collect::<Vec<_>>(),
+                vec![format!("{:?}", closed_frame(0, 0))],
+            );
+        }
+
+        #[test]
+        fn connection_loss_sends_no_closed() {
+            let route = credited_route(true);
+            route.mux.close_all();
+            route.mux.queue_closed_subscription_events(|_| true);
+            assert!(route.mux.pop_pending_close().is_none());
+        }
+
+        /// Settlement drops queued credit frames: CLOSED is the route's last
+        /// credit frame.
+        #[test]
+        fn settlement_drops_queued_credit_frames() {
+            let mut route = credited_route(true);
+            assert!(
+                route
+                    .adapter
+                    .try_write(&output_frame("sub", "queued"))
+                    .is_err()
+            );
+            route.handle.close();
+            route.mux.queue_closed_subscription_events(|_| true);
+            let lane = close_lane(&route.mux);
+            assert!(matches!(lane.last(), Some(UnixCloseLaneItem::Credit(_))));
+            assert!(route.mux.take_credit_frames().is_empty());
+        }
+    }
+
     pub(crate) fn output_frame(route: &str, marker: &str) -> RoutedTerminalFrame {
         RoutedTerminalFrame::new(
             RouteId::new(route).expect("route"),
@@ -656,6 +1244,9 @@ mod tests {
     impl Default for UnixTerminalAdapterDriver {
         fn default() -> Self {
             let (adapter, handle) = UnixTerminalAdapter::pair();
+            // Core's harness checks the slot contract, so the route holds
+            // more credit than the harness writes.
+            handle.grant_unbounded_for_test();
             Self {
                 adapter,
                 handle,
@@ -735,6 +1326,7 @@ mod tests {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
         assert!(mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone()));
+        handle.grant_unbounded_for_test();
         assert_eq!(adapter.try_write(&output_frame("sub", "flood")), Ok(()));
         assert_eq!(mux.snapshot_writes().len(), 1);
         handle.defer_flush();
@@ -749,6 +1341,7 @@ mod tests {
     #[test]
     fn slot_shares_the_body_without_copying_it() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
+        handle.grant_unbounded_for_test();
         let frame = output_frame("sub", "shared");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let active = handle.snapshot_active().expect("occupied slot");
@@ -778,7 +1371,8 @@ mod tests {
     #[tokio::test]
     async fn unix_mux_retains_a_write_wake_before_the_connection_waits() {
         let mux = UnixConnectionMux::new();
-        let (mut adapter, _handle) = mux.create_adapter();
+        let (mut adapter, handle) = mux.create_adapter();
+        handle.grant_unbounded_for_test();
         assert_eq!(adapter.try_write(&output_frame("sub", "early")), Ok(()));
         tokio::time::timeout(std::time::Duration::from_millis(50), mux.wait_for_write())
             .await
@@ -788,6 +1382,7 @@ mod tests {
     #[test]
     fn close_does_not_wait_on_occupied_slot() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
+        handle.grant_unbounded_for_test();
         assert_eq!(adapter.try_write(&output_frame("sub", "in-flight")), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();

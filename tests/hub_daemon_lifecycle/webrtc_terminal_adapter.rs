@@ -834,7 +834,7 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the webrtc adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 12);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 13);
 }
 
 #[test]
@@ -1339,7 +1339,7 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
 }
 
 #[test]
-fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_12() {
+fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_13() {
     let requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     let mut previous = botster_hub_client::DaemonCompatibility::current();
     previous
@@ -1356,10 +1356,10 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_12() {
             .iter()
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 12);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 13);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
-        52
+        53
     );
     const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }

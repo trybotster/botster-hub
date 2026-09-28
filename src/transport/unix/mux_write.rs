@@ -1,4 +1,4 @@
-//! Unix framing and mux scheduling for host-control protocol 12.
+//! Unix framing and mux scheduling for host-control protocol 13.
 //!
 //! Every frame is one length-prefixed container. Control frames are UTF-8
 //! JSON [`ServerFrame`] payloads. Terminal frames are written as two slices,
@@ -15,9 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
     ClientFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest, DaemonResponse,
-    DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES, MAX_UNIX_FRAME_BYTES,
-    ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader, decode_unix_frame,
-    encode_control_json, encode_server_frame,
+    DaemonUnixCreditFrame, DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES,
+    MAX_UNIX_FRAME_BYTES, ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader,
+    decode_unix_frame, encode_control_json, encode_server_frame,
 };
 use botster_terminal_protocol::MAX_TERMINAL_INPUT_FRAME_BYTES;
 
@@ -109,6 +109,7 @@ impl MuxWriteState {
     ) -> DaemonTransportResult<()> {
         let bytes = encode_control_json(encoded_frame).map_err(DaemonTransportError::from)?;
         self.enqueue_response_frame(PendingMuxFrame {
+            attach_ack: None,
             bytes: PendingMuxBytes::Control(bytes),
             offset: 0,
             complete_envelope: None,
@@ -117,6 +118,13 @@ impl MuxWriteState {
             delivery_receipt: None,
             close_after,
         })
+    }
+
+    /// Mark the last queued response as `route`'s `TerminalAttached`.
+    pub(crate) fn tag_last_response_attach(&mut self, route: UnixTerminalAdapterHandle) {
+        if let Some(frame) = self.queued_control.back_mut() {
+            frame.attach_ack = Some(route);
+        }
     }
 
     fn enqueue_response_frame(&mut self, frame: PendingMuxFrame) -> DaemonTransportResult<()> {
@@ -143,6 +151,7 @@ impl MuxWriteState {
             crate::entity_delivery::EntityDelivery::Typed(entity) => entity,
             crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
                 self.queued_events.push_back(PendingMuxFrame {
+                    attach_ack: None,
                     bytes: PendingMuxBytes::PreparedEntity(delivery),
                     offset: 0,
                     complete_envelope: None,
@@ -228,6 +237,9 @@ pub(crate) struct PendingMuxFrame {
     delivery_ack: Option<mpsc::Sender<()>>,
     delivery_receipt: Option<crate::runtime::SpawnDeliveryReceipt>,
     close_after: bool,
+    /// S13: a `TerminalAttached` response for this route. Once it is fully
+    /// written, the route's held credit frames may follow.
+    attach_ack: Option<UnixTerminalAdapterHandle>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -271,6 +283,13 @@ pub(crate) async fn flush_unix_mux_writes(
     if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
         return Ok(());
     }
+    // S13 credit frames ride the event lane, in order with close events, so
+    // a route's `CLOSED` always follows its earlier credit frames.
+    for frame in mux.take_credit_frames() {
+        write_state
+            .queued_events
+            .push_back(credit_mux_frame(&frame)?);
+    }
     let mut host_frames = 0;
     loop {
         if host_frames >= MAX_HOST_FRAMES_PER_FLUSH_TURN {
@@ -299,19 +318,19 @@ pub(crate) async fn flush_unix_mux_writes(
                 let frame = match write_state.queued_events.pop_front() {
                     Some(frame) => Some(frame),
                     None => {
-                        let event = mux.pop_pending_event().or_else(|| {
-                            event_mailbox.and_then(
+                        match mux.pop_pending_close() {
+                            Some(crate::transport::unix::adapter::UnixCloseLaneItem::Credit(
+                                closed,
+                            )) => Some(credit_mux_frame(&closed)?),
+                            Some(crate::transport::unix::adapter::UnixCloseLaneItem::Event(
+                                event,
+                            )) => Some(event_mux_frame(event)?),
+                            None => match event_mailbox.and_then(
                                 crate::subscription::package_events::ClientEventMailbox::take_ready_event,
-                            )
-                        });
-                        match event {
-                            Some(event) => Some(control_mux_frame(
-                                &ServerFrame::Event { event },
-                                PendingMuxClass::Event,
-                                None,
-                                false,
-                            )?),
-                            None => None,
+                            ) {
+                                Some(event) => Some(event_mux_frame(event)?),
+                                None => None,
+                            },
                         }
                     }
                 };
@@ -351,6 +370,7 @@ pub(crate) async fn flush_unix_mux_writes(
                 continue;
             };
             write_state.pending = Some(PendingMuxFrame {
+                attach_ack: None,
                 bytes: PendingMuxBytes::Terminal {
                     header,
                     body: Arc::clone(frame.frame.shared_bytes()),
@@ -378,6 +398,7 @@ pub(crate) fn control_mux_frame(
 ) -> DaemonTransportResult<PendingMuxFrame> {
     let bytes = encode_server_frame(frame).map_err(DaemonTransportError::from)?;
     Ok(PendingMuxFrame {
+        attach_ack: None,
         bytes: PendingMuxBytes::Control(bytes),
         offset: 0,
         complete_envelope: None,
@@ -438,10 +459,18 @@ pub(crate) async fn resume_pending_mux_write(
             if let Some(receipt) = pending.delivery_receipt {
                 receipt.delivered();
             }
-            if let Some(handle) = pending.complete_envelope
-                && !handle.is_closed()
-            {
-                let _ = handle.complete_active();
+            if let Some(route) = pending.attach_ack {
+                route.mark_attach_written();
+            }
+            if let Some(handle) = pending.complete_envelope {
+                // The whole frame is on the socket, so its credit is spent,
+                // even when the route closed during the write.
+                if let PendingMuxBytes::Terminal { body, .. } = &pending.bytes {
+                    handle.record_written(body.len());
+                }
+                if !handle.is_closed() {
+                    let _ = handle.complete_active();
+                }
             }
             Ok(MuxWrite::Written)
         }
@@ -507,6 +536,13 @@ pub(crate) enum UnixInbound {
         request: DaemonRequest,
     },
     Terminal(DaemonUnixTerminalFrame),
+    /// S13 output credit from the client. Only `GRANT` reaches here.
+    Grant {
+        route: String,
+        generation: u64,
+        items: u32,
+        bytes: u64,
+    },
 }
 
 /// Why an inbound frame could not be produced.
@@ -622,11 +658,20 @@ where
             }
             Ok(UnixInbound::Terminal(frame))
         }
-        // The Hub does not consume credit yet: until the S13 connection
-        // handling lands, a credit container closes the connection exactly as
-        // an unknown container did before it was defined.
+        Ok(DaemonUnixFrame::Credit(DaemonUnixCreditFrame::Grant {
+            route,
+            generation,
+            items,
+            bytes,
+        })) => Ok(UnixInbound::Grant {
+            route,
+            generation,
+            items,
+            bytes,
+        }),
+        // Only the Hub sends the other credit kinds.
         Ok(DaemonUnixFrame::Credit(_)) => Err(UnixInboundError::Protocol(
-            DaemonProtocolErrorCode::UnknownContainer,
+            DaemonProtocolErrorCode::MalformedFrame,
         )),
         Err(code) => Err(UnixInboundError::Protocol(code)),
     }
@@ -649,8 +694,26 @@ pub(crate) async fn write_async_server_frame(
         .map_err(DaemonTransportError::Io)
 }
 
-/// Build a host event frame for tests and diagnostics.
-#[cfg(test)]
+/// One S13 credit container on the event lane.
+pub(crate) fn credit_mux_frame(
+    frame: &botster_hub_client::DaemonUnixCreditFrame,
+) -> DaemonTransportResult<PendingMuxFrame> {
+    let bytes = botster_hub_client::encode_unix_credit_frame(frame).ok_or(
+        DaemonTransportError::Protocol("credit frame route does not fit"),
+    )?;
+    Ok(PendingMuxFrame {
+        bytes: PendingMuxBytes::Control(bytes),
+        offset: 0,
+        complete_envelope: None,
+        class: PendingMuxClass::Event,
+        delivery_ack: None,
+        delivery_receipt: None,
+        close_after: false,
+        attach_ack: None,
+    })
+}
+
+/// One host event frame on the event lane.
 pub(crate) fn event_mux_frame(
     event: botster_hub_client::DaemonEvent,
 ) -> DaemonTransportResult<PendingMuxFrame> {
@@ -673,9 +736,9 @@ pub(crate) mod mux_write_resume_tests {
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
     use botster_hub_client::{
-        DaemonEvent, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, ServerFrame,
-        TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, UnixTerminalContainerHeader,
-        encode_server_frame,
+        DaemonEvent, DaemonResponseKind, DaemonUnixCreditFrame, DaemonUnixFrameReader,
+        DaemonUnixMuxFrame, ServerFrame, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
+        UnixTerminalContainerHeader, encode_server_frame,
     };
     use botster_terminal_protocol::{
         RouteId, RoutedTerminalFrame, encode_output, encode_process_exit,
@@ -948,6 +1011,7 @@ pub(crate) mod mux_write_resume_tests {
             allow_remainder: false,
         };
         let mut pending = PendingMuxFrame {
+            attach_ack: None,
             bytes: PendingMuxBytes::Terminal {
                 header,
                 body: Arc::clone(frame.frame.shared_bytes()),
@@ -988,8 +1052,9 @@ pub(crate) mod mux_write_resume_tests {
             session_id.to_string(),
             subscription_id.to_string(),
             1,
-            handle,
+            handle.clone(),
         ));
+        handle.grant_unbounded_for_test();
         assert_eq!(
             adapter.try_write(&output_frame(subscription_id, marker)),
             Ok(())
@@ -1311,6 +1376,7 @@ pub(crate) mod mux_write_resume_tests {
             1,
             handle.clone(),
         ));
+        handle.grant_unbounded_for_test();
         let exit = RoutedTerminalFrame::new(
             RouteId::new("sub-late").expect("route"),
             1,
@@ -1354,10 +1420,12 @@ pub(crate) mod mux_write_resume_tests {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
         assert!(mux.register("closed".to_string(), "sub".to_string(), 1, handle.clone()));
+        handle.grant_unbounded_for_test();
         let frame = output_frame("sub", "closed");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let active = handle.snapshot_active().expect("active frame");
         let pending = PendingMuxFrame {
+            attach_ack: None,
             bytes: PendingMuxBytes::Terminal {
                 header: UnixTerminalContainerHeader::new("sub", 1, 0, active.frame.len())
                     .expect("header"),
@@ -1400,6 +1468,7 @@ pub(crate) mod mux_write_resume_tests {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
         assert!(mux.register("closing".to_string(), "sub".to_string(), 1, handle.clone()));
+        handle.grant_unbounded_for_test();
         assert_eq!(adapter.try_write(&output_frame("sub", "closing")), Ok(()));
         let mut writer = PrefixStallWriter {
             written: Vec::new(),
@@ -1450,6 +1519,24 @@ pub(crate) mod mux_write_resume_tests {
         );
         assert_eq!(frames.last().and_then(terminal_route), Some("sub-live"));
         assert!(!state.has_pending());
+        // S13: the route's CLOSED follows on a later turn. The frame that
+        // finished after the close is on the socket, so it counts as spent.
+        let before_closed = writer.written.len();
+        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
+            .await
+            .expect("credit settlement");
+        let settled = parse_written_mux_frames(&writer.written[before_closed..]);
+        let closing_bytes = u64::try_from(output_frame("sub", "closing").frame.len())
+            .expect("frame length fits u64");
+        assert_eq!(
+            settled,
+            vec![DaemonUnixMuxFrame::Credit(DaemonUnixCreditFrame::Closed {
+                route: "sub".to_string(),
+                generation: 1,
+                spent_items: 1,
+                spent_bytes: closing_bytes,
+            })]
+        );
         let length = writer.written.len();
         flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
             .await
@@ -1462,6 +1549,7 @@ pub(crate) mod mux_write_resume_tests {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
         assert!(mux.register("s".to_string(), "sub".to_string(), 1, handle.clone()));
+        handle.grant_unbounded_for_test();
         let output = output_frame("sub", "out");
         assert_eq!(adapter.try_write(&output), Ok(()));
         let mut writer = PrefixStallWriter {
@@ -1513,6 +1601,7 @@ pub(crate) mod mux_write_resume_tests {
             1,
             close_handle.clone(),
         ));
+        close_handle.grant_unbounded_for_test();
         assert_eq!(
             closer.try_write(&output_frame("sub-close", "close")),
             Ok(())

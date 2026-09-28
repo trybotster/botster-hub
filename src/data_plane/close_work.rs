@@ -56,7 +56,18 @@ impl RouteCloseState {
             &self.key.subscription_id,
             self.key.generation,
         ) {
-            self.reported.store(true, Ordering::SeqCst);
+            // A suppressed route sends no close event, but its credit still
+            // settles (S13); the adapter settles each generation once.
+            if !self.reported.swap(true, Ordering::SeqCst)
+                && self.ledger.report_route_end(
+                    None,
+                    &self.key.session_id,
+                    &self.key.subscription_id,
+                    self.key.generation,
+                )
+            {
+                (self.wake)();
+            }
             return;
         }
         if self.reported.swap(true, Ordering::SeqCst) {
@@ -69,13 +80,17 @@ impl RouteCloseState {
         } else {
             TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
         };
-        self.ledger
-            .push_event(DaemonEvent::TerminalSubscriptionClosed {
+        self.ledger.report_route_end(
+            Some(DaemonEvent::TerminalSubscriptionClosed {
                 session_id: self.key.session_id.clone(),
                 subscription_id: self.key.subscription_id.clone(),
                 generation: self.key.generation,
                 reason: reason.to_string(),
-            });
+            }),
+            &self.key.session_id,
+            &self.key.subscription_id,
+            self.key.generation,
+        );
         (self.wake)();
     }
 }

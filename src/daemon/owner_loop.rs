@@ -6440,8 +6440,9 @@ mod tests {
             "partial-session".to_string(),
             "partial-subscription".to_string(),
             1,
-            handle,
+            handle.clone(),
         ));
+        handle.grant_unbounded_for_test();
 
         let request_bytes = encode_client_frame(&ClientFrame::Request {
             request_id: "1".to_string(),
@@ -9812,8 +9813,9 @@ return botster.register({tools = {{
             "pressure-session".to_string(),
             "pressure-subscription".to_string(),
             1,
-            terminal_handle,
+            terminal_handle.clone(),
         ));
+        terminal_handle.grant_unbounded_for_test();
         assert!(!handle_control_message(
             &mut daemon,
             &mut state,

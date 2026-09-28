@@ -1,6 +1,6 @@
 //! Local runtime WebRTC smoke offerer.
 //!
-//! Owns the smoke offerer, host-control protocol 12 framing, waits, and the
+//! Owns the smoke offerer, host-control protocol 13 framing, waits, and the
 //! sender terminal-record proof. CLI argument handling and top-level result
 //! reporting stay in `main`.
 

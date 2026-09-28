@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 52.
+- conformance fixture revision 53.
 
 Conformance fixture revision 51 changes the plugin contract matrix fixture: it
 reads the result shape of `botster.capabilities.config.get()`
@@ -1715,6 +1715,58 @@ clients that need incremental READY-then-history use
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
+
+## Host-control protocol 13
+
+`PROTOCOL_VERSION` is 13 and `CONFORMANCE_FIXTURE_REVISION` is 53. This is a
+cold cut: a protocol-12 client fails closed at `ensure_compatible()`, with no
+negotiation and no fallback path. Protocol 13 adds per-route credit on the
+Unix connection, so neither side ever stops reading the socket.
+
+Credit frames use Unix container 3, little-endian:
+`u8 kind | u16 route_len | route | u64 generation | fields`. The route is the
+subscription id.
+
+| Kind | Name | Direction | Fields |
+| --- | --- | --- | --- |
+| 1 | `DEMAND` | Hub → client | `u64 bytes` |
+| 2 | `GRANT` | client → Hub | `u32 items, u64 bytes` |
+| 3 | `RETURN` | Hub → client | `u32 items, u64 bytes` |
+| 4 | `CLOSED` | Hub → client | `u64 spent_items, u64 spent_bytes` |
+| 6 | `INPUT_CREDIT` | Hub → client | `u32 items` |
+
+Kind 5 is unused. A client that sends a kind other than `GRANT` is closed
+with `malformed_frame`.
+
+Output credit:
+- A route holds no credit until it has output. When Core offers a terminal
+  frame that the route's credit does not cover, the Hub sends one `DEMAND`
+  for that frame's shortfall. A route has at most one outstanding demand.
+  A frame costs one item plus its terminal body length, the 8-byte header
+  included.
+- The client grants whole frames, in demand order. Grants add to the route's
+  pool. The Hub writes a frame only when the pool covers all of it.
+- When Core drops a head that a demand covered, the Hub sends the pool back in
+  a `RETURN`.
+- Every route end sends `CLOSED` exactly once per generation, after the
+  route's last terminal frame and after its `terminal_subscription_closed`
+  event, if any. `spent_*` count the frames written to the socket for that
+  generation. At `CLOSED` the client releases everything it granted for that
+  generation minus the spent counts and minus what was returned. The Hub
+  ignores a grant for a retired generation. A refused `Detach` leaves the
+  route live and sends no `CLOSED`. A connection loss sends none.
+- A route's credit frames follow its `TerminalAttached` response on the
+  socket. A client ignores a `DEMAND` for an unknown route generation.
+
+Input credit:
+- `DaemonTerminalAttach.input_credit_items` is the route's initial input
+  window, 64 frames (the adapter ingress capacity).
+- The Hub returns input credit in `INPUT_CREDIT` as Core consumes input.
+- Input beyond the route's credit, or before its `TerminalAttached` response,
+  closes the connection with the protocol error `input_credit_exceeded`. The
+  Hub never pauses its socket reader for input.
+
+Everything described under the earlier protocols below still applies.
 
 ## Host-control protocol 12
 
