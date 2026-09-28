@@ -616,7 +616,9 @@ fn abandonment(admitted: bool) {
         .wait(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    assert_eq!(remaining.envelopes.len(), if admitted { 1 } else { 2 });
+    // Receive is at-least-once: the admitted drain delivered abandon-0 to a
+    // caller that never got it, so it stays until acked and drains again.
+    assert_eq!(remaining.envelopes.len(), 2);
     assert!(state.coordination_capacity_waiters.is_empty());
     assert_eq!(state.budget.outstanding(), 0);
     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
