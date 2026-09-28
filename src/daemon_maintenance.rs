@@ -571,6 +571,15 @@ impl MaintenanceCoreReads {
     pub fn in_flight(&self) -> bool {
         self.journal.is_some() || self.baseline.is_some()
     }
+
+    /// Test-only: wait until the held baseline read is published, without
+    /// collecting it.
+    #[cfg(test)]
+    pub(crate) fn test_wait_baseline_published(&self, deadline: std::time::Instant) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|ticket| ticket.test_wait_published(deadline))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,6 +641,14 @@ impl MaintenanceState {
             return timeout_ms;
         }
         EVENT_INVOCATION_TIMEOUT_MS
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_start_baseline(&mut self) {
+        self.baseline = Some(BaselineRecovery {
+            snapshot: None,
+            after: None,
+        });
     }
 
     /// Readiness derived from state for the slices that no longer use wake
