@@ -17,6 +17,7 @@ pub(crate) mod plugins;
 pub(crate) mod reply;
 pub(crate) mod request;
 pub(crate) mod restart_records;
+pub(crate) mod restart_session;
 pub(crate) mod session_spawn;
 pub(crate) mod session_type_quarantine;
 pub(crate) mod session_types;
@@ -346,6 +347,9 @@ pub(crate) fn handle_runtime_control_request(
         }
         DaemonRequest::SpawnSessionType { .. } => {
             session_types::handle_runtime(daemon, state, observability, request)
+        }
+        DaemonRequest::RestartSession { .. } => {
+            restart_session::handle_runtime(daemon, state, observability, request)
         }
         DaemonRequest::ResolveQuarantine {
             target: DaemonQuarantineTarget::RepositorySessionTypes { root },

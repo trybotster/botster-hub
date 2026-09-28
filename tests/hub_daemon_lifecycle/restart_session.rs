@@ -97,3 +97,73 @@ fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
     drop(sessions);
     shutdown_cli_daemon(&data_dir, child);
 }
+
+fn restart_refusal_code(config: &botster_hub::HubConfig, session_id: &str) -> String {
+    let response = botster_hub::daemon_transport_request(
+        config,
+        botster_hub::DaemonRequest::RestartSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("restart request reaches the daemon");
+    assert_eq!(
+        response.kind,
+        botster_hub::DaemonResponseKind::OperatorError,
+        "{response:?}"
+    );
+    response.error.expect("a refusal carries its error").code
+}
+
+/// A restart is refused, with a typed code, for a session that is unknown,
+/// still running, or has ended without a restart record (a plain Spawn).
+#[test]
+fn a_restart_of_an_unknown_running_or_unrecorded_session_is_refused_with_its_code() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("restart-refusals");
+    let package_root = unique_test_dir("restart-refusals-package");
+    write_session_type_context_package(&package_root);
+    // A session that stays running for the whole test.
+    write_warm_executable(&package_root.join("bin/init.sh"), "#!/bin/sh\nsleep 60\n");
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable session type package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    let mut sessions =
+        botster_hub_client::subscribe_entities(&socket_endpoint(&data_dir), "session", "restart-refusals")
+            .expect("subscribe to sessions");
+
+    let running = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: "running-session".to_string(),
+            request: botster_hub::DaemonSessionTypeRequest::default(),
+        },
+    )
+    .expect("spawn a running session type session");
+    assert_eq!(running.kind, botster_hub::DaemonResponseKind::Spawned, "{running:?}");
+    let plain = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::Spawn {
+            session_id: "plain-session".to_string(),
+            command: "true".to_string(),
+        },
+    )
+    .expect("spawn a plain session");
+    assert_eq!(plain.kind, botster_hub::DaemonResponseKind::Spawned, "{plain:?}");
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_ended(frame, "plain-session")
+    });
+
+    assert_eq!(restart_refusal_code(&config, "no-such-session"), "unknown_session");
+    assert_eq!(restart_refusal_code(&config, "running-session"), "restart_not_ended");
+    assert_eq!(restart_refusal_code(&config, "plain-session"), "restart_record_unavailable");
+    drop(sessions);
+    shutdown_cli_daemon(&data_dir, child);
+}
