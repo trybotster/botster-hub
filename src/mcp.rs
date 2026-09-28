@@ -278,7 +278,7 @@ impl McpToolProvider for NativeHubToolProvider {
             ),
             McpToolDescriptor::new(
                 "receive_messages",
-                "Drain routed coordination messages for the caller session only.",
+                "Return the caller session's unacknowledged messages; each one is returned again until ack_message.",
                 receive_messages_schema(),
             ),
             McpToolDescriptor::new(
