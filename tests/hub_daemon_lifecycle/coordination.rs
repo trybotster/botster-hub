@@ -491,3 +491,57 @@ fn mcp_receive_redelivers_until_ack_and_republish_is_idempotent() {
     coordination_shutdown_session(&data_dir, "session-inbox");
     shutdown_cli_daemon(&data_dir, daemon);
 }
+
+#[test]
+fn a_session_credential_reaches_only_its_session() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("coord-cred");
+    let fifo_dir = unique_short_test_dir("coord-cred-fifo");
+    fs::create_dir_all(&fifo_dir).expect("create fifo dir");
+    let daemon = start_cli_daemon(&data_dir);
+    let fifo = fifo_dir.join("token.fifo");
+    make_fifo(&fifo);
+    coordination_spawn(
+        &data_dir,
+        "cred-session",
+        &format!(
+            "printf '%s' \"$BOTSTER_SESSION_TOKEN\" > {}; exec cat",
+            shell_quote(&fifo.display().to_string())
+        ),
+    );
+    let token = read_fifo_to_end(&fifo);
+    let (session_id, secret) = token.rsplit_once('.').expect("token separator");
+    assert_eq!(session_id, "cred-session");
+    assert_eq!(secret.len(), 64, "a 256-bit secret in hex");
+    assert!(secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    // Nothing a client or operator can read carries the token or its secret.
+    let mut observed = vec![
+        coordination_cli(&data_dir, &["sessions", "list"]),
+        coordination_cli(&data_dir, &["status"]),
+    ];
+    for (tool, arguments) in [
+        ("whoami", serde_json::json!({})),
+        ("hub.sessions.list", serde_json::json!({})),
+        ("hub.status", serde_json::json!({})),
+        (
+            "post_message",
+            serde_json::json!({ "session_id": "cred-missing", "body": "refused" }),
+        ),
+        (
+            "notify_session",
+            serde_json::json!({ "session_id": "cred-session", "message": "deferred" }),
+        ),
+    ] {
+        observed.push(
+            coordination_mcp_call(&data_dir, Some("cred-session"), tool, arguments).to_string(),
+        );
+    }
+    coordination_shutdown_session(&data_dir, "cred-session");
+    let output = shutdown_cli_daemon(&data_dir, daemon);
+    observed.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    observed.push(String::from_utf8_lossy(&output.stderr).into_owned());
+    for text in &observed {
+        assert!(!text.contains(secret), "the token secret leaked: {text}");
+    }
+}
