@@ -45,6 +45,7 @@ fi
 node --input-type=module - "$records" "$target" "$dry_run" <<'NODE'
 import { readFileSync, readdirSync, statSync, rmSync, existsSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
+import { spawnSync } from "node:child_process";
 
 const [recordsDir, target, dryRunArg] = process.argv.slice(2);
 const dryRun = dryRunArg === "1";
@@ -52,24 +53,33 @@ const hashOf = (name) => (name.match(/-([0-9a-f]{16})(?:\.|$)/) || [])[1];
 
 const keep = new Set();
 // Cargo reports a binary or an example by its uplifted, unhashed path
-// (target/debug/<name>, target/debug/examples/<name>), which is a hard link to
-// the hashed artifact. Resolve such a path to its hash through the inode.
-const inodeHash = new Map();
-for (const dir of [join(target, "deps"), join(target, "examples")]) {
-  if (!existsSync(dir)) continue;
-  for (const name of readdirSync(dir)) {
-    const hash = hashOf(name);
-    if (!hash) continue;
-    const stat = statSync(join(dir, name));
-    if (stat.isFile()) inodeHash.set(`${stat.dev}:${stat.ino}`, hash);
+// (target/debug/<name>, target/debug/examples/<name>). The uplift is a copy
+// (or a hard link) of the hashed artifact <name>-<hash> in deps/ or examples/;
+// find the hashed file with the same size and the same bytes.
+const hashedCandidates = (file) => {
+  const stem = basename(file);
+  const names = [stem, stem.replace(/-/g, "_")];
+  const size = statSync(file).size;
+  const found = [];
+  for (const dir of [join(target, "deps"), join(target, "examples")]) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      const hash = hashOf(name);
+      if (!hash || !names.some((n) => name === `${n}-${hash}`)) continue;
+      const path = join(dir, name);
+      if (statSync(path).size === size) found.push([path, hash]);
+    }
   }
-}
+  return found;
+};
 const hashOfArtifact = (file) => {
   const direct = hashOf(basename(file)) ?? hashOf(basename(dirname(file)));
   if (direct) return direct;
   if (!existsSync(file)) return undefined;
-  const stat = statSync(file);
-  return inodeHash.get(`${stat.dev}:${stat.ino}`);
+  for (const [path, hash] of hashedCandidates(file)) {
+    if (spawnSync("cmp", ["-s", file, path]).status === 0) return hash;
+  }
+  return undefined;
 };
 const lines = readdirSync(recordsDir)
   .filter((name) => name.endsWith(".json"))
