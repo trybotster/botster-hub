@@ -1961,7 +1961,7 @@ fn take_snapshot_item_page(
             cut = SnapshotPageCut::Elapsed;
             break;
         }
-        let entity = crate::session_projection::SessionProjection::project_entity(&row.record);
+        let entity = crate::session_projection::SessionProjection::project_row(row);
         let value = serde_json::to_value(&entity).expect("serialize session entity");
         let encoded_item_len = serde_json::to_vec(&value)
             .map(|body| body.len())
@@ -2342,7 +2342,7 @@ fn deliver_projection_delta_page(
                 page.more = true;
                 break;
             }
-            let entity = crate::session_projection::SessionProjection::project_entity(&row.record);
+            let entity = crate::session_projection::SessionProjection::project_row(row);
             let frame = match state.entities.get(id) {
                 None => {
                     state.next_seq = state.next_seq.saturating_add(1);
@@ -2437,9 +2437,7 @@ fn send_session_delta(
                     if let Some(row) = projection.rows.get(&id) {
                         state.entities.insert(
                             id,
-                            crate::session_projection::SessionProjection::project_entity(
-                                &row.record,
-                            ),
+                            crate::session_projection::SessionProjection::project_row(row),
                         );
                     }
                 }
@@ -2563,6 +2561,7 @@ fn project_session_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntit
         traits,
         interaction: metadata.get("botster.session_type.interaction").cloned(),
         session_type_lifecycle: metadata.get("botster.session_type.lifecycle").cloned(),
+        restartable: false,
     }
 }
 
@@ -3998,6 +3997,7 @@ mod tests {
                 traits: Vec::new(),
                 interaction: None,
                 session_type_lifecycle: None,
+                restartable: false,
             }
         };
         let current = entity("running", Some("running"), "current");

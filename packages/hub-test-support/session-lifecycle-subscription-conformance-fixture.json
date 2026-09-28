@@ -26,6 +26,7 @@
         "lifecycle": "running",
         "lifecycle_class": "current",
         "registry_state": "active",
+        "restartable": false,
         "rows": 24,
         "session_uuid": "slc-session",
         "traits": [],

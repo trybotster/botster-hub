@@ -1156,6 +1156,7 @@ export interface DaemonSessionEntity {
   traits?: string[];
   interaction?: string | null;
   session_type_lifecycle?: string | null;
+  restartable?: boolean;
 }
 
 export type DaemonEntityFrame =

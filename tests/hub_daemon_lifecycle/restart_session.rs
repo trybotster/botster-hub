@@ -12,6 +12,16 @@ fn session_frame_is_ended(frame: &botster_hub_client::DaemonEntityFrame, session
     fields.get("lifecycle_class").and_then(serde_json::Value::as_str) == Some("ended")
 }
 
+fn session_frame_is_restartable(frame: &botster_hub_client::DaemonEntityFrame, session_id: &str) -> bool {
+    let fields = match frame {
+        botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. } if id == session_id => entity,
+        botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. } if id == session_id => patch,
+        _ => return false,
+    };
+    session_frame_is_ended(frame, session_id)
+        && fields.get("restartable").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 /// A session-type spawn records how to restart the session before its reply,
 /// and removing the ended session deletes the record and retires its context.
 #[test]
@@ -63,8 +73,9 @@ fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
     assert!(record.get("environment_keys").is_none(), "{record}");
 
     // The fixture script exits after a second; wait for the entity to end.
+    // The entity turns restartable as it ends: the record is already durable.
     wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
-        session_frame_is_ended(frame, session_id)
+        session_frame_is_restartable(frame, session_id)
     });
     let removed = botster_hub::daemon_transport_request(
         &config,
