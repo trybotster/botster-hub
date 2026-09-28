@@ -13,13 +13,12 @@ use botster_core::{
     PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
     RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory,
-    SubscriptionId,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_core_daemon::{
     CoreCompletion, CoreDaemonError, GuardedWriteDecision, GuardedWriteDeliveryState,
     GuardedWriteRequest, GuardedWriteResult, LifecycleBaselineBudget, ReadinessEvidence,
-    SessionLifecycleBaselinePage,
+    RegistrySessionState, SessionLifecycleBaselinePage, SessionRegistryStateLookup,
 };
 use botster_hub_client::HistoryUnavailableReason;
 use botster_ui_contract::{
@@ -639,6 +638,8 @@ impl HubClientApi {
                     request_id,
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        require_running_session_targets(daemon, &envelope.targets)
+                            .map_err(&core_error)?;
                         daemon
                             .publish_routed_envelope(
                                 botster_core_daemon::PublishRoutedEnvelopeRequest { envelope },
@@ -2571,6 +2572,7 @@ pub(crate) fn spawn_request(
     session_id: SessionId,
     command: String,
 ) -> SessionSpawnRequest {
+    let environment = crate::session_types::raw_session_environment(runtime.config(), &session_id);
     SessionSpawnRequest {
         request_id,
         session_id,
@@ -2585,7 +2587,7 @@ pub(crate) fn spawn_request(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| ".".to_string()),
         },
-        environment: SpawnEnvironment::default(),
+        environment: environment,
         initial_pty_size: Some(botster_core::ResizePayload {
             rows: runtime.config().session_defaults.initial_rows,
             cols: runtime.config().session_defaults.initial_cols,
@@ -2609,6 +2611,25 @@ fn session_type_client_metadata(mut metadata: CoreSessionMetadata) -> CoreSessio
 
 #[allow(dead_code)]
 fn _runtime_error_type_is_not_public_payload(_: HubRuntimeError) {}
+
+/// Refuse an envelope for a session that Core does not hold as running.
+/// A queue for a missing session would never drain, so the sender learns now.
+fn require_running_session_targets(
+    daemon: &botster_core_daemon::CoreDaemon,
+    targets: &[EnvelopeTarget],
+) -> Result<(), CoreDaemonError> {
+    for target in targets {
+        let EnvelopeTarget::Session { session_id } = target else {
+            continue;
+        };
+        match daemon.session_registry_state(session_id)? {
+            SessionRegistryStateLookup::Found(RegistrySessionState::Running) => {}
+            // Ended, absent, and any future lookup state cannot receive mail.
+            _ => return Err(CoreDaemonError::UnknownSession(session_id.clone())),
+        }
+    }
+    Ok(())
+}
 
 fn package_allows_guarded_write(packages: &PackageRegistry, package_name: &str) -> bool {
     let Some(record) = packages.package(package_name) else {
