@@ -1,0 +1,25 @@
+{
+  "name": "kit-fixture",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Plugin test kit fixture: tools, plugin_db, events, and session_family.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "mcp" },
+    { "surface": "plugin_db", "scope": "kit-fixture" }
+  ],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+  "events": {
+    "emitted": [{
+      "name": "kit-fixture.noted",
+      "audience": ["plugins"],
+      "payload_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "key": { "type": "string" } },
+        "required": ["key"]
+      }
+    }]
+  }
+}

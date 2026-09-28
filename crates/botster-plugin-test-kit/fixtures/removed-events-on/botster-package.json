@@ -1,0 +1,10 @@
+{
+  "name": "removed-events-on",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Calls the removed global events.on, as botster-workspaces 7ec8fac did.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+}

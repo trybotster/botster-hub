@@ -285,7 +285,7 @@ impl ControlReply {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "plugin-test-kit"))]
     pub(crate) fn into_parts(
         self,
     ) -> (

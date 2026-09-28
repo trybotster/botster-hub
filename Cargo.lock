@@ -523,6 +523,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "botster-plugin-test-kit"
+version = "0.1.0"
+dependencies = [
+ "botster-hub",
+ "botster-hub-client",
+ "serde_json",
+]
+
+[[package]]
 name = "botster-terminal-ghostty"
 version = "0.1.0"
 source = "git+https://github.com/trybotster/botster-core.git?rev=5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c#5b13fb129bd3fadc42bd5160d4b9e853ff38ec6c"
