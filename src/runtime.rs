@@ -4399,7 +4399,7 @@ impl HubRuntime {
         metadata: CoreSessionMetadata,
     ) -> CoreOperationTracker {
         CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::Spawn(
-            SpawnSessionRequest { request, metadata },
+            crate::session_credential::credentialed(SpawnSessionRequest { request, metadata }),
         )))
     }
 
@@ -4588,7 +4588,9 @@ impl HubRuntime {
     ) -> CoreOperationTracker {
         CoreOperationTracker::new(self.core_daemon.begin_for_owner(
             waiter_id,
-            CoreOperation::Spawn(SpawnSessionRequest { request, metadata }),
+            CoreOperation::Spawn(crate::session_credential::credentialed(
+                SpawnSessionRequest { request, metadata },
+            )),
         ))
     }
 
@@ -4613,7 +4615,7 @@ impl HubRuntime {
             waiter_id,
             CoreOperation::SpawnReserved {
                 reservation,
-                request,
+                request: crate::session_credential::credentialed(request),
             },
         ))
     }
