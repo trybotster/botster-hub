@@ -1,6 +1,6 @@
 //! Unix accepted-connection driver and client connection role.
 //!
-//! One task serves one muxed connection under host-control protocol 12: Hello
+//! One task serves one muxed connection under host-control protocol 13: Hello
 //! first, then correlated requests that may complete out of order, entity
 //! subscription frames, host events, and content-blind terminal containers.
 use std::collections::BTreeSet;
@@ -165,7 +165,7 @@ pub(crate) async fn handle_connection_async(
     );
     let hello = match read_async_inbound(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT)).await {
         Ok(UnixInbound::Hello(hello)) => hello,
-        Ok(UnixInbound::Request { .. } | UnixInbound::Terminal(_)) => {
+        Ok(UnixInbound::Request { .. } | UnixInbound::Terminal(_) | UnixInbound::Grant { .. }) => {
             return close_with_protocol_error(
                 &mut write_half,
                 &mut cleanup,
@@ -226,17 +226,12 @@ pub(crate) async fn handle_connection_async(
     let (entity_tx, mut entity_rx) = tokio_mpsc::channel(UNIX_CONNECTION_ENTITY_QUEUE_CAPACITY);
     let mut in_flight: JoinSet<CompletedRequest> = JoinSet::new();
     let mut last_request_id: u64 = 0;
-    // One input frame that met a full adapter ingress. While it is parked,
-    // the connection stops reading the socket (input backpressure) and
-    // retries it when Core frees ingress room or the route closes.
-    let mut parked_input: Option<(UnixTerminalAdapterHandle, Vec<u8>)> = None;
 
     loop {
         let inbound = {
             let inbound = read_async_inbound(&mut reader, None);
             tokio::pin!(inbound);
             loop {
-                let parked_route = parked_input.as_ref().map(|(handle, _)| handle.clone());
                 let event_mailbox = event_reader.mailbox();
                 let event_output_ready = event_mailbox
                     .as_ref()
@@ -247,16 +242,10 @@ pub(crate) async fn handle_connection_async(
                 }
                 tokio::select! {
                     biased;
-                    inbound = &mut inbound, if parked_route.is_none() => break inbound,
-                    () = async {
-                        if let Some(handle) = parked_route.as_ref() {
-                            handle.ingress_room().await;
-                        }
-                    }, if parked_route.is_some() => {
-                        if let Some((handle, bytes)) = parked_input.take() {
-                            parked_input = park_or_store_input(handle, bytes);
-                        }
-                    }
+                    // S13: the reader never pauses. Input credit bounds
+                    // each route's ingress, so control frames and output
+                    // grants always get through.
+                    inbound = &mut inbound => break inbound,
                     completed = in_flight.join_next(), if !in_flight.is_empty() => {
                         let Some(Ok(completed)) = completed else {
                             cleanup.set_reason(ConnectionTerminalReason::Protocol);
@@ -364,8 +353,16 @@ pub(crate) async fn handle_connection_async(
                 .await;
             }
             Ok(UnixInbound::Terminal(frame)) => {
-                if let Some(handle) = mux.live_handle_for_route(&frame.route, frame.generation) {
-                    parked_input = park_or_store_input(handle, frame.body);
+                if let Some(handle) = mux.live_handle_for_route(&frame.route, frame.generation)
+                    && store_credited_input(&handle, frame.body) == InputCredit::Exceeded
+                {
+                    return close_with_protocol_error(
+                        &mut write_half,
+                        &mut cleanup,
+                        Some(&mux),
+                        DaemonProtocolErrorCode::InputCreditExceeded,
+                    )
+                    .await;
                 }
                 mux.clear_deferred_flushes();
                 if let Err(error) = flush_unix_mux_writes(
@@ -379,6 +376,19 @@ pub(crate) async fn handle_connection_async(
                     cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
                     mux.close_all();
                     return Err(error);
+                }
+                continue;
+            }
+            Ok(UnixInbound::Grant {
+                route,
+                generation,
+                items,
+                bytes,
+            }) => {
+                // A grant for a retired or unknown generation is stale: the
+                // client releases it at that generation's `CLOSED`.
+                if let Some(handle) = mux.live_handle_for_route(&route, generation) {
+                    handle.grant(items, bytes);
                 }
                 continue;
             }
@@ -517,6 +527,10 @@ async fn deliver_completed_request(
             delivery,
         } => {
             let response = (*response)?;
+            // S13: the route's credit frames wait for this response.
+            let attached_route = response.terminal_attach.as_ref().and_then(|attach| {
+                mux.live_handle_for_route(&attach.subscription_id, attach.generation)
+            });
             cleanup.apply_subscription_change(
                 completed.projection.attached_subscription_change(&response),
             );
@@ -536,6 +550,9 @@ async fn deliver_completed_request(
                 completed.close_after,
                 delivery,
             )?;
+            if let Some(route) = attached_route {
+                mux_write.tag_last_response_attach(route);
+            }
             drop(charge);
         }
         ControlReply::EncodedPlugin {
@@ -932,15 +949,25 @@ pub(crate) fn handle_connection(
 #[allow(dead_code)]
 const _: usize = DAEMON_MAX_CONNECTIONS;
 
-/// Store one input frame, or keep it when the adapter ingress is full.
-/// Returns the frame to park; `None` when it was stored or its route ended.
-fn park_or_store_input(
-    handle: UnixTerminalAdapterHandle,
-    bytes: Vec<u8>,
-) -> Option<(UnixTerminalAdapterHandle, Vec<u8>)> {
+#[derive(Debug, PartialEq, Eq)]
+enum InputCredit {
+    Within,
+    Exceeded,
+}
+
+/// Store one input frame. The route's input credit equals its ingress
+/// capacity, so a compliant client never meets a full ingress: a full
+/// ingress, or input before the route's `TerminalAttached` response is on
+/// the socket, exceeds the client's credit.
+fn store_credited_input(handle: &UnixTerminalAdapterHandle, bytes: Vec<u8>) -> InputCredit {
+    if !handle.is_attach_written() {
+        return InputCredit::Exceeded;
+    }
     match handle.try_push_ingress(bytes) {
-        IngressStore::Full(bytes) => Some((handle, bytes)),
-        IngressStore::Stored | IngressStore::Closed | IngressStore::Malformed => None,
+        IngressStore::Full(_) => InputCredit::Exceeded,
+        IngressStore::Stored | IngressStore::Closed | IngressStore::Malformed => {
+            InputCredit::Within
+        }
     }
 }
 
@@ -960,7 +987,8 @@ mod input_backpressure_tests {
     use botster_core::contract::terminal_wake::{TerminalWakeSource, WakingTerminalAdapter};
     use botster_core::{SessionId, SubscriptionId, TerminalSubscriptionGeneration};
     use botster_hub_client::{
-        DaemonRequest, DaemonResponseKind, DaemonUnixFrameReader, write_unix_terminal_frame,
+        DaemonCloseReason, DaemonRequest, DaemonResponseKind, DaemonUnixCreditFrame,
+        DaemonUnixFrameReader, DaemonUnixMuxFrame, ServerFrame, write_unix_terminal_frame,
     };
     use std::net::Shutdown;
 
@@ -979,14 +1007,20 @@ mod input_backpressure_tests {
         bytes
     }
 
-    /// S5: a paste burst larger than the 64-frame adapter ingress, sent while
-    /// Core reads nothing, is delivered whole: the connection parks the
-    /// frame that met a full ingress and stops reading the socket until Core
-    /// removes a frame. A Status request queued behind the burst on the same
-    /// socket is read only after the connection stored the last frame.
-    #[test]
-    fn a_paste_burst_past_the_ingress_is_delivered_whole_and_holds_the_socket() {
-        const BURST: usize = 100;
+    struct CreditConnection {
+        client: UnixStream,
+        reader: DaemonUnixFrameReader,
+        control_rx: tokio_mpsc::Receiver<ControlMessage>,
+        connection: thread::JoinHandle<DaemonTransportResult<()>>,
+        adapter: crate::transport::unix::UnixTerminalAdapter,
+        handle: UnixTerminalAdapterHandle,
+        wakes: TerminalWakeSource,
+    }
+
+    /// An admitted connection with one registered route, "paste" at
+    /// generation 1. `attach_written` stands in for the writer finishing the
+    /// route's `TerminalAttached` response.
+    fn credit_connection(attach_written: bool) -> CreditConnection {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1015,93 +1049,150 @@ mod input_backpressure_tests {
             SubscriptionId("paste".into()),
             TerminalSubscriptionGeneration(1),
         ));
-        let (full_tx, full_rx) = std::sync::mpsc::channel();
-        handle.set_ingress_full_observer(full_tx);
-        reply_tx.send(()).expect("ack unix admission");
-
-        // Core is stalled: nothing reads the ingress while the burst arrives.
-        for index in 0..BURST {
-            write_unix_terminal_frame(&mut client, "paste", 1, 0, &input_frame(index))
-                .expect("write paste frame");
+        if attach_written {
+            handle.mark_attach_written();
         }
-        write_request(&mut client, 1, DaemonRequest::Status);
-        // timer: deadline — bounds a connection that never fills the ingress.
-        full_rx
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the 65th frame meets a full ingress and the connection parks");
-        assert!(
-            control_rx.try_recv().is_err(),
-            "a parked connection has not read the request behind the burst"
-        );
+        reply_tx.send(()).expect("ack unix admission");
+        CreditConnection {
+            client,
+            reader,
+            control_rx,
+            connection,
+            adapter,
+            handle,
+            wakes,
+        }
+    }
 
-        // timer: deadline — bounds a lost wake; progress arrives as ingress
-        // wakes and the control request.
+    fn assert_closed_for_input_credit(mut connection: CreditConnection) {
+        match connection
+            .reader
+            .read_frame(&mut connection.client)
+            .expect("read the typed close")
+        {
+            DaemonUnixMuxFrame::Server(ServerFrame::Close {
+                reason: DaemonCloseReason::ProtocolError { code },
+            }) => assert_eq!(code, DaemonProtocolErrorCode::InputCreditExceeded),
+            other => panic!("expected the input_credit_exceeded close, got {other:?}"),
+        }
+        let result = connection
+            .connection
+            .join()
+            .expect("join daemon connection");
+        assert!(
+            matches!(
+                result,
+                Err(DaemonTransportError::Protocol("input_credit_exceeded"))
+            ),
+            "the connection ends typed: {result:?}"
+        );
+        assert!(
+            connection.handle.is_closed(),
+            "the typed close ends the route"
+        );
+    }
+
+    /// S13 (plan test 6): a client sends its whole input window while Core
+    /// reads nothing. The reader never pauses: a Status request behind the
+    /// window is read and answered while the ingress is full. Each frame Core
+    /// then removes returns one unit of input credit.
+    #[test]
+    fn input_within_credit_never_pauses_the_reader_and_its_credit_returns() {
+        let mut connection = credit_connection(true);
+        let window = MIN_ADAPTER_INGRESS_BUFFER_FRAMES;
+        for index in 0..window {
+            write_unix_terminal_frame(&mut connection.client, "paste", 1, 0, &input_frame(index))
+                .expect("write input frame");
+        }
+        write_request(&mut connection.client, 1, DaemonRequest::Status);
+        let ControlMessage::Request {
+            request, reply_tx, ..
+        } = receive_test_control_message(&mut connection.control_rx)
+        else {
+            panic!("the request behind a full ingress is read");
+        };
+        assert!(matches!(*request, DaemonRequest::Status));
+        reply_tx
+            .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
+            .expect("reply to status");
+        let response = read_response(&mut connection.client, &mut connection.reader, 1);
+        assert_eq!(response.kind, DaemonResponseKind::Status);
+
+        // timer: deadline — bounds a lost ingress wake.
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut delivered = Vec::new();
-        let mut status_seen_after = None;
-        while delivered.len() < BURST || status_seen_after.is_none() {
+        while delivered.len() < window {
             assert!(
                 Instant::now() < deadline,
-                "burst stalled: delivered={} status_seen_after={status_seen_after:?}",
+                "input stalled at {}",
                 delivered.len()
             );
-            if status_seen_after.is_none()
-                && let Ok(message) = control_rx.try_recv()
-            {
-                let ControlMessage::Request {
-                    request, reply_tx, ..
-                } = message
-                else {
-                    continue;
-                };
-                assert!(matches!(*request, DaemonRequest::Status));
-                status_seen_after = Some(delivered.len());
-                reply_tx
-                    .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
-                    .expect("reply to status");
-                continue;
-            }
-            match adapter.try_read() {
+            match connection.adapter.try_read() {
                 TerminalIngress::Frame(frame) => delivered.push(frame),
-                TerminalIngress::Empty if delivered.len() < BURST => {
-                    let _ = wakes.wait_wakes(deadline.saturating_duration_since(Instant::now()));
-                }
                 TerminalIngress::Empty => {
-                    let message = receive_test_control_message(&mut control_rx);
-                    let ControlMessage::Request {
-                        request, reply_tx, ..
-                    } = message
-                    else {
-                        continue;
-                    };
-                    assert!(matches!(*request, DaemonRequest::Status));
-                    status_seen_after = Some(delivered.len());
-                    reply_tx
-                        .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
-                        .expect("reply to status");
+                    let _ = connection
+                        .wakes
+                        .wait_wakes(deadline.saturating_duration_since(Instant::now()));
                 }
-                other => panic!("a stalled ingress must not end the route: {other:?}"),
+                other => panic!("input within credit must not end the route: {other:?}"),
             }
         }
         assert_eq!(
             delivered,
-            (0..BURST).map(input_frame).collect::<Vec<_>>(),
+            (0..window).map(input_frame).collect::<Vec<_>>(),
             "every frame arrives once, in order"
         );
-        assert!(!handle.is_closed(), "backpressure keeps the route open");
-        let status_seen_after = status_seen_after.expect("status answered");
-        assert!(
-            status_seen_after >= BURST - MIN_ADAPTER_INGRESS_BUFFER_FRAMES,
-            "the connection read past the burst before storing it: status after {status_seen_after} frames"
-        );
-        let response = read_response(&mut client, &mut reader, 1);
-        assert_eq!(response.kind, DaemonResponseKind::Status);
-        client
+        let mut returned = 0_usize;
+        while returned < window {
+            match connection
+                .reader
+                .read_frame(&mut connection.client)
+                .expect("read returned input credit")
+            {
+                DaemonUnixMuxFrame::Credit(DaemonUnixCreditFrame::InputCredit {
+                    route,
+                    generation,
+                    items,
+                }) => {
+                    assert_eq!((route.as_str(), generation), ("paste", 1));
+                    returned += usize::try_from(items).expect("items fit usize");
+                }
+                other => panic!("expected INPUT_CREDIT, got {other:?}"),
+            }
+        }
+        assert_eq!(returned, window, "exactly the consumed frames return");
+        assert!(!connection.handle.is_closed());
+        connection
+            .client
             .shutdown(Shutdown::Both)
             .expect("disconnect daemon client");
         connection
+            .connection
             .join()
             .expect("join daemon connection")
             .expect("client disconnect is a clean connection close");
+    }
+
+    /// S13 (plan test 9): one input frame past the window, while Core reads
+    /// nothing, closes the connection typed. The Hub neither buffers it nor
+    /// stops reading.
+    #[test]
+    fn input_beyond_credit_closes_the_connection_typed() {
+        let mut connection = credit_connection(true);
+        for index in 0..=MIN_ADAPTER_INGRESS_BUFFER_FRAMES {
+            write_unix_terminal_frame(&mut connection.client, "paste", 1, 0, &input_frame(index))
+                .expect("write input frame");
+        }
+        assert_closed_for_input_credit(connection);
+    }
+
+    /// S13 (plan test 9): input before the route's `TerminalAttached`
+    /// response is on the socket has no credit yet.
+    #[test]
+    fn input_before_the_attach_response_closes_the_connection_typed() {
+        let mut connection = credit_connection(false);
+        write_unix_terminal_frame(&mut connection.client, "paste", 1, 0, &input_frame(0))
+            .expect("write input frame");
+        assert_closed_for_input_credit(connection);
     }
 }

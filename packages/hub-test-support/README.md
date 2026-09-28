@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.49:
+Use this command for version 0.1.50:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.49
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.50
 ```
 
 ```js
@@ -81,21 +81,21 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.49"
+    "@trybotster/hub-test-support": "0.1.50"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.49` carries host-control protocol 12
+`@trybotster/hub-test-support@0.1.50` carries host-control protocol 13
 (`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
 Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
 GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
-revision 52). History attach delivers `attach_state`, `modes`,
+revision 53). History attach delivers `attach_state`, `modes`,
 `snapshot_ready`, `snapshot_history` pages, `snapshot_finish`, `output`, and
 `process_exit`. No-history attach delivers `snapshot_ready` then the GHOSTSNP
 finish record as one `snapshot_history` page. Import-visible state matches
 the ReadScreen oracles; do not dual-use a history-bearing golden as
-no-history. Protocol version is 12. The package includes paged snapshot
+no-history. Protocol version is 13. The package includes paged snapshot
 readback (`capture_snapshot`, `read_snapshot_page`), typed
 `HistoryUnavailableReason` values, explicit session-type execution modes,
 spawn-point session-type listing (`list_session_types_for_target`), and the
@@ -122,7 +122,7 @@ Protocol 11 adds the operator `resolve_quarantine` request (response kind
 and packages, with `durable` and `loaded`), and the package event-plane
 counters in `observability`.
 
-Version 0.1.49 carries protocol version 12 / conformance revision 52 with
+Version 0.1.50 carries protocol version 13 / conformance revision 53 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,

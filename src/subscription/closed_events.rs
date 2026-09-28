@@ -51,13 +51,69 @@ pub(crate) struct AttachCloseBookkeeping {
     pub released_attach_generations: u64,
 }
 
+/// One queued close item, written in queue order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClosedLedgerItem {
+    Event(DaemonEvent),
+    /// S13: settle this route generation's output credit (`CLOSED`). It
+    /// follows the route's close event, if any, on the same ordered lane.
+    SettleCredit {
+        session_id: String,
+        subscription_id: String,
+        generation: u64,
+    },
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ClosedEventLedger {
-    pending_events: Arc<Mutex<Vec<DaemonEvent>>>,
+    pending_events: Arc<Mutex<Vec<ClosedLedgerItem>>>,
     suppress_generations: Arc<Mutex<BTreeSet<(String, String, u64)>>>,
+    /// Queue a [`ClosedLedgerItem::SettleCredit`] on every route end (Unix).
+    settles_credit: bool,
 }
 
 impl ClosedEventLedger {
+    /// A ledger that settles each ended route's output credit (S13, Unix).
+    pub(crate) fn with_credit_settlement() -> Self {
+        Self {
+            settles_credit: true,
+            ..Self::default()
+        }
+    }
+
+    fn settle_item(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> Option<ClosedLedgerItem> {
+        self.settles_credit.then(|| ClosedLedgerItem::SettleCredit {
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            generation,
+        })
+    }
+
+    /// Queue one route end: its close event when it has one, then its credit
+    /// settlement. Returns whether anything was queued.
+    pub(crate) fn report_route_end(
+        &self,
+        event: Option<DaemonEvent>,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> bool {
+        let settle = self.settle_item(session_id, subscription_id, generation);
+        if event.is_none() && settle.is_none() {
+            return false;
+        }
+        if let Ok(mut pending) = self.pending_events.lock() {
+            pending.extend(event.map(ClosedLedgerItem::Event));
+            pending.extend(settle);
+        }
+        true
+    }
+
     pub(crate) fn suppress_session_keys(&self, keys: Vec<(String, String, u64)>) {
         if keys.is_empty() {
             return;
@@ -115,7 +171,7 @@ impl ClosedEventLedger {
             .is_some_and(|pending| !pending.is_empty())
     }
 
-    pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
+    pub(crate) fn pop_pending_item(&self) -> Option<ClosedLedgerItem> {
         self.pending_events.lock().ok().and_then(|mut pending| {
             if pending.is_empty() {
                 None
@@ -125,9 +181,19 @@ impl ClosedEventLedger {
         })
     }
 
+    /// The next close event. Only a ledger without credit settlement uses
+    /// this; it queues no settlement items.
+    pub(crate) fn pop_pending_event(&self) -> Option<DaemonEvent> {
+        debug_assert!(!self.settles_credit, "a settling ledger pops items");
+        match self.pop_pending_item()? {
+            ClosedLedgerItem::Event(event) => Some(event),
+            ClosedLedgerItem::SettleCredit { .. } => None,
+        }
+    }
+
     pub(crate) fn push_event(&self, event: DaemonEvent) {
         if let Ok(mut pending) = self.pending_events.lock() {
-            pending.push(event);
+            pending.push(ClosedLedgerItem::Event(event));
         }
     }
 
@@ -170,6 +236,11 @@ impl ClosedEventLedger {
                 route.generation,
             ) {
                 route.reported = true;
+                queued.extend(self.settle_item(
+                    &route.session_id,
+                    &route.subscription_id,
+                    route.generation,
+                ));
                 continue;
             }
             // A lost worker ends the session without PROCESS_EXIT on this
@@ -181,6 +252,11 @@ impl ClosedEventLedger {
                     None => continue,
                     Some(false) => {
                         route.reported = true;
+                        queued.extend(self.settle_item(
+                            &route.session_id,
+                            &route.subscription_id,
+                            route.generation,
+                        ));
                         continue;
                     }
                     Some(true) => {}
@@ -194,12 +270,19 @@ impl ClosedEventLedger {
             } else {
                 TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
             };
-            queued.push(DaemonEvent::TerminalSubscriptionClosed {
-                session_id: route.session_id.clone(),
-                subscription_id: route.subscription_id.clone(),
-                generation: route.generation,
-                reason: reason.to_string(),
-            });
+            queued.push(ClosedLedgerItem::Event(
+                DaemonEvent::TerminalSubscriptionClosed {
+                    session_id: route.session_id.clone(),
+                    subscription_id: route.subscription_id.clone(),
+                    generation: route.generation,
+                    reason: reason.to_string(),
+                },
+            ));
+            queued.extend(self.settle_item(
+                &route.session_id,
+                &route.subscription_id,
+                route.generation,
+            ));
         }
         if !queued.is_empty() {
             if let Ok(mut pending) = self.pending_events.lock() {

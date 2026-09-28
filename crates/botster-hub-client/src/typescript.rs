@@ -24,7 +24,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     line(&mut output, "");
     line(
         &mut output,
-        "// Host-control protocol 12 constants. See botster-hub-client/src/lib.rs.",
+        "// Host-control protocol 13 constants. See botster-hub-client/src/lib.rs.",
     );
     emit_const(&mut output, "PROTOCOL", &format!("\"{}\"", crate::PROTOCOL));
     emit_const(
@@ -268,6 +268,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "handshake_order",
             "invalid_route",
             "invalid_input_header",
+            "input_credit_exceeded",
         ],
     );
 

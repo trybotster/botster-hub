@@ -137,6 +137,12 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
+    /// Wake the transport writer only, for queued control output such as
+    /// S13 credit frames. Core is not woken.
+    pub(crate) fn wake_transport(&self) {
+        self.wake.wake();
+    }
+
     pub(crate) fn notify_writable(&self) {
         self.emit_writable();
         self.wake.wake();
