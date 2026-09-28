@@ -175,8 +175,12 @@ pub(crate) fn record_data_plane_progress(
     }
     runtime.reap_detached_core_operations();
     if progress.journal_advanced {
+        // Each consumer of a journal advance gets its own state: the journal
+        // pull its pending wake, and the observe pass a named mark. No
+        // consumer takes a bit that another consumer needs.
         state.maintenance.note_journal_advanced();
         state.maintenance.note_authoritative_mutation();
+        crate::daemon::owner_loop::mark_pump_ready(state);
     }
     if progress.terminal_inventory_changed {
         state.note_terminal_inventory_changed();
