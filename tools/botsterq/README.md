@@ -24,6 +24,7 @@ supervisor. State (socket, slot count, pid files) lives in
 ```sh
 botsterq run --label "hub lib" -- cargo test --locked -p botster-hub --lib
 botsterq run --label "hub lifecycle" --exclusive -- ./test.sh --locked --test hub_daemon_lifecycle_test
+botsterq run --label "hub tests" --exclusive --deadline 20m -- ./test.sh --locked   # shorter hang guard
 botsterq list            # queued and running jobs: id, state, enqueue time, label @ owner dir
 botsterq cancel <id>     # remove a queued job, or SIGTERM a running job's process group
 botsterq slots           # show how many jobs run at once (default 2)
@@ -47,6 +48,16 @@ botsterq slots 3         # change it (kept across server restarts)
   command's own status.
 - A job whose `run` process is gone when its turn comes does not start. A caller
   killed with SIGKILL while its job runs cannot be noticed; use `botsterq cancel <id>`.
+- Deadline: `--deadline <duration>` (seconds, or a number with `s`, `m` or `h`)
+  bounds a job's run time from its start (queue wait is not counted). At expiry the
+  supervisor prints `deadline expired`, stops the group like a cancel (SIGTERM,
+  SIGKILL when the grace ends, the slot held until the group is gone), and `run`
+  exits 124; a cancel (130) wins. An `--exclusive` job has a 45 minute deadline
+  unless it passes its own (any value replaces the default; the environment variable
+  `BOTSTERQ_EXCLUSIVE_DEADLINE`, in seconds, changes the default for tests). An
+  ordinary job has none. It is a hang guard, not a budget: it exists so one hung job
+  cannot hold the queue for hours. It does not apply after an unexpected supervisor
+  error, when the supervisor only holds the slot until the group is gone.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
