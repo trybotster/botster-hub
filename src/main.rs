@@ -812,6 +812,13 @@ fn local_runtime_smoke(args: Vec<String>) -> Result<(), SmokeError> {
     Ok(())
 }
 
+/// The smoke session's command: print the marker, then stay alive until the
+/// smoke's own `ShutdownSession`. A command that exits at once races the
+/// attach, and Core refuses to attach an exited session.
+fn smoke_session_command(marker: &str) -> String {
+    format!("printf 'smoke:{marker}\\n'; exec cat")
+}
+
 fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), SmokeError> {
     let session_id = format!(
         "smoke-{}",
@@ -826,7 +833,7 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
         config,
         DaemonRequest::Spawn {
             session_id: session_id.clone(),
-            command: format!("printf 'smoke:{marker}\\n'"),
+            command: smoke_session_command(marker),
         },
     )?;
     if spawn.kind == DaemonResponseKind::OperatorError {
@@ -834,12 +841,24 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             &spawn,
         )));
     }
+    // The session no longer ends by itself, so every path ends it here.
+    let result = smoke_attached_round_trip(config, &session_id, &subscription_id, marker);
+    let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
+    result
+}
+
+fn smoke_attached_round_trip(
+    config: &botster_hub::HubConfig,
+    session_id: &str,
+    subscription_id: &str,
+    marker: &str,
+) -> Result<(), SmokeError> {
     let mut connection =
         botster_hub::DaemonConnection::connect(config).map_err(SmokeError::Transport)?;
     let attach = connection
         .request(&DaemonRequest::Attach {
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
         })
         .map_err(SmokeError::Transport)?;
     if attach.kind == DaemonResponseKind::OperatorError {
@@ -858,7 +877,7 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
     while Instant::now() < deadline {
         let screen = connection
             .request(&DaemonRequest::ReadScreen {
-                session_id: session_id.clone(),
+                session_id: session_id.to_string(),
             })
             .map_err(SmokeError::Transport)?;
         observed = screen
@@ -867,12 +886,10 @@ fn smoke_session_round_trip(config: &botster_hub::HubConfig) -> Result<(), Smoke
             .map(|screen| screen.text.clone())
             .unwrap_or_default();
         if observed.contains(&format!("smoke:{marker}")) {
-            let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let _ = daemon_transport_request(config, DaemonRequest::ShutdownSession { session_id });
     Err(SmokeError::SessionRoundTrip(observed))
 }
 
@@ -5168,5 +5185,40 @@ mod cli_data_dir_tests {
                 "{command} usage must mark --data-dir optional"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod smoke_session_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+
+    /// The smoke attaches after the spawn, and Core refuses to attach an
+    /// exited session, so the command must outlive its marker line. A
+    /// command that exited after the marker would give EOF instead of the
+    /// echoed probe line; no timing is involved.
+    #[test]
+    fn the_smoke_session_command_outlives_its_marker() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(smoke_session_command("probe-marker"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the smoke command");
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read the marker");
+        assert_eq!(line, "smoke:probe-marker\n");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let _ = stdin.write_all(b"still-alive\n");
+        line.clear();
+        stdout.read_line(&mut line).expect("read the probe echo");
+        assert_eq!(
+            line, "still-alive\n",
+            "the smoke command must stay alive after its marker"
+        );
+        drop(stdin);
+        assert!(child.wait().expect("wait").success());
     }
 }
