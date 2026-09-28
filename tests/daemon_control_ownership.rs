@@ -349,6 +349,7 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "PluginSurfaceRender",
             "PluginSurfaceAction",
             "PluginLifecycleStatus",
+            "ReadPluginLogs",
         ],
     ),
     (
