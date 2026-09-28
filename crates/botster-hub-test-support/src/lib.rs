@@ -4421,6 +4421,10 @@ fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> Result<bool,
     }
     Ok(terminal
         .take_skipped_terminal()
+        .map_err(|source| ConformanceError::Client {
+            operation: "attach_wait",
+            source,
+        })?
         .iter()
         .any(frame_is_attached))
 }
