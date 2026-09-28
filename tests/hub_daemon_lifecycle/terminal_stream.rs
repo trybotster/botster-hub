@@ -105,6 +105,15 @@ impl RawUnixClient {
         }
     }
 
+    /// Answer output demands by hand: this client never grants (S13 test 10).
+    pub(crate) fn never_grant(mut self) -> Self {
+        self.credit = UnixOutputCredit::new(
+            UnixCreditMode::Manual,
+            botster_hub_client::DEFAULT_UNIX_OUTPUT_CREDIT_BYTES,
+        );
+        self
+    }
+
     pub(crate) fn stream(&self) -> &UnixStream {
         &self.stream
     }
