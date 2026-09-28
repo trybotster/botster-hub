@@ -801,6 +801,14 @@ mod tests {
             ),
             "a later contender must contend on the same inode"
         );
+        // Release explicitly, as SocketOwnerLock::drop does. A flock belongs to
+        // the open file description, which a child that a parallel test forks
+        // shares until its exec; closing only this descriptor would not
+        // release the lock while such a child exists.
+        // SAFETY: `flock` on an open descriptor with an integer flag.
+        unsafe {
+            libc::flock(early.as_raw_fd(), libc::LOCK_UN);
+        }
         drop(early);
         let later = acquire_socket_owner_lock(&socket).expect("lock after the early contender");
         let lock_path = SocketOwnerLock::lock_path(&socket);

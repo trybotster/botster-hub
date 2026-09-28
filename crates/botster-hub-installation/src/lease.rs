@@ -48,12 +48,21 @@ impl LeaseMode {
 /// A held installation lease. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct InstallationLease {
-    #[expect(
-        dead_code,
-        reason = "the lease is the open descriptor; holding it is the point"
-    )]
     descriptor: OwnedFd,
     mode: LeaseMode,
+}
+
+impl Drop for InstallationLease {
+    fn drop(&mut self) {
+        // Release explicitly before the descriptor closes. A flock belongs to
+        // the open file description, which any child forked while the lease is
+        // open shares until its exec (or its exit). Closing only this
+        // descriptor would leave the lease held by that child.
+        // SAFETY: `flock` on an open descriptor with an integer flag.
+        unsafe {
+            libc::flock(self.descriptor.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl InstallationLease {
