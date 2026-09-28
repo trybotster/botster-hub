@@ -62,6 +62,9 @@ struct AdapterCredit {
     outbox: VecDeque<DaemonUnixCreditFrame>,
     /// Input frames Core removed from ingress, not yet returned.
     input_credit: u32,
+    /// Input frames accepted and not yet returned to the client in an
+    /// `INPUT_CREDIT`. The client's input credit is the window minus this.
+    input_outstanding: u32,
     /// `CLOSED` was taken. Later grants are ignored and nothing more is sent.
     settled: bool,
 }
@@ -153,8 +156,24 @@ impl UnixTerminalAdapterInner {
             CreditCheck::Covered => {
                 let written = self.slot.try_write(frame);
                 if written.is_ok() {
-                    credit.output.commit(bytes);
+                    let surplus = credit.output.commit(bytes);
                     self.credit_short.store(false, Ordering::SeqCst);
+                    if let (Some(surplus), Some((route, generation))) =
+                        (surplus, credit.route.clone())
+                        && !credit.settled
+                    {
+                        credit.outbox.push_back(DaemonUnixCreditFrame::Return {
+                            route,
+                            generation,
+                            items: surplus.items,
+                            bytes: surplus.bytes,
+                        });
+                        let ready = credit.has_output();
+                        drop(credit);
+                        if ready {
+                            self.slot.wake_transport();
+                        }
+                    }
                 }
                 written
             }
@@ -232,6 +251,14 @@ impl UnixTerminalAdapterInner {
             return;
         }
         let outcome = credit.output.grant(items, bytes);
+        if let (Some(refund), Some((route, generation))) = (outcome.refund, credit.route.clone()) {
+            credit.outbox.push_back(DaemonUnixCreditFrame::Return {
+                route,
+                generation,
+                items: refund.items,
+                bytes: refund.bytes,
+            });
+        }
         if let (Some(demand), Some((route, generation))) = (outcome.demand, credit.route.clone()) {
             credit.outbox.push_back(DaemonUnixCreditFrame::Demand {
                 route,
@@ -769,6 +796,21 @@ impl UnixTerminalAdapterHandle {
         self.inner.grant(items, bytes);
     }
 
+    /// Take one unit of the client's input credit for a frame it just sent.
+    /// `false` when the client has none left: credit returns only when its
+    /// `INPUT_CREDIT` is taken for the socket, not when Core consumes the
+    /// frame, so free ingress capacity does not make a frame legal.
+    pub(crate) fn reserve_input_credit(&self, window: u32) -> bool {
+        let Some(mut credit) = self.inner.lock_credit() else {
+            return false;
+        };
+        if credit.input_outstanding >= window {
+            return false;
+        }
+        credit.input_outstanding += 1;
+        true
+    }
+
     /// The route's `TerminalAttached` response is fully on the socket; its
     /// held credit frames may follow.
     pub(crate) fn mark_attach_written(&self) {
@@ -810,10 +852,12 @@ impl UnixTerminalAdapterHandle {
         if credit.input_credit > 0
             && let Some((route, generation)) = credit.route.clone()
         {
+            let items = std::mem::take(&mut credit.input_credit);
+            credit.input_outstanding = credit.input_outstanding.saturating_sub(items);
             frames.push(DaemonUnixCreditFrame::InputCredit {
                 route,
                 generation,
-                items: std::mem::take(&mut credit.input_credit),
+                items,
             });
         }
     }
@@ -851,6 +895,9 @@ impl UnixTerminalAdapterHandle {
     /// a large budget does.
     #[cfg(test)]
     pub(crate) fn grant_unbounded_for_test(&self) {
+        if let Some(mut credit) = self.inner.lock_credit() {
+            credit.output.keep_surplus_for_test();
+        }
         self.inner.grant(u32::MAX, u64::from(u32::MAX));
     }
 
@@ -1089,18 +1136,84 @@ mod tests {
         /// Plan test 8: credit granted before the adapter's check is used
         /// with no demand and no wake.
         #[test]
-        fn credit_granted_before_the_check_is_used() {
+        fn a_grant_with_no_need_is_returned_at_once() {
             let mut route = credited_route(true);
             let frame = output_frame("sub", "ready");
+            let bytes = frame_bytes(&frame);
             let _ = core_wakes(&route.wakes);
-            route.handle.grant(1, frame_bytes(&frame));
+            route.handle.grant(1, bytes);
             assert_eq!(
                 core_wakes(&route.wakes),
                 0,
                 "a grant with no need raises nothing"
             );
-            assert_eq!(route.adapter.try_write(&frame), Ok(()));
-            assert!(route.mux.take_credit_frames().is_empty());
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![DaemonUnixCreditFrame::Return {
+                    route: "sub".to_string(),
+                    generation: 1,
+                    items: 1,
+                    bytes,
+                }],
+                "an idle route holds no credit"
+            );
+        }
+
+        /// A grant sized for a withdrawn large head funds a smaller
+        /// replacement; the remainder goes back at the write.
+        #[test]
+        fn the_remainder_of_a_grant_that_funds_a_smaller_head_is_returned() {
+            let mut route = credited_route(true);
+            let large = output_frame("sub", "a much larger head frame body");
+            let small = output_frame("sub", "s");
+            assert!(route.adapter.try_write(&large).is_err());
+            let _ = route.mux.take_credit_frames();
+            assert!(route.adapter.try_write(&small).is_err());
+            route.handle.grant(1, frame_bytes(&large));
+            assert_eq!(route.adapter.try_write(&small), Ok(()));
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![DaemonUnixCreditFrame::Return {
+                    route: "sub".to_string(),
+                    generation: 1,
+                    items: 0,
+                    bytes: frame_bytes(&large) - frame_bytes(&small),
+                }]
+            );
+        }
+
+        /// Plan test 9: credit returns when its INPUT_CREDIT is taken for the
+        /// socket, not when Core consumes the frame.
+        #[test]
+        fn input_credit_is_the_window_minus_frames_not_yet_returned() {
+            let route = credited_route(true);
+            let window = 4;
+            for _ in 0..window {
+                assert!(route.handle.reserve_input_credit(window));
+            }
+            assert!(!route.handle.reserve_input_credit(window));
+            // Core consumed one; its INPUT_CREDIT is not yet taken.
+            route
+                .handle
+                .inner
+                .lock_credit()
+                .expect("credit")
+                .input_credit += 1;
+            assert!(
+                !route.handle.reserve_input_credit(window),
+                "free ingress room is not issued credit"
+            );
+            let taken = route.mux.take_credit_frames();
+            assert_eq!(
+                taken,
+                vec![DaemonUnixCreditFrame::InputCredit {
+                    route: "sub".to_string(),
+                    generation: 1,
+                    items: 1,
+                }]
+            );
+            assert!(route.handle.reserve_input_credit(window));
+            assert!(!route.handle.reserve_input_credit(window));
         }
 
         /// Plan test 5: Core drops a head that a grant covered, and the pool
@@ -1146,6 +1259,8 @@ mod tests {
             let mut route = credited_route(true);
             let frame = output_frame("sub", "written");
             let bytes = frame_bytes(&frame);
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
             route.handle.grant(1, bytes);
             assert_eq!(route.adapter.try_write(&frame), Ok(()));
             route.handle.record_written(frame.frame.len());
@@ -1222,6 +1337,8 @@ mod tests {
         fn an_accepted_frame_dropped_at_close_is_not_spent() {
             let mut route = credited_route(true);
             let frame = output_frame("sub", "dropped");
+            assert!(route.adapter.try_write(&frame).is_err());
+            let _ = route.mux.take_credit_frames();
             route.handle.grant(1, frame_bytes(&frame));
             assert_eq!(route.adapter.try_write(&frame), Ok(()));
             route.handle.close();
@@ -1266,6 +1383,18 @@ mod tests {
         fn connection_loss_sends_no_closed() {
             let route = credited_route(true);
             route.mux.close_all();
+            route.mux.queue_closed_subscription_events(|_| true);
+            assert!(route.mux.pop_pending_close().is_none());
+        }
+
+        /// `close_all` stores `dying` before it takes the routes lock, so a
+        /// classification can hold the lock in between and see `dying` with
+        /// the closed route still present. The connection is gone: no CLOSED.
+        #[test]
+        fn a_classification_between_dying_and_the_route_drain_sends_no_closed() {
+            let route = credited_route(true);
+            route.handle.close();
+            route.mux.inner.dying.store(true, Ordering::SeqCst);
             route.mux.queue_closed_subscription_events(|_| true);
             assert!(route.mux.pop_pending_close().is_none());
         }

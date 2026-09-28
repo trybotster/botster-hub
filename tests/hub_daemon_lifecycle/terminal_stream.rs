@@ -144,6 +144,10 @@ impl RawUnixClient {
         let grants = match &frame {
             DaemonUnixMuxFrame::Credit(credit) => self.credit.on_hub_frame(credit),
             DaemonUnixMuxFrame::Terminal(terminal) => self.credit.consumed(terminal.body.len()),
+            DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. }) => {
+                self.credit.on_response(response);
+                Vec::new()
+            }
             DaemonUnixMuxFrame::Server(_) => Vec::new(),
         };
         for grant in grants {

@@ -27,6 +27,9 @@ pub(crate) struct GrantOutcome {
     pub(crate) wake: bool,
     /// The pool still does not cover the recorded need: demand the shortfall.
     pub(crate) demand: Option<u64>,
+    /// The grant answers no recorded need (Core withdrew the head first), so
+    /// the client gets it straight back.
+    pub(crate) refund: Option<CreditReturn>,
 }
 
 /// Credit given back to the client in a `RETURN`.
@@ -47,6 +50,10 @@ pub(crate) struct RouteCredit {
     /// armed while it is set.
     need: Option<u64>,
     demand_outstanding: bool,
+    /// A test route holding a grant far above what its writes debit keeps
+    /// that surplus instead of returning it at commit.
+    #[cfg(test)]
+    keep_surplus: bool,
 }
 
 impl RouteCredit {
@@ -80,11 +87,37 @@ impl RouteCredit {
     /// Debit an accepted frame of `bytes` from the pool. Call only after
     /// [`Self::check`] returned [`CreditCheck::Covered`] and the slot accepted
     /// the frame.
-    pub(crate) fn commit(&mut self, bytes: u64) {
+    ///
+    /// Returns the credit left over after the debit. A grant answers one
+    /// demand for one head frame, so a remainder exists only when Core
+    /// replaced the head with a smaller frame; nothing may keep it, or an
+    /// idle route would hold budget a sibling needs.
+    pub(crate) fn commit(&mut self, bytes: u64) -> Option<CreditReturn> {
         debug_assert!(self.covers(bytes), "commit only a covered frame");
         self.pool_items -= 1;
         self.pool_bytes -= bytes;
         self.need = None;
+        self.take_surplus()
+    }
+
+    /// The pool back to the client, unless a test route keeps it.
+    fn take_surplus(&mut self) -> Option<CreditReturn> {
+        #[cfg(test)]
+        if self.keep_surplus {
+            return None;
+        }
+        // The client budgets bytes, not items, so a leftover item with no
+        // bytes goes unreported.
+        if self.pool_bytes == 0 {
+            self.pool_items = 0;
+            return None;
+        }
+        self.take_pool()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_surplus_for_test(&mut self) {
+        self.keep_surplus = true;
     }
 
     /// Count a frame of `bytes` that is fully on the socket. Spend counts
@@ -100,8 +133,9 @@ impl RouteCredit {
     /// covers the recorded need, the wake is raised once and disarmed; when
     /// it still does not, the shortfall is demanded again.
     pub(crate) fn grant(&mut self, items: u32, bytes: u64) -> GrantOutcome {
-        self.pool_items += u64::from(items);
-        self.pool_bytes += bytes;
+        // A client can send any legal grant; saturate, never wrap or panic.
+        self.pool_items = self.pool_items.saturating_add(u64::from(items));
+        self.pool_bytes = self.pool_bytes.saturating_add(bytes);
         self.demand_outstanding = false;
         match self.need {
             Some(need) if self.covers(need) => {
@@ -109,15 +143,18 @@ impl RouteCredit {
                 GrantOutcome {
                     wake: true,
                     demand: None,
+                    refund: None,
                 }
             }
             Some(need) => GrantOutcome {
                 wake: false,
                 demand: self.next_demand(need),
+                refund: None,
             },
             None => GrantOutcome {
                 wake: false,
                 demand: None,
+                refund: self.take_surplus(),
             },
         }
     }
@@ -173,7 +210,8 @@ mod tests {
             credit.grant(1, 100),
             GrantOutcome {
                 wake: true,
-                demand: None
+                demand: None,
+                refund: None
             }
         );
         assert_eq!(credit.check(100), CreditCheck::Covered);
@@ -192,14 +230,16 @@ mod tests {
             credit.grant(1, 40),
             GrantOutcome {
                 wake: false,
-                demand: Some(60)
+                demand: Some(60),
+                refund: None
             }
         );
         assert_eq!(
             credit.grant(1, 60),
             GrantOutcome {
                 wake: true,
-                demand: None
+                demand: None,
+                refund: None
             }
         );
     }
@@ -216,15 +256,49 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_with_no_recorded_need_raises_nothing() {
+    fn a_grant_with_no_recorded_need_raises_nothing_and_is_refunded() {
         let mut credit = RouteCredit::default();
         assert_eq!(
             credit.grant(1, 10),
             GrantOutcome {
                 wake: false,
-                demand: None
+                demand: None,
+                refund: Some(CreditReturn {
+                    items: 1,
+                    bytes: 10
+                })
             }
         );
+        assert_eq!(credit.pool(), (0, 0));
+    }
+
+    /// Two legal grants that sum past u64 saturate; they neither panic nor wrap.
+    #[test]
+    fn grants_past_the_counter_range_saturate() {
+        let mut credit = RouteCredit::default();
+        assert!(matches!(credit.check(10), CreditCheck::Short { .. }));
+        credit.grant(u32::MAX, u64::MAX);
+        assert_eq!(credit.pool().1, u64::MAX);
+        let refund = credit.grant(u32::MAX, 1).refund.expect("no need: refund");
+        assert_eq!(refund.bytes, u64::MAX);
+    }
+
+    /// A grant sized for a head Core replaced with a smaller frame leaves a
+    /// remainder; commit gives it back so an idle route holds nothing.
+    #[test]
+    fn commit_returns_the_remainder_of_an_oversized_grant() {
+        let mut credit = RouteCredit::default();
+        assert!(matches!(credit.check(100), CreditCheck::Short { .. }));
+        assert!(matches!(credit.check(30), CreditCheck::Short { .. }));
+        credit.grant(1, 100);
+        assert_eq!(
+            credit.commit(30),
+            Some(CreditReturn {
+                items: 0,
+                bytes: 70
+            })
+        );
+        assert_eq!(credit.pool(), (0, 0));
     }
 
     #[test]
