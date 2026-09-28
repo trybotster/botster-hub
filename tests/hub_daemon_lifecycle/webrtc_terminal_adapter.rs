@@ -1359,7 +1359,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_12() {
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 12);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
-        52
+        53
     );
     const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }

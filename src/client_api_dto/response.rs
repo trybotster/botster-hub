@@ -342,6 +342,7 @@ pub(crate) fn daemon_plugin_logs(
         next_seq,
         first_available_seq,
         mut charge,
+        log_id,
     } = page;
     if let Some(charge) = charge.as_mut() {
         let levels: usize = records
@@ -350,7 +351,8 @@ pub(crate) fn daemon_plugin_logs(
             .sum();
         let reply_records =
             records.len() * std::mem::size_of::<botster_hub_client::DaemonPluginLogRecord>();
-        charge.grow(reply_records + levels).ok()?;
+        let id = log_id.map_or(0, crate::plugin_logs::LogId::text_len);
+        charge.grow(reply_records + levels + id).ok()?;
     }
     let mut response = daemon_response_base(DaemonResponseKind::PluginLogs);
     response.plugin_logs = Some(botster_hub_client::DaemonPluginLogs {
@@ -369,6 +371,7 @@ pub(crate) fn daemon_plugin_logs(
             .collect(),
         next_seq,
         first_available_seq,
+        log_id: log_id.map(|id| id.to_string()),
     });
     Some((response, charge))
 }
