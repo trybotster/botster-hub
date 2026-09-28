@@ -1458,6 +1458,20 @@ fn operator_session_types(args: Vec<String>) -> Result<(), OperatorError> {
             )?;
             print_daemon_response(response)?;
         }
+        "restart" => {
+            if args.len() != 5 || args.get(3).map(String::as_str) != Some("--session-id") {
+                return Err(OperatorError::Usage("session-types restart"));
+            }
+            let options = DataArgs::parse(args[1..3].to_vec(), "session-types restart")?;
+            let config = explicit_config(options.data_directory)?;
+            let response = daemon_transport_request(
+                &config,
+                DaemonRequest::RestartSession {
+                    session_id: args[4].clone(),
+                },
+            )?;
+            print_daemon_response(response)?;
+        }
         "create" | "update" => {
             let options = DataArgs::parse(args[1..].to_vec(), "session-types mutation")?;
             let (source, definition_json) =
@@ -4717,6 +4731,9 @@ Packages:
         }
         "session-types spawn" => {
             "usage: botster-hub session-types spawn [--data-dir <path>] <session-type-id> --session-id <id> [--target-id <id>] [--cwd <path>] [--env NAME=value] [--prompt <text>] [--branch <name>] [--ticket-id <id>] [--workspace-id <id>]"
+        }
+        "session-types restart" => {
+            "usage: botster-hub session-types restart [--data-dir <path>] --session-id <id>"
         }
         "spawn-targets" | "spawn-targets list" => {
             "usage: botster-hub spawn-targets list [--data-dir <path>]"

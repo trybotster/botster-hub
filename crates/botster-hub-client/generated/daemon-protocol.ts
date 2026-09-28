@@ -172,6 +172,7 @@ export type DaemonRequest =
   | { type: "delete_session_type"; source: DaemonSessionTypeMutationSource; session_type_id: string }
   | { type: "resolve_session_type"; session_type_id: string; request: DaemonSessionTypeRequest }
   | { type: "spawn_session_type"; session_type_id: string; session_id: string; request: DaemonSessionTypeRequest }
+  | { type: "restart_session"; session_id: string }
   | { type: "read_session_context"; session_id: string; context_id?: string | null; key?: string | null }
   | { type: "list_spawn_targets" }
   | { type: "show_spawn_target"; target_id: string }

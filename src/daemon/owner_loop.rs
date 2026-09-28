@@ -2554,6 +2554,7 @@ pub(crate) fn should_mark_pump_after_control(request: &DaemonRequest, succeeded:
     match request {
         DaemonRequest::Spawn { .. }
         | DaemonRequest::SpawnSessionType { .. }
+        | DaemonRequest::RestartSession { .. }
         | DaemonRequest::Attach { .. } => succeeded,
         DaemonRequest::Detach { .. }
         | DaemonRequest::ShutdownSession { .. }
