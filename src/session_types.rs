@@ -5448,6 +5448,28 @@ mod source_selection_tests {
         MaterializedSessionType,
         Result<ChargedSessionTypeMaterialization, &'static str>,
     ) {
+        let (memory, ordinary, charged, _) = charged_final_fixture_for(
+            "charged-explicit",
+            per_callback_bytes,
+            inherited_names,
+            entropy,
+        );
+        (memory, ordinary, charged)
+    }
+
+    /// The fixture for one session ID. The last value is the charged usage
+    /// just before the final materialization's single output grow.
+    fn charged_final_fixture_for(
+        session_id: &str,
+        per_callback_bytes: usize,
+        inherited_names: &[String],
+        entropy: crate::session_credential::Entropy,
+    ) -> (
+        std::sync::Arc<LuaMemoryAccount>,
+        MaterializedSessionType,
+        Result<ChargedSessionTypeMaterialization, &'static str>,
+        usize,
+    ) {
         let config = HubStartupOptions {
             data_directory: DataDirectoryOption::Explicit(
                 std::env::temp_dir().join("charged-final-output-parity"),
@@ -5469,7 +5491,7 @@ mod source_selection_tests {
             .allowed_environment_overrides
             .push("BOTSTER_SESSION_ID".into());
         let request = SessionTypeRequest {
-            session_id: Some(SessionId("charged-explicit".into())),
+            session_id: Some(SessionId(session_id.into())),
             environment: BTreeMap::from([("BOTSTER_SESSION_ID".into(), "request-value".into())]),
             ..SessionTypeRequest::default()
         };
@@ -5520,6 +5542,7 @@ mod source_selection_tests {
         let environment_injection =
             charged_inject_context_environment(&mut parent, &mut environment, &prefix, paths)
                 .unwrap();
+        let usage_before_grow = memory.usage().1;
         let charged = charged_final_materialization(FinalMaterializationInputs {
             parent,
             row_storage,
@@ -5536,7 +5559,7 @@ mod source_selection_tests {
             inherited_names,
             entropy,
         });
-        (memory, ordinary, charged)
+        (memory, ordinary, charged, usage_before_grow)
     }
 
     #[test]
@@ -5652,6 +5675,36 @@ mod source_selection_tests {
         );
         assert_eq!(refused.err(), Some("output copy capacity exhausted"));
         assert_eq!(short_memory.usage().1, 0);
+    }
+
+    /// The output grow must include the credential. The expected charge here
+    /// does not use `charged_credential_bytes`: lengthening the session ID
+    /// by `extra` bytes lengthens every retained copy of it. The copies in
+    /// the output grow are: the session ID; the context ID (`ctx-<id>`); the
+    /// request ID (`session-type-ctx-<id>`); the injected BOTSTER_SESSION_ID
+    /// and BOTSTER_CONTEXT_ID values; and the credential's token
+    /// (`<id>.<secret>`). Six in all; without the credential, five.
+    #[test]
+    fn charged_output_grow_includes_the_credential() {
+        const COPIES_OF_THE_ID_IN_THE_GROW: usize = 6;
+        let short = "charged-explicit";
+        let long = "charged-explicit-with-a-longer-session-id";
+        let extra = long.len() - short.len();
+        let grow_for = |id: &str| {
+            let (memory, _, charged, before) = charged_final_fixture_for(
+                id,
+                64 * 1024,
+                &[],
+                crate::session_credential::test_entropy::fixed,
+            );
+            let usage = memory.usage().1;
+            drop(charged.unwrap());
+            usage - before
+        };
+        assert_eq!(
+            grow_for(long) - grow_for(short),
+            COPIES_OF_THE_ID_IN_THE_GROW * extra
+        );
     }
 
     #[test]
