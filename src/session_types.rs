@@ -4380,6 +4380,7 @@ pub fn raw_session_environment(config: &HubConfig, session_id: &SessionId) -> Sp
             .into_iter()
             .map(|(name, value)| SpawnEnvironmentVariable { name, value })
             .collect(),
+        unset: Vec::new(),
     }
 }
 
