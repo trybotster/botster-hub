@@ -336,6 +336,8 @@ fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
             ("BOTSTER_SESSION_UUID", "leaked-session-uuid"),
             ("BOTSTER_CONTEXT_ID", "leaked-context"),
             ("BOTSTER_MCP_TOKEN", "leaked-token"),
+            // A credential under a name the test does not check one by one.
+            ("BOTSTER_SYNTHETIC_SECRET", "leaked-synthetic-secret-3f9c1a"),
         ],
     );
     let print_environment = "env | grep '^BOTSTER_' | sort";
@@ -397,32 +399,38 @@ fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
     );
     let typed = botster_environment(&read_fifo_to_end(&typed_fifo));
 
+    // Failure messages name variables only; a value could be a credential.
     for (session_id, environment) in [("leak-raw", &raw), ("leak-typed", &typed)] {
-        assert_eq!(
-            environment.get("BOTSTER_SESSION_ID").map(String::as_str),
-            Some(session_id),
-            "{session_id}: {environment:?}"
+        assert!(
+            environment.get("BOTSTER_SESSION_ID").map(String::as_str) == Some(session_id),
+            "{session_id}: BOTSTER_SESSION_ID is not its own session id"
         );
-        for (name, value) in environment {
-            assert!(
-                !value.starts_with("leaked-"),
-                "{session_id} inherited {name}={value}: {environment:?}"
-            );
-        }
-        for name in ["BOTSTER_SESSION_UUID", "BOTSTER_MCP_TOKEN"] {
+        let inherited = environment
+            .iter()
+            .filter(|(_, value)| value.starts_with("leaked-"))
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            inherited.is_empty(),
+            "{session_id} inherited the launcher's value of {inherited:?}"
+        );
+        for name in ["BOTSTER_SESSION_UUID", "BOTSTER_MCP_TOKEN", "BOTSTER_SYNTHETIC_SECRET"] {
             assert!(
                 !environment.contains_key(name),
-                "{session_id} inherited {name}: {environment:?}"
+                "{session_id} inherited {name}"
             );
         }
     }
     // A raw spawn has no context record, so no context id at all.
-    assert!(!raw.contains_key("BOTSTER_CONTEXT_ID"), "{raw:?}");
+    assert!(
+        !raw.contains_key("BOTSTER_CONTEXT_ID"),
+        "leak-raw has a BOTSTER_CONTEXT_ID"
+    );
     assert!(
         typed
             .get("BOTSTER_CONTEXT_ID")
-            .is_some_and(|context| context != "leaked-context"),
-        "{typed:?}"
+            .is_some_and(|context| !context.starts_with("leaked-")),
+        "leak-typed lacks its own BOTSTER_CONTEXT_ID"
     );
 
     for session_id in ["leak-raw", "leak-typed"] {

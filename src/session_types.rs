@@ -539,6 +539,9 @@ pub(crate) struct StartupMaterializationPaths {
     session_directory: String,
     hub_socket: String,
     hub_bin: Option<String>,
+    /// Inherited Botster names, captured once. A charged spawn copies them
+    /// only after its charge admits the copy.
+    inherited_names: std::sync::Arc<[String]>,
 }
 
 impl StartupMaterializationPaths {
@@ -568,6 +571,7 @@ impl StartupMaterializationPaths {
             session_directory: session_directory.display().to_string(),
             hub_socket,
             hub_bin,
+            inherited_names: inherited_botster_names().into(),
         }
     }
 }
@@ -584,6 +588,8 @@ struct ChargedMaterializationConfig {
     session_directory_text: String,
     hub_socket_text: String,
     hub_bin_text: Option<String>,
+    /// Shared with the startup capture; cloning the Arc allocates nothing.
+    inherited_names: std::sync::Arc<[String]>,
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
@@ -639,6 +645,7 @@ impl ChargedMaterializationConfig {
             session_directory_text,
             hub_socket_text,
             hub_bin_text,
+            inherited_names: std::sync::Arc::clone(&startup_paths.inherited_names),
             _storage: storage,
         })
     }
@@ -2017,6 +2024,7 @@ fn materialize_ordinary_charged(
         context,
         initial_rows: config.initial_rows,
         initial_cols: config.initial_cols,
+        inherited_names: &config.inherited_names,
     })
     .map_err(ChargedMaterializationFailure::Capacity);
     drop(sources);
@@ -3631,7 +3639,7 @@ fn charged_context(
 /// Every copy is admitted while all source and output payloads remain live.
 /// The charges and parts of one final materialization, in the original
 /// argument order; the charges keep that order so they drop as before.
-struct FinalMaterializationInputs {
+struct FinalMaterializationInputs<'a> {
     parent: crate::lua_memory::LuaCallbackCharge,
     row_storage: crate::lua_memory::LuaCallbackCharge,
     environment_storage: crate::lua_memory::LuaCallbackCharge,
@@ -3644,10 +3652,12 @@ struct FinalMaterializationInputs {
     context: ChargedSessionTypeContext,
     initial_rows: u16,
     initial_cols: u16,
+    /// Inherited names to unset. Production passes the daemon's snapshot.
+    inherited_names: &'a [String],
 }
 
 fn charged_final_materialization(
-    inputs: FinalMaterializationInputs,
+    inputs: FinalMaterializationInputs<'_>,
 ) -> Result<ChargedSessionTypeMaterialization, &'static str> {
     let FinalMaterializationInputs {
         mut parent,
@@ -3662,6 +3672,7 @@ fn charged_final_materialization(
         context,
         initial_rows,
         initial_cols,
+        inherited_names,
     } = inputs;
     let mut cwd_count = CountFormattedBytes(0);
     std::fmt::write(
@@ -3685,14 +3696,9 @@ fn charged_final_materialization(
             bytes.checked_add(key.len())?.checked_add(value.len())
         })
         .ok_or("output environment size overflow")?;
-    let unset = inherited_botster_names();
-    let unset_bytes = unset
-        .iter()
-        .try_fold(0usize, |bytes, name| bytes.checked_add(name.len()))
-        .and_then(|bytes| {
-            bytes.checked_add(unset.len().checked_mul(std::mem::size_of::<String>())?)
-        })
-        .ok_or("output unset size overflow")?;
+    // The names are copied only after the grow below admits them: the vector
+    // holds exactly n Strings, and each clone keeps capacity == len.
+    let unset_bytes = charged_unset_bytes(inherited_names).ok_or("output unset size overflow")?;
     let environment_nodes =
         crate::lua_memory::layout::btree_nodes_checked::<String, String>(environment.len())
             .ok_or("output environment node overflow")?;
@@ -3790,7 +3796,10 @@ fn charged_final_materialization(
         working_directory: SpawnWorkingDirectory {
             path: resolved.working_directory.clone(),
         },
-        environment: SpawnEnvironment { variables, unset },
+        environment: SpawnEnvironment {
+            variables,
+            unset: charged_unset_copy(inherited_names),
+        },
         initial_pty_size: Some(ResizePayload {
             rows: initial_rows,
             cols: initial_cols,
@@ -4393,6 +4402,22 @@ fn session_spawn_environment(variables: BTreeMap<String, String>) -> SpawnEnviro
 /// strings, so a name that is not UTF-8 cannot be removed and is skipped.
 fn inherited_botster_names() -> Vec<String> {
     botster_names(std::env::vars_os())
+}
+
+/// Retained bytes of a copy of `names`: n String slots, plus each clone's
+/// capacity, which equals its length.
+fn charged_unset_bytes(names: &[String]) -> Option<usize> {
+    names
+        .iter()
+        .try_fold(0usize, |bytes, name| bytes.checked_add(name.len()))?
+        .checked_add(names.len().checked_mul(std::mem::size_of::<String>())?)
+}
+
+/// The admitted copy whose size `charged_unset_bytes` counted.
+fn charged_unset_copy(names: &[String]) -> Vec<String> {
+    let mut unset = Vec::with_capacity(names.len());
+    unset.extend(names.iter().cloned());
+    unset
 }
 
 fn botster_names(
@@ -5362,8 +5387,16 @@ mod source_selection_tests {
         assert_eq!(memory.usage().1, 0);
     }
 
-    #[test]
-    fn charged_final_output_matches_ordinary_and_releases_allowance() {
+    /// The whole charged pipeline for one session type, ending in the final
+    /// materialization with `inherited_names`, beside the ordinary result.
+    fn charged_final_fixture(
+        per_callback_bytes: usize,
+        inherited_names: &[String],
+    ) -> (
+        std::sync::Arc<LuaMemoryAccount>,
+        MaterializedSessionType,
+        Result<ChargedSessionTypeMaterialization, &'static str>,
+    ) {
         let config = HubStartupOptions {
             data_directory: DataDirectoryOption::Explicit(
                 std::env::temp_dir().join("charged-final-output-parity"),
@@ -5375,8 +5408,8 @@ mod source_selection_tests {
         let memory = LuaMemoryAccount::new(LuaMemoryLimits {
             per_vm_bytes: 1,
             total_vm_bytes: 1,
-            per_callback_bytes: 64 * 1024,
-            total_callback_bytes: 64 * 1024,
+            per_callback_bytes,
+            total_callback_bytes: per_callback_bytes,
         })
         .unwrap();
         let mut source = source(SessionTypeSourceRank::Device, "final-output");
@@ -5449,14 +5482,18 @@ mod source_selection_tests {
             context,
             initial_rows: config.session_defaults.initial_rows,
             initial_cols: config.session_defaults.initial_cols,
-        })
-        .unwrap();
-        let (materialized, allowance) = charged.into_parts();
+            inherited_names,
+        });
+        (memory, ordinary, charged)
+    }
+
+    #[test]
+    fn charged_final_output_matches_ordinary_and_releases_allowance() {
+        let inherited = inherited_botster_names();
+        let (memory, ordinary, charged) = charged_final_fixture(64 * 1024, &inherited);
+        let (materialized, allowance) = charged.unwrap().into_parts();
         assert_eq!(materialized, ordinary);
-        assert_eq!(
-            materialized.spawn_request.environment.unset,
-            inherited_botster_names()
-        );
+        assert_eq!(materialized.spawn_request.environment.unset, inherited);
         assert_eq!(
             materialized.resolved.environment["BOTSTER_SESSION_ID"],
             "charged-explicit"
@@ -5464,6 +5501,39 @@ mod source_selection_tests {
         drop(materialized);
         drop(allowance);
         assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_unset_copy_is_charged_at_its_retained_size() {
+        let names = vec![
+            "BOTSTER_SYNTHETIC_ONE".to_string(),
+            "BOTSTER_SYNTHETIC_TWO_LONGER_NAME".to_string(),
+        ];
+        let (without_memory, _, without) = charged_final_fixture(64 * 1024, &[]);
+        let (with_memory, _, with) = charged_final_fixture(64 * 1024, &names);
+        let without = without.unwrap();
+        let with = with.unwrap();
+        let unset = &with.materialized.spawn_request.environment.unset;
+        assert_eq!(unset, &names);
+        // The copy retains exactly what was charged: n slots and len bytes each.
+        assert_eq!(unset.capacity(), names.len());
+        assert!(unset.iter().all(|name| name.capacity() == name.len()));
+        assert_eq!(
+            with_memory.usage().1 - without_memory.usage().1,
+            charged_unset_bytes(&names).unwrap()
+        );
+        drop((without, with));
+        assert_eq!(without_memory.usage().1, 0);
+        assert_eq!(with_memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_unset_names_beyond_the_allowance_are_refused_before_copying() {
+        // One inherited name larger than the whole callback allowance.
+        let names = vec![format!("BOTSTER_{}", "X".repeat(80 * 1024))];
+        let (memory, _, refused) = charged_final_fixture(64 * 1024, &names);
+        assert_eq!(refused.err(), Some("output copy capacity exhausted"));
+        assert_eq!(memory.usage().1, 0, "a refused copy leaves no charge");
     }
 
     #[test]
