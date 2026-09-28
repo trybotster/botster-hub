@@ -131,6 +131,59 @@ fn push_intent(
 }
 
 #[test]
+fn schema_five_migrates_to_six_with_no_restart_records() {
+    let fixture = Fixture::new();
+    let mut value = serde_json::to_value(HubState::from_config(&fixture.config)).unwrap();
+    value["schema_version"] = 5.into();
+    value.as_object_mut().unwrap().remove("restart_records");
+    fixture.replace_initialized_document(&serde_json::to_vec(&value).unwrap());
+    let loaded = fixture.state();
+    assert_eq!(loaded.schema_version, 6);
+    assert!(loaded.restart_records.is_empty());
+}
+
+#[test]
+fn a_schema_five_document_carrying_restart_records_is_refused() {
+    let fixture = Fixture::new();
+    let mut state = HubState::from_config(&fixture.config);
+    state
+        .restart_records
+        .insert("s1".to_string(), restart_record("claude"));
+    let mut value = serde_json::to_value(state).unwrap();
+    value["schema_version"] = 5.into();
+    fixture.reject_both_load_paths(
+        &serde_json::to_vec(&value).unwrap(),
+        HubStateError::UnsupportedVersion(5),
+    );
+}
+
+#[test]
+fn a_restart_record_survives_a_save_and_a_reload() {
+    let fixture = Fixture::new();
+    let (prior, authority) = fixture.retained_view();
+    let mut next = (*prior).clone();
+    next.restart_records
+        .insert("s1".to_string(), restart_record("claude"));
+    fixture
+        .store
+        .save_retained_startup_state(&authority, 0, Some(prior), next.clone())
+        .expect("save the restart record");
+    drop(authority);
+    let (reloaded, _authority) = fixture.store.load_retained(&fixture.config).unwrap();
+    assert_eq!(reloaded.restart_records, next.restart_records);
+}
+
+fn restart_record(session_type_id: &str) -> crate::restart_records::RestartRecord {
+    crate::restart_records::RestartRecord::from_request(
+        session_type_id,
+        &crate::session_types::SessionTypeRequest {
+            target_id: Some("target-1".to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
 fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     let fixture = Fixture::new();
     let mut value = serde_json::to_value(HubState::from_config(&fixture.config)).unwrap();
@@ -140,8 +193,9 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     let bytes = serde_json::to_vec(&value).unwrap();
     fixture.replace_initialized_document(&bytes);
     let loaded = fixture.state();
-    // Schema 3 migrates to the current schema, 5 (durable package quarantine).
-    assert_eq!(loaded.schema_version, 5);
+    // Schema 3 migrates to the current schema, 6 (session restart records).
+    assert_eq!(loaded.schema_version, 6);
+    assert!(loaded.restart_records.is_empty());
     assert_eq!(loaded.session_type_generation, 71);
     assert_eq!(loaded.recovery, RecoveryLedger::default());
     let (prior, authority) = fixture.retained_view();
