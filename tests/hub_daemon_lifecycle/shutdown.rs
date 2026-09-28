@@ -373,6 +373,16 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     )
     .expect("write receipt");
     let child = start_cli_daemon_with_home(&data_dir, &home);
+    // Launch the CLI once before the timed window. On macOS the first launch
+    // of this large debug binary from a process can stall in dyld for
+    // seconds (sampled: the shutdown CLI sat in _dyld_start), which alone
+    // outlasts the 3 s release-check deadline and the 5 s bound below. In a
+    // full run an earlier test has already paid it; alone, this test would.
+    let warm = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("help")
+        .output()
+        .expect("warm the botster-hub CLI launch");
+    assert!(warm.status.success(), "botster-hub help: {warm:?}");
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
     let update_endpoint = endpoint.clone();
     let (update_tx, update_rx) = mpsc::channel();
