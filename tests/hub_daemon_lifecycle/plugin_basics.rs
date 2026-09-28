@@ -353,6 +353,56 @@ return botster.register({
     daemon.shutdown();
 }
 
+/// Disabling and re-enabling a package starts a new log whose sequence
+/// restarts at 1; the page's `log_id` changes, so a reader holding a cursor
+/// into the old log knows to restart instead of skipping the new records.
+#[test]
+fn a_re_enabled_package_starts_a_new_log_with_a_new_log_id() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("logs-log-id");
+    let package_dir = unique_test_dir("logs-log-id-package");
+    write_versioned_package_with(
+        &package_dir,
+        "logs.identity",
+        "1.0.0",
+        "botster.log.info({ message = 'loaded' })",
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        UnixRouteClient::connect(&socket_endpoint(&data_dir)).expect("external connect");
+    let mut decide = |request: botster_hub_client::DaemonRequest| {
+        let response = connection.request(&request).expect("package decision");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::PackageDecision,
+            "{response:?}"
+        );
+    };
+    decide(botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+        path: package_dir.clone(),
+    });
+    let first = read_plugin_logs(&data_dir, "logs.identity");
+    let first_id = first.log_id.clone().expect("a log has an id");
+    assert_eq!(first.records.last().map(|record| record.seq), Some(1));
+    decide(botster_hub_client::DaemonRequest::DisablePackage {
+        package_name: "logs.identity".to_string(),
+    });
+    let disabled = read_plugin_logs(&data_dir, "logs.identity");
+    assert!(disabled.log_id.is_none() && disabled.records.is_empty(), "{disabled:?}");
+    decide(botster_hub_client::DaemonRequest::EnablePackage {
+        package_name: "logs.identity".to_string(),
+    });
+    let second = read_plugin_logs(&data_dir, "logs.identity");
+    assert_eq!(second.records.last().map(|record| record.seq), Some(1), "{second:?}");
+    assert_ne!(
+        second.log_id.as_deref(),
+        Some(first_id.as_str()),
+        "the new log announces itself with a new log_id"
+    );
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
 /// A first load whose entrypoint logs and then fails leaves no records.
 #[test]
 fn a_failed_first_load_removes_the_records_its_entrypoint_wrote() {

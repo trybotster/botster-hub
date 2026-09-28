@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 52.
+- conformance fixture revision 53.
 
 Conformance fixture revision 51 changes the plugin contract matrix fixture: it
 reads the result shape of `botster.capabilities.config.get()`
@@ -1229,7 +1229,17 @@ the plugin through `botster.log.{debug,info,warn,error}`.
 ```
 
 The response kind is `plugin_logs`, with `plugin_logs = { package_name,
-records, next_seq, first_available_seq }`. Each record has:
+records, next_seq, first_available_seq, log_id }`.
+
+`log_id` (conformance revision 53) is an opaque string that identifies one
+incarnation of the package's log. It is absent when the package has no log.
+A log continues, with the same `log_id` and rising `seq`, across reloads,
+including failed ones. It is created again, with a new `log_id` and `seq`
+restarting at 1, when the package loads after an unload or disable, after a
+failed first load, and after a Hub restart. A `log_id` never repeats, even
+across restarts. The client rule is exact: if a page's `log_id` differs from
+the `log_id` your cursor belongs to, discard the cursor and read again from
+`after_seq` 0. Compare `log_id` values only for equality; do not parse them. Each record has:
 - `seq`;
 - `generation`: the plugin load (VM) that wrote it, so records from different
   loads of one package are distinguishable;
@@ -1718,7 +1728,8 @@ host `Drain` JSON request.
 
 ## Host-control protocol 12
 
-`PROTOCOL_VERSION` is 12 and `CONFORMANCE_FIXTURE_REVISION` is 52. This is a
+`PROTOCOL_VERSION` is 12. It arrived at `CONFORMANCE_FIXTURE_REVISION` 52;
+revision 53 adds the optional plugin logs `log_id` (below). Protocol 12 is a
 cold cut: a protocol-11 client fails closed at `ensure_compatible()`, with no
 negotiation and no fallback path. Protocol 12 adds:
 - the `ReadPluginLogs` request and its `PluginLogs` response (see "Plugin
