@@ -1129,23 +1129,31 @@ impl HubRuntime {
     /// sender releases the data plane.
     #[cfg(test)]
     pub(crate) fn test_fill_core_request_queue(&self) -> std::sync::mpsc::Sender<()> {
-        use crate::owner_identity::WaiterId;
+        // Waiter ids from the top of the range, never reused by a later fill,
+        // stay clear of the owner's own ids.
+        static NEXT_FILL_WAITER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        let fill_waiter = || {
+            crate::owner_identity::WaiterId(
+                NEXT_FILL_WAITER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        };
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        let _blocker =
-            self.core_daemon
-                .submit_for_owner(WaiterId(u64::MAX - 1), move |_: &mut _| {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx.recv();
-                });
+        let _blocker = self
+            .core_daemon
+            .submit_for_owner(fill_waiter(), move |_: &mut _| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
         // timer: deadline — the shared test hang guard; the data plane enters at once
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the data plane runs the blocking operation");
-        for index in 0..=crate::data_plane::driver::CORE_REQUEST_CAPACITY as u64 {
+        for _ in 0..=crate::data_plane::driver::CORE_REQUEST_CAPACITY {
             let ticket: crate::CoreTicket<()> = self
                 .core_daemon
-                .submit_for_owner(WaiterId(u64::MAX - 2 - index), |_: &mut _| {});
+                .submit_for_owner(fill_waiter(), |_: &mut _| {});
             if ticket.refused_wait().is_some() {
                 return release_tx;
             }
