@@ -56,18 +56,7 @@ impl RouteCloseState {
             &self.key.subscription_id,
             self.key.generation,
         ) {
-            // A suppressed route sends no close event, but its credit still
-            // settles (S13); the adapter settles each generation once.
-            if !self.reported.swap(true, Ordering::SeqCst)
-                && self.ledger.report_route_end(
-                    None,
-                    &self.key.session_id,
-                    &self.key.subscription_id,
-                    self.key.generation,
-                )
-            {
-                (self.wake)();
-            }
+            self.settle_without_event();
             return;
         }
         if self.reported.swap(true, Ordering::SeqCst) {
@@ -92,6 +81,22 @@ impl RouteCloseState {
             self.key.generation,
         );
         (self.wake)();
+    }
+
+    /// A route end with no close event (suppressed, or its session ended)
+    /// still settles its credit (S13); the adapter settles each generation
+    /// once.
+    fn settle_without_event(&self) {
+        if !self.reported.swap(true, Ordering::SeqCst)
+            && self.ledger.report_route_end(
+                None,
+                &self.key.session_id,
+                &self.key.subscription_id,
+                self.key.generation,
+            )
+        {
+            (self.wake)();
+        }
     }
 }
 
@@ -306,7 +311,7 @@ impl RouteCloseState {
         if emit {
             self.enqueue_closed_event();
         } else {
-            self.reported.store(true, Ordering::SeqCst);
+            self.settle_without_event();
         }
     }
 }
@@ -314,6 +319,7 @@ impl RouteCloseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subscription::closed_events::ClosedLedgerItem;
 
     #[test]
     fn overflow_recovers_only_queued_non_retired_routes() {
@@ -420,6 +426,68 @@ mod tests {
             ledger.pop_pending_event().is_none(),
             "exact suppression must cover the direct close-work path"
         );
+    }
+
+    fn settlement(generation: u64) -> Option<ClosedLedgerItem> {
+        Some(ClosedLedgerItem::SettleCredit {
+            session_id: "session".into(),
+            subscription_id: "sub".into(),
+            generation,
+        })
+    }
+
+    /// S13: every route end on a settling ledger queues its credit
+    /// settlement after the close event, if any.
+    #[test]
+    fn a_settling_ledger_settles_every_direct_route_end() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let ledger = ClosedEventLedger::with_credit_settlement();
+
+        let hook = source.register(
+            "session".into(),
+            "sub".into(),
+            1,
+            ledger.clone(),
+            wake.clone(),
+        );
+        hook.notify_closed(CloseReport::default());
+        source
+            .take_batch(1)
+            .pop()
+            .expect("queued")
+            .report_if_live(true);
+        assert!(matches!(
+            ledger.pop_pending_item(),
+            Some(ClosedLedgerItem::Event(_))
+        ));
+        assert_eq!(ledger.pop_pending_item(), settlement(1));
+
+        let hook = source.register(
+            "session".into(),
+            "sub".into(),
+            2,
+            ledger.clone(),
+            wake.clone(),
+        );
+        ledger.suppress_generation("session", "sub", 2);
+        hook.notify_closed(CloseReport::default());
+        source
+            .take_batch(1)
+            .pop()
+            .expect("queued")
+            .report_if_live(true);
+        assert_eq!(ledger.pop_pending_item(), settlement(2), "suppressed");
+
+        let hook = source.register("session".into(), "sub".into(), 3, ledger.clone(), wake);
+        hook.notify_closed(CloseReport::default());
+        source
+            .take_batch(1)
+            .pop()
+            .expect("queued")
+            .report_if_live(false);
+        assert_eq!(ledger.pop_pending_item(), settlement(3), "session ended");
+        assert_eq!(ledger.pop_pending_item(), None);
     }
 
     #[test]
