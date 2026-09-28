@@ -291,6 +291,10 @@ name = "data_channel_stream_id_parity"
 path = "tests/data_channel_stream_id_parity.rs"
 
 [[test]]
+name = "data_channel_stream_id_reuse_rtc2rtc"
+path = "tests/data_channel_stream_id_reuse_rtc2rtc.rs"
+
+[[test]]
 name = "data_channels_close_by_rtc_interop"
 path = "tests/data_channels_close_by_rtc_interop.rs"
 
