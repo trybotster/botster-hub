@@ -27,6 +27,14 @@ use support::{
 };
 
 fn explicit_runtime(name: &str) -> HubRuntime {
+    let runtime = system_clock_runtime(name);
+    // Timer tests drain at explicit logical times that start at zero.
+    runtime.clock().make_logical(0, 0);
+    runtime
+}
+
+/// A Hub as production builds it: on the operating system's clocks.
+fn system_clock_runtime(name: &str) -> HubRuntime {
     let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     let config = HubStartupOptions {
         host: HostIdentityOptions {
@@ -1062,6 +1070,51 @@ fn hub_runtime_preserves_in_memory_websocket_stub() {
             .iter()
             .any(|event| matches!(event, CapabilityRuntimeEvent::Completed(_)))
     );
+}
+
+/// A timer is due `delay_ms` after the Hub clock's time at arming, not at
+/// `delay_ms` on the clock. Armed at 5000 with delay 1000, it is not due at
+/// 5999 and is due at 6000.
+#[test]
+fn a_timer_armed_after_the_clock_advanced_fires_a_delay_after_arming() {
+    let mut runtime = explicit_runtime("timer-relative");
+    let plugin_key = PluginKey("project-pipelines".to_string());
+    let clock = runtime.clock().clone();
+    assert_eq!(clock.advance(5_000), Some(5_000));
+    runtime
+        .submit_capability_request(request(
+            &plugin_key.0,
+            "relative",
+            CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 1_000 }),
+        ))
+        .expect("timer should submit");
+    let fired = |runtime: &mut HubRuntime, now_ms: u64| {
+        runtime
+            .drain_capability_events_at(&plugin_key, now_ms)
+            .expect("drain timer events")
+            .iter()
+            .any(|event| matches!(event, CapabilityRuntimeEvent::TimerFired(_)))
+    };
+    let now = clock.advance(999).expect("logical clock");
+    assert_eq!(now, 5_999);
+    assert!(!fired(&mut runtime, now), "not due 999 ms after arming");
+    let now = clock.advance(1).expect("logical clock");
+    assert!(fired(&mut runtime, now), "due 1000 ms after arming");
+}
+
+/// A Hub that no test switched reads the operating system's clocks, and its
+/// plugin VMs share that one clock.
+#[test]
+fn a_production_hub_reads_the_system_clock_and_shares_it_with_plugin_vms() {
+    let runtime = system_clock_runtime("clock-production");
+    assert!(!runtime.clock().is_logical());
+    assert!(
+        runtime
+            .lua_plugin_host_api()
+            .clock
+            .is_same_clock(runtime.clock())
+    );
+    assert_eq!(runtime.clock().advance(1), None);
 }
 
 #[test]
