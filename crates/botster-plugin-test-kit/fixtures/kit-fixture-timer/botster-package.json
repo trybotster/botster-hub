@@ -1,0 +1,13 @@
+{
+  "name": "kit-fixture-timer",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Plugin test kit fixture: arms a Hub timer and reads the Hub clock.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "mcp" },
+    { "surface": "timers", "scope": "callbacks" }
+  ],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+}
