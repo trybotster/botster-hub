@@ -70,12 +70,28 @@ impl LogId {
         }
     }
 
-    /// The length of `to_string()`: 32 hex digits, a dash, and the serial.
+    /// The formatted length: 32 hex digits, a dash, and the serial.
     pub(crate) fn text_len(self) -> usize {
         33 + self
             .serial
             .checked_ilog10()
             .map_or(1, |digits| digits as usize + 1)
+    }
+
+    /// Format the id into a string whose whole allocation `charge` funds.
+    /// The exact length is funded before the allocation, the string never
+    /// grows while it is written, and any rounding up by the allocator is
+    /// funded too. `None` when the account cannot fund it.
+    pub(crate) fn to_funded_string(self, charge: &mut LuaCallbackCharge) -> Option<String> {
+        use std::fmt::Write as _;
+        let len = self.text_len();
+        charge.grow(len).ok()?;
+        let mut text = String::with_capacity(len);
+        charge.grow(text.capacity() - len).ok()?;
+        let capacity = text.capacity();
+        write!(text, "{self}").expect("writing to a String cannot fail");
+        debug_assert_eq!((text.len(), text.capacity()), (len, capacity));
+        Some(text)
     }
 }
 
@@ -912,11 +928,14 @@ mod tests {
             crate::client_api_dto::response::daemon_plugin_logs("p".to_string(), page)
                 .expect("the account funds the reply");
         let logs = response.plugin_logs.as_ref().expect("a plugin_logs page");
-        assert_eq!(logs.log_id, Some(id.to_string()));
+        let text = logs.log_id.as_ref().expect("the reply carries the id");
+        assert_eq!(text, &id.to_string());
         // The reply grew the page's charge by its record vector, its level
-        // strings, and the id text; the id's share is exactly its length.
+        // strings, and the id text's whole allocation: its capacity, not
+        // just its length.
         let reply = size_of::<botster_hub_client::DaemonPluginLogRecord>() + "info".len();
-        assert_eq!(memory.usage().1, with_page + reply + id.text_len());
+        assert_eq!(memory.usage().1, with_page + reply + text.capacity());
+        assert_eq!(text.capacity(), id.text_len(), "the id string never grew");
         drop((response, charge));
     }
 
