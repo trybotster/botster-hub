@@ -786,6 +786,9 @@ struct TestPluginInvocationGateState {
     armed: bool,
     entered: bool,
     released: bool,
+    /// How long the held invocation waits for a release. `None` waits for
+    /// the release alone; the caller's own step deadline then bounds the wait.
+    deadline: Option<Duration>,
 }
 
 #[cfg(any(test, feature = "plugin-test-kit"))]
@@ -807,13 +810,19 @@ fn test_plugin_invocation_gate() -> &'static (
 
 #[cfg(test)]
 pub(crate) fn arm_test_plugin_invocation_gate() {
-    arm_test_plugin_invocation_gate_for(None, "controlled_gate");
+    // Ten seconds is a test safety bound. It is not a runtime latency requirement.
+    arm_test_plugin_invocation_gate_for(None, "controlled_gate", Some(Duration::from_secs(10)));
 }
 
 /// Arm the gate for the next invocation of `handler_id`, in `plugin_key`
-/// when given.
+/// when given. With a `deadline`, an unreleased hold fails the invocation
+/// when it expires; without one, only a release lets the handler run.
 #[cfg(any(test, feature = "plugin-test-kit"))]
-pub(crate) fn arm_test_plugin_invocation_gate_for(plugin_key: Option<&str>, handler_id: &str) {
+pub(crate) fn arm_test_plugin_invocation_gate_for(
+    plugin_key: Option<&str>,
+    handler_id: &str,
+    deadline: Option<Duration>,
+) {
     let (lock, _) = test_plugin_invocation_gate();
     let mut state = lock.lock().expect("plugin invocation gate mutex");
     *state = TestPluginInvocationGateState {
@@ -822,7 +831,15 @@ pub(crate) fn arm_test_plugin_invocation_gate_for(plugin_key: Option<&str>, hand
         armed: true,
         entered: false,
         released: false,
+        deadline,
     };
+}
+
+/// The deadline of the armed gate, for tests of the arming site.
+#[cfg(any(test, feature = "plugin-test-kit"))]
+pub(crate) fn test_plugin_invocation_gate_deadline() -> Option<Duration> {
+    let (lock, _) = test_plugin_invocation_gate();
+    lock.lock().expect("plugin invocation gate mutex").deadline
 }
 
 #[cfg(test)]
@@ -858,11 +875,23 @@ fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> 
     }
     state.entered = true;
     condition.notify_all();
-    // Ten seconds is a test safety bound. It is not a runtime latency requirement.
-    let (mut state, timeout) = condition
-        .wait_timeout_while(state, Duration::from_secs(10), |state| !state.released)
-        .expect("plugin invocation gate wait");
-    let released = state.released && !timeout.timed_out();
+    let released = match state.deadline {
+        Some(deadline) => {
+            // timer: deadline — a held test handler fails its invocation when
+            // the armed bound expires; expiry is never a release.
+            let (next, timeout) = condition
+                .wait_timeout_while(state, deadline, |state| !state.released)
+                .expect("plugin invocation gate wait");
+            state = next;
+            state.released && !timeout.timed_out()
+        }
+        None => {
+            state = condition
+                .wait_while(state, |state| !state.released)
+                .expect("plugin invocation gate wait");
+            state.released
+        }
+    };
     state.armed = false;
     released
 }

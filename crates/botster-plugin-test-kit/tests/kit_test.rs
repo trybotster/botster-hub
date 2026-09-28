@@ -108,6 +108,34 @@ fn an_emitted_event_reaches_the_downstream_handler_within_the_step() {
     );
 }
 
+/// The observer keeps the events of every enabled package. A later enable
+/// must not drop the earlier package's subscription.
+#[test]
+fn events_of_two_producers_are_both_observed_after_both_loads() {
+    let mut kit = start("two-producers");
+    for name in ["kit-fixture", "kit-fixture-b"] {
+        let response = kit.enable_package(&fixture(name)).expect("enable settles");
+        assert!(response.error.is_none(), "{response:?}");
+    }
+    for tool in ["kit-fixture.note", "kit-fixture-b.note"] {
+        let noted = kit
+            .call_tool(tool, serde_json::json!({ "key": "k" }))
+            .expect("call settles");
+        assert_eq!(
+            noted.plugin_tool_result,
+            serde_json::json!({ "emitted": true })
+        );
+    }
+    let mut names: Vec<String> = kit
+        .emitted_events()
+        .expect("observed events read")
+        .iter()
+        .map(|event| event["name"].as_str().expect("name").to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["kit-fixture-b.noted", "kit-fixture.noted"]);
+}
+
 #[test]
 fn session_lifecycle_input_reaches_the_plugin_as_production_frames() {
     let mut kit = start("session-family");
