@@ -194,14 +194,14 @@ pub struct HubRuntime {
     /// Test seam: the next plugin admissions return this refusal instead of
     /// reaching Core.
     #[cfg(test)]
-    forced_admission: Arc<Mutex<Option<ForcedAdmission>>>,
+    forced_admission: Arc<Mutex<Option<(Option<String>, ForcedAdmission)>>>,
 }
 
 /// What an entity provider admission on the Host worker needs.
 pub(crate) struct ProviderAdmission {
     pub(crate) lifecycle: HubPluginLifecycle,
     #[cfg(test)]
-    pub(crate) forced: Arc<Mutex<Option<ForcedAdmission>>>,
+    pub(crate) forced: Arc<Mutex<Option<(Option<String>, ForcedAdmission)>>>,
 }
 
 impl ProviderAdmission {
@@ -211,14 +211,26 @@ impl ProviderAdmission {
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
         #[cfg(test)]
-        if let Some(forced) = *self
-            .forced
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        if let Some(forced) = forced_for(&self.forced, &request.handler.plugin_key.0) {
             return forced.result(class, request.request_id);
         }
         self.lifecycle.try_admit(class, request)
+    }
+}
+
+#[cfg(test)]
+fn forced_for(
+    forced: &Mutex<Option<(Option<String>, ForcedAdmission)>>,
+    plugin_key: &str,
+) -> Option<ForcedAdmission> {
+    match &*forced
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        Some((scope, forced)) if scope.as_deref().is_none_or(|scope| scope == plugin_key) => {
+            Some(*forced)
+        }
+        _ => None,
     }
 }
 
@@ -4095,7 +4107,7 @@ impl HubRuntime {
         request: PluginInvocationRequest,
     ) -> Result<PluginAdmissionResult, crate::lifecycle::EventDeliveryRefusal> {
         #[cfg(test)]
-        if let Some(forced) = self.test_forced_admission() {
+        if let Some(forced) = forced_for(&self.forced_admission, &delivery.holder.plugin_key) {
             return Ok(forced.result(class, request.request_id));
         }
         self.plugin_lifecycle().try_admit_event(
@@ -4115,7 +4127,7 @@ impl HubRuntime {
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
         #[cfg(test)]
-        if let Some(forced) = self.test_forced_admission() {
+        if let Some(forced) = forced_for(&self.forced_admission, &request.handler.plugin_key.0) {
             return forced.result(class, request.request_id);
         }
         self.plugin_lifecycle().try_admit(class, request)
@@ -4135,15 +4147,17 @@ impl HubRuntime {
         *self
             .forced_admission
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = forced;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = forced.map(|forced| (None, forced));
     }
 
+    /// Force admissions for one plugin only to refuse.
     #[cfg(test)]
-    fn test_forced_admission(&self) -> Option<ForcedAdmission> {
+    pub(crate) fn set_test_forced_admission_for(&self, plugin_key: &str, forced: ForcedAdmission) {
         *self
             .forced_admission
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((Some(plugin_key.to_string()), forced));
     }
 
     pub(crate) fn try_acquire_plugin_entity_snapshot(
