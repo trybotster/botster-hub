@@ -49,6 +49,61 @@ pub(crate) fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Serials for log incarnations in this process; 0 is never issued.
+static NEXT_LOG_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// The identity of one log incarnation: this process's random boot id and a
+/// serial that never repeats within it. A plugin's log gets a new one each
+/// time its entry is created (first load, load after an unload, restart), so
+/// a reader holding a cursor into an older log can tell that it must restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogId {
+    boot: u128,
+    serial: u64,
+}
+
+impl LogId {
+    fn next() -> Self {
+        Self {
+            boot: boot_id(),
+            serial: NEXT_LOG_SERIAL.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The length of `to_string()`: 32 hex digits, a dash, and the serial.
+    pub(crate) fn text_len(self) -> usize {
+        33 + self
+            .serial
+            .checked_ilog10()
+            .map_or(1, |digits| digits as usize + 1)
+    }
+}
+
+impl std::fmt::Display for LogId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:032x}-{}", self.boot, self.serial)
+    }
+}
+
+/// Random per Hub process, so a log id never repeats across restarts.
+fn boot_id() -> u128 {
+    static BOOT: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(random_boot_id)
+}
+
+fn random_boot_id() -> u128 {
+    let mut bytes = [0_u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return u128::from_le_bytes(bytes);
+    }
+    // Without the OS source, the start time and process id still differ
+    // between restarts.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    nanos ^ (u128::from(std::process::id()) << 96)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogLevel {
     Debug,
@@ -113,6 +168,9 @@ pub(crate) struct LogPage {
     /// Funds `records`; the caller keeps it until the reply built from the
     /// page retires.
     pub(crate) charge: Option<LuaCallbackCharge>,
+    /// The log incarnation the page belongs to; `None` for a package with no
+    /// log. A different id than the reader's cursor means a new log.
+    pub(crate) log_id: Option<LogId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +221,7 @@ struct PluginLog {
     /// Records the mirror could not write since its last written record.
     unmirrored: u64,
     charge: LuaCallbackCharge,
+    log_id: LogId,
 }
 
 impl PluginLog {
@@ -342,6 +401,7 @@ impl PluginLogBook {
             mirror_next: 1,
             unmirrored: 0,
             charge,
+            log_id: LogId::next(),
         })
     }
 
@@ -359,6 +419,7 @@ impl PluginLogBook {
                 next_seq: 1,
                 first_available_seq: 1,
                 charge: None,
+                log_id: None,
             });
         };
         let selected = || log.records.iter().filter(|record| record.seq > after_seq);
@@ -380,6 +441,7 @@ impl PluginLogBook {
                 .front()
                 .map_or(log.next_seq, |record| record.seq),
             charge: Some(charge),
+            log_id: Some(log.log_id),
         })
     }
 
@@ -812,6 +874,68 @@ mod tests {
         let (book, _memory) = book();
         let huge = "z".repeat(MAX_RECORD_BYTES + 1);
         assert_eq!(append(&book, &huge, 0), AppendOutcome::TooLarge);
+    }
+
+    #[test]
+    fn a_recreated_log_gets_a_new_id_and_a_continuing_log_keeps_it() {
+        let (book, _memory) = book();
+        assert_eq!(book.read("p", 0).unwrap().log_id, None, "no log, no id");
+        append(&book, "first", 0);
+        let first = book.read("p", 0).unwrap().log_id.expect("a log has an id");
+        append(&book, "second", 0);
+        assert_eq!(
+            book.read("p", 0).unwrap().log_id,
+            Some(first),
+            "the same log"
+        );
+        book.remove("p");
+        append(&book, "again", 0);
+        let second = book.read("p", 0).unwrap().log_id.expect("a log has an id");
+        assert_ne!(second, first, "a recreated log is a new incarnation");
+        let (other, _memory) = super::tests::book();
+        other.append("p", 7, LogLevel::Info, "elsewhere", None, 0, 0);
+        let third = other.read("p", 0).unwrap().log_id.unwrap();
+        assert!(
+            third != first && third != second,
+            "ids never repeat in a process"
+        );
+    }
+
+    #[test]
+    fn the_reply_carries_the_log_id_and_funds_its_text() {
+        let (book, memory) = book();
+        append(&book, "one", 0);
+        let page = book.read("p", 0).unwrap();
+        let id = page.log_id.expect("a log has an id");
+        let with_page = memory.usage().1;
+        let (response, charge) =
+            crate::client_api_dto::response::daemon_plugin_logs("p".to_string(), page)
+                .expect("the account funds the reply");
+        let logs = response.plugin_logs.as_ref().expect("a plugin_logs page");
+        assert_eq!(logs.log_id, Some(id.to_string()));
+        // The reply grew the page's charge by its record vector, its level
+        // strings, and the id text; the id's share is exactly its length.
+        let reply = size_of::<botster_hub_client::DaemonPluginLogRecord>() + "info".len();
+        assert_eq!(memory.usage().1, with_page + reply + id.text_len());
+        drop((response, charge));
+    }
+
+    #[test]
+    fn a_log_id_text_len_is_its_formatted_length() {
+        for serial in [1, 9, 10, 99, 100, 12_345, u64::MAX] {
+            let id = LogId {
+                boot: u128::MAX,
+                serial,
+            };
+            assert_eq!(id.text_len(), id.to_string().len(), "serial {serial}");
+        }
+    }
+
+    #[test]
+    fn each_process_draws_a_random_boot_id() {
+        // A restarted Hub draws again, so its log ids cannot repeat the
+        // previous process's.
+        assert_ne!(random_boot_id(), random_boot_id());
     }
 
     #[test]

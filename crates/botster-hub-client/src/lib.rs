@@ -56,11 +56,11 @@ mod typescript;
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
 pub const PROTOCOL_VERSION: u16 = 12;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 52;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
 /// Protocol 10 is a cold cut: the floor equals the current revision.
-pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 52;
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Maximum byte length of a `request_id`: a canonical positive decimal `u64`, no leading zeros.
 pub const MAX_REQUEST_ID_BYTES: usize = 20;
 /// Outstanding (unanswered) control requests one connection may hold.
@@ -2460,6 +2460,12 @@ pub struct DaemonPluginLogs {
     pub next_seq: u64,
     /// The oldest sequence still retained; earlier records were evicted.
     pub first_available_seq: u64,
+    /// Opaque identity of this log incarnation, absent when the package has
+    /// no log. It is new whenever the log is created again (after an unload,
+    /// a failed first load, or a Hub restart) and never repeats. A reader
+    /// whose cursor belongs to a different `log_id` restarts at `after_seq` 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<String>,
 }
 
 /// One structured plugin log record.
@@ -5313,16 +5319,16 @@ mod tests {
         );
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
         let mut old_revision = previous.clone();
-        old_revision.conformance_fixture_revision = 51;
+        old_revision.conformance_fixture_revision = 52;
         let error = ensure_compatible(&requirement, &old_revision)
-            .expect_err("event requirement rejects revision 51");
+            .expect_err("event requirement rejects revision 52");
         assert!(
             error
                 .diagnostic
                 .contains("unsupported conformance fixture revision")
         );
         let error = ensure_compatible(&requirement, &previous)
-            .expect_err("event requirement rejects the missing feature at revision 52");
+            .expect_err("event requirement rejects the missing feature at revision 53");
         assert!(
             error
                 .diagnostic
@@ -5605,7 +5611,7 @@ mod tests {
     #[test]
     fn protocol_twelve_rejects_protocol_eleven_and_pins_the_conformance_floor() {
         assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let protocol_eleven = DaemonCompatibilityRequirement {
             protocol_version: 11,
@@ -5616,15 +5622,33 @@ mod tests {
             .expect_err("protocol-11 client must fail closed against protocol 12");
         assert!(error.diagnostic.contains("unsupported protocol version 12"));
 
-        let hub_at_fifty_one = DaemonCompatibility {
-            conformance_fixture_revision: 51,
+        let hub_at_fifty_two = DaemonCompatibility {
+            conformance_fixture_revision: 52,
             ..DaemonCompatibility::current()
         };
         ensure_compatible(
             &DaemonCompatibilityRequirement::current(),
-            &hub_at_fifty_one,
+            &hub_at_fifty_two,
         )
-        .expect_err("a protocol-12 client rejects a revision-51 Hub");
+        .expect_err("a protocol-12 client at the current floor rejects a revision-52 Hub");
+    }
+
+    #[test]
+    fn a_plugin_logs_page_without_log_id_decodes_as_absent() {
+        // A revision-52 Hub sends no log_id; the field is additive.
+        let page: DaemonPluginLogs = serde_json::from_value(serde_json::json!({
+            "package_name": "workflow.plugin",
+            "records": [],
+            "next_seq": 1,
+            "first_available_seq": 1
+        }))
+        .expect("a page without log_id decodes");
+        assert_eq!(page.log_id, None);
+        let encoded = serde_json::to_value(&page).expect("encode");
+        assert!(
+            encoded.get("log_id").is_none(),
+            "an absent log_id is not sent"
+        );
     }
 
     #[test]
@@ -6272,8 +6296,8 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
         assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
     }
 
     #[test]
@@ -8042,6 +8066,7 @@ mod tests {
                 }],
                 next_seq: 4,
                 first_available_seq: 1,
+                log_id: Some("0123456789abcdef0123456789abcdef-7".to_string()),
             }),
             plugin_action_result: Some(
                 serde_json::from_value(serde_json::json!({
@@ -8646,7 +8671,7 @@ mod tests {
     #[test]
     fn protocol_twelve_and_conformance_fifty_two_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -8710,8 +8735,8 @@ mod tests {
         // conformance revision with a floor. Protocol 11 is a cold cut, so the
         // default floor equals the current revision.
         assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 52);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 52);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -8757,8 +8782,9 @@ mod tests {
             minimum_conformance_fixture_revision: 52,
             ..DaemonCompatibilityRequirement::current()
         };
-        ensure_compatible(&pinned_at_fifty_two, &DaemonCompatibility::current())
-            .expect("a protocol-12 client pinned at conformance 52 accepts a revision-52 Hub");
+        ensure_compatible(&pinned_at_fifty_two, &DaemonCompatibility::current()).expect(
+            "a protocol-12 client pinned at conformance 52 accepts a revision-53 Hub: log_id is additive",
+        );
 
         assert_eq!(
             daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {
