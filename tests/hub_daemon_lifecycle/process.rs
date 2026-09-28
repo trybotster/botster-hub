@@ -362,7 +362,10 @@ pub(crate) fn worker_owned_descendant_pids(root_pid: u32) -> Result<Vec<u32>, St
     Ok(owned)
 }
 
-pub(crate) fn worker_belongs_to_data_dir(
+/// Whether a worker's argv names `data_dir`. A real worker's argv names its
+/// control socket, not the data dir, so this is never an ownership oracle; it
+/// only serves the negative control that proves that fact.
+pub(crate) fn worker_argv_names_data_dir(
     worker: &SessionWorkerProcessIdentity,
     data_dir: &Path,
 ) -> bool {
@@ -468,56 +471,6 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
         if Instant::now() >= deadline {
             return Err(format!(
                 "timed out waiting for registry-backed botster-session-worker + live shell descendant under {}; argv data-dir matching is not an ownership oracle",
-                data_dir.display()
-            ));
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
-}
-
-/// Wait for a new worktree `botster-session-worker` for this data directory.
-///
-/// Do not require a PPID-visible shell descendant. A marked wrapper spawned
-/// through portable-pty calls `setsid()`, so the real PTY child can leave the
-/// worker PPID tree while remaining alive in another Unix session.
-pub(crate) fn capture_new_session_workers_for_marked_pty(
-    data_dir: &Path,
-    before_pids: &std::collections::BTreeSet<u32>,
-    marker: &str,
-) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
-            .into_iter()
-            .filter(|worker| {
-                !before_pids.contains(&worker.pid)
-                    && worker_executable_is_validated_candidate(worker)
-            })
-            .collect();
-        let mut live_alive = Vec::new();
-        for worker in live_ours {
-            if process_is_alive_u32(worker.pid)? {
-                live_alive.push(worker);
-            }
-        }
-        let owned_by_dir: Vec<SessionWorkerProcessIdentity> = live_alive
-            .iter()
-            .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
-            .cloned()
-            .collect();
-        let live = if !owned_by_dir.is_empty() {
-            owned_by_dir
-        } else {
-            live_alive
-        };
-        let marked = unix_processes_matching_marker(marker)?;
-        if !live.is_empty() && !marked.is_empty() {
-            return Ok(live);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for botster-session-worker plus all-session PTY marker; \
-                 data_dir={} marker={marker} workers={live:?} marked={marked:?}",
                 data_dir.display()
             ));
         }
@@ -973,17 +926,43 @@ fn listed_running_sessions(socket_path: &Path, session_ids: &[&str]) -> Vec<Stri
     }
 }
 
-/// Session workers that still name this data directory after the hub child exits.
+/// Live session workers of this data dir, attributed through its session
+/// registry: each live session's recorded command pid resolves to its validated
+/// candidate `botster-session-worker` ancestor. The registry survives a Hub
+/// SIGKILL, and a worker's own argv does not name the data dir (see
+/// [`worker_argv_names_data_dir`]), so the registry is the attribution. A live
+/// recorded command whose worker ancestor is gone is returned as itself, so an
+/// absence check still sees it.
 pub(crate) fn live_session_workers_for_data_dir(
     data_dir: &Path,
 ) -> Result<Vec<SessionWorkerProcessIdentity>, String> {
-    Ok(session_worker_process_identities()?
-        .into_iter()
-        .filter(|worker| {
-            worker_executable_is_validated_candidate(worker)
-                && worker_belongs_to_data_dir(worker, data_dir)
-        })
-        .collect())
+    let census = session_worker_process_identities()?;
+    let mut owned: Vec<SessionWorkerProcessIdentity> = Vec::new();
+    for identity in registry_backed_worker_identities(data_dir)? {
+        let Some(command_pid) = identity.pid else {
+            continue;
+        };
+        if !process_is_alive_u32(command_pid)? {
+            continue;
+        }
+        let pid = validated_candidate_session_worker_ancestor(command_pid).unwrap_or(command_pid);
+        if owned.iter().any(|worker| worker.pid == pid) {
+            continue;
+        }
+        let worker = census
+            .iter()
+            .find(|worker| worker.pid == pid)
+            .cloned()
+            .unwrap_or_else(|| SessionWorkerProcessIdentity {
+                pid,
+                command: process_snapshot(pid)
+                    .map(|snapshot| snapshot.command)
+                    .unwrap_or_default(),
+                shell_descendant_pids: Vec::new(),
+            });
+        owned.push(worker);
+    }
+    Ok(owned)
 }
 
 /// Hub process shutdown keeps durable workers. Tests that SIGKILL a victim

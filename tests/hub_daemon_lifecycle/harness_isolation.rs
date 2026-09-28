@@ -282,6 +282,26 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
     wait_for_process_snapshot(worker_a_pid, "own setsid", |snapshot| {
         snapshot.pgid != daemon_a.id() && snapshot.sid != daemon_a.id().to_string()
     });
+    // Positive control: the attribution used for the leftover checks below sees
+    // each data dir's own worker, and only its own.
+    let worker_a_owner = validated_candidate_session_worker_ancestor(worker_a_pid)
+        .expect("A worker ancestor");
+    let worker_b_owner = validated_candidate_session_worker_ancestor(
+        worker_b.pid.expect("B worker pid"),
+    )
+    .expect("B worker ancestor");
+    let attributed_a = live_session_workers_for_data_dir(&data_dir_a).expect("A attribution");
+    let attributed_b = live_session_workers_for_data_dir(&data_dir_b).expect("B attribution");
+    assert!(
+        attributed_a.iter().any(|worker| worker.pid == worker_a_owner)
+            && !attributed_a.iter().any(|worker| worker.pid == worker_b_owner),
+        "A attribution must see A's worker and not B's: {attributed_a:?}"
+    );
+    assert!(
+        attributed_b.iter().any(|worker| worker.pid == worker_b_owner)
+            && !attributed_b.iter().any(|worker| worker.pid == worker_a_owner),
+        "B attribution must see B's worker and not A's: {attributed_b:?}"
+    );
     let mut child_a = daemon_a.disarm();
     unsafe {
         libc::kill(child_a.id() as libc::pid_t, libc::SIGKILL);
@@ -639,11 +659,20 @@ fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
     wait_for_process_snapshot(command_pid, "own setsid", |snapshot| {
         snapshot.pgid != daemon.id() && snapshot.sid != daemon.id().to_string()
     });
+    let argv_naming_dir = session_worker_process_identities()
+        .expect("worker argv census")
+        .into_iter()
+        .filter(|worker| worker_argv_names_data_dir(worker, &data_dir))
+        .collect::<Vec<_>>();
     assert!(
-        live_session_workers_for_data_dir(&data_dir)
-            .expect("data-dir argv census")
-            .is_empty(),
-        "real worker argv must omit the Hub data directory so the argv census is not the oracle"
+        argv_naming_dir.is_empty(),
+        "real worker argv must omit the Hub data directory so the argv census is not the oracle: {argv_naming_dir:?}"
+    );
+    // Positive control for the registry attribution that replaced argv matching.
+    let attributed = live_session_workers_for_data_dir(&data_dir).expect("registry attribution");
+    assert!(
+        attributed.iter().any(|worker| worker.pid == worker_pid),
+        "registry attribution must see this data dir's real worker {worker_pid}: {attributed:?}"
     );
     let mut child = daemon.transfer_sessions().disarm();
     request_cli_daemon_shutdown(&data_dir).ok();
@@ -1459,5 +1488,68 @@ fn write_warm_executable_launches_the_file_without_running_its_body() {
         fs::read_to_string(&marker).expect("the body runs on a normal launch"),
         "ran:explicit\n",
         "the guard must not change what a normal launch does with its arguments"
+    );
+}
+
+/// Positive control for every consumer of `live_session_workers_for_data_dir`:
+/// a durable worker that outlives its Hub (transfer-mode stop) is attributed
+/// to the data dir, fails the CLI fixture absence check by name, and is
+/// stopped by the data-dir reap.
+#[test]
+fn data_dir_worker_attribution_sees_a_worker_that_outlives_its_hub() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("wattr");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let daemon = start_cli_daemon(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir));
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::Spawn {
+            session_id: "attribution-session".to_string(),
+            command: "sh -c 'sleep 30'".to_string(),
+        },
+    )
+    .expect("spawn attribution session");
+    let identity = wait_for_registry_worker(&data_dir);
+    let command_pid = identity.pid.expect("attribution command pid");
+    let worker_pid = validated_candidate_session_worker_ancestor(command_pid)
+        .expect("validated candidate worker ancestor");
+    let mut child = daemon.transfer_sessions().disarm();
+    let hub_pid = child.id();
+    request_cli_daemon_shutdown(&data_dir).ok();
+    let _ = child.wait();
+    assert!(process_exists(worker_pid), "positive control: the transferred worker outlives its Hub");
+
+    let attributed = live_session_workers_for_data_dir(&data_dir).expect("registry attribution");
+    assert!(
+        attributed.iter().any(|worker| worker.pid == worker_pid),
+        "the data dir's registry must attribute the surviving worker {worker_pid}: {attributed:?}"
+    );
+
+    let socket_path = daemon_socket_path(&data_dir);
+    let absence = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_cli_fixture_absent(&data_dir, hub_pid, &socket_path, "wattr-unused-marker", &[], &[]);
+    }));
+    let message = absence
+        .expect_err("a live attributed worker must fail the CLI fixture absence check")
+        .downcast::<String>()
+        .map(|text| *text)
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("workers=[{worker_pid}")) || message.contains(&format!(", {worker_pid}")),
+        "the absence failure must name the worker {worker_pid}: {message}"
+    );
+
+    reap_session_workers_for_data_dir(&data_dir).expect("data-dir reap stops the worker");
+    assert!(
+        // timer: deadline — the reaped worker's exit event ends the wait.
+        botster_hub::process_exit::wait_for_pid_exit(worker_pid, Instant::now() + Duration::from_secs(5))
+            .expect("wait for the reaped worker to exit"),
+        "the reaped worker {worker_pid} must exit"
+    );
+    let remaining = live_session_workers_for_data_dir(&data_dir).expect("attribution after reap");
+    assert!(
+        !remaining.iter().any(|worker| worker.pid == worker_pid),
+        "no attributed worker may remain after the reap: {remaining:?}"
     );
 }
