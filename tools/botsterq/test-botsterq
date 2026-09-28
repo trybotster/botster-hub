@@ -76,14 +76,14 @@ wait "$A"; codeA=$?
 
 # 5. Cancelling a running job whose child ignores SIGTERM after the leader exits.
 sleep 300 & control=$!
-"$Q" run --label R -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>&1 &
+"$Q" run --label R -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>"$work/R.err" &
 R=$!
 await_state "R @" running
 g=$(job_group)
-kill -TERM "$R"; wait "$R"
-[ -n "$g" ] && [ "$(group_members "$g")" = 0 ] && kill -0 "$control" 2>/dev/null \
-  && pass "cancel escalates to SIGKILL for a TERM-ignoring child; control untouched" \
-  || fail "resistant descendant" "group=$g members=$(group_members "$g")"
+kill -TERM "$R"; wait "$R"; codeR=$?
+[ "$codeR" = 130 ] && [ -n "$g" ] && [ "$(group_members "$g")" = 0 ] && kill -0 "$control" 2>/dev/null \
+  && pass "cancel escalates to SIGKILL for a TERM-ignoring child (run exit 130); control untouched" \
+  || fail "resistant descendant" "run=$codeR group=$g members=$(group_members "$g") stderr=$(cat "$work/R.err")"
 
 # 6. Start race, before the pid file: the job has started but not published
 #    its pid when cancel arrives. It must not run its command.
@@ -150,11 +150,51 @@ TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -w >/dev/null 2>&1
 "$Q" run --label C -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>&1 &
 C=$!
 await_state "C @" running
-id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '/ C @ / && $2 == "running" { print $1 }')
+id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[C @ ") && $2 == "running" { print $1 }')
 g=$(job_group)
-"$Q" cancel "$id" >/dev/null 2>&1
+"$Q" cancel "$id" >"$work/cancel.out" 2>&1; codeCancel=$?
 wait "$C" 2>/dev/null
-[ "$(group_members "$g")" = 0 ] && pass "cancel <id> escalates to SIGKILL" || fail "cancel id" "group $g alive"
+[ "$codeCancel" = 0 ] && [ "$(group_members "$g")" = 0 ] && pass "cancel <id> escalates to SIGKILL (cancel exit 0)" \
+  || fail "cancel id" "cancel=$codeCancel group $g members=$(group_members "$g") out=$(cat "$work/cancel.out")"
+
+# 12. Admission window: the job starts while its run process is still inside
+#     admission (the id not yet stored); cancelling the run must stop it.
+"$Q" slots 2 >/dev/null
+mkfifo "$work/admit"
+BOTSTERQ_TEST_ADMIT_HOLD="$work/admit" "$Q" run --label W -- sh -c 'touch "$0/W-started"; sleep 60' "$work" >/dev/null 2>"$work/W.err" &
+W=$!
+await_file "$work/W-started"
+g=$(job_group)
+kill -TERM "$W"
+printf x >"$work/admit"
+wait "$W"; codeW=$?
+[ "$codeW" = 130 ] && [ -n "$g" ] && [ "$(group_members "$g")" = 0 ] \
+  && pass "cancel during admission (job already started, id not yet stored) stops the job" \
+  || fail "admission window" "run=$codeW group=$g members=$(group_members "$g") stderr=$(cat "$work/W.err")"
+
+# 13. The slot is released only when the cancelled group is gone: the next
+#     job must see no member of the cancelled job's group when it starts.
+"$Q" slots 1 >/dev/null
+"$Q" run --label K -- sh -c 'sh -c "trap \"\" TERM; sleep 60" & trap "exit 0" TERM; wait' >/dev/null 2>&1 &
+K=$!
+await_state "K @" running
+g=$(job_group)
+"$Q" run --label N -- sh -c 'ps -axo pgid= | awk -v g="$1" "\$1 == g" | wc -l | tr -d " " > "$0/N.seen"' "$work" "$g" >/dev/null 2>&1 &
+N=$!
+await_state "N @" queued
+kill -TERM "$K"; wait "$K"
+wait "$N"
+[ "$(cat "$work/N.seen" 2>/dev/null)" = 0 ] \
+  && pass "next job starts only after the cancelled group is empty" \
+  || fail "slot release" "members of $g seen by the next job: $(cat "$work/N.seen" 2>/dev/null)"
+
+# 14. A job that exits leaving a process in its group: the supervisor stops it
+#     after the grace and warns, and the group is empty when run returns.
+"$Q" run --label L -- sh -c 'sleep 60 & exit 0' >/dev/null 2>"$work/L.err"; codeL=$?
+g=$(grep -o 'running: \[[0-9]*' "$work/L.err" | tr -dc 0-9)
+[ "$codeL" = 0 ] && grep -q "left 1 process" "$work/L.err" && [ -z "$(ps -axo pid= | awk -v p="$g" '$1 == p')" ] \
+  && pass "leftover process is stopped and reported; run keeps the command's status" \
+  || fail "leftover" "run=$codeL stderr=$(cat "$work/L.err")"
 
 echo "failures: $failures"
 [ "$failures" = 0 ]

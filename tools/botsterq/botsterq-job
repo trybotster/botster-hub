@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""botsterq job supervisor: runs one queued command and leads its process group.
+
+Usage: botsterq-job <pidfile> <marker> <joblock> <owner-pid> <grace-seconds> -- <command...>
+
+task-spooler starts this as the job, in a new process group that this process
+leads. It exits only when every other member of that group is gone, so the
+queue slot is never released while any of the job's processes still run.
+
+- Start: under the job lock it either consumes a cancel marker (and exits 130
+  without running anything) or publishes its pid, which is the group id. A job
+  whose `botsterq run` process is gone does not start.
+- Run: the command runs as a child in this group, under `nice -n 10`.
+- Cancel: SIGTERM (or SIGINT, SIGHUP) to this process sends SIGTERM to every
+  other group member, and SIGKILL to any member left when the grace ends.
+- End: after the command exits (or after cancelling), it waits on process-exit
+  events (kqueue NOTE_EXIT on macOS, pidfd on Linux) until the group is empty,
+  re-enumerating members after each round so a process forked meanwhile is
+  still waited for. It then exits with the command's status, or 130 when
+  cancelled.
+"""
+
+import fcntl
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+
+def group_members(pgid):
+    """Live processes in group pgid other than this one and the census's own
+    `ps` (which runs in this group), zombies excluded."""
+    census = subprocess.Popen(["ps", "-axo", "pid=,pgid=,stat="], stdout=subprocess.PIPE, text=True)
+    out, _ = census.communicate()
+    if census.returncode != 0:
+        raise RuntimeError(f"ps census exited {census.returncode}")
+    members = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        pid, group, stat = int(parts[0]), int(parts[1]), parts[2]
+        if group == pgid and pid not in (os.getpid(), census.pid) and "Z" not in stat:
+            members.append(pid)
+    return members
+
+
+def wait_exits(pids, deadline):
+    """Block on exit events for pids until all have exited or deadline passes.
+
+    Returns True when all exited. A pid that is already gone counts as exited.
+    """
+    if not pids:
+        return True
+    if hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        pending = set()
+        for pid in pids:
+            event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+            try:
+                queue.control([event], 0, 0)
+                pending.add(pid)
+            except OSError:
+                pass  # already exited (or a zombie, which kqueue refuses)
+        while pending:
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if timeout == 0.0:
+                return False
+            for event in queue.control(None, len(pending), timeout):
+                pending.discard(event.ident)
+            if deadline is not None and pending and time.monotonic() >= deadline:
+                return False
+        return True
+    # Linux: a pidfd becomes readable when its process exits.
+    fds = {}
+    for pid in pids:
+        try:
+            fds[os.pidfd_open(pid)] = pid
+        except ProcessLookupError:
+            pass
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLIN)
+    while fds:
+        timeout = None if deadline is None else max(0, int((deadline - time.monotonic()) * 1000))
+        if timeout == 0:
+            return False
+        for fd, _ in poller.poll(timeout):
+            poller.unregister(fd)
+            os.close(fd)
+            fds.pop(fd, None)
+    return True
+
+
+def main():
+    pidfile, marker, joblock, owner, grace = sys.argv[1:6]
+    if sys.argv[6] != "--":
+        sys.exit("botsterq-job: usage error")
+    command = sys.argv[7:]
+    grace = float(grace)
+    pgid = os.getpgrp()
+
+    hold = os.environ.get("BOTSTERQ_TEST_BEFORE_PIDFILE")
+    if hold:
+        with open(hold) as fifo:
+            fifo.read(1)
+    try:
+        os.kill(int(owner), 0)
+    except ProcessLookupError:
+        sys.exit(130)  # its `botsterq run` is gone: do not start
+    # Under the job lock: a cancel that came first left a marker (consume it and
+    # do not start); otherwise publish this group for any later cancel.
+    with open(joblock, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(marker):
+            os.unlink(marker)
+            sys.exit(130)
+        with open(pidfile, "w") as published:
+            published.write(f"{pgid}\n")
+    hold = os.environ.get("BOTSTERQ_TEST_AFTER_PIDFILE")
+    if hold:
+        with open(hold) as fifo:
+            fifo.read(1)
+
+    cancelled = False
+    kill_at = None
+
+    def on_cancel(signum, frame):
+        nonlocal cancelled, kill_at
+        if not cancelled:
+            cancelled = True
+            kill_at = time.monotonic() + grace
+            for pid in group_members(pgid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, on_cancel)
+
+    env = dict(os.environ, BOTSTERQ_JOB=str(pgid))
+    child = subprocess.Popen(["nice", "-n", "10", *command], env=env)
+    status = None
+    while status is None:
+        try:
+            status = child.wait()
+        except InterruptedError:
+            continue
+
+    # The command is done. Anything still in the group is a leftover: it gets the
+    # grace period to exit, then SIGTERM, then SIGKILL, each followed by waiting
+    # on exit events, re-enumerated so a process forked meanwhile is included.
+    def signal_all(signum):
+        for pid in group_members(pgid):
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+
+    if not cancelled:
+        members = group_members(pgid)
+        if members and not wait_exits(members, time.monotonic() + grace):
+            left = group_members(pgid)
+            print(f"botsterq: the job left {len(left)} process(es) running: {left}; stopping them", file=sys.stderr)
+            signal_all(signal.SIGTERM)
+        kill_at = time.monotonic() + grace
+    for signum in (None, signal.SIGKILL):
+        while True:
+            members = group_members(pgid)
+            if not members or not wait_exits(members, kill_at):
+                break
+        if not group_members(pgid):
+            break
+        if signum is None:
+            signal_all(signal.SIGKILL)
+            kill_at = time.monotonic() + grace
+    survivors = group_members(pgid)
+    if survivors:
+        print(f"botsterq: process(es) {survivors} survived SIGKILL", file=sys.stderr)
+        sys.exit(137)
+
+    if cancelled:
+        sys.exit(130)
+    sys.exit(status if status >= 0 else 128 - status)
+
+
+if __name__ == "__main__":
+    main()
