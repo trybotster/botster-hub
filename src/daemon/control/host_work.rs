@@ -1286,7 +1286,8 @@ impl HostMutationContinuation {
             HostMutationResult::Recovered(outcome) => match outcome {
                 RecoveryOutcome::PackageConfiguration { failure, .. }
                 | RecoveryOutcome::SpawnTarget { failure, .. }
-                | RecoveryOutcome::RegisteredWorktree { failure, .. } => {
+                | RecoveryOutcome::RegisteredWorktree { failure, .. }
+                | RecoveryOutcome::RestartRecord { failure, .. } => {
                     release_document(state, waiter_id);
                     finish_error(permit, operation, failure)
                 }
