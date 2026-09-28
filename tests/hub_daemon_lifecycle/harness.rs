@@ -716,27 +716,13 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
     let mut outcome = WorkerReapOutcome::default();
     for identity in identities {
         let Some(pid) = identity.pid else {
-            match live_session_workers_for_data_dir(data_dir) {
-                Ok(workers) => {
-                    let mut matched = false;
-                    for worker in workers {
-                        if worker_pid_matches_validated_candidate(worker.pid) {
-                            match signal_worker_group(worker.pid) {
-                                Ok(()) => outcome.reaped.push(worker.pid),
-                                Err(error) => outcome.errors.push(error),
-                            }
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        outcome.errors.push(format!(
-                            "registry session {} has no process pid and no worktree session-worker",
-                            identity.session_id
-                        ));
-                    }
-                }
-                Err(error) => outcome.errors.push(error),
-            }
+            // Without a recorded pid nothing attributes a process to this
+            // session: a worker's argv does not name the data dir, so the old
+            // argv fallback here never matched a real worker.
+            outcome.errors.push(format!(
+                "registry session {} has no process pid and no worktree session-worker",
+                identity.session_id
+            ));
             continue;
         };
         match validated_candidate_session_worker_ancestor(pid) {
@@ -874,7 +860,7 @@ fn prove_owned_absence(
         return Ok(());
     }
     wait_for_owned_absence(OWNED_PROCESS_EXIT_GRACE, || {
-        owned_processes_absence_error(data_dir, owned)
+        owned_processes_absence_error(owned)
     })
 }
 
@@ -892,10 +878,7 @@ pub(crate) fn wait_for_owned_absence(
     }
 }
 
-fn owned_processes_absence_error(
-    data_dir: &Path,
-    owned: &OwnedSessionProcesses,
-) -> Result<Option<String>, String> {
+fn owned_processes_absence_error(owned: &OwnedSessionProcesses) -> Result<Option<String>, String> {
     for pid in &owned.pids {
         if process_exists(*pid) {
             return Ok(Some(format!("owned worker pid {pid} still live")));
@@ -921,15 +904,10 @@ fn owned_processes_absence_error(
             Err(error) => return Err(error),
         }
     }
-    let leftover = session_worker_process_identities()?
-        .into_iter()
-        .filter(|worker| worker_belongs_to_data_dir(worker, data_dir))
-        .collect::<Vec<_>>();
-    if !leftover.is_empty() {
-        return Ok(Some(format!(
-            "data-dir session workers still live: {leftover:?}"
-        )));
-    }
+    // No data-dir clause: this proof works from known worker pids and groups.
+    // A worker's argv does not name the data dir, so a data-dir census here
+    // never matched a real worker, and a transferred durable worker may
+    // outlive the Hub (guard_proof_requires_worker_pid_when_argv_omits_data_dir).
     Ok(None)
 }
 
