@@ -8421,6 +8421,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_reload_keeps_the_log_id_and_a_load_after_unload_starts_a_new_one() {
+        let (mut runtime, root, policy) =
+            unloaded_logging_provider("log-id-lifetime", "botster.log.info({ message = 'up' })");
+        let log_id = |runtime: &HubRuntime| {
+            runtime
+                .plugin_logs()
+                .read("producer", 0)
+                .unwrap()
+                .log_id
+                .expect("a loaded package that logged has a log id")
+        };
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let first = log_id(&runtime);
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("log-id-reload".into()),
+                policy.registry(),
+                "producer",
+            )
+            .unwrap();
+        assert_eq!(log_id(&runtime), first, "a reload continues the same log");
+        runtime
+            .unload_plugin_package(RequestId("log-id-unload".into()), "producer")
+            .unwrap();
+        assert_eq!(
+            runtime.plugin_logs().read("producer", 0).unwrap().log_id,
+            None
+        );
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let second = log_id(&runtime);
+        assert_ne!(second, first, "a load after an unload starts a new log");
+        assert_eq!(
+            runtime.plugin_logs().read("producer", 0).unwrap().records[0].seq,
+            1,
+            "the new log restarts its sequence, which the new id announces"
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_failed_load_over_a_live_generation_keeps_its_grants() {
         // The runtime accepts a load of a package that is already loaded (the
         // commit replaces the previous worker). If that load fails, the live

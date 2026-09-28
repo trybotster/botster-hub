@@ -4185,7 +4185,7 @@ stream.write(encodeControlFrame({
       protocol: 'botster-hub-daemon-v1',
       protocol_version: 12,
       required_features: [],
-      minimum_conformance_fixture_revision: 52,
+      minimum_conformance_fixture_revision: 53,
       client_name: 'foreground-terminal-app-open-fixture',
     },
   },
