@@ -85,7 +85,9 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
   lock, so either the job published first (the cancel signals the supervisor) or the
   cancel came first (the job deletes the marker and does not start). A job whose
   `run` is gone does not start. The supervisor runs the command as a child, and on
-  SIGTERM signals the group, then SIGKILLs what outlives the grace. It exits only
+  SIGTERM signals the group, then SIGKILLs what outlives the grace, the command
+  itself included. A cancel before the command starts means it never starts
+  (cancel signals are blocked around the spawn). It exits only
   when the group is empty, waiting on exit events (kqueue NOTE_EXIT on macOS, pidfd
   on Linux) and re-enumerating members after each round so a process forked
   meanwhile is included. Its exit, observed with `ts -w`, is the event that the job
@@ -97,9 +99,11 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
 - `tools/botsterq/test-botsterq` is the regression suite (a private queue): it
   covers the exit code and environment, slot refusal, exclusive reservations and
   fairness, cancel of queued and running jobs, a SIGTERM-ignoring child with an
-  untouched control process, both sides of the start/cancel race and a cancel during
+  untouched control process, a SIGTERM-ignoring command, both sides of the
+  start/cancel race, a cancel before the command starts and a cancel during
   admission (pinned with test hooks), slot release only after the cancelled group is
-  empty, leftover processes, nesting, an orphaned queued job, and `cancel <id>`.
+  empty, leftover processes (including a command that exits before the supervisor
+  first looks), nesting, an orphaned queued job, and `cancel <id>`.
 
 ## Stage 2 (design only): a remote Linux backend
 
