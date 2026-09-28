@@ -2190,13 +2190,7 @@ fn materialize_session_type_from_resolved(
         working_directory: SpawnWorkingDirectory {
             path: resolved.working_directory.clone(),
         },
-        environment: SpawnEnvironment {
-            variables: environment
-                .into_iter()
-                .map(|(name, value)| SpawnEnvironmentVariable { name, value })
-                .collect(),
-            unset: Vec::new(),
-        },
+        environment: session_spawn_environment(environment),
         initial_pty_size: Some(ResizePayload {
             rows: config.initial_rows,
             cols: config.initial_cols,
@@ -2330,13 +2324,7 @@ pub(crate) fn materialize_managed_session_type(
         working_directory: SpawnWorkingDirectory {
             path: resolved.working_directory.clone(),
         },
-        environment: SpawnEnvironment {
-            variables: environment
-                .into_iter()
-                .map(|(name, value)| SpawnEnvironmentVariable { name, value })
-                .collect(),
-            unset: Vec::new(),
-        },
+        environment: session_spawn_environment(environment),
         initial_pty_size: Some(ResizePayload {
             rows: config.session_defaults.initial_rows,
             cols: config.session_defaults.initial_cols,
@@ -3697,6 +3685,14 @@ fn charged_final_materialization(
             bytes.checked_add(key.len())?.checked_add(value.len())
         })
         .ok_or("output environment size overflow")?;
+    let unset = inherited_botster_names();
+    let unset_bytes = unset
+        .iter()
+        .try_fold(0usize, |bytes, name| bytes.checked_add(name.len()))
+        .and_then(|bytes| {
+            bytes.checked_add(unset.len().checked_mul(std::mem::size_of::<String>())?)
+        })
+        .ok_or("output unset size overflow")?;
     let environment_nodes =
         crate::lua_memory::layout::btree_nodes_checked::<String, String>(environment.len())
             .ok_or("output environment node overflow")?;
@@ -3732,6 +3728,7 @@ fn charged_final_materialization(
         .and_then(|bytes| bytes.checked_add(environment_strings))
         .and_then(|bytes| bytes.checked_add(environment_nodes))
         .and_then(|bytes| bytes.checked_add(environment_slots))
+        .and_then(|bytes| bytes.checked_add(unset_bytes))
         .and_then(|bytes| bytes.checked_add(context_key_bytes))
         .and_then(|bytes| bytes.checked_add(context_key_slots))
         .ok_or("output copy size overflow")?;
@@ -3793,10 +3790,7 @@ fn charged_final_materialization(
         working_directory: SpawnWorkingDirectory {
             path: resolved.working_directory.clone(),
         },
-        environment: SpawnEnvironment {
-            variables,
-            unset: Vec::new(),
-        },
+        environment: SpawnEnvironment { variables, unset },
         initial_pty_size: Some(ResizePayload {
             rows: initial_rows,
             cols: initial_cols,
@@ -4375,13 +4369,33 @@ pub const SESSION_ID_ENVIRONMENT: &str = "BOTSTER_SESSION_ID";
 pub fn raw_session_environment(config: &HubConfig, session_id: &SessionId) -> SpawnEnvironment {
     let mut environment = BTreeMap::new();
     inject_context_environment(config.into(), &mut environment, session_id, None);
+    session_spawn_environment(environment)
+}
+
+/// Environment names that belong to Botster. A spawned session never
+/// inherits one from the process that started the Hub; the Hub sets its own.
+pub const BOTSTER_ENVIRONMENT_PREFIX: &str = "BOTSTER_";
+
+/// The spawn environment for every session path: inherited Botster names are
+/// removed first, then `variables` (including the Hub's own) are set.
+fn session_spawn_environment(variables: BTreeMap<String, String>) -> SpawnEnvironment {
     SpawnEnvironment {
-        variables: environment
+        variables: variables
             .into_iter()
             .map(|(name, value)| SpawnEnvironmentVariable { name, value })
             .collect(),
-        unset: Vec::new(),
+        unset: inherited_botster_names(),
     }
+}
+
+/// Inherited Botster names, read from this process: a session's child
+/// inherits the worker's environment, which is this daemon's. `unset` takes
+/// strings, so a name that is not UTF-8 cannot be removed and is skipped.
+fn inherited_botster_names() -> Vec<String> {
+    std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with(BOTSTER_ENVIRONMENT_PREFIX))
+        .collect()
 }
 
 fn inject_context_environment(
