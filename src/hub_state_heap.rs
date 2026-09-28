@@ -169,6 +169,7 @@ impl HeapSize for HubState {
             runtime_settings,
             audit_history,
             recovery,
+            restart_records,
         } = self;
         schema_version.add_to(walk);
         host.add_to(walk);
@@ -186,6 +187,45 @@ impl HeapSize for HubState {
         runtime_settings.add_to(walk);
         audit_history.add_to(walk);
         recovery.add_to(walk);
+        restart_records.add_to(walk);
+    }
+}
+
+impl HeapSize for crate::restart_records::RestartRecord {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            session_type_id,
+            target_id,
+            cwd,
+            environment_keys,
+            context,
+        } = self;
+        session_type_id.add_to(walk);
+        target_id.add_to(walk);
+        cwd.add_to(walk);
+        environment_keys.add_to(walk);
+        context.add_to(walk);
+    }
+}
+
+impl HeapSize for crate::restart_records::RestartContext {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            worktree_path,
+            repo_path,
+            branch_name,
+            prompt,
+            ticket_id,
+            workspace_id,
+            metadata,
+        } = self;
+        worktree_path.add_to(walk);
+        repo_path.add_to(walk);
+        branch_name.add_to(walk);
+        prompt.add_to(walk);
+        ticket_id.add_to(walk);
+        workspace_id.add_to(walk);
+        metadata.add_to(walk);
     }
 }
 
