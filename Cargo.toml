@@ -96,6 +96,13 @@ botster-ui-contract = { path = "crates/botster-ui-contract" }
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
 
+# Dev and test builds keep line tables only: panics and backtraces still name
+# every frame's file and line, but variable and type debug info (most of the
+# DWARF, and most of target/) is dropped. Each writer worktree rebuilds many
+# hashed copies of these artifacts, so this scales with every rebuild.
+[profile.dev]
+debug = "line-tables-only"
+
 # The lifecycle harness verifies the candidate manifest (SHA-256 of the
 # ~110 MB Hub binary) on every IsolatedHub start. Unoptimized sha2 takes
 # seconds per hash; optimizing only sha2 keeps the same check at a fraction
