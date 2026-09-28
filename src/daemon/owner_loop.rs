@@ -8680,7 +8680,8 @@ return botster.register({ handlers = {} })
                 // published (its notifier wake arrived), then one ordinary turn
                 // runs, as an incidental wake would. The held drain must not
                 // consume it.
-                if !wakes.wait_for_kind(Instant::now() + hang_guard, "PluginCompletionPublished") {
+                let window_deadline = Instant::now() + hang_guard;
+                if !wakes.wait_for_kind(window_deadline, "PluginCompletionPublished") {
                     panic!(
                         "the completion was never published: {}",
                         describe(&daemon, &state)
@@ -8695,6 +8696,11 @@ return botster.register({ handlers = {} })
                 publish_completion_wakes(&daemon, &mut state);
                 publish_maintenance_wakes(&mut state);
                 while !state.owner_ready.is_empty() {
+                    assert!(
+                        Instant::now() < window_deadline,
+                        "the hang guard expired in the forced window: {}",
+                        describe(&daemon, &state)
+                    );
                     assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                     publish_completion_wakes(&daemon, &mut state);
                     publish_maintenance_wakes(&mut state);
