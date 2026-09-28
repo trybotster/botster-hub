@@ -5730,6 +5730,9 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
             SessionReservationRefusal::Unavailable => "session_reservation.unavailable",
             SessionReservationRefusal::InvalidToken => "session_reservation.invalid_token",
             SessionReservationRefusal::Capacity => "session_reservation.capacity",
+            SessionReservationRefusal::SessionIdTooLong => {
+                "session_reservation.session_id_too_long"
+            }
         },
         CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::Runtime(runtime_error),
@@ -11050,6 +11053,10 @@ pub(crate) mod tests {
             (
                 SessionReservationRefusal::Capacity,
                 "session_reservation.capacity",
+            ),
+            (
+                SessionReservationRefusal::SessionIdTooLong,
+                "session_reservation.session_id_too_long",
             ),
         ];
         for (refusal, class) in mapped {
