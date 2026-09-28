@@ -22,7 +22,9 @@
 #
 # Admission (enqueueing, and changing the slot count) is serialized by one
 # lock, and `slots N` refuses while any job is queued or running, so an
-# exclusive job's reservation always equals the slot count.
+# exclusive job's reservation always equals the slot count. Admission is in
+# arrival order: an ordinary job that meets a queued exclusive job waits for it
+# WHILE HOLDING that lock, so nothing that arrives later can enqueue ahead of it.
 #
 # Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`):
 # a queued job never starts; a running job's process group gets SIGTERM, and
@@ -67,6 +69,15 @@ with_admission_lock() {
   perl -MFcntl=:flock -e '
     open(my $lock, ">>", shift) or die "botsterq: open lock: $!\n";
     flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+    exit(system(@ARGV) >> 8);
+  ' "$state/admission.lock" "$@"
+}
+
+# Like with_admission_lock, but fails at once (exit 75) when the lock is held.
+try_admission_lock() {
+  perl -MFcntl=:flock -e '
+    open(my $lock, ">>", shift) or die "botsterq: open lock: $!\n";
+    flock($lock, LOCK_EX | LOCK_NB) or exit 75;
     exit(system(@ARGV) >> 8);
   ' "$state/admission.lock" "$@"
 }
@@ -163,7 +174,12 @@ cmd_slots() {
   case "$1" in
     ''|*[!0-9]*|0) echo "botsterq: slots must be a positive integer" >&2; exit 2 ;;
   esac
-  with_admission_lock "$self" __set-slots "$1"
+  # A run waiting for an exclusive job holds the lock for as long as that job
+  # runs, and a queued or running job means slots cannot change anyway.
+  try_admission_lock "$self" __set-slots "$1" || {
+    [ "$?" -ne 75 ] || { echo "botsterq: jobs are queued or waiting to queue; change slots when the queue is empty" >&2; exit 1; }
+    exit 1
+  }
 }
 
 set_slots_locked() {
@@ -204,6 +220,8 @@ cmd_cancel() {
 admit_locked() {
   token=$1 exclusive=$2 label=$3 deadline=$4
   shift 4
+  # `run` interrupts a waiting admission by TERM to the pid in this file.
+  echo "$$" >"$state/run/$token.admit"
   if [ "$exclusive" = 1 ]; then
     slots_needed=$(ts -S)
     marker_text=" [exclusive]"
@@ -211,13 +229,22 @@ admit_locked() {
     slots_needed=1
     marker_text=
     # An exclusive job needs every slot at once; task-spooler would keep
-    # filling single free slots from behind it, so ordinary jobs wait for it.
-    queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
-    if [ -n "$queued_exclusive" ]; then
-      echo "wait $queued_exclusive"
-      return
-    fi
+    # filling single free slots from behind it, so an ordinary job waits until
+    # no exclusive job is queued. It waits here, holding the admission lock, so
+    # a job that arrives later queues behind it at the lock instead of ahead of
+    # it in the queue.
+    while :; do
+      queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
+      [ -n "$queued_exclusive" ] || break
+      echo "botsterq: waiting for exclusive job $queued_exclusive before queueing" >&2
+      ts -w "$queued_exclusive" >/dev/null 2>&1 &
+      waiting=$!
+      trap 'kill "$waiting" 2>/dev/null; exit 130' TERM
+      wait "$waiting" || true
+      trap ':' TERM
+    done
   fi
+  trap ':' TERM
   job_paths "$token"
   enqueued="$state/run/$token.enqueued"
   rm -f "$enqueued"
@@ -271,9 +298,18 @@ cmd_run() {
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
   export BOTSTERQ_OWNER=$$
   id=
+  admitting=
   interrupted() {
     trap - INT TERM HUP
     status=130
+    # A run still inside admission: TERM its admission process (only one that
+    # waits for an exclusive job acts on it), and let it end before the job is
+    # resolved by its token.
+    if [ -n "${admitting:-}" ]; then
+      [ ! -f "$state/run/$token.admit" ] || kill -TERM "$(cat "$state/run/$token.admit")" 2>/dev/null || true
+      wait "$admitting" 2>/dev/null || true
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admit"
+    fi
     # The signal may arrive before the admitted id is stored; the token names
     # the job either way, so resolve its id and stop it.
     [ -n "$id" ] || id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
@@ -285,17 +321,15 @@ cmd_run() {
   # The job's output goes to the caller's stdout and stderr (fds 3 and 4),
   # not into the command substitution that reads the admitted id.
   exec 3>&1 4>&2
-  while :; do
-    admitted=$(with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$deadline" "$@")
-    case "$admitted" in
-      "wait "*)
-        echo "botsterq: waiting for exclusive job ${admitted#wait } before queueing" >&2
-        ( ts -w "${admitted#wait }" >/dev/null 2>&1 ) &
-        wait $! || true
-        ;;
-      *) id=$admitted; break ;;
-    esac
-  done
+  # Admission runs in the background (its result goes to a file), so a cancel
+  # that arrives while it waits for an exclusive job is handled at once.
+  admitted_file="$state/run/$token.admitted"
+  with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" &
+  admitting=$!
+  wait "$admitting" || true
+  id=$(cat "$admitted_file" 2>/dev/null || true)
+  rm -f "$admitted_file" "$state/run/$token.admit"
+  [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!
   status=0
