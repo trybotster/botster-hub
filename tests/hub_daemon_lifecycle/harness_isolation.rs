@@ -1335,3 +1335,81 @@ fn test_owned_sweep_census_failure_fails_and_taints_without_replacing_a_panic() 
         reset_harness_taint_after_proof();
     }
 }
+
+/// Starts an orphan group leader that is NOT test-owned: its own command line
+/// does not name `dir`. It forks a child whose command line names `dir` and an
+/// unrelated sibling, both in the leader's group, like an external supervisor.
+/// Returns (leader, matched child, sibling).
+fn spawn_foreign_group_with_matched_child(dir: &Path) -> (u32, u32, u32) {
+    const LEADER: &str = concat!(
+        "setpgrp(0, 0); ",
+        "my $m = fork(); if ($m == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "exec('perl', '-e', 'sleep 300', $ENV{BH_SWEEP_DIR}); } ",
+        "my $s = fork(); if ($s == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); ",
+        "exec('sleep', '300'); } ",
+        "print \"$$ $m $s\\n\"; close(STDOUT); close(STDERR); sleep 300;"
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("perl -e \"$0\" </dev/null &")
+        .arg(LEADER)
+        .env("BH_SWEEP_DIR", dir)
+        .output()
+        .expect("spawn foreign group fixture");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut pids = text
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("fixture pid"));
+    (
+        pids.next().expect("leader pid"),
+        pids.next().expect("matched child pid"),
+        pids.next().expect("sibling pid"),
+    )
+}
+
+#[test]
+fn daemon_test_guard_leaves_a_foreign_group_leader_and_sibling_of_a_matched_child() {
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let result = thread::spawn(move || {
+        let _guard = daemon_test_guard();
+        let dir = unique_short_test_dir("sweep-foreign");
+        let pids = spawn_foreign_group_with_matched_child(&dir);
+        pid_tx.send(pids).expect("send fixture pids");
+        let (leader, matched, sibling) = pids;
+        let dir_text = dir.to_string_lossy().to_string();
+        for (pid, names_dir) in [(leader, false), (matched, true), (sibling, false)] {
+            let snapshot = process_snapshot(pid).expect("positive control: fixture pid is live");
+            assert_eq!(snapshot.pgid, leader, "positive control: {pid} is in the leader's group");
+            assert_eq!(
+                snapshot.command.contains(&dir_text),
+                names_dir,
+                "positive control: only the matched child names the test dir: {snapshot:?}"
+            );
+        }
+    })
+    .join();
+    let (leader, matched, sibling) = pid_rx.recv().expect("fixture pids");
+    let leader_alive = process_snapshot(leader).is_some();
+    let sibling_alive = process_snapshot(sibling).is_some();
+    // This test started the foreign group, so it stops it by its recorded pgid.
+    unsafe { libc::killpg(leader as libc::pid_t, libc::SIGKILL) };
+    let message = result
+        .expect_err("the matched child is a leak and must fail the passing test")
+        .downcast::<String>()
+        .map(|text| *text)
+        .unwrap_or_default();
+    assert!(
+        message.contains("test-owned processes outlived the test")
+            && message.contains(&matched.to_string()),
+        "the sweep must report the matched child {matched}: {message}"
+    );
+    assert!(
+        !message.contains(&format!("{{ pid: {leader},"))
+            && !message.contains(&format!("{{ pid: {sibling},")),
+        "the foreign leader and sibling must stay outside the owned set: {message}"
+    );
+    assert_orphan_gone(matched);
+    assert!(leader_alive, "the sweep must not signal the foreign group leader {leader}");
+    assert!(sibling_alive, "the sweep must not signal the unrelated sibling {sibling}");
+    assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
+}
