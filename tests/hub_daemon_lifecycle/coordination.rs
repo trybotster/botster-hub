@@ -127,9 +127,11 @@ fn shell_quote(value: &str) -> String {
 #[test]
 fn spawned_sessions_carry_the_identity_that_mcp_serve_reports() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-identity");
+    // Sessions reach the daemon through the absolute data directory, so it
+    // must keep the socket path under the Unix limit.
+    let data_dir = unique_short_test_dir("coord-id");
     let daemon = start_cli_daemon(&data_dir);
-    let fifo_dir = unique_test_dir("coordination-identity-fifos");
+    let fifo_dir = unique_short_test_dir("coord-fifo");
     fs::create_dir_all(&fifo_dir).expect("create fifo dir");
 
     let requests = format!(
