@@ -351,9 +351,14 @@ pub(crate) fn daemon_plugin_logs(
             .sum();
         let reply_records =
             records.len() * std::mem::size_of::<botster_hub_client::DaemonPluginLogRecord>();
-        let id = log_id.map_or(0, crate::plugin_logs::LogId::text_len);
-        charge.grow(reply_records + levels + id).ok()?;
+        charge.grow(reply_records + levels).ok()?;
     }
+    // A page with a log always carries its charge; the id's text is funded
+    // for its whole allocation.
+    let log_id = match (log_id, charge.as_mut()) {
+        (Some(id), Some(charge)) => Some(id.to_funded_string(charge)?),
+        _ => None,
+    };
     let mut response = daemon_response_base(DaemonResponseKind::PluginLogs);
     response.plugin_logs = Some(botster_hub_client::DaemonPluginLogs {
         package_name,
@@ -371,7 +376,7 @@ pub(crate) fn daemon_plugin_logs(
             .collect(),
         next_seq,
         first_available_seq,
-        log_id: log_id.map(|id| id.to_string()),
+        log_id,
     });
     Some((response, charge))
 }
