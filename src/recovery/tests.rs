@@ -164,10 +164,11 @@ fn a_restart_record_survives_a_save_and_a_reload() {
     let mut next = (*prior).clone();
     next.restart_records
         .insert("s1".to_string(), restart_record("claude"));
-    fixture
+    let saved = fixture
         .store
         .save_retained_startup_state(&authority, 0, Some(prior), next.clone())
         .expect("save the restart record");
+    assert!(matches!(saved, FileCommitOutcome::Synced { .. }));
     drop(authority);
     let (reloaded, _authority) = fixture.store.load_retained(&fixture.config).unwrap();
     assert_eq!(reloaded.restart_records, next.restart_records);
