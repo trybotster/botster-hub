@@ -191,24 +191,63 @@ pub struct HubRuntime {
     event_plane_owner_ops_changed: std::cell::Cell<bool>,
     event_plane_cleanup_faults: std::cell::RefCell<Vec<EventPlaneCleanupFault>>,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
-    force_plugin_admit_backpressure: Arc<std::sync::atomic::AtomicBool>,
-    pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
-    force_park_test_events: std::sync::atomic::AtomicBool,
+    /// Test seam: the next plugin admissions return this refusal instead of
+    /// reaching Core.
+    #[cfg(test)]
+    forced_admission: Arc<Mutex<Option<ForcedAdmission>>>,
 }
 
-enum PendingTestEvent {
-    Requeue {
-        delivery: crate::package_event_router::ReadyDelivery,
-        scope: Option<(u64, crate::package_event_router::LeaseIdentity)>,
-    },
-    Complete {
-        delivery: crate::package_event_router::ReadyDelivery,
-        scope: Option<(u64, crate::package_event_router::LeaseIdentity)>,
-    },
-    Release {
-        scope_id: u64,
-        identity: crate::package_event_router::LeaseIdentity,
-    },
+/// What an entity provider admission on the Host worker needs.
+pub(crate) struct ProviderAdmission {
+    pub(crate) lifecycle: HubPluginLifecycle,
+    #[cfg(test)]
+    pub(crate) forced: Arc<Mutex<Option<ForcedAdmission>>>,
+}
+
+impl ProviderAdmission {
+    pub(crate) fn try_admit(
+        self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        #[cfg(test)]
+        if let Some(forced) = *self
+            .forced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return forced.result(class, request.request_id);
+        }
+        self.lifecycle.try_admit(class, request)
+    }
+}
+
+/// A refusal a test forces on plugin admission (see `set_test_forced_admission`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedAdmission {
+    Backpressured,
+    LockBusy,
+}
+
+#[cfg(test)]
+impl ForcedAdmission {
+    pub(crate) fn result(
+        self,
+        class: PluginInvocationClass,
+        request_id: RequestId,
+    ) -> PluginAdmissionResult {
+        match self {
+            Self::Backpressured => PluginAdmissionResult::Backpressured {
+                request_id,
+                class,
+                cause: botster_core::PluginBackpressureCause::ClassQueue,
+                reason: "test-forced plugin admission backpressure".to_string(),
+                backpressure: None,
+            },
+            Self::LockBusy => PluginAdmissionResult::LockBusy { request_id, class },
+        }
+    }
 }
 
 type SharedCoreDaemon = crate::data_plane::driver::CoreDaemonHandle;
@@ -763,9 +802,8 @@ impl HubRuntime {
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
-            force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_test_event_settlements: Mutex::new(Vec::new()),
-            force_park_test_events: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            forced_admission: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -966,9 +1004,8 @@ impl HubRuntime {
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
-            force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_test_event_settlements: Mutex::new(Vec::new()),
-            force_park_test_events: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            forced_admission: Arc::new(Mutex::new(None)),
         };
         runtime.reconcile_sessions(0)?;
         if !runtime.reconciliation.incompatible_sessions.is_empty() {
@@ -4033,186 +4070,6 @@ impl HubRuntime {
         })
     }
 
-    /// Admit ready package-event deliveries and wait for completions.
-    ///
-    /// Production delivery uses the owner-loop `PackageEventDelivery` slice.
-    /// Tests use this helper when they do not own that loop. Each pulled copy
-    /// keeps one causal scope. On every exit the copy is completed, requeued,
-    /// or retired. Busy no-wait results stay in a durable retry store. The
-    /// helper never drops that store when a settle-turn limit ends.
-    pub fn drive_package_events_for_test(&self) -> Vec<botster_core::PluginCompletion> {
-        use std::time::{Duration, Instant};
-
-        use botster_core::{PluginCompletion, PluginInvocationClass, PluginInvocationContext};
-
-        use crate::package_event_router::CausalAdmitResult;
-
-        let mut pending = self
-            .pending_test_event_settlements
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect::<Vec<_>>();
-        let mut outcomes = Vec::new();
-        if pending.is_empty() {
-            let mut pulled = Vec::new();
-            loop {
-                let batch = self
-                    .package_event_router
-                    .pull_ready_batch(16, 64 * 1024, Instant::now(), Duration::from_secs(5))
-                    .unwrap_or_default();
-                if batch.is_empty() {
-                    break;
-                }
-                pulled.extend(batch);
-            }
-
-            for delivery in pulled {
-                let Ok(handler) = self.package_event_handler(&delivery) else {
-                    pending.push(PendingTestEvent::Complete {
-                        delivery,
-                        scope: None,
-                    });
-                    continue;
-                };
-                let request_id = RequestId(format!(
-                    "package-event-test-{}-{}-{}",
-                    delivery.name, delivery.envelope_id, delivery.holder.handler_id
-                ));
-                let identity = crate::package_event_router::LeaseIdentity::EventInFlight;
-                let Some(scope_id) = self.causal_scopes.mint_with_lease(Some(identity)) else {
-                    pending.push(PendingTestEvent::Requeue {
-                        delivery,
-                        scope: None,
-                    });
-                    continue;
-                };
-
-                if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-                    && self
-                        .force_plugin_admit_backpressure
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    pending.push(PendingTestEvent::Requeue {
-                        delivery,
-                        scope: Some((scope_id, identity)),
-                    });
-                    continue;
-                }
-
-                let outcome = self.plugin_lifecycle().invoke(PluginInvocationRequest {
-                    request_id,
-                    handler: handler.handler,
-                    timeout_ms: 1_000,
-                    context: PluginInvocationContext {
-                        client_id: None,
-                        session_id: None,
-                        subscription_id: None,
-                        surface_id: None,
-                        origin: Some("package-event-test".to_string()),
-                        metadata: None,
-                    },
-                    payload: BoundaryJson(delivery.payload_json.clone()),
-                });
-                pending.push(PendingTestEvent::Complete {
-                    delivery,
-                    scope: Some((scope_id, identity)),
-                });
-                outcomes.push(PluginCompletion {
-                    class: PluginInvocationClass::Background,
-                    result: outcome.result,
-                });
-            }
-        }
-
-        let park = std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && self
-                .force_park_test_events
-                .load(std::sync::atomic::Ordering::SeqCst);
-        if !park {
-            const MAX_SETTLE_TURNS: usize = 64;
-            let push_release =
-                |leftover: &mut Vec<PendingTestEvent>,
-                 scope: Option<(u64, crate::package_event_router::LeaseIdentity)>| {
-                    let Some((scope_id, identity)) = scope else {
-                        return;
-                    };
-                    match self.admit_causal_op(CausalOp::Release { scope_id, identity }) {
-                        CausalAdmitResult::Applied => {
-                            self.apply_causal_owner_ops();
-                        }
-                        CausalAdmitResult::Retry(_) => {
-                            leftover.push(PendingTestEvent::Release { scope_id, identity })
-                        }
-                    }
-                };
-            for _ in 0..MAX_SETTLE_TURNS {
-                if pending.is_empty() {
-                    break;
-                }
-                let mut leftover = Vec::new();
-                for item in pending.drain(..) {
-                    match item {
-                        PendingTestEvent::Requeue { delivery, scope } => {
-                            match self.package_event_router.requeue_delivery(delivery) {
-                                Ok(()) => push_release(&mut leftover, scope),
-                                Err((
-                                    delivery,
-                                    crate::package_event_router::EventPlaneStatus::ShedBusy,
-                                )) => leftover.push(PendingTestEvent::Requeue {
-                                    delivery: *delivery,
-                                    scope,
-                                }),
-                                Err((delivery, _)) => leftover.push(PendingTestEvent::Complete {
-                                    delivery: *delivery,
-                                    scope,
-                                }),
-                            }
-                        }
-                        PendingTestEvent::Complete { delivery, scope } => {
-                            match self.package_event_router.complete_pulled_delivery(delivery) {
-                                Ok(()) => push_release(&mut leftover, scope),
-                                Err((delivery, _)) => leftover.push(PendingTestEvent::Complete {
-                                    delivery: *delivery,
-                                    scope,
-                                }),
-                            }
-                        }
-                        PendingTestEvent::Release { scope_id, identity } => {
-                            push_release(&mut leftover, Some((scope_id, identity)));
-                        }
-                    }
-                }
-                pending = leftover;
-            }
-        }
-        self.pending_test_event_settlements
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(pending);
-        outcomes
-    }
-
-    pub fn set_test_plugin_admit_backpressure(&self, on: bool) {
-        self.force_plugin_admit_backpressure
-            .store(on, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn set_test_park_package_events(&self, on: bool) {
-        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test") {
-            self.force_park_test_events
-                .store(on, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[must_use]
-    pub fn test_pending_event_settlements(&self) -> usize {
-        self.pending_test_event_settlements
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0)
-    }
-
     /// Look up the handler for one delivery, only under the consumer plugin
     /// generation its subscription was admitted with.
     pub fn package_event_handler(
@@ -4237,18 +4094,9 @@ impl HubRuntime {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> Result<PluginAdmissionResult, crate::lifecycle::EventDeliveryRefusal> {
-        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && self
-                .force_plugin_admit_backpressure
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Ok(PluginAdmissionResult::Backpressured {
-                request_id: request.request_id,
-                class,
-                cause: botster_core::PluginBackpressureCause::ClassQueue,
-                reason: "test-forced plugin admission backpressure".to_string(),
-                backpressure: None,
-            });
+        #[cfg(test)]
+        if let Some(forced) = self.test_forced_admission() {
+            return Ok(forced.result(class, request.request_id));
         }
         self.plugin_lifecycle().try_admit_event(
             delivery.holder.plugin_generation,
@@ -4266,27 +4114,36 @@ impl HubRuntime {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
-        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            && self
-                .force_plugin_admit_backpressure
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return PluginAdmissionResult::Backpressured {
-                request_id: request.request_id,
-                class,
-                cause: botster_core::PluginBackpressureCause::ClassQueue,
-                reason: "test-forced plugin admission backpressure".to_string(),
-                backpressure: None,
-            };
+        #[cfg(test)]
+        if let Some(forced) = self.test_forced_admission() {
+            return forced.result(class, request.request_id);
         }
         self.plugin_lifecycle().try_admit(class, request)
     }
 
-    pub(crate) fn plugin_provider_admission(&self) -> (HubPluginLifecycle, Arc<AtomicBool>) {
-        (
-            self.plugin_lifecycle().clone(),
-            Arc::clone(&self.force_plugin_admit_backpressure),
-        )
+    pub(crate) fn plugin_provider_admission(&self) -> ProviderAdmission {
+        ProviderAdmission {
+            lifecycle: self.plugin_lifecycle().clone(),
+            #[cfg(test)]
+            forced: Arc::clone(&self.forced_admission),
+        }
+    }
+
+    /// Force the next plugin admissions to refuse, or stop forcing.
+    #[cfg(test)]
+    pub(crate) fn set_test_forced_admission(&self, forced: Option<ForcedAdmission>) {
+        *self
+            .forced_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = forced;
+    }
+
+    #[cfg(test)]
+    fn test_forced_admission(&self) -> Option<ForcedAdmission> {
+        *self
+            .forced_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn try_acquire_plugin_entity_snapshot(

@@ -50,10 +50,9 @@ pub(crate) enum Command {
         request_id: botster_core::RequestId,
     },
     AdmitProvider {
-        lifecycle: crate::lifecycle::HubPluginLifecycle,
+        admission: crate::runtime::ProviderAdmission,
         plan: ProviderRequestPlan,
         scope_id: Option<u64>,
-        force_backpressure: Arc<AtomicBool>,
     },
     RefuseProvider {
         plan: Option<ProviderRequestPlan>,
@@ -331,28 +330,15 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             }
         }
         Command::AdmitProvider {
-            lifecycle,
+            admission,
             mut plan,
             scope_id,
-            force_backpressure,
         } => {
             plan.set_scope(scope_id);
-            let admission = if force_backpressure.load(Ordering::SeqCst)
-                && std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
-            {
-                botster_core::PluginAdmissionResult::Backpressured {
-                    request_id: plan.request.request_id,
-                    class: botster_core::PluginInvocationClass::RequestResponse,
-                    cause: botster_core::PluginBackpressureCause::ClassQueue,
-                    reason: "test-forced plugin admission backpressure".into(),
-                    backpressure: None,
-                }
-            } else {
-                lifecycle.try_admit(
-                    botster_core::PluginInvocationClass::RequestResponse,
-                    plan.request,
-                )
-            };
+            let admission = admission.try_admit(
+                botster_core::PluginInvocationClass::RequestResponse,
+                plan.request,
+            );
             use botster_core::PluginAdmissionResult;
             let refusal = match admission {
                 PluginAdmissionResult::Queued { .. } => None,
