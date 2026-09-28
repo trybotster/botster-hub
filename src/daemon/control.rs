@@ -20,6 +20,7 @@ pub(crate) mod session_spawn;
 pub(crate) mod session_type_quarantine;
 pub(crate) mod session_types;
 pub(crate) mod sessions;
+pub(crate) mod state_record;
 pub(crate) mod status;
 pub(crate) mod webrtc;
 

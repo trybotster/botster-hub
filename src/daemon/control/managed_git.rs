@@ -5,11 +5,12 @@ use std::time::Instant;
 use botster_hub_client::DaemonResponseKind;
 
 use crate::HubDaemon;
-use crate::daemon::control::host_work::{
-    DocumentAdmission, HostRecoveryRequired, admit_document, release_document, retain_submission,
-};
+use crate::daemon::control::host_work::{HostRecoveryRequired, retain_submission};
 use crate::daemon::control::pending::{
     ControlPoll, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_owner_ready,
+};
+use crate::daemon::control::state_record::{
+    StateRecordAction, StateRecordStage, StateRecordTarget, StateRecordWrite,
 };
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
@@ -17,10 +18,7 @@ use crate::host_executor::{
     HostCommand, HostJobIdentity, HostResult, HostSubmissionFailure, HostSubmitError,
     HostWorkPermit,
 };
-use crate::host_mutations::{
-    HostCommit, HostMutationCommand, HostMutationResult, HostPrepare, PreparedMutation,
-    RecoveryOutcome,
-};
+use crate::host_mutations::PreparedMutation;
 use crate::managed_git_worktrees::{
     MANAGED_GIT_OPERATION_TIMEOUT, ManagedGitError, ManagedWorktreeDecision,
     PreparedManagedWorktree, managed_worktree_id,
@@ -31,18 +29,16 @@ use crate::runtime::{ManagedSessionSpawnStart, PendingManagedSessionSpawn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Create,
-    PrepareRecord,
-    ParkRecord,
-    CommitRecord,
+    /// The managed worktree record write (prepare, park, commit).
+    Record,
     Spawn,
     /// Delivery succeeded; a removed-during-launch release settles before
     /// the worktree commit finalizes.
     Handoff,
     FinalizeCommit,
     FinalizeRollback,
-    PrepareRemoval,
-    ParkRemoval,
-    CommitRemoval,
+    /// The managed worktree record removal (prepare, park, commit).
+    Removal,
     Done,
 }
 
@@ -54,7 +50,7 @@ pub(crate) struct ManagedSpawnOperation {
     core_release_confirmed: bool,
     pending: Option<PendingManagedSessionSpawn>,
     prepared: Option<PreparedManagedWorktree>,
-    prepared_mutation: Option<Box<PreparedMutation>>,
+    record_write: Option<StateRecordWrite>,
     spawn: Option<ManagedSessionSpawnStart>,
     permit: Option<HostWorkPermit>,
     phase: Phase,
@@ -147,7 +143,7 @@ fn accept_confirmed_rollback(
         core_release_confirmed: false,
         pending: None,
         prepared: Some(prepared),
-        prepared_mutation: None,
+        record_write: None,
         spawn: None,
         permit: None,
         phase: Phase::FinalizeRollback,
@@ -307,7 +303,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         core_release_confirmed: false,
         pending: Some(pending),
         prepared: None,
-        prepared_mutation: None,
+        record_write: None,
         spawn: None,
         permit: None,
         phase: Phase::Create,
@@ -379,7 +375,9 @@ impl ManagedSpawnOperation {
             payload: Box::new((
                 self.pending.take(),
                 self.prepared.take(),
-                self.prepared_mutation.take(),
+                self.record_write
+                    .as_mut()
+                    .and_then(StateRecordWrite::take_prepared),
                 self.spawn.take(),
                 self.deferred_error.take(),
                 result,
@@ -412,7 +410,12 @@ impl ManagedSpawnOperation {
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
     ) -> ControlPoll {
-        if matches!(self.phase, Phase::ParkRecord | Phase::ParkRemoval) {
+        if matches!(self.phase, Phase::Record | Phase::Removal)
+            && self
+                .record_write
+                .as_ref()
+                .is_some_and(StateRecordWrite::is_parked)
+        {
             return self.admit_parked(daemon, state);
         }
         if self.phase == Phase::Spawn {
@@ -438,17 +441,10 @@ impl ManagedSpawnOperation {
         self.permit = Some(permit);
         match self.phase {
             Phase::Create => self.created(daemon, state, result),
-            Phase::PrepareRecord => self.record_prepared(daemon, state, result),
-            Phase::CommitRecord => self.record_committed(daemon, state, result),
+            Phase::Record | Phase::Removal => self.record_write_completed(daemon, state, result),
             Phase::FinalizeCommit => self.finalized_commit(state, result),
             Phase::FinalizeRollback => self.finalized_rollback(daemon, state, result),
-            Phase::PrepareRemoval => self.removal_prepared(daemon, state, result),
-            Phase::CommitRemoval => self.removal_committed(daemon, state, result),
-            Phase::ParkRecord
-            | Phase::ParkRemoval
-            | Phase::Spawn
-            | Phase::Handoff
-            | Phase::Done => self.finish_reconciliation(
+            Phase::Spawn | Phase::Handoff | Phase::Done => self.finish_reconciliation(
                 "the managed Git owner received an unexpected host completion",
             ),
         }
@@ -498,7 +494,7 @@ impl ManagedSpawnOperation {
                         None,
                     );
                 }
-                self.submit_record_prepare(daemon, state, None)
+                self.start_record_write(daemon, state)
             }
             HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
                 self.retain_recovery(state, prepared, error)
@@ -509,197 +505,220 @@ impl ManagedSpawnOperation {
         }
     }
 
-    fn record_prepared(
+    fn start_record_write(
         &mut self,
         daemon: &HubDaemon,
         state: &mut DaemonControlState,
-        result: HostResult,
     ) -> ControlPoll {
-        match result {
-            HostResult::Mutation(HostMutationResult::Prepared(prepared)) => {
-                self.prepared_mutation = Some(Box::new(prepared));
-                self.admit_record(daemon, state, false)
-            }
-            HostResult::Mutation(HostMutationResult::Failed(error)) => {
-                self.deferred_error =
-                    Some(ManagedGitError::new("persistence_failed", error.message));
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
-            }
-            _ => self.finish_reconciliation(
-                "the host executor returned an invalid record preparation result",
-            ),
-        }
+        let worktree = self
+            .prepared
+            .as_ref()
+            .expect("managed worktree exists")
+            .worktree();
+        let (write, action) = StateRecordWrite::begin(
+            daemon,
+            self.waiter_id,
+            StateRecordTarget::ManagedWorktree(worktree),
+        )
+        .expect("File managed Git mutation retains its state authority");
+        self.record_write = Some(write);
+        self.apply_record_action(daemon, state, Phase::Record, action)
+    }
+
+    fn start_removal_write(
+        &mut self,
+        daemon: &HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        let worktree_id = self
+            .prepared
+            .as_ref()
+            .expect("managed worktree exists")
+            .worktree_id
+            .clone();
+        let (write, action) = StateRecordWrite::begin(
+            daemon,
+            self.waiter_id,
+            StateRecordTarget::RemoveManagedWorktree(worktree_id),
+        )
+        .expect("File managed Git mutation retains its state authority");
+        self.record_write = Some(write);
+        self.apply_record_action(daemon, state, Phase::Removal, action)
     }
 
     fn admit_parked(&mut self, daemon: &HubDaemon, state: &mut DaemonControlState) -> ControlPoll {
-        match self.phase {
-            Phase::ParkRecord => self.admit_record(daemon, state, true),
-            Phase::ParkRemoval => self.admit_removal(daemon, state, true),
-            _ => ControlPoll::Pending,
-        }
+        let phase = self.phase;
+        let action = self
+            .record_write
+            .as_mut()
+            .expect("a parked phase has a record write")
+            .admit(daemon, state, true);
+        self.apply_record_action(daemon, state, phase, action)
     }
 
-    fn admit_record(
-        &mut self,
-        daemon: &HubDaemon,
-        state: &mut DaemonControlState,
-        parked: bool,
-    ) -> ControlPoll {
-        let base_revision = self
-            .prepared_mutation
-            .as_ref()
-            .expect("record preparation exists")
-            .base_revision;
-        match admit_document(state, self.waiter_id, base_revision, daemon.state_view().0) {
-            DocumentAdmission::Granted => {
-                if !state.reserve_uncertain_publication(self.waiter_id) {
-                    release_document(state, self.waiter_id);
-                    self.deferred_error = Some(ManagedGitError::new(
-                        "state_publication_slot_occupied",
-                        "another unresolved state publication owns the retention cell",
-                    ));
-                    let discard = self.prepared_mutation.take();
-                    return self.submit_finalize(
-                        daemon,
-                        state,
-                        ManagedWorktreeDecision::Rollback,
-                        discard,
-                    );
-                }
-                let prepared = *self
-                    .prepared_mutation
-                    .take()
-                    .expect("record preparation exists");
-                let poll = self.submit_host(
-                    daemon,
-                    state,
-                    Phase::CommitRecord,
-                    HostCommand::Mutation(HostMutationCommand::Commit(HostCommit { prepared })),
-                );
-                if !matches!(poll, ControlPoll::Pending) {
-                    state.release_uncertain_reservation(self.waiter_id);
-                }
-                poll
-            }
-            DocumentAdmission::Busy => {
-                self.phase = Phase::ParkRecord;
-                ControlPoll::Pending
-            }
-            DocumentAdmission::Stale => {
-                if parked {
-                    state.document_waiters.remove(&self.waiter_id);
-                }
-                let superseded = self.prepared_mutation.take();
-                self.submit_record_prepare(daemon, state, superseded)
-            }
-        }
-    }
-
-    fn record_committed(
+    fn record_write_completed(
         &mut self,
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
         result: HostResult,
     ) -> ControlPoll {
-        if !matches!(
-            result,
-            HostResult::Mutation(HostMutationResult::PublishedUncertain { .. })
-        ) {
-            state.release_uncertain_reservation(self.waiter_id);
-        }
-        match result {
-            HostResult::Mutation(HostMutationResult::PublishedUncertain { write, rollback }) => {
-                let prepared = self.prepared.take().expect("managed worktree exists");
-                state.retain_uncertain_publication(
-                    self.waiter_id,
-                    write,
-                    rollback,
-                    Some(
-                        crate::daemon::owner_loop::UncertainPublicationCleanup::ManagedGit(
-                            prepared,
-                        ),
-                    ),
-                );
-                release_document(state, self.waiter_id);
-                self.finish_error(ManagedGitError::new(
-                    "state_publication_uncertain",
-                    "the managed worktree record reached publication without a confirmed durable result",
-                ))
+        let phase = self.phase;
+        let Some(write) = self.record_write.as_mut() else {
+            return self.finish_reconciliation(
+                "the managed Git owner received a record completion without a record write",
+            );
+        };
+        let prepared = &mut self.prepared;
+        let action = write.on_completion(daemon, state, result, || {
+            Some(
+                crate::daemon::owner_loop::UncertainPublicationCleanup::ManagedGit(
+                    prepared.take().expect("managed worktree exists"),
+                ),
+            )
+        });
+        self.apply_record_action(daemon, state, phase, action)
+    }
+
+    /// Carry out one record-write step. `phase` is Record or Removal: the
+    /// same write, each with the outcomes it has always had.
+    fn apply_record_action(
+        &mut self,
+        daemon: &HubDaemon,
+        state: &mut DaemonControlState,
+        phase: Phase,
+        action: StateRecordAction,
+    ) -> ControlPoll {
+        let removal = phase == Phase::Removal;
+        match action {
+            StateRecordAction::Submit(command) => {
+                let commit = self
+                    .record_write
+                    .as_ref()
+                    .is_some_and(StateRecordWrite::awaits_commit);
+                let poll = self.submit_host(daemon, state, phase, command);
+                if commit
+                    && !matches!(poll, ControlPoll::Pending)
+                    && let Some(write) = self.record_write.as_mut()
+                {
+                    write.commit_not_submitted(state);
+                }
+                poll
             }
-            HostResult::Mutation(HostMutationResult::Committed(committed)) => {
-                if committed.committed_revision != daemon.state_view().0.saturating_add(1) {
-                    release_document(state, self.waiter_id);
-                    self.deferred_error = Some(ManagedGitError::new(
-                        "reconciliation_required",
-                        "the managed worktree commit revision is not the next Hub revision",
-                    ));
-                    return self.submit_finalize(
-                        daemon,
-                        state,
-                        ManagedWorktreeDecision::Rollback,
-                        None,
-                    );
+            StateRecordAction::Park => ControlPoll::Pending,
+            StateRecordAction::Committed => {
+                self.record_write = None;
+                if removal {
+                    self.finish_deferred_error()
+                } else {
+                    self.record_published(daemon, state)
                 }
-                daemon.publish_state(committed.view);
-                release_document(state, self.waiter_id);
-                self.record_committed = true;
-                if self.deadline_elapsed() {
-                    self.deferred_error = Some(timeout_error());
-                    return self.submit_finalize(
-                        daemon,
-                        state,
-                        ManagedWorktreeDecision::Rollback,
-                        None,
-                    );
-                }
-                let Some(runtime) = daemon.runtime() else {
-                    self.deferred_error = Some(ManagedGitError::new(
-                        "spawn_failed",
-                        "the Hub runtime stopped before the session spawn",
-                    ));
-                    return self.submit_finalize(
-                        daemon,
-                        state,
-                        ManagedWorktreeDecision::Rollback,
-                        None,
-                    );
-                };
-                let start = runtime.spawn_prepared_managed_session(
-                    self.pending.as_ref().expect("managed request exists"),
-                    self.prepared.as_ref().expect("managed worktree exists"),
-                    self.waiter_id,
-                );
-                match start {
-                    Ok(start) => {
-                        self.spawn = Some(start);
-                        self.phase = Phase::Spawn;
-                        ControlPoll::Pending
+            }
+            StateRecordAction::Failed {
+                stage,
+                message,
+                discard,
+                ..
+            } => {
+                self.record_write = None;
+                match (removal, stage) {
+                    (false, StateRecordStage::PublicationSlot) => {
+                        self.deferred_error = Some(ManagedGitError::new(
+                            "state_publication_slot_occupied",
+                            "another unresolved state publication owns the retention cell",
+                        ));
+                        self.submit_finalize(
+                            daemon,
+                            state,
+                            ManagedWorktreeDecision::Rollback,
+                            discard,
+                        )
                     }
-                    Err(error) => {
-                        self.deferred_error = Some(error);
+                    (false, _) => {
+                        self.deferred_error =
+                            Some(ManagedGitError::new("persistence_failed", message));
                         self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
                     }
+                    (true, StateRecordStage::PublicationSlot) => {
+                        drop(discard);
+                        let prepared = self.prepared.take().expect("managed worktree exists");
+                        self.retain_recovery_with_code(
+                            state,
+                            prepared,
+                            crate::host_executor::HostError::new(
+                                "state_publication_slot_occupied",
+                                "another unresolved state publication owns the retention cell",
+                            ),
+                            "state_publication_slot_occupied",
+                        )
+                    }
+                    (true, _) => self.finish_reconciliation(&format!(
+                        "managed worktree record removal failed: {message}"
+                    )),
                 }
             }
-            HostResult::Mutation(HostMutationResult::Failed(error)) => {
-                release_document(state, self.waiter_id);
-                self.deferred_error =
-                    Some(ManagedGitError::new("persistence_failed", error.message));
+            StateRecordAction::Uncertain => {
+                self.record_write = None;
+                self.finish_error(ManagedGitError::new(
+                    "state_publication_uncertain",
+                    if removal {
+                        "the managed worktree removal reached publication without a confirmed durable result"
+                    } else {
+                        "the managed worktree record reached publication without a confirmed durable result"
+                    },
+                ))
+            }
+            StateRecordAction::RevisionMismatch => {
+                self.record_write = None;
+                if removal {
+                    return self.finish_reconciliation(
+                        "the managed worktree removal revision is not the next Hub revision",
+                    );
+                }
+                self.deferred_error = Some(ManagedGitError::new(
+                    "reconciliation_required",
+                    "the managed worktree commit revision is not the next Hub revision",
+                ));
                 self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
             }
-            HostResult::Mutation(HostMutationResult::Recovered(
-                RecoveryOutcome::RegisteredWorktree { failure, .. },
-            )) => {
-                release_document(state, self.waiter_id);
-                self.deferred_error =
-                    Some(ManagedGitError::new("persistence_failed", failure.message));
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+            StateRecordAction::Reconciliation(message) => {
+                self.record_write = None;
+                self.finish_reconciliation(&message)
             }
-            _ => {
-                release_document(state, self.waiter_id);
-                self.finish_reconciliation(
-                    "the host executor returned an invalid record commit result",
-                )
+        }
+    }
+
+    /// The managed worktree record is durable and published: spawn the session.
+    fn record_published(
+        &mut self,
+        daemon: &HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        self.record_committed = true;
+        if self.deadline_elapsed() {
+            self.deferred_error = Some(timeout_error());
+            return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
+        }
+        let Some(runtime) = daemon.runtime() else {
+            self.deferred_error = Some(ManagedGitError::new(
+                "spawn_failed",
+                "the Hub runtime stopped before the session spawn",
+            ));
+            return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
+        };
+        let start = runtime.spawn_prepared_managed_session(
+            self.pending.as_ref().expect("managed request exists"),
+            self.prepared.as_ref().expect("managed worktree exists"),
+            self.waiter_id,
+        );
+        match start {
+            Ok(start) => {
+                self.spawn = Some(start);
+                self.phase = Phase::Spawn;
+                ControlPoll::Pending
+            }
+            Err(error) => {
+                self.deferred_error = Some(error);
+                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
             }
         }
     }
@@ -719,7 +738,7 @@ impl ManagedSpawnOperation {
             core_release_confirmed: false,
             pending: Some(pending),
             prepared: Some(prepared),
-            prepared_mutation: None,
+            record_write: None,
             spawn: Some(start),
             permit: None,
             phase: Phase::Spawn,
@@ -744,7 +763,7 @@ impl ManagedSpawnOperation {
             core_release_confirmed: true,
             pending: None,
             prepared: None,
-            prepared_mutation: None,
+            record_write: None,
             spawn: None,
             permit: Some(permit),
             phase: Phase::Spawn,
@@ -922,7 +941,7 @@ impl ManagedSpawnOperation {
                         .as_ref()
                         .is_some_and(|prepared| prepared.created_worktree);
                 if remove_record {
-                    self.submit_removal_prepare(daemon, state, None)
+                    self.start_removal_write(daemon, state)
                 } else {
                     self.finish_deferred_error()
                 }
@@ -942,222 +961,6 @@ impl ManagedSpawnOperation {
                 self.finish_reconciliation("the host executor returned an invalid rollback result")
             }
         }
-    }
-
-    fn removal_prepared(
-        &mut self,
-        daemon: &HubDaemon,
-        state: &mut DaemonControlState,
-        result: HostResult,
-    ) -> ControlPoll {
-        match result {
-            HostResult::Mutation(HostMutationResult::Prepared(prepared)) => {
-                self.prepared_mutation = Some(Box::new(prepared));
-                self.admit_removal(daemon, state, false)
-            }
-            HostResult::Mutation(HostMutationResult::Failed(error)) => self.finish_reconciliation(
-                &format!("managed worktree record removal failed: {}", error.message),
-            ),
-            _ => self.finish_reconciliation(
-                "the host executor returned an invalid removal preparation result",
-            ),
-        }
-    }
-
-    fn admit_removal(
-        &mut self,
-        daemon: &HubDaemon,
-        state: &mut DaemonControlState,
-        parked: bool,
-    ) -> ControlPoll {
-        let base_revision = self
-            .prepared_mutation
-            .as_ref()
-            .expect("record removal exists")
-            .base_revision;
-        match admit_document(state, self.waiter_id, base_revision, daemon.state_view().0) {
-            DocumentAdmission::Granted => {
-                if !state.reserve_uncertain_publication(self.waiter_id) {
-                    release_document(state, self.waiter_id);
-                    let prepared = self.prepared.take().expect("managed worktree exists");
-                    self.prepared_mutation.take();
-                    return self.retain_recovery_with_code(
-                        state,
-                        prepared,
-                        crate::host_executor::HostError::new(
-                            "state_publication_slot_occupied",
-                            "another unresolved state publication owns the retention cell",
-                        ),
-                        "state_publication_slot_occupied",
-                    );
-                }
-                let prepared = *self
-                    .prepared_mutation
-                    .take()
-                    .expect("record removal exists");
-                let poll = self.submit_host(
-                    daemon,
-                    state,
-                    Phase::CommitRemoval,
-                    HostCommand::Mutation(HostMutationCommand::Commit(HostCommit { prepared })),
-                );
-                if !matches!(poll, ControlPoll::Pending) {
-                    state.release_uncertain_reservation(self.waiter_id);
-                }
-                poll
-            }
-            DocumentAdmission::Busy => {
-                self.phase = Phase::ParkRemoval;
-                ControlPoll::Pending
-            }
-            DocumentAdmission::Stale => {
-                if parked {
-                    state.document_waiters.remove(&self.waiter_id);
-                }
-                let superseded = self.prepared_mutation.take();
-                self.submit_removal_prepare(daemon, state, superseded)
-            }
-        }
-    }
-
-    fn removal_committed(
-        &mut self,
-        daemon: &mut HubDaemon,
-        state: &mut DaemonControlState,
-        result: HostResult,
-    ) -> ControlPoll {
-        if !matches!(
-            result,
-            HostResult::Mutation(HostMutationResult::PublishedUncertain { .. })
-        ) {
-            state.release_uncertain_reservation(self.waiter_id);
-        }
-        match result {
-            HostResult::Mutation(HostMutationResult::PublishedUncertain { write, rollback }) => {
-                let prepared = self.prepared.take().expect("managed worktree exists");
-                state.retain_uncertain_publication(
-                    self.waiter_id,
-                    write,
-                    rollback,
-                    Some(
-                        crate::daemon::owner_loop::UncertainPublicationCleanup::ManagedGit(
-                            prepared,
-                        ),
-                    ),
-                );
-                release_document(state, self.waiter_id);
-                self.finish_error(ManagedGitError::new(
-                    "state_publication_uncertain",
-                    "the managed worktree removal reached publication without a confirmed durable result",
-                ))
-            }
-            HostResult::Mutation(HostMutationResult::Committed(committed)) => {
-                if committed.committed_revision != daemon.state_view().0.saturating_add(1) {
-                    release_document(state, self.waiter_id);
-                    return self.finish_reconciliation(
-                        "the managed worktree removal revision is not the next Hub revision",
-                    );
-                }
-                daemon.publish_state(committed.view);
-                release_document(state, self.waiter_id);
-                self.finish_deferred_error()
-            }
-            HostResult::Mutation(HostMutationResult::Failed(error)) => {
-                release_document(state, self.waiter_id);
-                self.finish_reconciliation(&format!(
-                    "managed worktree record removal failed: {}",
-                    error.message
-                ))
-            }
-            HostResult::Mutation(HostMutationResult::Recovered(
-                RecoveryOutcome::RegisteredWorktree { failure, .. },
-            )) => {
-                release_document(state, self.waiter_id);
-                self.finish_reconciliation(&format!(
-                    "managed worktree record removal failed: {}",
-                    failure.message
-                ))
-            }
-            _ => {
-                release_document(state, self.waiter_id);
-                self.finish_reconciliation(
-                    "the host executor returned an invalid removal commit result",
-                )
-            }
-        }
-    }
-
-    fn submit_record_prepare(
-        &mut self,
-        daemon: &HubDaemon,
-        state: &mut DaemonControlState,
-        superseded: Option<Box<PreparedMutation>>,
-    ) -> ControlPoll {
-        let (base_revision, view) = daemon.state_view();
-        let command = HostPrepare::ManagedWorktree {
-            worktree: self
-                .prepared
-                .as_ref()
-                .expect("managed worktree exists")
-                .worktree(),
-            base_revision,
-            authority: daemon
-                .runtime()
-                .expect("managed operation requires runtime")
-                .state_authority()
-                .expect("File managed Git mutation retains its state authority"),
-            state: view,
-            data_directory: daemon
-                .runtime()
-                .expect("managed operation requires runtime")
-                .config()
-                .data_directory
-                .clone(),
-            superseded,
-        };
-        self.submit_host(
-            daemon,
-            state,
-            Phase::PrepareRecord,
-            HostCommand::Mutation(HostMutationCommand::Prepare(Box::new(command))),
-        )
-    }
-
-    fn submit_removal_prepare(
-        &mut self,
-        daemon: &HubDaemon,
-        state: &mut DaemonControlState,
-        superseded: Option<Box<PreparedMutation>>,
-    ) -> ControlPoll {
-        let (base_revision, view) = daemon.state_view();
-        let command = HostPrepare::RemoveManagedWorktree {
-            worktree_id: self
-                .prepared
-                .as_ref()
-                .expect("managed worktree exists")
-                .worktree_id
-                .clone(),
-            base_revision,
-            authority: daemon
-                .runtime()
-                .expect("managed operation requires runtime")
-                .state_authority()
-                .expect("File managed Git mutation retains its state authority"),
-            state: view,
-            data_directory: daemon
-                .runtime()
-                .expect("managed operation requires runtime")
-                .config()
-                .data_directory
-                .clone(),
-            superseded,
-        };
-        self.submit_host(
-            daemon,
-            state,
-            Phase::PrepareRemoval,
-            HostCommand::Mutation(HostMutationCommand::Prepare(Box::new(command))),
-        )
     }
 
     fn submit_finalize(
