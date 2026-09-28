@@ -2046,7 +2046,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) pump: PumpState,
     pub(crate) released_entity_generations: u64,
     pub(crate) attach_close: crate::subscription::closed_events::AttachCloseBookkeeping,
-    pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
+    pub(crate) hub_update_check: Option<crate::daemon::control::host::HubUpdateCheck>,
     /// Requests whose response waits on a Core owner-thread result.
     pub(crate) pending_requests: BTreeMap<
         crate::owner_identity::WaiterId,
@@ -2326,7 +2326,7 @@ impl Default for DaemonControlState {
             pump: PumpState::default(),
             released_entity_generations: 0,
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
-            pending_hub_update_reply: None,
+            hub_update_check: None,
             pending_requests: BTreeMap::new(),
             retained_explicit_reservations: Vec::new(),
             waiter_ids,

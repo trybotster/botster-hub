@@ -98,6 +98,7 @@ pub(crate) fn handle(
         // Unavailable/daemon_shutdown/retry, which is acceptable because the
         // client retries. The fetch's late completion then finds no parked
         // reply and sends nothing (`host::hub_update_check_completed`).
+        // The fetch's record stays, so a retry while it runs gets busy.
         super::request::finish_shutdown_update_reply(state);
     }
     ControlStep::Pending(super::pending::PendingStep {
@@ -1740,7 +1741,9 @@ mod tests {
             Some(reply_rx)
         };
         let (update_tx, update_rx) = control_reply_channel();
-        state.pending_hub_update_reply = Some(update_tx);
+        state.hub_update_check = Some(super::super::host::HubUpdateCheck {
+            reply: Some(update_tx),
+        });
         assert!(!super::super::request::handle(
             &mut daemon,
             &mut state,
@@ -1760,7 +1763,7 @@ mod tests {
         // any owner turn: its own fetch deadline can no longer win the race.
         let mut update_rx = update_rx;
         assert_update_reply_is_daemon_shutdown(&mut update_rx);
-        assert!(state.pending_hub_update_reply.is_none());
+        assert_update_record_kept_without_reply(&state);
         assert_eq!(
             daemon.runtime().unwrap().host_executor().outstanding(),
             HOST_OPERATION_CAPACITY
@@ -1875,11 +1878,15 @@ mod tests {
         }
         // The finished shutdown sends no second reply, and the fetch's late
         // completion finds nothing parked.
-        assert!(state.pending_hub_update_reply.is_none());
-        assert!(!super::super::host::hub_update_check_completed(
-            &mut state,
-            late_update_check()
-        ));
+        assert_update_record_kept_without_reply(&state);
+        // The record holds no reply sender here (asserted above), so the late
+        // completion has nothing to send with. The bool it returns means
+        // "stop the daemon", not "sent".
+        let _ = super::super::host::hub_update_check_completed(&mut state, late_update_check());
+        assert!(
+            state.hub_update_check.is_none(),
+            "the late completion clears the record"
+        );
         assert!(!crate::daemon::owner_loop::drive_ready_test_turn(
             &mut daemon,
             &mut state
@@ -1906,6 +1913,18 @@ mod tests {
             reason: Some("release_source_timeout".to_string()),
             action: None,
         }
+    }
+
+    /// Shutdown took the caller's reply, but the fetch still runs: its record
+    /// stays, so a check that arrives now is busy.
+    fn assert_update_record_kept_without_reply(state: &DaemonControlState) {
+        assert!(
+            state
+                .hub_update_check
+                .as_ref()
+                .is_some_and(|check| check.reply.is_none()),
+            "shutdown takes the reply and keeps the in-flight record"
+        );
     }
 
     fn assert_update_reply_is_daemon_shutdown(
@@ -1952,7 +1971,9 @@ mod tests {
             tokio::sync::mpsc::channel(crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY);
         let (reply_tx, _reply_rx) = control_reply_channel();
         let (update_tx, mut update_rx) = control_reply_channel();
-        state.pending_hub_update_reply = Some(update_tx);
+        state.hub_update_check = Some(super::super::host::HubUpdateCheck {
+            reply: Some(update_tx),
+        });
         assert!(!super::super::request::handle(
             &mut daemon,
             &mut state,
@@ -1969,7 +1990,7 @@ mod tests {
             }
         ));
         assert_update_reply_is_daemon_shutdown(&mut update_rx);
-        assert!(state.pending_hub_update_reply.is_none());
+        assert_update_record_kept_without_reply(&state);
 
         // Drive the admitted shutdown into its failed-preparation branch.
         let (&waiter_id, entry) = state
@@ -2026,11 +2047,15 @@ mod tests {
             "the forced failure ends the shutdown with status_preparation_failed"
         );
         assert_eq!(state.shutdown_waiter, None, "the daemon keeps running");
-        assert!(state.pending_hub_update_reply.is_none());
-        assert!(!super::super::host::hub_update_check_completed(
-            &mut state,
-            late_update_check()
-        ));
+        assert_update_record_kept_without_reply(&state);
+        // The record holds no reply sender here (asserted above), so the late
+        // completion has nothing to send with. The bool it returns means
+        // "stop the daemon", not "sent".
+        let _ = super::super::host::hub_update_check_completed(&mut state, late_update_check());
+        assert!(
+            state.hub_update_check.is_none(),
+            "the late completion clears the record"
+        );
         state.pending_requests.clear();
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove test state");
