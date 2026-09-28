@@ -319,3 +319,43 @@ fn botster_clock_inside_a_handler_returns_the_logical_time() {
     );
     assert_eq!(after["now"], 1_700_000_000_250u64);
 }
+
+/// Core's routed store delivers at least once: a receive does not remove an
+/// envelope, and only the target's acknowledgement does.
+#[test]
+fn a_routed_envelope_is_received_again_until_its_target_acknowledges_it() {
+    use botster_plugin_test_kit::{EnvelopeId, EnvelopeTarget, SessionId};
+    let mut kit = start("routed-ack");
+    let response = kit
+        .enable_package(&fixture("kit-fixture"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    let target = EnvelopeTarget::Session {
+        session_id: SessionId("sess-b".to_string()),
+    };
+    let routed = kit
+        .call_tool(
+            "kit-fixture.route",
+            serde_json::json!({
+                "envelope_id": "env-ack",
+                "target": serde_json::to_value(&target).expect("target encodes"),
+                "body": "hi",
+            }),
+        )
+        .expect("call settles");
+    assert!(routed.error.is_none(), "{routed:?}");
+
+    for _ in 0..2 {
+        let received = kit
+            .receive_routed(target.clone(), None, 10)
+            .expect("receive");
+        assert_eq!(received.envelopes.len(), 1, "{received:?}");
+        assert_eq!(received.envelopes[0].id.0, "env-ack");
+    }
+    kit.ack_routed(target.clone(), EnvelopeId("env-ack".to_string()))
+        .expect("ack");
+    let after_ack = kit
+        .receive_routed(target, None, 10)
+        .expect("receive after ack");
+    assert!(after_ack.envelopes.is_empty(), "{after_ack:?}");
+}
