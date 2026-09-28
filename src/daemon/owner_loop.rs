@@ -1111,6 +1111,9 @@ pub(crate) const TEST_HANG_GUARD: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) struct TestOwnerWakes {
     receiver: tokio_mpsc::Receiver<ControlMessage>,
+    /// The owner doorbell the daemon loop also blocks on. Progress that only
+    /// rings it (a raised key with no control message) wakes the test too.
+    signal: Option<Arc<crate::daemon::owner_signal::OwnerSignal>>,
     blocking: tokio::runtime::Runtime,
     /// The kind of every wake `wait` received, in order.
     pub(crate) received: Vec<&'static str>,
@@ -1120,18 +1123,24 @@ pub(crate) struct TestOwnerWakes {
 impl TestOwnerWakes {
     pub(crate) fn bind(daemon: &HubDaemon, state: &DaemonControlState) -> Self {
         let (sender, receiver) = tokio_mpsc::channel(64);
+        let mut signal = None;
         if let Some(runtime) = daemon.runtime() {
             runtime.bind_data_plane_owner_wake(sender.clone());
             runtime.bind_host_owner_wake(sender.clone());
             runtime.bind_managed_spawn_owner_wake(sender.clone());
+            signal = Some(Arc::clone(runtime.owner_signal()));
         }
         state.plugin_result_budget.bind_owner_wake(sender);
-        Self::from_receiver(receiver)
+        Self::from_receiver(receiver, signal)
     }
 
-    fn from_receiver(receiver: tokio_mpsc::Receiver<ControlMessage>) -> Self {
+    fn from_receiver(
+        receiver: tokio_mpsc::Receiver<ControlMessage>,
+        signal: Option<Arc<crate::daemon::owner_signal::OwnerSignal>>,
+    ) -> Self {
         Self {
             receiver,
+            signal,
             blocking: tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
@@ -1158,14 +1167,31 @@ impl TestOwnerWakes {
     pub(crate) fn wait(&mut self, deadline: Instant) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let receiver = &mut self.receiver;
+        let signal = self.signal.as_deref();
+        let rung = async {
+            match signal {
+                Some(signal) => signal.rung().await,
+                None => std::future::pending().await,
+            }
+        };
         // timer: deadline — the shared test hang guard; normal progress
         // arrives as an owner wake before it.
         // The timer must be created inside the runtime's context.
-        match self
-            .blocking
-            .block_on(async { tokio::time::timeout(remaining, receiver.recv()).await })
-        {
-            Ok(Some(message)) => {
+        match self.blocking.block_on(async {
+            tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    biased;
+                    message = receiver.recv() => Some(message),
+                    () = rung => None,
+                }
+            })
+            .await
+        }) {
+            Ok(None) => {
+                self.received.push("OwnerSignal");
+                true
+            }
+            Ok(Some(Some(message))) => {
                 self.received.push(match message {
                     ControlMessage::PluginCompletionPublished => "PluginCompletionPublished",
                     ControlMessage::CoreCompletionPublished => "CoreCompletionPublished",
@@ -1175,7 +1201,7 @@ impl TestOwnerWakes {
                 });
                 true
             }
-            Ok(None) => panic!("the owner wake channel closed"),
+            Ok(Some(None)) => panic!("the owner wake channel closed"),
             Err(_) => false,
         }
     }
