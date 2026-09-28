@@ -188,6 +188,7 @@ impl std::fmt::Debug for HostMutationCommand {
                 HostPrepare::SessionType { .. } => "PrepareSessionType",
                 HostPrepare::ManagedWorktree { .. } => "PrepareManagedWorktree",
                 HostPrepare::RemoveManagedWorktree { .. } => "PrepareRemoveManagedWorktree",
+                HostPrepare::RestartRecord { .. } => "PrepareRestartRecord",
             },
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
@@ -244,6 +245,16 @@ pub(crate) enum HostPrepare {
     },
     RemoveManagedWorktree {
         worktree_id: String,
+        base_revision: u64,
+        authority: Arc<HubStateAuthority>,
+        state: SharedView<HubState>,
+        data_directory: PathBuf,
+        superseded: Option<Box<PreparedMutation>>,
+    },
+    /// Set (`Some`) or remove (`None`) one session's restart record.
+    RestartRecord {
+        session_id: String,
+        record: Option<crate::restart_records::RestartRecord>,
         base_revision: u64,
         authority: Arc<HubStateAuthority>,
         state: SharedView<HubState>,
@@ -761,6 +772,7 @@ pub(crate) enum PreparedChange {
     PackageConfiguration(PreparedStateChange),
     SpawnTarget(PreparedStateChange),
     RegisteredWorktree(PreparedStateChange),
+    RestartRecord(PreparedStateChange),
     SessionType(PreparedSessionTypeChange),
 }
 
@@ -932,7 +944,8 @@ impl PreparedMutation {
             PreparedChange::SessionType(PreparedSessionTypeChange::Document(change))
             | PreparedChange::PackageConfiguration(change)
             | PreparedChange::SpawnTarget(change)
-            | PreparedChange::RegisteredWorktree(change) => &change.write,
+            | PreparedChange::RegisteredWorktree(change)
+            | PreparedChange::RestartRecord(change) => &change.write,
         };
         Some(write.views())
     }
@@ -953,6 +966,9 @@ pub(crate) enum RollbackDescriptor {
         previous: SharedView<HubState>,
     },
     RegisteredWorktree {
+        previous: SharedView<HubState>,
+    },
+    RestartRecord {
         previous: SharedView<HubState>,
     },
     SessionType {
@@ -981,6 +997,10 @@ pub(crate) enum RecoveryOutcome {
         failure: HostMutationError,
     },
     RegisteredWorktree {
+        view: SharedView<HubState>,
+        failure: HostMutationError,
+    },
+    RestartRecord {
         view: SharedView<HubState>,
         failure: HostMutationError,
     },
@@ -1727,7 +1747,60 @@ fn execute_prepare(
             drop(superseded);
             result
         }
+        HostPrepare::RestartRecord {
+            session_id,
+            record,
+            base_revision,
+            authority,
+            state,
+            data_directory,
+            superseded,
+        } => {
+            let result = prepare_restart_record(
+                session_id,
+                record,
+                base_revision,
+                authority,
+                state,
+                data_directory,
+            );
+            drop(superseded);
+            result
+        }
     }
+}
+
+fn prepare_restart_record(
+    session_id: String,
+    record: Option<crate::restart_records::RestartRecord>,
+    base_revision: u64,
+    authority: Arc<HubStateAuthority>,
+    state: SharedView<HubState>,
+    data_directory: PathBuf,
+) -> Result<PreparedMutation, HostMutationError> {
+    let mut candidate = (*state).clone();
+    // The reply stays inside the Hub: the spawn or removal answers its client.
+    let kind = match record {
+        Some(record) => {
+            candidate.restart_records.insert(session_id, record);
+            DaemonResponseKind::Spawned
+        }
+        None => {
+            candidate.restart_records.remove(&session_id);
+            DaemonResponseKind::SessionRemoved
+        }
+    };
+    prepare_state_change(StateChangeInputs {
+        base_revision,
+        authority,
+        previous: state,
+        candidate,
+        data_directory,
+        reply: HostReply::try_new(crate::client_api_dto::response::daemon_response_base(kind))?,
+        family: MutationFamily::RestartRecord,
+        packages: None,
+        package_effect: None,
+    })
 }
 
 fn prepare_managed_worktree_removal(
@@ -2500,6 +2573,10 @@ fn prepare_state_change(inputs: StateChangeInputs) -> Result<PreparedMutation, H
             PreparedChange::RegisteredWorktree(change),
             RollbackDescriptor::RegisteredWorktree { previous },
         ),
+        MutationFamily::RestartRecord => (
+            PreparedChange::RestartRecord(change),
+            RollbackDescriptor::RestartRecord { previous },
+        ),
     };
     Ok(PreparedMutation {
         base_revision,
@@ -2807,6 +2884,10 @@ fn execute_recovery(recover: HostRecover) -> RecoveryOutcome {
                 failure: recover.failure,
             }
         }
+        RollbackDescriptor::RestartRecord { previous } => RecoveryOutcome::RestartRecord {
+            view: previous,
+            failure: recover.failure,
+        },
         RollbackDescriptor::SessionType {
             previous,
             repo_file,
@@ -2836,7 +2917,8 @@ fn into_state_change(change: PreparedChange) -> PreparedStateChange {
     match change {
         PreparedChange::PackageConfiguration(change)
         | PreparedChange::SpawnTarget(change)
-        | PreparedChange::RegisteredWorktree(change) => change,
+        | PreparedChange::RegisteredWorktree(change)
+        | PreparedChange::RestartRecord(change) => change,
         PreparedChange::SessionType(_) => unreachable!("session-type commit uses both stores"),
     }
 }
@@ -2854,6 +2936,9 @@ fn families_match(change: &PreparedChange, rollback: &RollbackDescriptor) -> boo
             PreparedChange::RegisteredWorktree(_),
             RollbackDescriptor::RegisteredWorktree { .. }
         ) | (
+            PreparedChange::RestartRecord(_),
+            RollbackDescriptor::RestartRecord { .. }
+        ) | (
             PreparedChange::SessionType(_),
             RollbackDescriptor::SessionType { .. }
         )
@@ -2865,6 +2950,7 @@ enum MutationFamily {
     PackageConfiguration,
     SpawnTarget,
     RegisteredWorktree,
+    RestartRecord,
 }
 
 fn validate_spawn_target_update(
@@ -3848,6 +3934,55 @@ mod tests {
             "committed-target"
         );
         assert!(data_directory.join("hub-state.json").is_file());
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn a_restart_record_commits_and_its_removal_commits_on_the_next_revision() {
+        let (state, _packages, data_directory, authority) = persisted_inputs("restart-record");
+        let record = crate::restart_records::RestartRecord::from_request(
+            "claude",
+            &crate::session_types::SessionTypeRequest {
+                target_id: Some("target-1".to_string()),
+                ..Default::default()
+            },
+        );
+        let prepare = |record, base_revision, state| {
+            let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+                Box::new(HostPrepare::RestartRecord {
+                    session_id: "s1".to_string(),
+                    record,
+                    base_revision,
+                    authority: Arc::clone(&authority),
+                    state,
+                    data_directory: data_directory.clone(),
+                    superseded: None,
+                }),
+            )) else {
+                panic!("restart record prepare must succeed");
+            };
+            assert!(matches!(
+                prepared.rollback,
+                RollbackDescriptor::RestartRecord { .. }
+            ));
+            let HostMutationResult::Committed(committed) =
+                execute(HostMutationCommand::Commit(HostCommit { prepared }))
+            else {
+                panic!("restart record commit must succeed");
+            };
+            committed
+        };
+        let set = prepare(Some(record.clone()), 7, state);
+        assert_eq!(set.committed_revision, 8);
+        assert_eq!(set.reply.response.kind, DaemonResponseKind::Spawned);
+        assert_eq!(set.view.restart_records.get("s1"), Some(&record));
+        let removed = prepare(None, 8, set.view.clone());
+        assert_eq!(removed.committed_revision, 9);
+        assert_eq!(
+            removed.reply.response.kind,
+            DaemonResponseKind::SessionRemoved
+        );
+        assert!(removed.view.restart_records.is_empty());
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
