@@ -1498,13 +1498,15 @@ impl DataPlaneDriver {
                 ready_tx.send(control).expect("publish Core pump control");
                 run_loop(
                     &mut daemon,
-                    request_rx,
+                    RequestQueue {
+                        receiver: request_rx,
+                        pending: thread_request_pending,
+                        owner_waiting: thread_owner_waiting,
+                        capacity: thread_capacity,
+                    },
                     close_work,
                     thread_owner_wake,
                     thread_progress_latch,
-                    thread_request_pending,
-                    thread_owner_waiting,
-                    thread_capacity,
                 );
                 if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
                     daemon.release_for_restart();
@@ -1604,16 +1606,30 @@ impl Drop for DataPlaneDriver {
     }
 }
 
+/// The data-plane thread's end of the Core request queue.
+struct RequestQueue {
+    receiver: Receiver<CoreRequest>,
+    /// Set by a submitter; the thread runs requests before it waits.
+    pending: Arc<AtomicBool>,
+    /// Set while the thread may wait; a submitter then interrupts the wait.
+    owner_waiting: Arc<AtomicBool>,
+    /// Wakes an owner parked on a full queue once requests are dequeued.
+    capacity: DataPlaneCapacity,
+}
+
 fn run_loop(
     core_daemon: &mut CoreDaemon,
-    requests: Receiver<CoreRequest>,
+    queue: RequestQueue,
     close_work: CloseWorkSource,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
     progress_latch: Arc<DataPlaneProgressLatch>,
-    request_pending: Arc<AtomicBool>,
-    owner_waiting: Arc<AtomicBool>,
-    capacity: DataPlaneCapacity,
 ) {
+    let RequestQueue {
+        receiver: requests,
+        pending: request_pending,
+        owner_waiting,
+        capacity,
+    } = queue;
     let mut pending_operations = PendingCoreOperations::new();
     loop {
         owner_waiting.store(true, Ordering::Release);
