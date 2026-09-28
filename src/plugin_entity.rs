@@ -343,6 +343,7 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
                 botster_core::PluginAdmissionResult::Backpressured {
                     request_id: plan.request.request_id,
                     class: botster_core::PluginInvocationClass::RequestResponse,
+                    cause: botster_core::PluginBackpressureCause::ClassQueue,
                     reason: "test-forced plugin admission backpressure".into(),
                     backpressure: None,
                 }
