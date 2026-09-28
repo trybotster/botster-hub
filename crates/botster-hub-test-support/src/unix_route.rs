@@ -295,7 +295,7 @@ impl UnixRouteClient {
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         let response = self.inner.request(request)?;
         self.note_attach(&response);
-        self.capture_skipped_route_events();
+        self.capture_skipped_route_events()?;
         self.note_detach(request, &response);
         Ok(response)
     }
@@ -342,8 +342,8 @@ impl UnixRouteClient {
         }
     }
 
-    fn capture_skipped_route_events(&mut self) {
-        for frame in self.inner.take_skipped_terminal() {
+    fn capture_skipped_route_events(&mut self) -> DaemonTransportResult<()> {
+        for frame in self.inner.take_skipped_terminal()? {
             let event = self.decode_and_observe(frame);
             if self.pending_events.len() == MAX_PENDING_EVENTS {
                 let failure = self.observers.get(&event.route).map_or_else(
@@ -368,6 +368,7 @@ impl UnixRouteClient {
             }
             self.pending_events.push_back(event);
         }
+        Ok(())
     }
 
     #[must_use]
@@ -456,7 +457,8 @@ impl UnixRouteClient {
         }) {
             events.push(self.decode_and_observe(frame));
         }
-        self.capture_skipped_route_events();
+        self.capture_skipped_route_events()
+            .unwrap_or_else(|error| panic!("failed to consume skipped Unix route events: {error}"));
         events.extend(self.pending_events.drain(..));
         events
     }

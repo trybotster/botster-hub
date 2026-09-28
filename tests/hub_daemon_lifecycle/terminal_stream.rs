@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEvent, DaemonRequest,
     DaemonResponse, DaemonTransportResult, DaemonUnixFrameReader, DaemonUnixMuxFrame,
-    DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame, connect_and_hello_with_requirement,
-    write_client_frame, write_unix_terminal_frame,
+    DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame, UnixCreditMode, UnixOutputCredit,
+    connect_and_hello_with_requirement, write_client_frame, write_unix_credit_frame,
+    write_unix_terminal_frame,
 };
 pub(crate) use botster_hub_test_support::unix_route::{
     RouteEvent, RouteOperationIds, UnixRouteClient, bytes_contain, decode_route_event,
@@ -73,6 +74,9 @@ pub(crate) struct RawUnixClient {
     operation_ids: RouteOperationIds,
     /// Entity frames that arrived while a request waited for its response.
     pub(crate) entity_frames: Vec<botster_hub_client::DaemonEntityFrame>,
+    /// S13 output credit. A proof reads every frame itself, so a terminal
+    /// frame is consumed when it is read.
+    credit: UnixOutputCredit,
 }
 
 impl RawUnixClient {
@@ -94,6 +98,10 @@ impl RawUnixClient {
             routes: BTreeMap::new(),
             operation_ids: RouteOperationIds::default(),
             entity_frames: Vec::new(),
+            credit: UnixOutputCredit::new(
+                UnixCreditMode::Auto,
+                botster_hub_client::DEFAULT_UNIX_OUTPUT_CREDIT_BYTES,
+            ),
         }
     }
 
@@ -121,9 +129,18 @@ impl RawUnixClient {
         request_id
     }
 
-    /// Read one frame of any kind.
+    /// Read one frame of any kind, answering output demands with grants.
     pub(crate) fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-        self.frames.read_frame(&mut self.stream)
+        let frame = self.frames.read_frame(&mut self.stream)?;
+        let grants = match &frame {
+            DaemonUnixMuxFrame::Credit(credit) => self.credit.on_hub_frame(credit),
+            DaemonUnixMuxFrame::Terminal(terminal) => self.credit.consumed(terminal.body.len()),
+            DaemonUnixMuxFrame::Server(_) => Vec::new(),
+        };
+        for grant in grants {
+            write_unix_credit_frame(&mut self.stream, &grant)?;
+        }
+        Ok(frame)
     }
 
     fn note_attach(&mut self, response: &DaemonResponse) {
@@ -164,7 +181,7 @@ impl RawUnixClient {
                     return response;
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => frames.push(frame),
-                // Credit messages (S13) are not sent before the Hub consumes credit.
+                // `read_frame` already applied the credit message (S13).
                 DaemonUnixMuxFrame::Credit(_) => {}
                 DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => events.push(event),
                 DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {

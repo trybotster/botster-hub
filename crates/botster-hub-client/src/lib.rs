@@ -642,6 +642,163 @@ impl DaemonUnixCreditFrame {
     }
 }
 
+/// Default terminal output budget of a first-party Unix client (S13): the
+/// bytes of its granted, in-flight, and unconsumed terminal frames. Every
+/// terminal frame is at most 4 MiB, so a head demand always fits.
+pub const DEFAULT_UNIX_OUTPUT_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How a client answers the Hub's output `DEMAND`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixCreditMode {
+    /// Grant each demand, in order, while the budget allows.
+    Auto,
+    /// The caller grants with [`DaemonConnection::grant_output_credit`].
+    Manual,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RouteGrants {
+    granted_bytes: u64,
+    returned_bytes: u64,
+}
+
+/// Client-side S13 output credit: one shared byte budget for every route.
+///
+/// A grant charges the budget. The charge returns when the caller consumes
+/// the frame it covered, when the Hub sends `RETURN`, and at the route
+/// generation's `CLOSED`, which releases what was granted minus what the Hub
+/// spent and minus what it returned. Demands are served first come, first
+/// served, whole frames only, so a large frame is never starved.
+#[derive(Debug)]
+pub struct UnixOutputCredit {
+    mode: UnixCreditMode,
+    budget_bytes: u64,
+    charged_bytes: u64,
+    demands: std::collections::VecDeque<(String, u64, u64)>,
+    routes: BTreeMap<(String, u64), RouteGrants>,
+}
+
+impl UnixOutputCredit {
+    #[must_use]
+    pub fn new(mode: UnixCreditMode, budget_bytes: u64) -> Self {
+        Self {
+            mode,
+            budget_bytes,
+            charged_bytes: 0,
+            demands: std::collections::VecDeque::new(),
+            routes: BTreeMap::new(),
+        }
+    }
+
+    /// Bytes granted and not yet released.
+    #[must_use]
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged_bytes
+    }
+
+    /// Apply one Hub credit frame. Returns the grants to send now.
+    pub fn on_hub_frame(&mut self, frame: &DaemonUnixCreditFrame) -> Vec<DaemonUnixCreditFrame> {
+        match frame {
+            DaemonUnixCreditFrame::Demand {
+                route,
+                generation,
+                bytes,
+            } => {
+                self.demands.push_back((route.clone(), *generation, *bytes));
+            }
+            DaemonUnixCreditFrame::Return {
+                route,
+                generation,
+                bytes,
+                ..
+            } => {
+                if let Some(grants) = self.routes.get_mut(&(route.clone(), *generation)) {
+                    grants.returned_bytes = grants.returned_bytes.saturating_add(*bytes);
+                }
+                self.release(*bytes);
+            }
+            DaemonUnixCreditFrame::Closed {
+                route,
+                generation,
+                spent_bytes,
+                ..
+            } => {
+                let key = (route.clone(), *generation);
+                if let Some(grants) = self.routes.remove(&key) {
+                    self.release(
+                        grants
+                            .granted_bytes
+                            .saturating_sub(*spent_bytes)
+                            .saturating_sub(grants.returned_bytes),
+                    );
+                }
+                self.demands
+                    .retain(|(route, generation, _)| (route, generation) != (&key.0, &key.1));
+            }
+            DaemonUnixCreditFrame::Grant { .. } | DaemonUnixCreditFrame::InputCredit { .. } => {}
+        }
+        self.serve()
+    }
+
+    /// The caller consumed a received terminal frame of `body_len` bytes.
+    /// Returns the grants its released charge allows.
+    pub fn consumed(&mut self, body_len: usize) -> Vec<DaemonUnixCreditFrame> {
+        self.release(u64::try_from(body_len).unwrap_or(u64::MAX));
+        self.serve()
+    }
+
+    /// Record a grant the caller sends itself ([`UnixCreditMode::Manual`]).
+    pub fn record_grant(&mut self, route: &str, generation: u64, bytes: u64) {
+        self.charged_bytes = self.charged_bytes.saturating_add(bytes);
+        let grants = self
+            .routes
+            .entry((route.to_string(), generation))
+            .or_default();
+        grants.granted_bytes = grants.granted_bytes.saturating_add(bytes);
+    }
+
+    /// Demands not yet granted, oldest first.
+    #[must_use]
+    pub fn pending_demands(&self) -> Vec<(String, u64, u64)> {
+        self.demands.iter().cloned().collect()
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.charged_bytes = self.charged_bytes.saturating_sub(bytes);
+    }
+
+    fn serve(&mut self) -> Vec<DaemonUnixCreditFrame> {
+        let mut grants = Vec::new();
+        if self.mode == UnixCreditMode::Manual {
+            return grants;
+        }
+        while let Some((_, _, bytes)) = self.demands.front()
+            && self.charged_bytes.saturating_add(*bytes) <= self.budget_bytes
+        {
+            let (route, generation, bytes) = self.demands.pop_front().expect("front exists");
+            self.record_grant(&route, generation, bytes);
+            grants.push(DaemonUnixCreditFrame::Grant {
+                route,
+                generation,
+                items: 1,
+                bytes,
+            });
+        }
+        grants
+    }
+}
+
+/// Write one credit frame to the socket.
+pub fn write_unix_credit_frame(
+    stream: &mut UnixStream,
+    frame: &DaemonUnixCreditFrame,
+) -> DaemonTransportResult<()> {
+    let bytes = encode_unix_credit_frame(frame).ok_or(DaemonTransportError::Protocol(
+        "credit frame route is invalid",
+    ))?;
+    stream.write_all(&bytes).map_err(normalize_socket_io_error)
+}
+
 /// Encode one credit message as a complete Unix frame (length prefix,
 /// container byte, payload). Returns `None` for an invalid route.
 #[must_use]
@@ -1003,8 +1160,10 @@ pub struct DaemonConnection {
     outstanding: Vec<u64>,
     parked_responses: Vec<(u64, DaemonResponse)>,
     skipped_terminal: Vec<DaemonUnixTerminalFrame>,
-    /// Credit messages (S13) read while waiting for something else.
+    /// Credit messages (S13) read while waiting for something else. Kept
+    /// only in [`UnixCreditMode::Manual`]; auto mode applies them.
     skipped_credit: Vec<DaemonUnixCreditFrame>,
+    credit: UnixOutputCredit,
     skipped_events: Vec<DaemonEvent>,
     skipped_entity_frames: Vec<DaemonEntityFrame>,
     required_features: Vec<String>,
@@ -1073,6 +1232,7 @@ impl DaemonConnection {
             parked_responses: Vec::new(),
             skipped_terminal: Vec::new(),
             skipped_credit: Vec::new(),
+            credit: UnixOutputCredit::new(UnixCreditMode::Auto, DEFAULT_UNIX_OUTPUT_CREDIT_BYTES),
             skipped_events: Vec::new(),
             skipped_entity_frames: Vec::new(),
             required_features,
@@ -1170,7 +1330,7 @@ impl DaemonConnection {
                     ));
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
-                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.park_credit(frame),
             }
         }
     }
@@ -1181,8 +1341,74 @@ impl DaemonConnection {
         self.wait_response(request_id)
     }
 
+    /// Answer the Hub's output demands this way from now on. The budget is
+    /// [`DEFAULT_UNIX_OUTPUT_CREDIT_BYTES`].
+    #[must_use]
+    pub fn with_credit_mode(mut self, mode: UnixCreditMode) -> Self {
+        self.credit = UnixOutputCredit::new(mode, DEFAULT_UNIX_OUTPUT_CREDIT_BYTES);
+        self
+    }
+
+    /// This connection's output credit ledger.
+    #[must_use]
+    pub fn output_credit(&self) -> &UnixOutputCredit {
+        &self.credit
+    }
+
+    /// Grant one whole frame of `bytes` to a route generation
+    /// ([`UnixCreditMode::Manual`]).
+    pub fn grant_output_credit(
+        &mut self,
+        route: &str,
+        generation: u64,
+        bytes: u64,
+    ) -> DaemonTransportResult<()> {
+        self.credit.record_grant(route, generation, bytes);
+        write_unix_credit_frame(
+            &mut self.stream,
+            &DaemonUnixCreditFrame::Grant {
+                route: route.to_string(),
+                generation,
+                items: 1,
+                bytes,
+            },
+        )
+    }
+
+    /// Credit frames kept while waiting for something else (manual mode).
+    pub fn take_skipped_credit(&mut self) -> Vec<DaemonUnixCreditFrame> {
+        std::mem::take(&mut self.skipped_credit)
+    }
+
+    fn park_credit(&mut self, frame: DaemonUnixCreditFrame) {
+        if self.credit.mode == UnixCreditMode::Manual {
+            self.skipped_credit.push(frame);
+        }
+    }
+
+    fn send_grants(&mut self, grants: Vec<DaemonUnixCreditFrame>) -> DaemonTransportResult<()> {
+        for grant in grants {
+            write_unix_credit_frame(&mut self.stream, &grant)?;
+        }
+        Ok(())
+    }
+
+    /// Hand one terminal frame to the caller: its budget charge returns.
+    fn consume_terminal(
+        &mut self,
+        frame: DaemonUnixTerminalFrame,
+    ) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
+        let grants = self.credit.consumed(frame.body.len());
+        self.send_grants(grants)?;
+        Ok(frame)
+    }
+
     fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
         let frame = self.frames.read_frame(&mut self.reader)?;
+        if let DaemonUnixMuxFrame::Credit(credit) = &frame {
+            let grants = self.credit.on_hub_frame(credit);
+            self.send_grants(grants)?;
+        }
         if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
             && let Some(id) = parse_request_id(request_id)
         {
@@ -1222,15 +1448,22 @@ impl DaemonConnection {
             }));
         }
         if !self.skipped_terminal.is_empty() {
-            return Ok(DaemonUnixMuxFrame::Terminal(
-                self.skipped_terminal.remove(0),
-            ));
+            let frame = self.skipped_terminal.remove(0);
+            return self
+                .consume_terminal(frame)
+                .map(DaemonUnixMuxFrame::Terminal);
         }
         let frame = self.read_next_frame()?;
-        if let DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) = &frame {
-            self.closed = Some(reason.clone());
+        match frame {
+            DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                self.closed = Some(reason.clone());
+                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }))
+            }
+            DaemonUnixMuxFrame::Terminal(frame) => self
+                .consume_terminal(frame)
+                .map(DaemonUnixMuxFrame::Terminal),
+            frame => Ok(frame),
         }
-        Ok(frame)
     }
 
     /// Read the next frame, or `None` when `timeout` elapses first.
@@ -1285,8 +1518,13 @@ impl DaemonConnection {
     }
 
     /// Opaque terminal frames skipped while waiting for a host response.
-    pub fn take_skipped_terminal(&mut self) -> Vec<DaemonUnixTerminalFrame> {
-        std::mem::take(&mut self.skipped_terminal)
+    /// Taking them consumes them, so their credit returns.
+    pub fn take_skipped_terminal(&mut self) -> DaemonTransportResult<Vec<DaemonUnixTerminalFrame>> {
+        let frames = std::mem::take(&mut self.skipped_terminal);
+        let bytes = frames.iter().map(|frame| frame.body.len()).sum();
+        let grants = self.credit.consumed(bytes);
+        self.send_grants(grants)?;
+        Ok(frames)
     }
 
     /// Host events skipped while waiting for a host response.
@@ -1375,7 +1613,7 @@ impl DaemonConnection {
                     ));
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
-                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.park_credit(frame),
             }
         }
     }
@@ -1402,12 +1640,13 @@ impl DaemonConnection {
     /// not write to the socket.
     pub fn next_terminal(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
         if !self.skipped_terminal.is_empty() {
-            return Ok(self.skipped_terminal.remove(0));
+            let frame = self.skipped_terminal.remove(0);
+            return self.consume_terminal(frame);
         }
         loop {
             match self.read_next_frame()? {
-                DaemonUnixMuxFrame::Terminal(frame) => return Ok(frame),
-                DaemonUnixMuxFrame::Credit(frame) => self.skipped_credit.push(frame),
+                DaemonUnixMuxFrame::Terminal(frame) => return self.consume_terminal(frame),
+                DaemonUnixMuxFrame::Credit(frame) => self.park_credit(frame),
                 DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
                     self.skipped_events.push(event);
                 }
@@ -1441,7 +1680,8 @@ impl DaemonConnection {
         timeout: Duration,
     ) -> DaemonTransportResult<Option<DaemonUnixTerminalFrame>> {
         if !self.skipped_terminal.is_empty() {
-            return Ok(Some(self.skipped_terminal.remove(0)));
+            let frame = self.skipped_terminal.remove(0);
+            return self.consume_terminal(frame).map(Some);
         }
         let deadline = Instant::now() + timeout;
         let previous = self
@@ -1457,8 +1697,10 @@ impl DaemonConnection {
                 break Err(error);
             }
             match self.read_next_frame() {
-                Ok(DaemonUnixMuxFrame::Terminal(frame)) => break Ok(Some(frame)),
-                Ok(DaemonUnixMuxFrame::Credit(frame)) => self.skipped_credit.push(frame),
+                Ok(DaemonUnixMuxFrame::Terminal(frame)) => {
+                    break self.consume_terminal(frame).map(Some);
+                }
+                Ok(DaemonUnixMuxFrame::Credit(frame)) => self.park_credit(frame),
                 Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event { event })) => {
                     self.skipped_events.push(event);
                 }
@@ -5057,7 +5299,13 @@ mod tests {
         assert_eq!(connection.outstanding_request_ids(), &[] as &[u64]);
         let response = connection.wait_response(second).expect("parked second");
         assert_eq!(response.kind, DaemonResponseKind::Sessions);
-        assert_eq!(connection.take_skipped_terminal().len(), 1);
+        assert_eq!(
+            connection
+                .take_skipped_terminal()
+                .expect("consume skipped terminal")
+                .len(),
+            1
+        );
         assert_eq!(connection.take_skipped_events().len(), 1);
         assert!(matches!(
             connection.wait_response(999),

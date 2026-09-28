@@ -37,7 +37,7 @@ fn serve(
         // The client parks unsolicited frames until the response arrives.
         drop(connection.take_skipped_entity_frames());
         drop(connection.take_skipped_events());
-        drop(connection.take_skipped_terminal());
+        drop(connection.take_skipped_terminal()?);
         serde_json::to_writer(&mut *output, &response)?;
         writeln!(output)?;
         output.flush()?;
