@@ -517,8 +517,8 @@ fn a_session_credential_reaches_only_its_session() {
 
     // Nothing a client or operator can read carries the token or its secret.
     let mut observed = vec![
-        coordination_cli(&data_dir, &["sessions", "list"]),
-        coordination_cli(&data_dir, &["status"]),
+        ("sessions list", coordination_cli(&data_dir, &["sessions", "list"])),
+        ("status", coordination_cli(&data_dir, &["status"])),
     ];
     for (tool, arguments) in [
         ("whoami", serde_json::json!({})),
@@ -533,15 +533,39 @@ fn a_session_credential_reaches_only_its_session() {
             serde_json::json!({ "session_id": "cred-session", "message": "deferred" }),
         ),
     ] {
-        observed.push(
+        observed.push((
+            tool,
             coordination_mcp_call(&data_dir, Some("cred-session"), tool, arguments).to_string(),
-        );
+        ));
     }
     coordination_shutdown_session(&data_dir, "cred-session");
     let output = shutdown_cli_daemon(&data_dir, daemon);
-    observed.push(String::from_utf8_lossy(&output.stdout).into_owned());
-    observed.push(String::from_utf8_lossy(&output.stderr).into_owned());
-    for text in &observed {
-        assert!(!text.contains(secret), "the token secret leaked: {text}");
+    observed.push(("daemon stdout", String::from_utf8_lossy(&output.stdout).into_owned()));
+    observed.push(("daemon stderr", String::from_utf8_lossy(&output.stderr).into_owned()));
+    for (surface, text) in &observed {
+        assert_secret_absent(surface, text, secret);
     }
+}
+
+/// Fail naming the surface only: printing the text that holds a secret would
+/// turn a failed secrecy check into a leak of its own.
+fn assert_secret_absent(surface: &str, text: &str, secret: &str) {
+    assert!(!text.contains(secret), "a session secret appears in {surface}");
+}
+
+#[test]
+fn a_leaked_secret_is_reported_by_surface_name_only() {
+    let secret = "synthetic-secret-9d41c7";
+    let leaked = format!("{{\"token\":\"cred-session.{secret}\"}}");
+    let failure = std::panic::catch_unwind(|| {
+        assert_secret_absent("synthetic surface", &leaked, secret);
+    })
+    .expect_err("a leaked secret fails the check");
+    let message = failure
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| failure.downcast_ref::<&str>().map(ToString::to_string))
+        .expect("a panic message");
+    assert!(message.contains("synthetic surface"), "the failure names the surface");
+    assert!(!message.contains(secret), "the failure does not repeat the secret");
 }
