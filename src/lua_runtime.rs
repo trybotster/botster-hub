@@ -2211,6 +2211,7 @@ fn install_botster_api(
         ),
     )?;
 
+    let identity_state = host_api.spawn_targets.clone();
     let capabilities_table = lua.create_table()?;
     let timer_capabilities = host_api.capabilities.clone();
     let timer_plugin_key = plugin_key.clone();
@@ -2266,6 +2267,7 @@ fn install_botster_api(
     )?;
     capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
+    botster.set("hub", hub_table(lua, identity_state)?)?;
     let (coordination, capacity_string) = coordination_table(
         lua,
         plugin_key.clone(),
@@ -2331,6 +2333,26 @@ fn state_unavailable(lua: &Lua) -> mlua::Result<Table> {
         result::ErrorKind::Unavailable,
         "the hub state is unavailable",
     )
+}
+
+/// `botster.hub`: facts about the Hub the plugin runs in. No grant applies:
+/// the identity is the Hub's own public name, not another package's data.
+fn hub_table(lua: &Lua, state: SharedSpawnTargets) -> Result<Table, mlua::Error> {
+    let table = lua.create_table()?;
+    table.set(
+        "identity",
+        lua.create_function(move |lua, _: Value| {
+            let Ok((_, state)) = state.try_snapshot() else {
+                return state_unavailable(lua);
+            };
+            let identity = lua.to_value(&json!({
+                "hub_id": state.host.id,
+                "display_name": state.host.display_name,
+            }))?;
+            result::ok(lua, identity)
+        })?,
+    )?;
+    Ok(table)
 }
 
 fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<Table, mlua::Error> {
