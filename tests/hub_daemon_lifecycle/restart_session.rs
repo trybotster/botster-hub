@@ -1,0 +1,99 @@
+fn hub_state_json(data_dir: &Path) -> serde_json::Value {
+    let bytes = fs::read(data_dir.join("hub-state.json")).expect("read hub-state.json");
+    serde_json::from_slice(&bytes).expect("hub-state.json is JSON")
+}
+
+fn session_frame_is_ended(frame: &botster_hub_client::DaemonEntityFrame, session_id: &str) -> bool {
+    let fields = match frame {
+        botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. } if id == session_id => entity,
+        botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. } if id == session_id => patch,
+        _ => return false,
+    };
+    fields.get("lifecycle_class").and_then(serde_json::Value::as_str) == Some("ended")
+}
+
+/// A session-type spawn records how to restart the session before its reply,
+/// and removing the ended session deletes the record and retires its context.
+#[test]
+fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("restart-record");
+    let package_root = unique_test_dir("restart-record-package");
+    write_session_type_context_package(&package_root);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable session type package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    let mut sessions =
+        botster_hub_client::subscribe_entities(&socket_endpoint(&data_dir), "session", "restart-record")
+            .expect("subscribe to sessions");
+
+    let session_id = "restart-record-session";
+    let spawned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: session_id.to_string(),
+            request: botster_hub::DaemonSessionTypeRequest {
+                context: botster_hub::DaemonSessionTypeContextInput {
+                    prompt: Some("pipeline prompt".to_string()),
+                    ticket_id: Some("ticket-123".to_string()),
+                    ..botster_hub::DaemonSessionTypeContextInput::default()
+                },
+                ..botster_hub::DaemonSessionTypeRequest::default()
+            },
+        },
+    )
+    .expect("spawn session type");
+    assert_eq!(spawned.kind, botster_hub::DaemonResponseKind::Spawned, "{spawned:?}");
+
+    // The record is durable before the Spawned reply.
+    let state = hub_state_json(&data_dir);
+    assert_eq!(state["schema_version"], 6);
+    let record = &state["restart_records"][session_id];
+    assert_eq!(record["session_type_id"], "init", "{state}");
+    assert_eq!(record["context"]["prompt"], "pipeline prompt");
+    assert_eq!(record["context"]["ticket_id"], "ticket-123");
+    assert!(record.get("environment_keys").is_none(), "{record}");
+
+    // The fixture script exits after a second; wait for the entity to end.
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_ended(frame, session_id)
+    });
+    let removed = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::RemoveSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("remove ended session");
+    assert_eq!(removed.kind, botster_hub::DaemonResponseKind::SessionRemoved, "{removed:?}");
+
+    let state = hub_state_json(&data_dir);
+    assert!(
+        state["restart_records"].get(session_id).is_none(),
+        "removal deletes the restart record: {state}"
+    );
+    let context = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReadSessionContext {
+            session_id: session_id.to_string(),
+            context_id: None,
+            key: Some("prompt".to_string()),
+        },
+    )
+    .expect("read context after removal");
+    assert_ne!(
+        context.kind,
+        botster_hub::DaemonResponseKind::SessionContext,
+        "removal retires the session context: {context:?}"
+    );
+    drop(sessions);
+    shutdown_cli_daemon(&data_dir, child);
+}
