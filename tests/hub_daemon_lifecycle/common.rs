@@ -698,8 +698,8 @@ pub(crate) fn test_owned_process_tree(tokens: &[String]) -> Result<Vec<TestOwned
 }
 
 /// The identities the sweep owns once it has found a leak: the matched PIDs,
-/// every descendant of them, and every process group they started (never the
-/// harness's own group). Ownership is retained, not rediscovered from argv, so
+/// every descendant of them, and every process group led by one of them
+/// (never the harness's own group). Ownership is retained, not rediscovered from argv, so
 /// a descendant without the token still counts after its parent exits.
 struct TestOwnedIdentities {
     tokens: Vec<String>,
@@ -734,7 +734,11 @@ impl TestOwnedIdentities {
                     || self.pgids.contains(&row.pgid);
                 if owned {
                     self.pids.insert(row.pid);
-                    if row.pgid != self.own_pgid && row.pgid > 1 {
+                    // Claim a group only when an owned process leads it, which
+                    // means the test's own process tree created it. A matched
+                    // process inside someone else's group owns only itself
+                    // and its descendants, never its siblings.
+                    if row.pid == row.pgid && row.pgid != self.own_pgid && row.pgid > 1 {
                         self.pgids.insert(row.pgid);
                     }
                 }
