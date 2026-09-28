@@ -248,7 +248,7 @@ pub(crate) fn finish_status_delivery(
     shutdown
 }
 
-fn finish_shutdown_update_reply(state: &mut DaemonControlState) {
+pub(crate) fn finish_shutdown_update_reply(state: &mut DaemonControlState) {
     if let Some(update_reply_tx) = state.pending_hub_update_reply.take() {
         let _ = send_control_response(
             update_reply_tx,
