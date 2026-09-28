@@ -238,11 +238,17 @@ T2=$!
 await_file "$work/T2-ready"
 g=$(job_group)
 id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[T2 @ ") && $2 == "running" { print $1 }')
+# At 1 slot, N2 waits behind T2; when it starts it records how many members of
+# T2's group still exist, which must be 0 (the slot is held until cleanup).
+"$Q" run --label N2 -- sh -c 'ps -axo pgid= | awk -v g="$1" "\$1 == g" | wc -l | tr -d " " > "$0/N2.seen"' "$work" "$g" >/dev/null 2>&1 &
+N2=$!
+await_state "N2 @" queued
 "$Q" cancel "$id" >"$work/T2.cancel" 2>&1; codeT2=$?
 wait "$T2"; runT2=$?
-[ "$codeT2" = 0 ] && [ "$runT2" = 130 ] && [ "$(group_members "$g")" = 0 ] \
-  && pass "cancel <id> of a TERM-ignoring direct command (cancel 0, run 130)" \
-  || fail "cancel TERM-ignoring" "cancel=$codeT2 run=$runT2 members=$(group_members "$g") out=$(cat "$work/T2.cancel")"
+wait "$N2"
+[ "$codeT2" = 0 ] && [ "$runT2" = 130 ] && [ "$(group_members "$g")" = 0 ] && [ "$(cat "$work/N2.seen" 2>/dev/null)" = 0 ] \
+  && pass "cancel <id> of a TERM-ignoring direct command (cancel 0, run 130); the next job starts after cleanup" \
+  || fail "cancel TERM-ignoring" "cancel=$codeT2 run=$runT2 members=$(group_members "$g") next-job-saw=$(cat "$work/N2.seen" 2>/dev/null) out=$(cat "$work/T2.cancel")"
 
 # 16. Cancel after the supervisor installed its handlers but before it starts
 #     the command: the command must never start.
@@ -254,7 +260,12 @@ kill -TERM "$S"
 # `run` prints "stopping job" once it has signalled the supervisor (which is
 # held before spawning); only then is the hold released.
 await_file "$work/S.err"
-until grep -q "stopping job" "$work/S.err" 2>/dev/null; do perl -e 'select(undef,undef,undef,0.05)'; done
+i=0
+until grep -q "stopping job" "$work/S.err" 2>/dev/null; do
+  i=$((i + 1)); [ "$i" -gt 200 ] && break
+  # timer: deadline — test-side wait for run's cancel message.
+  perl -e 'select(undef, undef, undef, 0.05)'
+done
 printf x >"$work/spawn"
 wait "$S"; codeS=$?
 [ "$codeS" = 130 ] && [ ! -e "$work/S-ran" ] && [ "$(group_members "$g")" = 0 ] \
