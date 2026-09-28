@@ -93,34 +93,39 @@ stop_job() {
   # publishes its pid and checks the marker under the same lock, so exactly
   # one holds: the job published first (its supervisor is signalled here), or
   # the job will see the marker, delete it, and not start.
-  group=$(perl -MFcntl=:flock -e '
+  # The pid file holds the supervisor's pid, then (once started) the command's
+  # process group.
+  published=$(perl -MFcntl=:flock -e '
     my ($lock, $marker, $pidfile) = @ARGV;
     open(my $l, ">>", $lock) or die "botsterq: open job lock: $!\n";
     flock($l, LOCK_EX) or die "botsterq: job lock: $!\n";
     open(my $m, ">", $marker) or die "botsterq: marker: $!\n";
     close($m);
-    if (open(my $p, "<", $pidfile)) { my $g = <$p>; print $g if defined $g; }
-  ' "$joblock" "$marker" "$pidfile" | tr -d ' \n')
+    if (open(my $p, "<", $pidfile)) { chomp(my @ids = <$p>); print "@ids"; }
+  ' "$joblock" "$marker" "$pidfile")
+  supervisor_pid=${published%% *}
+  command_group=
+  case "$published" in *" "*) command_group=${published#* } ;; esac
   if [ -n "$id" ] && ts -r "$id" >/dev/null 2>&1; then
     rm -f "$marker"
     return 0
   fi
-  [ -n "$group" ] || return 0
+  [ -n "$supervisor_pid" ] || return 0
   rm -f "$marker"
-  # The job's supervisor leads its group: it signals the members, SIGKILLs any
-  # that outlive the grace, and exits only when the group is empty. So the
+  # The job's supervisor signals the command's group, SIGKILLs it when the
+  # grace ends, and exits only when the kernel reports the group gone. So the
   # queue slot is released only after every member is gone, and its end
-  # (ts -w) is the event that the group is empty.
-  echo "botsterq: stopping job ${id:-?} (process group $group)" >&2
-  kill -TERM "$group" 2>/dev/null || true
+  # (ts -w) is the event that the group is gone.
+  echo "botsterq: stopping job ${id:-?} (supervisor $supervisor_pid${command_group:+, process group $command_group})" >&2
+  kill -TERM "$supervisor_pid" 2>/dev/null || true
   if [ -n "$id" ]; then
     ( ts -w "$id" >/dev/null 2>&1 ) &
     wait $! || true
   fi
-  if group_alive "$group"; then
+  if [ -n "$command_group" ] && group_alive "$command_group"; then
     # Only reachable if the supervisor itself was killed.
-    echo "botsterq: job ${id:-?} supervisor is gone but group $group remains; sending SIGKILL" >&2
-    kill -KILL "-$group" 2>/dev/null || true
+    echo "botsterq: job ${id:-?} supervisor is gone but group $command_group remains; sending SIGKILL" >&2
+    kill -KILL "-$command_group" 2>/dev/null || true
     return 1
   fi
   return 0

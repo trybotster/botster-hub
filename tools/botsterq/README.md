@@ -34,13 +34,14 @@ botsterq slots 3         # change it (kept across server restarts)
   command's exit code.
 - The job runs in the caller's directory with the caller's environment (so
   `RUSTUP_TOOLCHAIN`, `BOTSTER_HUB_BIN` and the other test variables pass through),
-  under `nice -n 10`, in its own process group.
+  under `nice -n 10`, in a process group of its own.
 - Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`): a
   queued job never starts. A running job's group gets SIGTERM, and SIGKILL for any
   member still there when the grace period (10 s, `BOTSTERQ_KILL_GRACE`) ends,
   including a child that ignores SIGTERM after its leader exits. The queue slot is
   released only when the whole group is gone, so the next job never starts beside
-  the remains of a cancelled one. `run` exits 130 after a cancel.
+  the remains of a cancelled one, even if a process survives SIGKILL. `run` exits
+  130 after a cancel.
 - A job that exits while leaving other processes in its group gets them stopped the
   same way (grace, SIGTERM, SIGKILL), with a warning naming them; `run` keeps the
   command's own status.
@@ -79,23 +80,28 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
 - `-f` keeps the job a child of the caller's `ts` client (caller's environment and
   directory); `-n` streams output instead of storing it; `ts -w <id>` returns the
   job's exit code.
-- Each job runs under `botsterq-job`, a small Python supervisor that leads the job's
-  process group. It publishes its pid (the group id) and checks for a cancel marker
-  under a per-job lock; a cancel creates the marker and reads the pid under the same
-  lock, so either the job published first (the cancel signals the supervisor) or the
-  cancel came first (the job deletes the marker and does not start). A job whose
-  `run` is gone does not start. The supervisor runs the command as a child, and on
-  SIGTERM signals the group, then SIGKILLs what outlives the grace, the command
-  itself included. A cancel before the command starts means it never starts
-  (cancel signals are blocked around the spawn). It exits only
-  when the group is empty, waiting on exit events (kqueue NOTE_EXIT on macOS, pidfd
-  on Linux) and re-enumerating members after each round so a process forked
-  meanwhile is included. Its exit, observed with `ts -w`, is the event that the job
-  and its group are gone.
+- Each job runs under `botsterq-job`, a small Python supervisor. It publishes its
+  pid and checks for a cancel marker under a per-job lock; a cancel creates the
+  marker and reads the pid under the same lock, so either the job published first
+  (the cancel signals the supervisor) or the cancel came first (the job deletes the
+  marker and does not start). A job whose `run` is gone does not start.
+- The supervisor runs the command as a child in a process group of its own and
+  publishes that group as the pid file's second line. A cancel sends the group
+  SIGTERM, then SIGKILL when the grace ends, the command itself included. A cancel
+  before the command starts means it never starts (cancel signals are blocked
+  around the spawn).
+- The supervisor exits, which releases the slot, only when the kernel reports the
+  command's group gone: `killpg(group, 0)` fails with ESRCH (zombies count as
+  present; macOS answers EPERM for a group of zombies only). A process that
+  survives SIGKILL, a failed `ps` census or a failed exit watch never ends the job:
+  the slot stays held, with a warning, until the group is gone. Its exit, observed
+  with `ts -w`, is the event that the job and its group are gone.
 - A cancel that arrives while `run` is still inside admission resolves the job by its
   token, so a job that already started is stopped too.
-- Waiting uses `wait`, `ts -w` and process-exit events, never polls. The only timer is
-  the kill grace, a deadline.
+- Waiting uses `wait`, `ts -w` and process-exit events (kqueue NOTE_EXIT on macOS,
+  pidfd on Linux) on the members a `ps` census names. The timers are the kill grace
+  (a deadline) and, only when no exit event can be watched (a failed census or
+  watch, or a group of zombies awaiting their reaper), a 0.1 s recheck of absence.
 - `tools/botsterq/test-botsterq` is the regression suite (a private queue): it
   covers the exit code and environment, slot refusal, exclusive reservations and
   fairness, cancel of queued and running jobs, a SIGTERM-ignoring child with an
@@ -103,7 +109,9 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
   start/cancel race, a cancel before the command starts and a cancel during
   admission (pinned with test hooks), slot release only after the cancelled group is
   empty, leftover processes (including a command that exits before the supervisor
-  first looks), nesting, an orphaned queued job, and `cancel <id>`.
+  first looks), nesting, an orphaned queued job, `cancel <id>`, and the slot held
+  while absence is unproved (a SIGKILL survivor, alone and with a failed census or
+  a failed watch, through test hooks).
 
 ## Stage 2 (design only): a remote Linux backend
 
