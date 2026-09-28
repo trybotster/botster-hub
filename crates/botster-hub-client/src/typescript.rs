@@ -789,6 +789,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("records", "DaemonPluginLogRecord[]"),
             ("next_seq", "number"),
             ("first_available_seq", "number"),
+            ("log_id?", "string"),
         ],
     );
     emit_interface(
