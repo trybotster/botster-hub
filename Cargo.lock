@@ -2536,8 +2536,6 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8823005e23738c18e7ddf86ed15e4e539565ec07de1609017fab3422988a7587"
 dependencies = [
  "bytes",
  "crc32c",

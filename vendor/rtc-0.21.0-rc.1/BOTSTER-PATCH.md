@@ -9,7 +9,7 @@ This directory contains the published `rtc 0.21.0-rc.1` crate with two local rep
 - The directory preserves `LICENSE-APACHE` and `LICENSE-MIT` without changes.
 - The package version and public function signatures remain unchanged.
 
-The rest of the `rtc` family is consumed unmodified from crates.io at the same version.
+`rtc-sctp` is vendored beside this crate with Repair 4 (`../rtc-sctp-0.21.0-rc.1/BOTSTER-PATCH.md`); its regression test, `tests/data_channel_stream_id_reuse_rtc2rtc.rs`, lives here. The rest of the `rtc` family is consumed unmodified from crates.io at the same version.
 `Cargo.lock` records these checksums for the family members this crate depends on:
 
 | crate | sha256 |
@@ -123,7 +123,7 @@ Hub client and test-support do not depend on the Hub runtime crate.
 A consumer that embeds the Hub runtime from another workspace must select this patch explicitly.
 
 This crate is excluded from the Hub workspace and is also patched by path, so Cargo cannot test it in place.
-Tests run from a disposable copy of this directory with an empty `[workspace]` table appended to its `Cargo.toml`.
+Tests run from a disposable copy of this directory with an empty `[workspace]` table appended to its `Cargo.toml`, and a `[patch.crates-io]` entry pointing `rtc-sctp` at a copy of `../rtc-sctp-0.21.0-rc.1` (without it, the copy tests against the unrepaired published `rtc-sctp`).
 The Hub strict gate lints Hub workspace members, not this crate.
 
 Validation results belong in the Hub implementation report. Source preparation alone is not delivery proof.
