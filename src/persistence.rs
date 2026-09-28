@@ -6,6 +6,7 @@
 //! single-writer store. Retained directory ownership excludes another writer.
 //! A write that reaches rename has a distinct published outcome.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 #[cfg(test)]
@@ -33,8 +34,9 @@ use crate::shared_view::{SharedView, SharedViewBudget, SharedViewCharge};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
-/// Version 5 adds the durable package quarantine.
-const HUB_STATE_SCHEMA_VERSION: u16 = 5;
+/// Version 5 adds the durable package quarantine; version 6 adds the
+/// session restart records.
+const HUB_STATE_SCHEMA_VERSION: u16 = 6;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
 
 /// Persistence buckets the host profile must govern.
@@ -52,7 +54,8 @@ pub enum PersistenceBucket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
     /// Version of this JSON schema. Version 4 adds recovery ownership; version 5
-    /// adds the durable package quarantine.
+    /// adds the durable package quarantine; version 6 adds the session restart
+    /// records.
     pub schema_version: u16,
     /// Host identity metadata resolved from hub config.
     pub host: HostIdentity,
@@ -92,6 +95,10 @@ pub struct HubState {
     /// Hub-owned intent and evidence. The worktree collection remains the registry.
     #[serde(default)]
     pub(crate) recovery: crate::recovery::record::RecoveryLedger,
+    /// What each ended session-type session needs to be spawned again, keyed
+    /// by session id. It holds no environment values.
+    #[serde(default)]
+    pub(crate) restart_records: BTreeMap<String, crate::restart_records::RestartRecord>,
 }
 
 impl HubState {
@@ -115,6 +122,7 @@ impl HubState {
             runtime_settings: LocalRuntimeSettings::from_config(config),
             audit_history: Vec::new(),
             recovery: crate::recovery::record::RecoveryLedger::default(),
+            restart_records: BTreeMap::new(),
         }
     }
 
@@ -945,13 +953,15 @@ struct HubStateVersion<'a> {
 fn decode_hub_state(bytes: &[u8]) -> HubStateStoreResult<HubState> {
     let version: HubStateVersion<'_> =
         serde_json::from_slice(bytes).map_err(HubStateStoreError::Corrupt)?;
-    if !matches!(version.schema_version, 3 | 4 | HUB_STATE_SCHEMA_VERSION) {
+    if !matches!(version.schema_version, 3 | 4 | 5 | HUB_STATE_SCHEMA_VERSION) {
         return Err(HubStateStoreError::State(
             HubStateError::UnsupportedVersion(version.schema_version),
         ));
     }
-    // Version 4 differs from 5 only by the optional package quarantine.
-    if matches!(version.schema_version, 4 | HUB_STATE_SCHEMA_VERSION) && version.recovery.is_none()
+    // Versions 4 and 5 differ from 6 only by optional additions: the package
+    // quarantine (5) and the restart records (6).
+    if matches!(version.schema_version, 4 | 5 | HUB_STATE_SCHEMA_VERSION)
+        && version.recovery.is_none()
     {
         return Err(HubStateStoreError::State(
             HubStateError::InvalidRecoveryState,
@@ -959,14 +969,21 @@ fn decode_hub_state(bytes: &[u8]) -> HubStateStoreResult<HubState> {
     }
     let mut state: HubState = serde_json::from_slice(bytes).map_err(HubStateStoreError::Corrupt)?;
     if version.schema_version == 3 {
-        if state.recovery != crate::recovery::record::RecoveryLedger::default() {
+        if state.recovery != crate::recovery::record::RecoveryLedger::default()
+            || !state.restart_records.is_empty()
+        {
             return Err(HubStateStoreError::State(
                 HubStateError::InvalidRecoveryState,
             ));
         }
         state.schema_version = HUB_STATE_SCHEMA_VERSION;
     }
-    if state.schema_version == 4 {
+    if matches!(state.schema_version, 4 | 5) {
+        if !state.restart_records.is_empty() {
+            return Err(HubStateStoreError::State(
+                HubStateError::UnsupportedVersion(state.schema_version),
+            ));
+        }
         state.schema_version = HUB_STATE_SCHEMA_VERSION;
     }
     state
