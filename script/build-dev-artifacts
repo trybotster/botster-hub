@@ -75,10 +75,11 @@ if [ -z "$core_revision" ]; then
   exit 1
 fi
 
-BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked -p botster-hub --bin botster-hub
-cargo build --locked -p botster-core-daemon --bin botster-session-worker
+# Each build records its artifacts for script/prune-target.
+BOTSTER_BUILD_REVISION="$hub_revision" script/cargo-recorded candidate-hub build --locked -p botster-hub --bin botster-hub
+script/cargo-recorded session-worker build --locked -p botster-core-daemon --bin botster-session-worker
 if [ "$WITH_HARNESS_ADAPTER" -eq 1 ]; then
-  BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked -p botster-hub-client --example harness_control
+  BOTSTER_BUILD_REVISION="$hub_revision" script/cargo-recorded candidate-harness-control build --locked -p botster-hub-client --example harness_control
 fi
 
 target_dir=${CARGO_TARGET_DIR:-target}
