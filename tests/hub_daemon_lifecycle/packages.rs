@@ -2667,16 +2667,10 @@ fn daemon_spawns_repo_local_session_type_after_state_reload() {
     fs::create_dir_all(repo_root.join(".botster")).expect("create repo .botster dir");
     fs::create_dir_all(repo_root.join("bin")).expect("create repo bin dir");
     let script = repo_root.join("bin/repo-template.sh");
-    fs::write(
+    write_warm_executable(
         &script,
         "#!/bin/sh\nprintf 'repo:%s\\n' \"$BOTSTER_MODE\" > repo-template-output.txt\nsleep 30\n",
-    )
-    .expect("write repo template script");
-    let mut permissions = fs::metadata(&script)
-        .expect("script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod repo script");
+    );
     fs::write(
         repo_root.join(".botster/session-types.json"),
         serde_json::to_string_pretty(&serde_json::json!({
@@ -2817,16 +2811,10 @@ fn daemon_list_session_types_for_target_includes_device_globals() {
     fs::create_dir_all(&target_root).expect("create admitted target root");
     fs::create_dir_all(device_root.join("bin")).expect("create device bin");
     let script = device_root.join("bin/noop.sh");
-    fs::write(
+    write_warm_executable(
         &script,
         "#!/bin/sh\nprintf 'spawned:%s\\n' \"$BOTSTER_SESSION_ID\"\nsleep 30\n",
-    )
-    .expect("write device spawn script");
-    let mut permissions = fs::metadata(&script)
-        .expect("script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod device script");
+    );
 
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -4627,13 +4615,10 @@ return botster.register({
     )
     .expect("write ordinary Lua tool");
     let script = package_dir.join("bin/init.sh");
-    fs::write(
+    write_warm_executable(
         &script,
         "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\" \"$PWD\" \"$1\" > \"spawn-$BOTSTER_SESSION_ID.txt\"\n\"$BOTSTER_HUB_BIN\" context --key prompt > \"context-$BOTSTER_SESSION_ID.json\"\nmkfifo \"hold-$BOTSTER_SESSION_ID.fifo\"\nread _ < \"hold-$BOTSTER_SESSION_ID.fifo\"\n",
-    )
-    .expect("write ordinary session command");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-        .expect("make ordinary session command executable");
+    );
     let source_root = fs::canonicalize(&package_dir).expect("canonical ordinary package root");
     fs::write(
         package_dir.join("botster-package.json"),

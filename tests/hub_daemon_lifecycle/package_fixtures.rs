@@ -218,13 +218,10 @@ return botster.register({
     )
     .expect("write managed Git plugin");
     let script = root.join("bin/init.sh");
-    fs::write(
+    write_warm_executable(
         &script,
         "#!/bin/sh\nprintf 'live-managed\\n' > live-managed.txt\n",
-    )
-    .expect("write managed Git session command");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-        .expect("make managed Git session command executable");
+    );
     let source_root = fs::canonicalize(root).expect("canonical managed Git package root");
     fs::write(
         root.join("botster-package.json"),
@@ -344,13 +341,10 @@ return botster.register({{
 pub(crate) fn write_cross_package_template_contributor(root: &Path, target_id: &str) {
     fs::create_dir_all(root.join("bin")).expect("create template contributor bin");
     let command = root.join("bin/init.sh");
-    fs::write(
+    write_warm_executable(
         &command,
         "#!/bin/sh\nprintf 'cross-package\\n' > cross-package-executed.txt\n",
-    )
-    .expect("write cross-package template command");
-    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
-        .expect("make cross-package template command executable");
+    );
     let source_root = fs::canonicalize(root).expect("canonical template contributor root");
     fs::write(
         root.join("botster-package.json"),
@@ -671,16 +665,10 @@ pub(crate) fn write_session_type_context_package(root: &Path) {
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write session type plugin entrypoint");
     let script = root.join("bin/init.sh");
-    fs::write(
+    write_warm_executable(
         &script,
         "#!/bin/sh\nprintf 'started\\n' > context-started.txt\n\"$BOTSTER_HUB_BIN\" context --key prompt > context-output.json 2> context-error.txt\nsleep 1\n",
-    )
-    .expect("write session type script");
-    let mut permissions = fs::metadata(&script)
-        .expect("script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod session type script");
+    );
     let manifest = serde_json::json!({
         "name": "runtime.session-type",
         "version": "1.0.0",
@@ -716,13 +704,10 @@ pub(crate) fn write_session_type_execution_package(root: &Path) {
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write execution plugin entrypoint");
     let relative_script = root.join("bin/relative.sh");
-    fs::write(
+    write_warm_executable(
         &relative_script,
         "#!/bin/sh\nprintf 'relative:%s\\n' \"$1\" > relative-output.txt\nsleep 30\n",
-    )
-    .expect("write relative executable");
-    fs::set_permissions(&relative_script, fs::Permissions::from_mode(0o755))
-        .expect("make relative executable runnable");
+    );
     let manifest = serde_json::json!({
         "name": "runtime.session-type-execution",
         "version": "1.0.0",

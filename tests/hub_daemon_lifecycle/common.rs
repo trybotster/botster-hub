@@ -152,6 +152,64 @@ pub(crate) fn shutdown_through_core(runtime: &botster_hub::HubRuntime, session_i
     }
 }
 
+/// Argument that makes a test-written script exit before its body runs.
+pub(crate) const WARM_EXEC_ARG: &str = "--botster-test-warm-exec";
+
+/// Writes a `#!/bin/sh` script, makes it executable, and launches it once with
+/// [`WARM_EXEC_ARG`], which exits on the script's second line before its body.
+///
+/// macOS assesses a newly written executable on its first exec, and that
+/// assessment queues behind other new executables on the host: a first exec
+/// took 1.5 s mean and 2.4 s max with eight concurrent fresh-exec loops, against
+/// 27 ms for a second exec (hub-test-speed evidence, first-exec-pressure.log).
+/// Launching the file here moves that one-time cost out of the test's timed
+/// window. The body never runs here, so no output the test waits for exists
+/// before the daemon starts the script, and the test's own deadline is unchanged.
+pub(crate) fn write_warm_executable(path: &Path, contents: impl AsRef<str>) {
+    let contents = contents.as_ref();
+    let (shebang, body) = contents
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("script {} needs a shebang line", path.display()));
+    assert_eq!(
+        shebang,
+        "#!/bin/sh",
+        "warm executables are /bin/sh scripts: {}",
+        path.display()
+    );
+    let guarded = format!("{shebang}\n[ \"${{1-}}\" = \"{WARM_EXEC_ARG}\" ] && exit 0\n{body}");
+    fs::write(path, guarded).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+    let mut child = Command::new(path)
+        .arg(WARM_EXEC_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("warm-launch {}: {error}", path.display()));
+    let (done_tx, done_rx) = mpsc::channel();
+    let pid = child.id();
+    let waiter = thread::spawn(move || {
+        let _ = done_tx.send(child.wait());
+    });
+    // A liveness backstop, not a test oracle: the guard exits at once after the
+    // OS lets the new file start.
+    match done_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(status)) => assert!(
+            status.success(),
+            "warm-launch of {} must exit 0 at its guard: {status}",
+            path.display()
+        ),
+        Ok(Err(error)) => panic!("wait for warm-launch of {}: {error}", path.display()),
+        Err(_) => {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let _ = waiter.join();
+            panic!("warm-launch of {} did not exit within 60 s", path.display());
+        }
+    }
+    let _ = waiter.join();
+}
+
 pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

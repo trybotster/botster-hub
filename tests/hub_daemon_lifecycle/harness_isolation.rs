@@ -1435,3 +1435,29 @@ fn daemon_test_guard_leaves_a_foreign_group_leader_and_sibling_of_a_matched_chil
     let _guard = daemon_test_guard();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
+
+#[test]
+fn write_warm_executable_launches_the_file_without_running_its_body() {
+    let dir = unique_short_test_dir("warm-exec");
+    fs::create_dir_all(&dir).expect("create warm-exec dir");
+    let marker = dir.join("body-ran.txt");
+    let script = dir.join("script.sh");
+    write_warm_executable(
+        &script,
+        format!("#!/bin/sh\nprintf 'ran:%s\\n' \"$1\" > '{}'\n", marker.display()),
+    );
+    assert!(
+        !marker.exists(),
+        "the warm launch must exit at the guard, before the body writes its output"
+    );
+    let status = Command::new(&script)
+        .arg("explicit")
+        .status()
+        .expect("run the warmed script normally");
+    assert!(status.success(), "normal run: {status}");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("the body runs on a normal launch"),
+        "ran:explicit\n",
+        "the guard must not change what a normal launch does with its arguments"
+    );
+}

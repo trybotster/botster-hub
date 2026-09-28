@@ -613,12 +613,7 @@ pub(crate) fn write_marked_echo_wrapper(dir: &Path, marker: &str) -> PathBuf {
 fn write_marked_wrapper(dir: &Path, marker: &str, body: &str) -> PathBuf {
     fs::create_dir_all(dir).expect("create marked wrapper directory");
     let path = dir.join(marker);
-    fs::write(&path, body).expect("write marked wrapper");
-    let mut permissions = fs::metadata(&path)
-        .expect("read marked wrapper metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).expect("chmod marked wrapper");
+    write_warm_executable(&path, body);
     path
 }
 
