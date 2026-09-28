@@ -1,0 +1,172 @@
+#!/bin/sh
+# botsterq: a machine-wide queue for heavy work (cargo builds, test suites).
+#
+#   botsterq run [--label <text>] [--exclusive] -- <command...>
+#   botsterq list
+#   botsterq cancel <id>
+#   botsterq slots [N]
+#
+# Jobs run through task-spooler (`ts`, brew install task-spooler) on a
+# dedicated socket, at most N at once (default 2). `run` blocks until its job
+# has run, streams the job's output live, and exits with the job's exit code.
+# The job runs in the caller's directory with the caller's environment, under
+# `nice -n 10`, in its own process group. `--exclusive` makes the job take
+# every slot, so it runs alone (use it for the load-sensitive lifecycle target).
+#
+# Ctrl-C, SIGTERM or SIGHUP to `run` cancels its job: a queued job is removed
+# from the queue; a running job's process group gets SIGTERM, then SIGKILL
+# after a grace period. Only that job's group is signalled, never by name.
+# A caller killed with SIGKILL cannot be noticed; its job then runs to the
+# end. `botsterq cancel <id>` (id from `botsterq list`) stops such a job.
+set -eu
+
+state=${BOTSTERQ_HOME:-$HOME/.botsterq}
+mkdir -p "$state/run"
+export TS_SOCKET="$state/queue.sock"
+default_slots=2
+kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
+
+usage() {
+  sed -n '3,7p' "$0" | sed 's/^# //' >&2
+  exit 2
+}
+
+command -v ts >/dev/null 2>&1 || {
+  echo "botsterq: task-spooler is missing; run: brew install task-spooler" >&2
+  exit 127
+}
+
+configured_slots() {
+  if [ -f "$state/slots" ]; then cat "$state/slots"; else echo "$default_slots"; fi
+}
+
+# Start the server with the configured slot count if it is not running yet.
+# TS_SLOTS is read only at server start; `ts -S` changes a running server.
+ensure_server() {
+  TS_SLOTS=$(configured_slots) ts -l >/dev/null
+  # A pid file is named <owner pid>-...; drop those whose botsterq is gone.
+  for pidfile in "$state"/run/*.pid; do
+    [ -e "$pidfile" ] || continue
+    owner=$(basename "$pidfile" | cut -d- -f1)
+    kill -0 "$owner" 2>/dev/null || rm -f "$pidfile"
+  done
+}
+
+cmd_slots() {
+  ensure_server
+  if [ "$#" -eq 0 ]; then
+    ts -S
+    return
+  fi
+  case "$1" in
+    ''|*[!0-9]*|0) echo "botsterq: slots must be a positive integer" >&2; exit 2 ;;
+  esac
+  printf '%s\n' "$1" >"$state/slots"
+  ts -S "$1"
+  echo "botsterq: $1 slots"
+}
+
+cmd_list() {
+  ensure_server
+  printf '%-5s %-8s %-9s %s\n' ID STATE ENQUEUED "LABEL @ OWNER"
+  ts -l | awk '$2 == "queued" || $2 == "running" { print $1, $2 }' | while read -r id job_state; do
+    label=$(ts -l | awk -v id="$id" '$1 == id' | sed -n 's/^[^[]*\[\(.*\) #[^]]*\].*$/\1/p')
+    enqueued=$(ts -i "$id" 2>/dev/null | sed -n 's/^Enqueue time: [A-Za-z]* [A-Za-z]* *[0-9]* \([0-9:]*\) .*/\1/p')
+    printf '%-5s %-8s %-9s %s\n' "$id" "$job_state" "${enqueued:-?}" "$label"
+  done
+}
+
+cmd_cancel() {
+  [ "$#" -eq 1 ] || usage
+  ensure_server
+  case $(ts -s "$1" 2>/dev/null) in
+    queued) ts -r "$1" && echo "botsterq: removed queued job $1" ;;
+    running) ts -k "$1" && echo "botsterq: sent SIGTERM to job $1's process group" ;;
+    *) echo "botsterq: job $1 is not queued or running" >&2; exit 1 ;;
+  esac
+}
+
+cmd_run() {
+  label=job
+  slots_needed=1
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --label) [ "$#" -ge 2 ] || usage; label=$2; shift 2 ;;
+      --exclusive) slots_needed=all; shift ;;
+      --) shift; break ;;
+      *) usage ;;
+    esac
+  done
+  [ "$#" -ge 1 ] || usage
+  # Inside a botsterq job, run directly: queueing would wait for a slot this
+  # job's own parent holds, which deadlocks when the slots are full.
+  if [ -n "${BOTSTERQ_JOB:-}" ]; then
+    exec "$@"
+  fi
+  ensure_server
+  exclusive_marker=
+  if [ "$slots_needed" = all ]; then
+    slots_needed=$(ts -S)
+    exclusive_marker=" [exclusive]"
+  else
+    # An exclusive job needs every slot at once. task-spooler fills a free slot
+    # from later in the queue, so ordinary jobs arriving behind a queued
+    # exclusive job could starve it; they wait for it to finish instead.
+    for exclusive_id in $(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1 }'); do
+      echo "botsterq: waiting for exclusive job $exclusive_id before queueing" >&2
+      ts -w "$exclusive_id" >/dev/null 2>&1 || true
+    done
+  fi
+
+  token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+  pidfile="$state/run/$token.pid"
+  # The label names the job for `list`: text, owner directory, unique token.
+  job_label="$label$exclusive_marker @ $(pwd) #$token"
+
+  # The job records its pid, which is also its process group, then execs.
+  ts -f -n -N "$slots_needed" -L "$job_label" \
+    sh -c 'printf "%s\n" "$$" >"$1"; shift; BOTSTERQ_JOB=$$ exec nice -n 10 "$@"' botsterq-job "$pidfile" "$@" &
+  client=$!
+
+  cancel() {
+    trap - INT TERM HUP
+    if [ -s "$pidfile" ]; then
+      group=$(cat "$pidfile")
+      echo "botsterq: cancelling running job (process group $group)" >&2
+      kill -TERM "-$group" 2>/dev/null || true
+      # timer: deadline — the kill grace; the job's exit ends `wait` first.
+      ( sleep "$kill_grace_seconds"; kill -KILL "-$group" 2>/dev/null ) &
+      grace=$!
+      wait "$client" 2>/dev/null || true
+      kill "$grace" 2>/dev/null || true
+      wait "$grace" 2>/dev/null || true
+    else
+      id=$(ts -l | awk -v token="#$token" 'index($0, token) && $2 == "queued" { print $1 }')
+      if [ -n "$id" ]; then
+        echo "botsterq: removing queued job $id" >&2
+        ts -r "$id" >/dev/null 2>&1 || true
+      fi
+      kill "$client" 2>/dev/null || true
+      wait "$client" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+    exit 130
+  }
+  trap cancel INT TERM HUP
+
+  status=0
+  wait "$client" || status=$?
+  rm -f "$pidfile"
+  exit "$status"
+}
+
+[ "$#" -ge 1 ] || usage
+subcommand=$1
+shift
+case "$subcommand" in
+  run) cmd_run "$@" ;;
+  list) cmd_list ;;
+  cancel) cmd_cancel "$@" ;;
+  slots) cmd_slots "$@" ;;
+  *) usage ;;
+esac
