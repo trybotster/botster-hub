@@ -454,6 +454,17 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         state
             .maintenance
             .mark_signaled_waits(runtime.owner_signal());
+        let signal = runtime.owner_signal();
+        let moved: Vec<_> = state
+            .background_signal_waits
+            .iter()
+            .filter(|(_, seen)| signal.moved(**seen))
+            .map(|(work, _)| *work)
+            .collect();
+        for work in moved {
+            state.background_signal_waits.remove(&work);
+            mark_background_ready(state, work);
+        }
     }
     mark_signaled_requests(state);
     if state.entity_capacity_wake.take() {
@@ -1768,11 +1779,21 @@ fn run_inventory_reconcile_phase_progress(
         else {
             return BackgroundProgress::Done;
         };
+        #[cfg(test)]
+        let queried = routes.clone();
+        let ticket = runtime.terminal_subscription_generations_for_owner(waiter_id, routes);
+        if let Some(seen) = ticket.refused_wait() {
+            // A full request queue: park on its room, never on an unrelated wake.
+            state
+                .background_signal_waits
+                .insert(BackgroundWork::InventoryReconcile, seen);
+            return BackgroundProgress::Waiting;
+        }
         state.reconcile_inventory = Some(InventoryRead {
             read_epoch,
             #[cfg(test)]
-            queried: routes.clone(),
-            ticket: runtime.terminal_subscription_generations_for_owner(waiter_id, routes),
+            queried,
+            ticket,
         });
         return BackgroundProgress::Waiting;
     };
@@ -1856,12 +1877,20 @@ fn run_pump_observe_phase(
         let Some(waiter_id) = background_waiter_id(state, BackgroundWork::PumpObserve) else {
             return BackgroundProgress::Done;
         };
-        state.observe_read = Some(runtime.observe_lifecycle_slice_for_owner(
+        let ticket = runtime.observe_lifecycle_slice_for_owner(
             waiter_id,
             now,
             state.observe_resume.as_ref(),
             OBSERVE_SLICE_BUDGET,
-        ));
+        );
+        if let Some(seen) = ticket.refused_wait() {
+            // A full request queue: park on its room, never on an unrelated wake.
+            state
+                .background_signal_waits
+                .insert(BackgroundWork::PumpObserve, seen);
+            return BackgroundProgress::Waiting;
+        }
+        state.observe_read = Some(ticket);
         return BackgroundProgress::Waiting;
     };
     let slice = match ticket.poll() {
@@ -2040,6 +2069,8 @@ pub(crate) struct DaemonControlState {
     /// ready when its lock's key moves (readiness plan 2.2).
     pub(crate) signal_request_waits:
         BTreeMap<crate::owner_identity::WaiterId, crate::daemon::owner_signal::Parked>,
+    /// Background work parked on a cross-thread wait, marked when it moves.
+    background_signal_waits: BTreeMap<BackgroundWork, crate::daemon::owner_signal::Seen>,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
@@ -2317,6 +2348,7 @@ impl Default for DaemonControlState {
             entity_capacity_wake: EntitySubscriptionCapacityWake::default(),
             client_events: crate::daemon::client_events::ClientEvents::default(),
             signal_request_waits: BTreeMap::new(),
+            background_signal_waits: BTreeMap::new(),
             event_plane: std::sync::Arc::new(
                 crate::subscription::package_events::ClientEventPlane::default(),
             ),
@@ -3475,6 +3507,53 @@ mod tests {
         let answer = answer.expect("a subscribed response");
         assert!(answer.error.is_none(), "{answer:?}");
         assert!(state.signal_request_waits.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_pump_read_parks_until_the_data_plane_dequeues() {
+        let root = unique_package_control_dir("refused-pump-read");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let release = daemon.runtime().unwrap().test_fill_core_request_queue();
+        assert!(matches!(
+            run_pump_observe_phase(&daemon, &mut state),
+            BackgroundProgress::Waiting
+        ));
+        assert!(
+            state.observe_read.is_none(),
+            "a refused read holds no ticket"
+        );
+        let seen = *state
+            .background_signal_waits
+            .get(&BackgroundWork::PumpObserve)
+            .expect("the refused pump read parked on queue room");
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(
+            state
+                .background_signal_waits
+                .contains_key(&BackgroundWork::PumpObserve),
+            "the pump read stays parked while the queue is full"
+        );
+        drop(release);
+        crate::daemon::owner_signal::test_wait_until_moved(
+            daemon.runtime().unwrap().owner_signal(),
+            seen,
+        );
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(
+            state.background_signal_waits.is_empty(),
+            "the data plane's dequeue wakes the parked pump read"
+        );
+        assert!(matches!(
+            run_pump_observe_phase(&daemon, &mut state),
+            BackgroundProgress::Waiting
+        ));
+        assert!(
+            state.observe_read.is_some(),
+            "the read is submitted once there is room"
+        );
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
