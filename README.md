@@ -400,6 +400,12 @@ invocations. Package state persists through `hub-state.json`, core registry
 metadata persists under the hub data directory, and live worker-backed sessions
 can be adopted after an intentional daemon restart.
 
+On macOS, the first launch of a newly installed or updated `botster-hub` binary
+can take 3 to 5 seconds before the command starts. macOS pays this cost once per
+new executable, before `main` runs, and later launches take milliseconds. The
+daemon pays the same cost for `botster-session-worker`, and it runs one worker
+probe before it reports ready, so the first session spawn does not pay it.
+
 The end-to-end local production runtime proofs are:
 
 ```sh
