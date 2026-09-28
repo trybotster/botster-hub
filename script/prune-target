@@ -45,42 +45,33 @@ fi
 node --input-type=module - "$records" "$target" "$dry_run" <<'NODE'
 import { readFileSync, readdirSync, statSync, rmSync, existsSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
-import { spawnSync } from "node:child_process";
 
 const [recordsDir, target, dryRunArg] = process.argv.slice(2);
 const dryRun = dryRunArg === "1";
 const hashOf = (name) => (name.match(/-([0-9a-f]{16})(?:\.|$)/) || [])[1];
 
 const keep = new Set();
-// Cargo reports a binary or an example by its uplifted, unhashed path
-// (target/debug/<name>, target/debug/examples/<name>). The uplift is a copy
-// (or a hard link) of the hashed artifact <name>-<hash> in deps/ or examples/;
-// find the hashed file with the same size and the same bytes.
-const hashedCandidates = (file) => {
-  const stem = basename(file);
-  const names = [stem, stem.replace(/-/g, "_")];
-  const size = statSync(file).size;
-  const found = [];
-  for (const dir of [join(target, "deps"), join(target, "examples")]) {
-    if (!existsSync(dir)) continue;
-    for (const name of readdirSync(dir)) {
-      const hash = hashOf(name);
-      if (!hash || !names.some((n) => name === `${n}-${hash}`)) continue;
-      const path = join(dir, name);
-      if (statSync(path).size === size) found.push([path, hash]);
-    }
+// A bin or an example is reported by its unhashed uplifted path; cargo-recorded
+// resolved its hash when the shape ran (<shape>.uplifted). Anything it could
+// not resolve means this script cannot know what to keep, so it prunes nothing.
+const unresolved = [];
+for (const name of readdirSync(recordsDir).filter((name) => name.endsWith(".json"))) {
+  const uplifted = join(recordsDir, name.replace(/\.json$/, ".uplifted"));
+  if (!existsSync(uplifted)) {
+    unresolved.push(`${name} (no .uplifted record; rerun the gate)`);
+    continue;
   }
-  return found;
-};
-const hashOfArtifact = (file) => {
-  const direct = hashOf(basename(file)) ?? hashOf(basename(dirname(file)));
-  if (direct) return direct;
-  if (!existsSync(file)) return undefined;
-  for (const [path, hash] of hashedCandidates(file)) {
-    if (spawnSync("cmp", ["-s", file, path]).status === 0) return hash;
+  for (const line of readFileSync(uplifted, "utf8").split("\n")) {
+    const [hash, file] = line.split(" ");
+    if (!hash) continue;
+    if (hash === "unresolved") unresolved.push(file);
+    else keep.add(hash);
   }
-  return undefined;
-};
+}
+if (unresolved.length > 0) {
+  console.error(`prune-target: uplifted artifacts without a recorded hash; pruning nothing:\n  ${unresolved.join("\n  ")}`);
+  process.exit(3);
+}
 const lines = readdirSync(recordsDir)
   .filter((name) => name.endsWith(".json"))
   .flatMap((name) => readFileSync(join(recordsDir, name), "utf8").split("\n"));
@@ -89,9 +80,9 @@ for (const line of lines) {
   const message = JSON.parse(line);
   if (message.reason === "compiler-artifact") {
     // A build script's artifact is build/<pkg>-<hash>/build-script-build: the
-    // hash is on its directory. A bin or example is reported unhashed.
+    // hash is on its directory. A bin or example is reported unhashed (above).
     for (const file of [...(message.filenames ?? []), message.executable].filter(Boolean)) {
-      const hash = hashOfArtifact(file);
+      const hash = hashOf(basename(file)) ?? hashOf(basename(dirname(file)));
       if (hash) keep.add(hash);
     }
   } else if (message.reason === "build-script-executed" && message.out_dir) {
