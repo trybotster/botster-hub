@@ -263,6 +263,13 @@ bad input.
   a time). After load the VM has no filesystem access; `require` serves only
   the staged set, runs each module once, and reports circular requires.
 
+## Hub identity
+
+`botster.hub.identity()` returns `{ ok = true, value = { hub_id, display_name } }`,
+the identity of the Hub the plugin runs in. It needs no grant. A state read
+that is temporarily unavailable returns the usual `state_unavailable` error
+result.
+
 ## Capability Access
 
 Lua has no ambient `os`, `io`, or `package` globals. Filesystem, network,
