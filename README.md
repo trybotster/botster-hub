@@ -963,8 +963,10 @@ Native tools route through the running daemon, not directly into hub state:
 - `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
   envelope, which removes it. Posting an envelope id that the target still
   holds changes nothing, so a retried post cannot duplicate a message.
-- Every session the Hub spawns starts without any `BOTSTER_*` name inherited
-  from the process that started the Hub; the Hub then sets its own values.
+- Every session the Hub spawns starts without the `BOTSTER_*` names it would
+  inherit from the process that started the Hub; the Hub then sets its own
+  values. A name that is not valid UTF-8 cannot be listed for removal and is
+  still inherited.
 - `notify_session` is a guarded-write doorbell attempt. The current native MCP
   surface does not yet gather terminal readiness evidence from attached clients,
   so it reports core's guarded-write decision and can defer instead of injecting
