@@ -15,7 +15,7 @@ ln -sf ~/.local/share/botsterq/botsterq ~/.local/bin/botsterq
 
 Install a copy, not a link into a worktree, so removing a worktree cannot break it.
 
-`~/.local/bin` must be on `PATH`, and `python3` (3.9 or later) must be available for the job
+`~/.local/bin` must be on `PATH`, and `python3` (3.9 or later; `botsterq run` refuses an older one before admission) must be available for the job
 supervisor. State (socket, slot count, pid files) lives in
 `~/.botsterq` (override with `BOTSTERQ_HOME`).
 
@@ -99,9 +99,14 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
 - A cancel that arrives while `run` is still inside admission resolves the job by its
   token, so a job that already started is stopped too.
 - Waiting uses `wait`, `ts -w` and process-exit events (kqueue NOTE_EXIT on macOS,
-  pidfd on Linux) on the members a `ps` census names. The timers are the kill grace
-  (a deadline) and, only when no exit event can be watched (a failed census or
-  watch, or a group of zombies awaiting their reaper), a 0.1 s recheck of absence.
+  pidfd on Linux) on the members a `ps` census names. The kill grace is a deadline.
+  The one exception to waiting on events is a degraded mode: when no exit event can
+  be watched (the census or a watch failed at any step, or the group holds only
+  zombies awaiting their reaper), the supervisor polls for absence every 0.1 s. It is
+  a progress poll, not a give-up deadline: it never ends the job. An unexpected
+  error in the supervisor's loop also never releases the slot early: the command
+  runs on and is reaped, a cancel still escalates, and the slot is held until the
+  group is gone.
 - `tools/botsterq/test-botsterq` is the regression suite (a private queue): it
   covers the exit code and environment, slot refusal, exclusive reservations and
   fairness, cancel of queued and running jobs, a SIGTERM-ignoring child with an
@@ -109,9 +114,11 @@ task-spooler (`ts`) on the socket `~/.botsterq/queue.sock`, with `TS_SLOTS` slot
   start/cancel race, a cancel before the command starts and a cancel during
   admission (pinned with test hooks), slot release only after the cancelled group is
   empty, leftover processes (including a command that exits before the supervisor
-  first looks), nesting, an orphaned queued job, `cancel <id>`, and the slot held
-  while absence is unproved (a SIGKILL survivor, alone and with a failed census or
-  a failed watch, through test hooks).
+  first looks), nesting, an orphaned queued job, `cancel <id>`, the slot held
+  while absence is unproved (a SIGKILL survivor alone, and with a failed census,
+  kqueue creation, registration, wait, fallback select, or supervisor loop, each
+  injected at the real boundary through test hooks), and the Python version check.
+  Run it once more with `PATH=/usr/bin:$PATH` to cover the oldest supported Python.
 
 ## Stage 2 (design only): a remote Linux backend
 
