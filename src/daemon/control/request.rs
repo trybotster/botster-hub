@@ -249,7 +249,13 @@ pub(crate) fn finish_status_delivery(
 }
 
 pub(crate) fn finish_shutdown_update_reply(state: &mut DaemonControlState) {
-    if let Some(update_reply_tx) = state.pending_hub_update_reply.take() {
+    // Take only the reply: the fetch still runs, and its record keeps later
+    // checks busy until its completion clears it.
+    if let Some(update_reply_tx) = state
+        .hub_update_check
+        .as_mut()
+        .and_then(|check| check.reply.take())
+    {
         let _ = send_control_response(
             update_reply_tx,
             Ok(daemon_hub_update(DaemonHubUpdate {
