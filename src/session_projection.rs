@@ -4,7 +4,7 @@
 //! This module does not import terminal semantic bodies and does not name
 //! package-owned product policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use botster_core::SessionLifecycleState;
 use botster_core_daemon::{
@@ -25,6 +25,8 @@ pub struct SessionProjectionRow {
     pub live_ended: bool,
     /// Journal sequence that last mutated this row.
     pub change_seq: u64,
+    /// Derived: ended, and the durable restart-record set holds this id.
+    pub restartable: bool,
 }
 
 /// One Hub lifecycle cursor and one canonical session projection.
@@ -38,6 +40,9 @@ pub struct SessionProjection {
     pub baseline_complete: bool,
     /// True when delivery or source pressure requires a complete baseline.
     pub gap: bool,
+    /// Session ids that hold a durable restart record. Refreshed from the
+    /// published Hub state at each baseline, then kept by keyed changes.
+    pub restart_ids: BTreeSet<String>,
 }
 
 impl SessionProjection {
@@ -88,6 +93,58 @@ impl SessionProjection {
             traits,
             interaction: metadata.get("botster.session_type.interaction").cloned(),
             session_type_lifecycle: metadata.get("botster.session_type.lifecycle").cloned(),
+            restartable: false,
+        }
+    }
+
+    /// Project one row, including its derived `restartable` flag.
+    #[must_use]
+    pub fn project_row(row: &SessionProjectionRow) -> DaemonSessionEntity {
+        DaemonSessionEntity {
+            restartable: row.restartable,
+            ..Self::project_entity(&row.record)
+        }
+    }
+
+    fn derive_restartable(&self, lifecycle_class: &str, session_id: &str) -> bool {
+        lifecycle_class == "ended" && self.restart_ids.contains(session_id)
+    }
+
+    /// Replace the durable restart-record id set. Rows already projected are
+    /// re-derived, and the ids whose flag flipped are returned.
+    pub fn sync_restart_ids(&mut self, ids: BTreeSet<String>) -> Vec<String> {
+        self.restart_ids = ids;
+        let mut flipped = Vec::new();
+        let ids = &self.restart_ids;
+        for (id, row) in &mut self.rows {
+            let restartable = row.lifecycle_class == "ended" && ids.contains(id);
+            if restartable != row.restartable {
+                row.restartable = restartable;
+                flipped.push(id.clone());
+            }
+        }
+        flipped
+    }
+
+    /// One durable restart record was set or removed. Returns true when the
+    /// projected row's flag flipped. A row not yet projected derives the flag
+    /// when it is ingested.
+    pub fn restart_record_changed(&mut self, session_id: &str, present: bool) -> bool {
+        if present {
+            self.restart_ids.insert(session_id.to_string());
+        } else {
+            self.restart_ids.remove(session_id);
+        }
+        let restartable = self
+            .rows
+            .get(session_id)
+            .is_some_and(|row| self.derive_restartable(row.lifecycle_class, session_id));
+        match self.rows.get_mut(session_id) {
+            Some(row) if row.restartable != restartable => {
+                row.restartable = restartable;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -100,6 +157,8 @@ impl SessionProjection {
                     record.lifecycle.as_ref(),
                 );
                 let live_ended = lifecycle_class == "ended";
+                let restartable =
+                    self.derive_restartable(lifecycle_class, &record.session.session_id.0);
                 self.rows.insert(
                     record.session.session_id.0.clone(),
                     SessionProjectionRow {
@@ -107,6 +166,7 @@ impl SessionProjection {
                         lifecycle_class,
                         live_ended,
                         change_seq: change.cursor.sequence,
+                        restartable,
                     },
                 );
             }
@@ -142,6 +202,8 @@ impl SessionProjection {
         for record in records {
             let lifecycle_class =
                 session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
+            let restartable =
+                self.derive_restartable(lifecycle_class, &record.session.session_id.0);
             self.rows.insert(
                 record.session.session_id.0.clone(),
                 SessionProjectionRow {
@@ -149,6 +211,7 @@ impl SessionProjection {
                     lifecycle_class,
                     live_ended: false,
                     change_seq: sequence,
+                    restartable,
                 },
             );
         }
@@ -321,6 +384,72 @@ mod tests {
             RegistrySessionState::Exited => 3,
             RegistrySessionState::Stale => 4,
         }
+    }
+
+    fn ended(id: &str) -> SessionLifecycleRecord {
+        record(
+            id,
+            RegistrySessionState::Exited,
+            Some(SessionLifecycleState::Exited { code: Some(0) }),
+        )
+    }
+
+    #[test]
+    fn restartable_flips_only_for_an_ended_row_with_a_durable_record() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            cursor(1),
+            [
+                ended("done"),
+                ended("plain"),
+                record(
+                    "live",
+                    RegistrySessionState::Running,
+                    Some(SessionLifecycleState::Running),
+                ),
+            ],
+        );
+        assert!(!SessionProjection::project_row(&projection.rows["done"]).restartable);
+        assert!(projection.restart_record_changed("done", true));
+        assert!(SessionProjection::project_row(&projection.rows["done"]).restartable);
+        assert!(
+            !projection.restart_record_changed("done", true),
+            "idempotent"
+        );
+        // A record for a running session, or none for a plain Spawn, stays false.
+        assert!(!projection.restart_record_changed("live", true));
+        assert!(!projection.rows["live"].restartable);
+        assert!(!projection.rows["plain"].restartable);
+        assert!(projection.restart_record_changed("done", false));
+        assert!(!projection.rows["done"].restartable);
+    }
+
+    #[test]
+    fn a_record_committed_before_its_row_is_projected_is_derived_at_ingest() {
+        let mut projection = SessionProjection::default();
+        assert!(!projection.restart_record_changed("late", true));
+        projection.ingest_baseline_rows(1, [ended("late"), ended("other")]);
+        assert!(projection.rows["late"].restartable);
+        assert!(!projection.rows["other"].restartable);
+        // A live change that ends a running row derives the flag too.
+        projection.restart_record_changed("run", true);
+        projection.apply_change(&SessionLifecycleChange {
+            cursor: cursor(2),
+            kind: SessionLifecycleChangeKind::Upsert {
+                record: ended("run"),
+            },
+        });
+        assert!(projection.rows["run"].restartable);
+    }
+
+    #[test]
+    fn syncing_the_durable_set_rederives_rows_and_reports_flips() {
+        let mut projection = SessionProjection::default();
+        projection.ingest_baseline_rows(1, [ended("a"), ended("b")]);
+        let flipped = projection.sync_restart_ids(BTreeSet::from(["a".to_string()]));
+        assert_eq!(flipped, vec!["a".to_string()]);
+        let flipped = projection.sync_restart_ids(BTreeSet::from(["b".to_string()]));
+        assert_eq!(flipped, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

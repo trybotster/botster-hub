@@ -173,7 +173,18 @@ impl RecordWrite {
                 self.submit(daemon, state, waiter_id, session_id, command);
             }
             StateRecordAction::Park => {}
-            StateRecordAction::Committed => self.done = true,
+            StateRecordAction::Committed => {
+                // The durable set changed: re-derive this id's `restartable`.
+                let present = daemon
+                    .state_view()
+                    .1
+                    .restart_records
+                    .contains_key(session_id);
+                state
+                    .maintenance
+                    .restart_record_changed(session_id, present);
+                self.done = true;
+            }
             StateRecordAction::Failed {
                 code,
                 message,

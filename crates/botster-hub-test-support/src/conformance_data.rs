@@ -856,6 +856,7 @@ pub fn session_lifecycle_subscription_conformance_scenario()
         traits: Vec::new(),
         interaction: None,
         session_type_lifecycle: None,
+        restartable: false,
     };
 
     SessionLifecycleSubscriptionConformanceScenario {
@@ -965,6 +966,7 @@ pub fn session_plugin_binding_conformance_scenario() -> SessionPluginBindingConf
             traits: Vec::new(),
             interaction: None,
             session_type_lifecycle: None,
+            restartable: false,
         })
         .expect("serialize session entity")
     };
