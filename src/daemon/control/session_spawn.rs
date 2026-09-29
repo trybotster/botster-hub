@@ -287,7 +287,6 @@ impl std::ops::DerefMut for ChargedSessionTypeOperation {
     }
 }
 
-#[allow(dead_code)] // Production admission waits for the charged parser proof.
 impl SessionTypeSpawnOperation {
     #[cfg(test)]
     pub(crate) fn test_reservation_identity(
@@ -318,41 +317,6 @@ impl SessionTypeSpawnOperation {
             model: None,
             storage: None,
         })
-    }
-
-    pub(crate) fn new(
-        waiter_id: WaiterId,
-        request_id: String,
-        retirement: CoreWaiterRetirement,
-        product: ChargedSessionTypeMaterialization,
-    ) -> Self {
-        Self {
-            waiter_id,
-            request_id,
-            product: Some(product),
-            start: None,
-            delivery: None,
-            conversion: None,
-            host_receipt: None,
-            plugin_response: None,
-            admitted_failure: None,
-            failure: None,
-            phase: Phase::Ready,
-            handoff_begun: false,
-            retirement,
-        }
-    }
-
-    pub(crate) fn new_plugin(
-        waiter_id: WaiterId,
-        request_id: String,
-        retirement: CoreWaiterRetirement,
-        product: ChargedSessionTypeMaterialization,
-        response: SpawnReplySender<AdmittedSpawnDelivery>,
-    ) -> Self {
-        let mut operation = Self::new(waiter_id, request_id, retirement, product);
-        operation.plugin_response = Some(response);
-        operation
     }
 
     pub(crate) fn waiting_for_host(

@@ -179,7 +179,6 @@ pub(super) fn formatted_error_storage_bytes(
 /// Bound ordinary semantic errors using borrowed input lengths only.
 /// This excludes I/O, parser, managed-spawn, Core, and allocation-refusal errors.
 /// Successful products and other live temporary storage need separate charges.
-#[allow(dead_code)] // A reviewed construction caller must supply its live terms.
 pub(super) fn construction_error_storage_bytes(
     longest_override_name: Option<usize>,
 ) -> Option<usize> {
@@ -228,6 +227,7 @@ pub(super) struct ChargedMaterializationError {
 }
 
 impl ChargedMaterializationError {
+    #[cfg(test)]
     pub(super) fn error(&self) -> &SessionTypeError {
         &self.error
     }

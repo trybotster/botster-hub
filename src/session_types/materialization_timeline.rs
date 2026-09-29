@@ -124,6 +124,7 @@ impl<'a> Track<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn release(self, bytes: usize) -> Option<()> {
         self.change(|state| state.release(bytes))
     }

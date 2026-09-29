@@ -130,6 +130,7 @@ impl ContentContainer {
 
 /// Count raw Content recursively without constructing its vectors or strings.
 /// The caller must fund the deserializer scratch and possible errors separately.
+#[cfg(test)]
 pub(super) struct ContentSeed;
 
 /// The model retains completed allocations when decoding stops inside a child.
@@ -163,6 +164,7 @@ pub(super) struct ObservedContentSeed<'a> {
     track: Track<'a>,
 }
 
+#[cfg(test)]
 impl ContentSeed {
     pub(super) fn with_progress(progress: &Cell<ContentProgress>) -> ObservedContentSeed<'_> {
         ObservedContentSeed {
@@ -183,6 +185,7 @@ impl<'de> DeserializeSeed<'de> for ObservedContentSeed<'_> {
     }
 }
 
+#[cfg(test)]
 impl<'de> DeserializeSeed<'de> for ContentSeed {
     type Value = ContentStorage;
 
@@ -197,6 +200,7 @@ pub(super) struct ContentVisitor<'a> {
 }
 
 impl<'a> ContentVisitor<'a> {
+    #[cfg(test)]
     pub(super) fn untracked() -> Self {
         Self {
             progress: None,

@@ -16,7 +16,9 @@ use super::definition_budget::{DefinitionStorage, Shape};
 use super::materialization_error::{ErrorTrack, TypedErrorCandidates};
 use super::materialization_timeline::{Timeline, Track};
 use super::scratch_budget::ScratchStorage;
-use crate::lua_memory::{LuaCallbackCharge, LuaMemoryCapacityError, LuaMemoryClass};
+use crate::lua_memory::LuaCallbackCharge;
+#[cfg(test)]
+use crate::lua_memory::{LuaMemoryCapacityError, LuaMemoryClass};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind {
@@ -783,8 +785,9 @@ struct ChargedCountingResult<'input> {
 #[derive(Debug)]
 enum CountingRefusal {
     Arithmetic,
+    #[cfg(test)]
     Capacity(LuaMemoryCapacityError),
-    Correspondence { offset: usize },
+    Correspondence,
 }
 
 impl ChargedCountingResult<'_> {
@@ -795,8 +798,8 @@ impl ChargedCountingResult<'_> {
         }
         match self.cursor.failure {
             Some((FailureKind::Arithmetic, _)) => return Err(CountingRefusal::Arithmetic),
-            Some((FailureKind::Disagreement, offset)) => {
-                return Err(CountingRefusal::Correspondence { offset });
+            Some((FailureKind::Disagreement, _)) => {
+                return Err(CountingRefusal::Correspondence);
             }
             _ => {}
         }
@@ -824,6 +827,7 @@ impl ChargedCountingResult<'_> {
 /// The caller admits the aggregate charge through the plugin account first.
 /// Splitting it cannot create a second independent callback allowance.
 /// Refusal occurs before decoder construction and leaves the input untouched.
+#[cfg(test)]
 fn count_with_storage<'input>(
     input: &'input [u8],
     available: &mut LuaCallbackCharge,
