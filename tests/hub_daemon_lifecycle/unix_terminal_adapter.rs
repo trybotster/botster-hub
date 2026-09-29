@@ -1521,6 +1521,32 @@ fn route_whose_socket_is_never_connected_is_released() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+/// A client that closes its end of a route socket ends only that route; the
+/// control connection reports it as a host-side close.
+#[test]
+fn closing_a_route_socket_reports_a_host_adapter_close_on_the_control_socket() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("crs");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "crs-session", "crs-sub", "exec cat", &mut envelopes, &mut events);
+    client.close_route_socket("crs-sub");
+    assert!(
+        wait_for_subscription_closed(&mut client, "crs-session", "crs-sub", &mut envelopes, &mut events),
+        "closing the route socket must be reported: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { session_id, reason, .. }
+            if session_id == "crs-session"
+                && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+    )));
+    drop(client);
+    shutdown_short_lived_session(hub.endpoint(), "crs-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 /// Route sockets: the Hub guarantees end of stream after a route ends, on
 /// every path. `Detach`:
 #[test]
