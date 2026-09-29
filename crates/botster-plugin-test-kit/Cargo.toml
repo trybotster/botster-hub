@@ -9,6 +9,7 @@ license-file = "../../LICENSE"
 [dependencies]
 botster-hub = { path = "../..", features = ["plugin-test-kit"] }
 botster-hub-client = { path = "../botster-hub-client" }
+botster-hub-test-support = { path = "../botster-hub-test-support" }
 serde = "1.0.228"
 serde_json = "1.0.150"
 # Same requirement and features as botster-hub: one audited mlua build.

@@ -359,3 +359,34 @@ fn a_routed_envelope_is_received_again_until_its_target_acknowledges_it() {
         .expect("receive after ack");
     assert!(after_ack.envelopes.is_empty(), "{after_ack:?}");
 }
+
+/// Timers that one `advance` crosses fire in deadline order. The resource
+/// ids sort the other way here ("...-1000" before "...-200"), so an order by
+/// resource id would put the 1000 ms timer first.
+#[test]
+fn timers_crossed_by_one_advance_fire_in_deadline_order() {
+    let mut kit = start("timer-order");
+    let response = kit
+        .enable_package(&fixture("kit-fixture-timer"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    for delay_ms in [1_000, 200] {
+        let armed = kit
+            .call_tool(
+                "kit-fixture-timer.arm",
+                serde_json::json!({ "delay_ms": delay_ms }),
+            )
+            .expect("arm settles");
+        assert!(armed.error.is_none(), "{armed:?}");
+    }
+    let fired = kit.advance(1_000).expect("advance");
+    let ids: Vec<&str> = fired
+        .iter()
+        .map(|timer| timer.resource_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["timer-lua-timer-200", "timer-lua-timer-1000"],
+        "{fired:?}"
+    );
+}

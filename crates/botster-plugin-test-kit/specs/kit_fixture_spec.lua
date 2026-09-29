@@ -84,3 +84,21 @@ kit.test("published entities reach a client subscription as flat frames", functi
   t:eq(frames[#frames].id, "a")
   t:match(frames[#frames].entity, { label = "First" })
 end)
+
+kit.test("a refused entity subscription raises and is retried, never an empty read", function(t)
+  local p = t:load("kit-fixture")
+  for attempt = 1, 2 do
+    local ok, err = pcall(function() return p:entities("no.such.type") end)
+    t:eq(ok, false, "attempt " .. attempt .. " raises")
+    t:ok(tostring(err):find("entity_provider_unavailable", 1, true), tostring(err))
+  end
+end)
+
+kit.test("distinct large integers are unequal for eq and match", function(t)
+  local low, high = 9007199254740992, 9007199254740993
+  t:eq(pcall(function() t:eq(low, high) end), false)
+  t:eq(pcall(function() t:match(low, high) end), false)
+  t:eq(pcall(function() t:eq({ n = { low } }, { n = { high } }) end), false)
+  t:eq(pcall(function() t:match({ n = { low } }, { n = { high } }) end), false)
+  t:eq(pcall(function() t:eq(low, low) end), true)
+end)
