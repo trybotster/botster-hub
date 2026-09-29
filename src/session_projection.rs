@@ -513,6 +513,56 @@ mod tests {
     }
 
     #[test]
+    fn the_plugin_view_follows_every_projection_mutator() {
+        use crate::session_view::{SessionView, SessionViewError};
+        let view = Arc::new(SessionView::default());
+        let mut projection = SessionProjection::default();
+        projection.attach_view(&view);
+        // Rows ingested before the baseline seals are not readable yet.
+        projection.ingest_baseline_rows(1, [ended("a")]);
+        assert_eq!(view.get("a"), Err(SessionViewError::NotReady));
+        projection.seal_baseline(cursor(1));
+        assert_eq!(view.get("a").unwrap().unwrap().lifecycle_class, "ended");
+        // A journal upsert replaces the row; a removal drops it.
+        projection.apply_change(&SessionLifecycleChange {
+            cursor: cursor(2),
+            kind: SessionLifecycleChangeKind::Upsert {
+                record: record(
+                    "a",
+                    RegistrySessionState::Running,
+                    Some(SessionLifecycleState::Running),
+                ),
+            },
+        });
+        assert_eq!(view.get("a").unwrap().unwrap().lifecycle_class, "current");
+        projection.apply_change(&SessionLifecycleChange {
+            cursor: cursor(3),
+            kind: SessionLifecycleChangeKind::Removed {
+                session_id: SessionId("a".to_string()),
+            },
+        });
+        assert_eq!(view.get("a"), Ok(None));
+        // A restart-record flip reaches the view without a journal change.
+        projection.apply_change(&SessionLifecycleChange {
+            cursor: cursor(4),
+            kind: SessionLifecycleChangeKind::Upsert { record: ended("b") },
+        });
+        assert!(!view.get("b").unwrap().unwrap().restartable);
+        projection.restart_record_changed("b", true);
+        assert!(view.get("b").unwrap().unwrap().restartable);
+        // Baseline recovery empties the view and makes it not ready, not empty.
+        projection.begin_baseline_recovery();
+        assert_eq!(view.get("b"), Err(SessionViewError::NotReady));
+        assert_eq!(view.page(None), Err(SessionViewError::NotReady));
+        projection.replace_complete_baseline(cursor(5), [ended("c")]);
+        assert_eq!(view.get("b"), Ok(None));
+        assert!(view.get("c").unwrap().is_some());
+        // A gap makes the view not ready again.
+        projection.mark_gap();
+        assert_eq!(view.get("c"), Err(SessionViewError::NotReady));
+    }
+
+    #[test]
     fn begin_baseline_recovery_marks_a_gap_without_a_cursor() {
         let mut projection = SessionProjection::default();
         projection.replace_complete_baseline(
