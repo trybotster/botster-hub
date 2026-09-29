@@ -304,6 +304,36 @@ wait "$B3"; code=$?; elapsed=$(( $(date +%s) - started ))
 [ "$b3_waited" = yes ] && pass "cancel at the boundary: b3 the run waits for its admission process" || fail "boundary b3 wait" "the run exited while its admission process was held"
 boundary_check b3 "$code" "$elapsed" B3
 
+# 8l. A run killed without a chance to cancel (SIGKILL) while its admission
+#     waits at the lock: the cancel fifo reports end of file, the admission
+#     cancels itself, and no admission process is left waiting at the lock.
+"$Q" slots 2 >/dev/null
+"$Q" run --label M1 --exclusive -- sh -c 'sleep 3' >/dev/null 2>&1 &
+M1=$!
+await_state "M1 [exclusive] @" running
+"$Q" run --label M0 --exclusive -- sh -c 'sleep 0.5' >/dev/null 2>&1 &
+M0=$!
+await_state "M0 [exclusive] @" queued
+"$Q" run --label MO -- sh -c 'touch "$0/MO.ran"' "$work" >/dev/null 2>"$work/MO.err" &
+MO=$!
+await_text "$work/MO.err" "waiting for exclusive job"
+mkfifo "$work/mk.announce"
+BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/mk.announce" "$Q" run --label MK -- sh -c 'touch "$0/MK.ran"' "$work" >/dev/null 2>&1 &
+MK=$!
+read _ <"$work/mk.announce"
+kill -KILL "$MK"; wait "$MK" 2>/dev/null
+i=0
+until [ "$(lock_waiters)" = 1 ]; do
+  i=$((i + 1)); [ "$i" -gt 100 ] && break
+  # timer: deadline — bounded wait for the orphaned admission to end itself.
+  perl -e 'select(undef, undef, undef, 0.05)'
+done
+waiters_killed=$(lock_waiters)
+wait "$M1" "$M0" "$MO"
+[ "$waiters_killed" = 1 ] && [ ! -e "$work/MK.ran" ] && [ -e "$work/MO.ran" ] \
+  && pass "a run killed with SIGKILL while its admission waits at the lock: the admission cancels itself and its command never runs" \
+  || fail "SIGKILLed run" "lock_waiters=$waiters_killed MK.ran=$([ -e "$work/MK.ran" ] && echo yes || echo no) MO.ran=$([ -e "$work/MO.ran" ] && echo yes || echo no)"
+
 # 8f. Several waiters behind the holder start in the order they arrived. The
 #     order among waiters at the lock is the kernel's flock wakeup order, which
 #     is not a promise; this checks what the platform does, over three waiters.
