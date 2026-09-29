@@ -666,7 +666,7 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=13
+protocol_version=14
 conformance_fixture_revision=53
 package_count=2
 enabled_package_count=2
@@ -967,7 +967,19 @@ bearer_token_env_var = "BOTSTER_MCP_TOKEN"
 
 Run Codex with `--no-daemon` and its own `CODEX_HOME` when several sessions
 share a machine: the shared Codex app-server daemon keeps the environment of
-the session that started it, so its MCP calls carry that session's token.
+the session that started it, so its MCP calls carry that session's token. The
+per-session setup, exactly as the end-to-end proof runs it inside a Hub
+session:
+
+```sh
+CH="$(mktemp -d)"                       # this session's own CODEX_HOME
+cp "$HOME/.codex/auth.json" "$CH/"      # the user's login
+printf '[mcp_servers.botster]\nurl = "%s"\nbearer_token_env_var = "BOTSTER_MCP_TOKEN"\ndefault_tools_approval_mode = "approve"\n' \
+  "$BOTSTER_MCP_URL" > "$CH/config.toml"
+CODEX_HOME="$CH" codex --no-daemon exec --skip-git-repo-check "<prompt>" < /dev/null
+```
+
+`--no-daemon` is a top-level `codex` flag, so it goes before `exec`.
 
 The agent-side file belongs to the user's agent setup; the Hub only sets the
 two variables. A restarted session gets a new token, and its old token is
@@ -997,10 +1009,20 @@ keep the URL in their environment. The daemon records it in
 daemon binds a new one, rewrites the file, and reports it; running sessions
 keep the old URL until they restart.
 
-Tools route through the running daemon: the HTTP task sends each call to the
-owner as a control message that carries the bearer token, and the owner proves
-the token against the session's stored digest in the same Core submission that
-carries out the operation. Native tools:
+Tools route through the running daemon. Every request first proves its bearer
+token with a `whoami` whose reply must be a success naming the token's own
+session (a session that has ended does not prove: Core keeps its registry row
+until it releases the session, so the proof requires the session to be
+running). A proof that fails is a refusal, never a pass: 401 when the token
+does not prove the session, 503 when the daemon could not answer. Then the
+call runs. Messaging, notification and `whoami` carry the token into their own
+Core submission and prove it again there, so the proof and the effect see one
+Core state. Status, the session list and plugin tools run as the session the
+first proof named: their admission point is that proof, and the token is not
+checked again before they run. A session replaced between the proof and the
+dispatch (an operator restart in that window) could let one such call run as
+the same session id under the old token; the call is then made as that session
+id, which the new process holds too. Native tools:
 
 - `hub.status` and `hub.sessions.list` return sanitized daemon status and
   session labels.

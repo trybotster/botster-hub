@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.51:
+Use this command for version 0.1.52:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.51
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.52
 ```
 
 ```js
@@ -81,12 +81,12 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.51"
+    "@trybotster/hub-test-support": "0.1.52"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.51` carries host-control protocol 13
+`@trybotster/hub-test-support@0.1.52` carries host-control protocol 14
 (`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
 Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
 GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
@@ -122,7 +122,7 @@ Protocol 11 adds the operator `resolve_quarantine` request (response kind
 and packages, with `durable` and `loaded`), and the package event-plane
 counters in `observability`.
 
-Version 0.1.51 carries protocol version 13 / conformance revision 53. Revision
+Version 0.1.52 carries protocol version 14 / conformance revision 53. Revision
 53 adds the optional plugin logs `log_id`: a different `log_id` means a new
 log, so reset the cursor to `after_seq` 0. It carries
 advertised optional `unix_terminal_adapter`,
