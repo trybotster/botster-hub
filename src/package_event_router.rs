@@ -318,6 +318,12 @@ impl EventOwnerWork {
     }
 }
 
+/// The `event_generation` of a registration whose producer has no live
+/// contract. It is above every real generation, so no cleanup of any
+/// generation removes or lowers it: a registration made against a newer
+/// producer generation likewise survives a cleanup of an older one.
+const WAITING_EVENT_GENERATION: u64 = u64::MAX;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EventSubscription {
     pub plugin_key: String,
@@ -327,6 +333,13 @@ pub struct EventSubscription {
     pub generation: u64,
     pub event_generation: u64,
     pub plugin_generation: u64,
+}
+
+impl EventSubscription {
+    /// The producer has no live contract for this event yet, or no longer.
+    fn is_waiting(&self) -> bool {
+        self.event_generation == WAITING_EVENT_GENERATION
+    }
 }
 
 /// Connection-scoped client holder. Identity is `(connection_id, subscription_id)`.
@@ -776,6 +789,7 @@ impl PackageEventRouter {
         }
         for owner in owners {
             let generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
+            bind_registrations(&mut inner, &owner, generation);
             commit_diagnostic_state(&mut inner, &self.counters, &owner, generation);
         }
         Ok(())
@@ -1176,11 +1190,12 @@ impl PackageEventRouter {
             .into_iter()
             .flatten()
             .filter(|subscription| {
-                inner
-                    .contracts
-                    .get(&subscription.owner)
-                    .and_then(|events| events.get(&subscription.name))
-                    .is_some_and(|contract| contract.audience.contains(&EventAudience::Plugins))
+                !subscription.is_waiting()
+                    && inner
+                        .contracts
+                        .get(&subscription.owner)
+                        .and_then(|events| events.get(&subscription.name))
+                        .is_some_and(|contract| contract.audience.contains(&EventAudience::Plugins))
             })
             .cloned()
             .collect();
@@ -1993,6 +2008,47 @@ fn snapshot_admission(
                 }
             });
     }
+    // The bind step rebinds or refuses every consumer registration under this
+    // owner, so capture the buckets and plugin counts it can change that the
+    // proposals above did not already capture.
+    if let Some(events) = inner.subscriptions.get(owner) {
+        snapshot.subscription_owners.insert(owner.to_string());
+        for (name, registered) in events {
+            snapshot
+                .subscriptions
+                .entry((owner.to_string(), name.clone()))
+                .or_insert_with(|| {
+                    #[cfg(test)]
+                    {
+                        inner.snapshot_visits.event_buckets += 1;
+                        inner.snapshot_visits.subscriptions += registered.len();
+                    }
+                    Some(registered.clone())
+                });
+            for subscription in registered {
+                snapshot
+                    .plugins
+                    .entry(subscription.plugin_key.clone())
+                    .or_insert_with(|| {
+                        let events = inner
+                            .subscription_events_by_plugin
+                            .get(&subscription.plugin_key);
+                        #[cfg(test)]
+                        {
+                            inner.snapshot_visits.plugins += 1;
+                            inner.snapshot_visits.memberships += events.map_or(0, HashMap::len);
+                        }
+                        PluginAdmissionSnapshot {
+                            count: inner
+                                .subscriptions_per_plugin
+                                .get(&subscription.plugin_key)
+                                .copied(),
+                            events: events.cloned(),
+                        }
+                    });
+            }
+        }
+    }
     snapshot
 }
 
@@ -2081,7 +2137,7 @@ fn replacement_removals(
             inner.preview_visits.subscriptions += holders.len();
         }
         for subscription in holders {
-            if unload_removes_subscription(subscription, owner, unload_generation) {
+            if unload_removes_registration(subscription, owner, unload_generation) {
                 *removed_plugins
                     .entry(subscription.plugin_key.clone())
                     .or_default() += 1;
@@ -2245,10 +2301,19 @@ fn preview_package_replacement(
                 .expect("selected removals cannot exceed the event count")
                 .saturating_add(inner.pending_event_reserve(&key))
         });
+        let producer_active = if subscription.owner == owner {
+            !proposed_contracts.is_empty()
+        } else {
+            inner
+                .contracts
+                .get(&subscription.owner)
+                .is_some_and(|events| !events.is_empty())
+        };
         let status = subscription_admission_status(
             &inner.policy,
             subscription,
             contract,
+            producer_active,
             *plugin_count,
             *event_count,
         );
@@ -2261,10 +2326,15 @@ fn preview_package_replacement(
     Ok(())
 }
 
+/// `producer_active`: the event owner has at least one contract, so an
+/// undeclared name is a mistake. An owner with none is absent or inactive: the
+/// subscription is accepted and waits, and its audience is checked when the
+/// producer's contract registers.
 fn subscription_admission_status(
     policy: &PackageEventPlanePolicy,
     subscription: &EventSubscription,
     contract: Option<&EmittedContract>,
+    producer_active: bool,
     plugin_count: usize,
     event_count: usize,
 ) -> EventPlaneStatus {
@@ -2274,11 +2344,14 @@ fn subscription_admission_status(
     if subscription.owner.trim().is_empty() || subscription.name.trim().is_empty() {
         return EventPlaneStatus::RejectedInvalid;
     }
-    let Some(contract) = contract else {
-        return EventPlaneStatus::RejectedUndeclared;
-    };
-    if !contract.audience.contains(&EventAudience::Plugins) {
-        return EventPlaneStatus::RejectedAudience;
+    match contract {
+        Some(contract) => {
+            if !contract.audience.contains(&EventAudience::Plugins) {
+                return EventPlaneStatus::RejectedAudience;
+            }
+        }
+        None if producer_active => return EventPlaneStatus::RejectedUndeclared,
+        None => {}
     }
     if plugin_count >= policy.subscriptions_per_plugin_max {
         return EventPlaneStatus::RejectedInvalid;
@@ -2309,6 +2382,7 @@ fn commit_package_generation_locked(
         contract.package_generation = generation;
         inner.insert_contract(contract);
     }
+    bind_registrations(inner, owner, generation);
     for subscription in subscriptions {
         let status = subscribe_locked(inner, subscription);
         if status != EventPlaneStatus::Accepted {
@@ -2318,6 +2392,56 @@ fn commit_package_generation_locked(
     }
     commit_diagnostic_state(inner, counters, owner, generation);
     Ok(generation)
+}
+
+/// The producer `owner` committed its contracts at `generation`: bind each
+/// consumer registration under it. A declared event with the `Plugins`
+/// audience binds to the new generation, which a cleanup of an older one
+/// cannot remove. An event the producer does not declare, or declares
+/// without that audience, is refused now: the registration leaves, its counts
+/// return, and one Hub log line names it. The producer's commit still succeeds.
+fn bind_registrations(inner: &mut RouterInner, owner: &str, generation: u64) {
+    let Some(events) = inner.subscriptions.get_mut(owner) else {
+        return;
+    };
+    let contracts = inner.contracts.get(owner);
+    let mut refused: Vec<(String, String, EventPlaneStatus)> = Vec::new();
+    for (name, subscriptions) in events.iter_mut() {
+        let contract = contracts.and_then(|events| events.get(name));
+        subscriptions.retain_mut(|subscription| match contract {
+            Some(contract) if contract.audience.contains(&EventAudience::Plugins) => {
+                subscription.event_generation = generation;
+                true
+            }
+            Some(_) => {
+                refused.push((
+                    subscription.plugin_key.clone(),
+                    name.clone(),
+                    EventPlaneStatus::RejectedAudience,
+                ));
+                false
+            }
+            None => {
+                refused.push((
+                    subscription.plugin_key.clone(),
+                    name.clone(),
+                    EventPlaneStatus::RejectedUndeclared,
+                ));
+                false
+            }
+        });
+    }
+    events.retain(|_, subscriptions| !subscriptions.is_empty());
+    if events.is_empty() {
+        inner.subscriptions.remove(owner);
+    }
+    for (plugin, name, status) in refused {
+        release_registration_counts(inner, &plugin, &(owner.to_string(), name.clone()));
+        crate::hub_log::hub_log!(
+            "event_subscription_refused_at_bind consumer={plugin} producer={owner} event={name} status={}",
+            status.as_str()
+        );
+    }
 }
 
 fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) -> EventPlaneStatus {
@@ -2339,19 +2463,26 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
         .and_then(|events| events.get(&key.1))
         .map_or(0, Vec::len)
         .saturating_add(inner.pending_event_reserve(&key));
+    let producer_active = inner
+        .contracts
+        .get(&key.0)
+        .is_some_and(|events| !events.is_empty());
     let status = subscription_admission_status(
         &inner.policy,
         &subscription,
         contract,
+        producer_active,
         plugin_count,
         event_count,
     );
     if status != EventPlaneStatus::Accepted {
         return status;
     }
-    let event_generation = contract
-        .expect("accepted subscription has a contract")
-        .package_generation;
+    // A subscription to an absent producer waits; `bind_registrations` binds it
+    // when the producer commits its contracts.
+    let event_generation = contract.map_or(WAITING_EVENT_GENERATION, |contract| {
+        contract.package_generation
+    });
     let plugin_generation = inner
         .package_generation
         .get(&subscription.plugin_key)
@@ -2604,13 +2735,18 @@ fn remove_unloaded_subscriptions(
         inner.cleanup_visits.subscriptions += subscriptions.len();
     }
     let mut removed_plugins = Vec::new();
-    subscriptions.retain(|subscription| {
-        if unload_removes_subscription(subscription, owner, generation) {
+    subscriptions.retain_mut(|subscription| {
+        if unload_removes_registration(subscription, owner, generation) {
             removed_plugins.push(subscription.plugin_key.clone());
-            false
-        } else {
-            true
+            return false;
         }
+        // The producer unloaded: a consumer's registration stays and waits for
+        // the producer's next contract. A registration bound to a newer
+        // generation, and one already waiting, are not touched.
+        if subscription.owner == owner && subscription.event_generation <= generation {
+            subscription.event_generation = WAITING_EVENT_GENERATION;
+        }
+        true
     });
     if subscriptions.is_empty() {
         events.remove(&key.1);
@@ -2619,31 +2755,48 @@ fn remove_unloaded_subscriptions(
         inner.subscriptions.remove(&key.0);
     }
     for plugin in removed_plugins {
-        let count = inner
-            .subscriptions_per_plugin
-            .get_mut(&plugin)
-            .expect("a subscription has a plugin count");
-        *count = count.checked_sub(1).expect("each subscription leaves once");
-        if *count == 0 {
-            inner.subscriptions_per_plugin.remove(&plugin);
-        }
-        let events = inner
-            .subscription_events_by_plugin
-            .get_mut(&plugin)
-            .expect("a subscription has plugin membership");
-        let count = events
-            .get_mut(key)
-            .expect("a subscription has event membership");
-        *count = count.checked_sub(1).expect("each subscription leaves once");
-        if *count == 0 {
-            events.remove(key);
-        }
-        if events.is_empty() {
-            inner.subscription_events_by_plugin.remove(&plugin);
-        }
+        release_registration_counts(inner, &plugin, key);
     }
 }
 
+/// One registration of `plugin` under `key` left: return its two counts.
+fn release_registration_counts(inner: &mut RouterInner, plugin: &str, key: &(String, String)) {
+    let count = inner
+        .subscriptions_per_plugin
+        .get_mut(plugin)
+        .expect("a subscription has a plugin count");
+    *count = count.checked_sub(1).expect("each subscription leaves once");
+    if *count == 0 {
+        inner.subscriptions_per_plugin.remove(plugin);
+    }
+    let events = inner
+        .subscription_events_by_plugin
+        .get_mut(plugin)
+        .expect("a subscription has plugin membership");
+    let count = events
+        .get_mut(key)
+        .expect("a subscription has event membership");
+    *count = count.checked_sub(1).expect("each subscription leaves once");
+    if *count == 0 {
+        events.remove(key);
+    }
+    if events.is_empty() {
+        inner.subscription_events_by_plugin.remove(plugin);
+    }
+}
+
+/// The unload of `owner` removes a REGISTRATION only when `owner` is its
+/// subscriber. A registration to an unloading producer stays and waits.
+fn unload_removes_registration(
+    subscription: &EventSubscription,
+    owner: &str,
+    generation: u64,
+) -> bool {
+    subscription.plugin_key == owner && subscription.plugin_generation <= generation
+}
+
+/// The unload of `owner` drops a queued COPY when `owner` is its producer or
+/// its subscriber. A waiting registration never made a copy.
 fn unload_removes_subscription(
     subscription: &EventSubscription,
     owner: &str,
@@ -4969,8 +5122,10 @@ mod tests {
                 contracts: 2,
                 event_buckets: 4,
                 subscriptions: 3,
-                plugins: 2,
-                memberships: 2,
+                // `peer` sits in the owner's bucket: the bind step can change
+                // its count, so the snapshot captures it too.
+                plugins: 3,
+                memberships: 3,
             }
         );
     }
@@ -5047,8 +5202,10 @@ mod tests {
                     sample_contract("remote", "ready"),
                 ])
                 .expect("contracts");
+            // `limited` keeps this registration across the owner's replacement:
+            // a producer's unload does not remove its consumers' subscriptions,
+            // so it still counts against the plugin and event limits.
             subscribe(&router, "limited", "owner", "ready");
-            subscribe(&router, "limited", "remote", "ready");
             subscribe(&router, "owner", "remote", "ready");
             assert_eq!(
                 router.try_ingress(
@@ -5067,11 +5224,11 @@ mod tests {
                     Err(EventPlaneStatus::RejectedInvalid)
                 }
                 "fanout-at-limit" => {
-                    targets = vec![("one", "owner"), ("two", "owner")];
+                    targets = vec![("one", "owner")];
                     Ok(())
                 }
                 "fanout-over-limit" => {
-                    targets = vec![("one", "owner"), ("two", "owner"), ("three", "owner")];
+                    targets = vec![("one", "owner"), ("two", "owner")];
                     Err(EventPlaneStatus::RejectedOverFanout)
                 }
                 "consumer-removed" => {
@@ -5091,8 +5248,10 @@ mod tests {
                     Err(EventPlaneStatus::RejectedAudience)
                 }
                 "removed-contract" => {
+                    // The producer no longer declares any event: it is inactive
+                    // for the registration, which waits instead of failing.
                     contracts.clear();
-                    Err(EventPlaneStatus::RejectedUndeclared)
+                    Ok(())
                 }
                 _ => Ok(()),
             };
@@ -5209,9 +5368,11 @@ mod tests {
                     generations: 1,
                     contracts: 1,
                     event_buckets: 2,
-                    subscriptions: 1,
+                    // The owner's own bucket `ready` is captured whole for
+                    // the bind step, beyond the one proposed registration.
+                    subscriptions: 2,
                     plugins: 2,
-                    memberships: 3,
+                    memberships: 4,
                 }
             )
         );
@@ -5742,20 +5903,28 @@ mod tests {
                 1,
             );
             assert_router_accounting(&router);
+            // A stale unload of the producer leaves the old consumer
+            // registration in place: it was rebound to the producer's new
+            // generation, so it still receives the new event until the
+            // consumer's own unload of its old generation removes it.
+            let copies = if unload_producer { 2 } else { 1 };
             let snapshot = router.snapshot().expect("remaining occupancy");
-            assert_eq!(snapshot.queued_holders, 1);
+            assert_eq!(snapshot.queued_holders, copies);
             assert_eq!(snapshot.producer_events["producer"], 1);
-            let mut batch = router
+            let batch = router
                 .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
                 .expect("new delivery");
-            assert_eq!(batch.len(), 1);
-            let delivery = batch.pop().expect("replacement copy");
-            assert_eq!(delivery.payload_json, new_payload);
-            assert_eq!(delivery.holder.event_generation, 2);
-            assert_eq!(delivery.holder.plugin_generation, 2);
-            router
-                .complete_pulled_delivery(delivery)
-                .expect("complete new copy");
+            assert_eq!(batch.len(), copies);
+            for delivery in batch {
+                assert_eq!(delivery.payload_json, new_payload);
+                assert_eq!(delivery.holder.event_generation, 2);
+                if !unload_producer {
+                    assert_eq!(delivery.holder.plugin_generation, 2);
+                }
+                router
+                    .complete_pulled_delivery(delivery)
+                    .expect("complete new copy");
+            }
             assert_router_accounting(&router);
             assert_eq!(
                 router.snapshot().expect("retired").global_in_flight_bytes,
@@ -6405,8 +6574,12 @@ mod tests {
             router
                 .try_register_contracts(vec![sample_contract("producer", "ready")])
                 .expect("generation");
-            if generation % 2 == 0 {
+            // The consumer registers once. It survives every unload of the
+            // producer, so it never registers again.
+            if generation == 2 {
                 subscribe(&router, "consumer", "producer", "ready");
+            }
+            if generation % 2 == 0 {
                 assert_eq!(
                     router.try_ingress(
                         "producer",
@@ -6691,7 +6864,7 @@ mod tests {
     }
 
     #[test]
-    fn unload_subtracts_every_removed_subscription() {
+    fn producer_unload_keeps_registrations_and_consumer_unload_subtracts_them() {
         let policy = PackageEventPlanePolicy {
             subscriptions_per_plugin_max: 2,
             ..PackageEventPlanePolicy::default()
@@ -6705,13 +6878,37 @@ mod tests {
             .expect("register");
         subscribe(&router, "consumer", "producer", "one");
         subscribe(&router, "consumer", "producer", "two");
-        let generation = router
+        let extra = || EventSubscription {
+            plugin_key: "consumer".into(),
+            owner: "producer".into(),
+            name: "one".into(),
+            handler_id: "extra".into(),
+            generation: 9,
+            ..EventSubscription::default()
+        };
+        // The producer unloads: the consumer's two registrations stay and
+        // still count, so the plugin is at its limit.
+        let producer_generation = router
             .current_package_generation("producer")
             .expect("generation");
-        run_unload(&router, "producer", generation);
+        run_unload(&router, "producer", producer_generation);
+        assert_eq!(
+            router.try_subscribe(extra()),
+            EventPlaneStatus::RejectedInvalid
+        );
+        // The consumer unloads: both registrations leave and both counts fall.
         router
             .begin_package_generation("consumer")
             .expect("consumer gen");
+        let consumer_generation = router
+            .current_package_generation("consumer")
+            .expect("generation");
+        run_unload(&router, "consumer", consumer_generation);
+        {
+            let inner = lock_inner(&router.inner).expect("state");
+            assert!(!inner.subscriptions_per_plugin.contains_key("consumer"));
+            assert!(!inner.subscription_events_by_plugin.contains_key("consumer"));
+        }
         router
             .try_register_contracts(vec![
                 sample_contract("producer", "one"),
@@ -6721,14 +6918,7 @@ mod tests {
         subscribe(&router, "consumer", "producer", "one");
         subscribe(&router, "consumer", "producer", "two");
         assert_eq!(
-            router.try_subscribe(EventSubscription {
-                plugin_key: "consumer".into(),
-                owner: "producer".into(),
-                name: "one".into(),
-                handler_id: "extra".into(),
-                generation: 9,
-                ..EventSubscription::default()
-            }),
+            router.try_subscribe(extra()),
             EventPlaneStatus::RejectedInvalid
         );
     }
@@ -7986,5 +8176,336 @@ mod tests {
             .activate_staged_generation(second)
             .expect("activate v2");
         assert_eq!(router.current_package_generation("pkg"), Ok(2));
+    }
+
+    // P10: a subscription to an absent producer waits and binds at the
+    // producer's next commit.
+
+    fn commit_producer(router: &PackageEventRouter, owner: &str, names: &[&str]) -> u64 {
+        router
+            .try_commit_package_generation(
+                owner,
+                names
+                    .iter()
+                    .map(|name| sample_contract(owner, name))
+                    .collect(),
+                Vec::new(),
+            )
+            .expect("producer commits")
+    }
+
+    fn emit_ready(router: &PackageEventRouter, owner: &str) -> EventPlaneStatus {
+        router.try_ingress(
+            owner,
+            "ready",
+            &serde_json::json!({"ok": true}),
+            Instant::now(),
+        )
+    }
+
+    /// Pull every ready delivery and return the consumer of each.
+    fn pull_consumers(router: &PackageEventRouter) -> Vec<String> {
+        let batch = router
+            .pull_ready_batch(8, usize::MAX, Instant::now(), StdDuration::from_secs(1))
+            .expect("pull");
+        let consumers = batch
+            .iter()
+            .map(|delivery| delivery.holder.plugin_key.clone())
+            .collect();
+        for delivery in batch {
+            router.complete_pulled_delivery(delivery).expect("complete");
+        }
+        consumers
+    }
+
+    fn registration_generation(router: &PackageEventRouter, owner: &str, name: &str) -> u64 {
+        lock_inner(&router.inner).expect("state").subscriptions[owner][name][0].event_generation
+    }
+
+    #[test]
+    fn a_subscription_to_an_absent_producer_is_accepted_and_counted() {
+        let router = router();
+        subscribe(&router, "consumer", "producer", "ready");
+        assert_eq!(
+            registration_generation(&router, "producer", "ready"),
+            WAITING_EVENT_GENERATION
+        );
+        assert_eq!(
+            lock_inner(&router.inner)
+                .expect("state")
+                .subscriptions_per_plugin["consumer"],
+            1
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_consumer_that_loads_first_receives_events_after_the_producer_commits() {
+        let router = router();
+        subscribe(&router, "consumer", "producer", "ready");
+        assert_eq!(
+            emit_ready(&router, "producer"),
+            EventPlaneStatus::RejectedUndeclared,
+            "the producer cannot emit before it commits"
+        );
+        let generation = commit_producer(&router, "producer", &["ready"]);
+        assert_eq!(
+            registration_generation(&router, "producer", "ready"),
+            generation
+        );
+        assert_eq!(emit_ready(&router, "producer"), EventPlaneStatus::Accepted);
+        assert_eq!(pull_consumers(&router), ["consumer"]);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_producer_that_is_disabled_and_enabled_again_still_delivers() {
+        let router = router();
+        commit_producer(&router, "producer-t3", &["ready"]);
+        subscribe(&router, "consumer-t3", "producer-t3", "ready");
+        assert_eq!(
+            emit_ready(&router, "producer-t3"),
+            EventPlaneStatus::Accepted
+        );
+        run_unload(&router, "producer-t3", 1);
+        assert_eq!(
+            registration_generation(&router, "producer-t3", "ready"),
+            WAITING_EVENT_GENERATION,
+            "the registration stays and waits"
+        );
+        assert_eq!(
+            lock_inner(&router.inner)
+                .expect("state")
+                .subscriptions_per_plugin["consumer-t3"],
+            1,
+            "and still counts"
+        );
+        let generation = commit_producer(&router, "producer-t3", &["ready"]);
+        assert_eq!(
+            registration_generation(&router, "producer-t3", "ready"),
+            generation
+        );
+        assert_eq!(
+            emit_ready(&router, "producer-t3"),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(pull_consumers(&router), ["consumer-t3"]);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_producer_replacement_keeps_the_registration_and_drops_old_copies() {
+        let router = router();
+        commit_producer(&router, "producer-t4", &["ready"]);
+        subscribe(&router, "consumer-t4", "producer-t4", "ready");
+        assert_eq!(
+            emit_ready(&router, "producer-t4"),
+            EventPlaneStatus::Accepted
+        );
+        let replaced = router
+            .try_replace_package_generation(
+                "producer-t4",
+                vec![sample_contract("producer-t4", "ready")],
+                Vec::new(),
+            )
+            .expect("replace");
+        assert_eq!(
+            registration_generation(&router, "producer-t4", "ready"),
+            replaced,
+            "the registration rebinds to the new generation"
+        );
+        assert!(
+            pull_consumers(&router).is_empty(),
+            "the copy of the old generation is dropped"
+        );
+        assert_eq!(
+            emit_ready(&router, "producer-t4"),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(pull_consumers(&router), ["consumer-t4"]);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_waiting_subscription_to_an_undeclared_event_is_refused_at_bind() {
+        let router = router();
+        subscribe(&router, "consumer-t5", "producer-t5", "missing");
+        commit_producer(&router, "producer-t5", &["ready"]);
+        let inner = lock_inner(&router.inner).expect("state");
+        assert!(!inner.subscriptions.contains_key("producer-t5"));
+        assert!(!inner.subscriptions_per_plugin.contains_key("consumer-t5"));
+        drop(inner);
+        assert_eq!(
+            crate::hub_log::captured_matching(&[
+                "event_subscription_refused_at_bind",
+                "consumer=consumer-t5",
+                "event=missing",
+                "status=rejected_undeclared",
+            ])
+            .len(),
+            1
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_waiting_subscription_to_an_event_without_the_plugins_audience_is_refused_at_bind() {
+        let router = router();
+        subscribe(&router, "consumer-t6", "producer-t6", "ready");
+        let mut clients_only = sample_contract("producer-t6", "ready");
+        clients_only.audience = BTreeSet::from([EventAudience::Clients]);
+        router
+            .try_commit_package_generation("producer-t6", vec![clients_only], Vec::new())
+            .expect("the producer commit succeeds");
+        assert!(
+            !lock_inner(&router.inner)
+                .expect("state")
+                .subscriptions_per_plugin
+                .contains_key("consumer-t6")
+        );
+        assert_eq!(
+            crate::hub_log::captured_matching(&[
+                "event_subscription_refused_at_bind",
+                "consumer=consumer-t6",
+                "status=rejected_audience",
+            ])
+            .len(),
+            1
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn an_active_producer_with_an_undeclared_name_still_refuses_at_load() {
+        let router = router();
+        commit_producer(&router, "producer-t7", &["ready"]);
+        assert_eq!(
+            router.try_subscribe(EventSubscription {
+                plugin_key: "consumer-t7".into(),
+                owner: "producer-t7".into(),
+                name: "typo".into(),
+                handler_id: "h".into(),
+                generation: 1,
+                ..EventSubscription::default()
+            }),
+            EventPlaneStatus::RejectedUndeclared
+        );
+    }
+
+    #[test]
+    fn a_consumer_unload_removes_its_waiting_subscription() {
+        let router = router();
+        subscribe(&router, "consumer-t8", "producer-t8", "ready");
+        router
+            .begin_package_generation("consumer-t8")
+            .expect("consumer generation");
+        run_unload(&router, "consumer-t8", 1);
+        let inner = lock_inner(&router.inner).expect("state");
+        assert!(!inner.subscriptions.contains_key("producer-t8"));
+        assert!(!inner.subscriptions_per_plugin.contains_key("consumer-t8"));
+        drop(inner);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_waiting_subscription_counts_against_the_limits() {
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            subscriptions_per_plugin_max: 1,
+            subscribers_per_event_max: 1,
+            ..PackageEventPlanePolicy::default()
+        });
+        subscribe(&router, "consumer-t9", "producer-t9", "one");
+        let waiting = |plugin: &str, name: &str| EventSubscription {
+            plugin_key: plugin.into(),
+            owner: "producer-t9".into(),
+            name: name.into(),
+            handler_id: "h".into(),
+            generation: 1,
+            ..EventSubscription::default()
+        };
+        assert_eq!(
+            router.try_subscribe(waiting("consumer-t9", "two")),
+            EventPlaneStatus::RejectedInvalid,
+            "per-plugin limit"
+        );
+        assert_eq!(
+            router.try_subscribe(waiting("other-t9", "one")),
+            EventPlaneStatus::RejectedOverFanout,
+            "per-event limit"
+        );
+    }
+
+    #[test]
+    fn a_failed_producer_commit_restores_the_waiting_subscriptions_and_counts() {
+        let router = router();
+        subscribe(&router, "consumer-t10", "producer-t10", "ready");
+        subscribe(&router, "consumer-t10", "producer-t10", "missing");
+        let before = lock_inner(&router.inner)
+            .expect("state")
+            .subscriptions
+            .clone();
+        let counts = lock_inner(&router.inner)
+            .expect("state")
+            .subscriptions_per_plugin
+            .clone();
+        // The bind step would bind "ready" and refuse "missing"; the package's
+        // own subscription to an undeclared name then fails the commit.
+        assert_eq!(
+            router.try_commit_package_generation(
+                "producer-t10",
+                vec![sample_contract("producer-t10", "ready")],
+                vec![EventSubscription {
+                    plugin_key: "producer-t10".into(),
+                    owner: "producer-t10".into(),
+                    name: "undeclared".into(),
+                    handler_id: "own".into(),
+                    generation: 1,
+                    ..EventSubscription::default()
+                }],
+            ),
+            Err(EventPlaneStatus::RejectedUndeclared)
+        );
+        let inner = lock_inner(&router.inner).expect("state");
+        assert_eq!(inner.subscriptions, before);
+        assert_eq!(inner.subscriptions_per_plugin, counts);
+        assert!(!inner.package_generation.contains_key("producer-t10"));
+        drop(inner);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_stale_cleanup_removes_neither_a_waiting_nor_a_newer_bound_registration() {
+        let router = router();
+        // Waiting: a cleanup of any generation of the absent producer leaves it.
+        subscribe(&router, "waiting-t11", "absent-t11", "ready");
+        run_unload(&router, "absent-t11", 5);
+        assert_eq!(
+            registration_generation(&router, "absent-t11", "ready"),
+            WAITING_EVENT_GENERATION
+        );
+        // Bound to generation 2: a delayed cleanup of generation 1 leaves it.
+        commit_producer(&router, "producer-t11", &["ready"]);
+        subscribe(&router, "bound-t11", "producer-t11", "ready");
+        let second = commit_producer(&router, "producer-t11", &["ready"]);
+        assert_eq!(second, 2);
+        assert_eq!(registration_generation(&router, "producer-t11", "ready"), 2);
+        run_unload(&router, "producer-t11", 1);
+        assert_eq!(registration_generation(&router, "producer-t11", "ready"), 2);
+        assert_eq!(
+            emit_ready(&router, "producer-t11"),
+            EventPlaneStatus::Accepted
+        );
+        assert_eq!(pull_consumers(&router), ["bound-t11"]);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn a_waiting_registration_receives_nothing_from_an_unrelated_producer_with_the_same_name() {
+        let router = router();
+        subscribe(&router, "consumer-t12", "absent-t12", "ready");
+        commit_producer(&router, "other-t12", &["ready"]);
+        assert_eq!(emit_ready(&router, "other-t12"), EventPlaneStatus::Accepted);
+        assert!(pull_consumers(&router).is_empty());
+        assert_router_accounting(&router);
     }
 }
