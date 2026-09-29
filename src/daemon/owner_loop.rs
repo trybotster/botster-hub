@@ -2899,7 +2899,7 @@ mod tests {
                                     ),
                                     botster_core::PluginAdmissionResult::Queued { .. }
                                 ));
-                                let deadline = Instant::now() + Duration::from_secs(3);
+                                let deadline = Instant::now() + TEST_HANG_GUARD;
                                 while lifecycle.debug_snapshot().undrained_completions != 1 {
                                     assert!(
                                         Instant::now() < deadline,
@@ -3016,15 +3016,15 @@ mod tests {
                 })
                 .unwrap();
             let inspect = inspect_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .unwrap_or_else(|error| {
                     panic!(
                         "serve reaches the selected exit: {error:?}; outcome: {:?}",
-                        finished_rx.recv_timeout(Duration::from_secs(1))
+                        finished_rx.recv_timeout(TEST_HANG_GUARD)
                     )
                 });
             let worker = entered_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("Host starts terminal disposal");
             let (
                 coordination,
@@ -3033,7 +3033,7 @@ mod tests {
                 publication_response,
                 spawner,
                 spawner_drops,
-            ) = bridges_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            ) = bridges_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
             assert!(worker.starts_with("botster-hub-host"), "{worker}");
             assert_eq!(
                 inspect(),
@@ -3054,7 +3054,7 @@ mod tests {
             assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, true));
             gate.release();
             let engine_worker = engine_entered_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("the final engine owner reaches destruction");
             assert!(
                 engine_worker.starts_with("botster-hub-host"),
@@ -3077,7 +3077,7 @@ mod tests {
             assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, true));
             engine_gate.release();
             let publication_worker = publication_entered_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("Host destroys the queued publication after engine disposal");
             assert!(publication_worker.starts_with("botster-hub-host"));
             assert_eq!(inspect(), (1, true, false));
@@ -3085,7 +3085,7 @@ mod tests {
             assert_eq!(coordination.test_pending_count(), 0);
             assert!(
                 coordination_disposed_rx
-                    .recv_timeout(Duration::from_secs(1))
+                    .recv_timeout(TEST_HANG_GUARD)
                     .unwrap()
                     .starts_with("botster-hub-host")
             );
@@ -3101,7 +3101,7 @@ mod tests {
             ));
             publication_gate.release();
             let first_spawner_drop = spawner_drops
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("Host destroys spawner payloads after publication disposal");
             assert!(first_spawner_drop.0.starts_with("botster-hub-host"));
             assert!(
@@ -3118,7 +3118,7 @@ mod tests {
             assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, true));
             spawner_gate_tx.send(()).unwrap();
             let result = finished_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("serve exits after Host disposal");
             if error_exit {
                 assert!(matches!(
@@ -3128,7 +3128,7 @@ mod tests {
             } else {
                 assert!(result.is_ok(), "{result:?}");
             }
-            stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            stopped_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
             assert_eq!(inspect(), (0, false, true));
             assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, false));
             let remaining_spawner_drops: Vec<_> = spawner_drops.try_iter().collect();
@@ -3140,13 +3140,13 @@ mod tests {
             );
             assert!(
                 publication_disposed_rx
-                    .recv_timeout(Duration::from_secs(1))
+                    .recv_timeout(TEST_HANG_GUARD)
                     .unwrap()
                     .starts_with("botster-hub-host")
             );
             assert!(
                 engine_disposed_rx
-                    .recv_timeout(Duration::from_secs(1))
+                    .recv_timeout(TEST_HANG_GUARD)
                     .unwrap()
                     .starts_with("botster-hub-host")
             );
@@ -3197,7 +3197,7 @@ mod tests {
     }
 
     fn settle_cleanup_test_owner(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         loop {
             assert!(!drive_ready_test_turn(daemon, state));
             if state.owner_ready.is_empty()
@@ -3371,7 +3371,7 @@ mod tests {
             ));
             drive_until_requests_answered(&mut daemon, &mut state);
             assert!(read_response(&mut client, &mut reader, 3).error.is_none());
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while !connection.test_cleanup_started() {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -3385,9 +3385,9 @@ mod tests {
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             event_reader.test_on_empty_read(move || {
                 entered_tx.send(()).unwrap();
-                resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                resume_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
             });
-            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            entered_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
             let timer_ticks = event_reader.test_timer_ticks();
             sibling
                 .try_push(
@@ -3444,7 +3444,7 @@ mod tests {
             panic!("the Unix transport must return its original cleanup permit");
         };
         handle_connection_cleanup(&mut daemon, &mut state, control_tx.clone(), cleanup);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -3581,7 +3581,7 @@ mod tests {
         ));
         // The release raised the slots key; one owner pass answers the request
         // with no other wake.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let answer = loop {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             if let Ok(answer) = response.try_recv() {
@@ -3785,7 +3785,7 @@ mod tests {
             }
             assert!(submit(&daemon, &mut state, work), "room admits the retry");
             // timer: deadline — the shared test hang guard; Core answers at once
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             assert!(if work == baseline {
                 state
                     .maintenance_reads
@@ -3937,7 +3937,7 @@ mod tests {
                 ));
                 state.owner_ready =
                     crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + TEST_HANG_GUARD;
                 let completion = loop {
                     match daemon.runtime().unwrap().host_executor().poll_completion() {
                         crate::host_executor::HostCompletionPoll::Ready(completion) => {
@@ -4043,7 +4043,7 @@ mod tests {
             assert!(state.owner_ready.is_empty());
         }
         close_cleanup_test_connection(&mut daemon, &mut state, permit);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(Instant::now() < deadline);
@@ -4164,7 +4164,7 @@ mod tests {
                 );
             }
             close_cleanup_test_connection(&mut daemon, &mut state, permit);
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while state.budget.outstanding() != 0 {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(Instant::now() < deadline);
@@ -4194,7 +4194,7 @@ mod tests {
         ));
         state.owner_ready =
             crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !state.host_completion_drain_faulted {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -4281,7 +4281,7 @@ mod tests {
                 _ => unreachable!(),
             }
             close_cleanup_test_connection(&mut daemon, &mut state, permit);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while !state.client_events.test_recovery("cleanup-connection") {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -4337,7 +4337,7 @@ mod tests {
             .unwrap();
         daemon.runtime_mut().unwrap().test_stop_host_submissions();
         close_cleanup_test_connection(&mut daemon, &mut state, permit);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !state.client_events.has_capacity_waiters() {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -4477,7 +4477,7 @@ mod tests {
             close_cleanup_test_connection(&mut daemon, &mut state, permit);
             assert_eq!(state.budget.outstanding(), 1);
             drop(permits.pop());
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while if poison {
                 !state.client_events.test_recovery("cleanup-connection")
             } else {
@@ -4584,7 +4584,7 @@ mod tests {
         assert_eq!(router.test_client_holder_count("cleanup-connection"), 1);
         mailbox.test_with_inner_held(|| {
             drop(permits.pop());
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while router.test_client_holder_count("cleanup-connection") != 0 {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -4610,7 +4610,7 @@ mod tests {
                 );
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -4653,7 +4653,7 @@ mod tests {
                 item,
                 &mut turn
             ));
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             let mut completion = loop {
                 match daemon.runtime().unwrap().host_executor().poll_completion() {
                     crate::host_executor::HostCompletionPoll::Ready(completion) => {
@@ -4761,7 +4761,7 @@ mod tests {
                 "reservation expiry must publish its own cleanup wake or submit its worker"
             );
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while router.test_client_holder_count("cleanup-connection") != 0
             || daemon.runtime().unwrap().host_executor().outstanding() != 0
         {
@@ -4831,7 +4831,7 @@ mod tests {
             );
         }
         drop(host_permits.pop());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -4917,7 +4917,7 @@ mod tests {
             "parked-request",
         );
         // timer: deadline — bounds each owner-driven phase below.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let turn = |daemon: &mut HubDaemon, state: &mut DaemonControlState| {
             publish_completion_wakes(daemon, state);
             publish_maintenance_wakes(state);
@@ -5028,7 +5028,7 @@ mod tests {
                 "cleanup-client",
                 "cleanup-request",
             );
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             loop {
                 let retained = state.host_completions.values().any(|completion| matches!(
                     &*completion.result,
@@ -5300,7 +5300,7 @@ mod tests {
                 }));
                 assert!(poisoned.is_err());
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while state.host_recovery.is_empty() {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -5420,7 +5420,7 @@ mod tests {
                 "shutdown-request",
             );
             let waiter = state.shutdown_waiter.expect("accepted shutdown");
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             loop {
                 assert!(
                     !drive_ready_test_turn(&mut daemon, &mut state),
@@ -5476,7 +5476,7 @@ mod tests {
             ));
             reply = Some(response);
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !drive_ready_test_turn(&mut daemon, &mut state) {
             assert!(
                 Instant::now() < deadline,
@@ -5553,7 +5553,7 @@ mod tests {
                     );
                 }
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while daemon.runtime().unwrap().event_plane_owner_ops_pending() {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -5726,7 +5726,7 @@ mod tests {
             "publication-shutdown",
         );
         assert!(shutdown.try_recv().is_err());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         loop {
             drive_ready_test_turn(&mut daemon, &mut state);
             if let Ok(reply) = shutdown.try_recv() {
@@ -5994,7 +5994,7 @@ mod tests {
             crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT
         );
         assert!(remaining > 0 && remaining < ids.len());
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while daemon.runtime().unwrap().causal_owner_ops_pending() {
             drive_ready_test_turn(&mut daemon, &mut state);
             assert!(
@@ -6031,7 +6031,7 @@ mod tests {
             daemon.runtime().unwrap().event_plane_owner_ops_pending(),
             "one owner turn cannot drain all queued operations"
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while daemon.runtime().unwrap().event_plane_owner_ops_pending() {
             drive_ready_test_turn(&mut daemon, &mut state);
             assert!(Instant::now() < deadline, "queued operations must finish");
@@ -6046,7 +6046,7 @@ mod tests {
     /// reads its response must let the owner reach it.
     fn drive_until_requests_answered(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
         // timer: deadline — the shared test hang guard; each turn is event-driven
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !state.pending_requests.is_empty() {
             assert!(!drive_ready_test_turn(daemon, state));
             assert!(
@@ -6795,7 +6795,7 @@ mod tests {
             .expect("report shutdown response delivery attempt");
         assert!(
             stopped_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("daemon stop decision follows delivery attempt")
         );
     }
@@ -6820,7 +6820,7 @@ mod tests {
 
         assert!(
             stopped_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("dropped delivery owner releases daemon stop")
         );
     }
@@ -6885,7 +6885,7 @@ mod tests {
         );
         assert!(
             stopped_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(TEST_HANG_GUARD)
                 .expect("failed response delivery releases daemon stop")
         );
     }
@@ -7287,7 +7287,7 @@ return botster.register({
             runtime.install_plugin_completion_notifier(
                 state.plugin_result_budget.completion_notifier(),
             );
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             let (completion, mut reply, mut frames) = 'admission: loop {
                 let (frame_tx, frame_rx) = tokio_mpsc::channel(8);
                 let (reply_tx, mut reply_rx) =
@@ -7705,7 +7705,7 @@ return botster.register({ handlers = {{
         let baseline = metadata.used();
         let mut replies = Vec::new();
         let mut frames = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         crate::lua_runtime::arm_test_plugin_invocation_gate();
         for index in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
             loop {
@@ -7835,7 +7835,7 @@ return botster.register({ handlers = {{
         let mut deferred = Vec::new();
         let mut replies = Vec::new();
         let mut frames = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         for index in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
             let (reply, frame) = 'request: loop {
                 let (frame_tx, frame_rx) = tokio_mpsc::channel(8);
@@ -7958,7 +7958,7 @@ return botster.register({ handlers = {{
                 "snapshot_seq": 1, "id": "entity-1"}), None,
         ).unwrap();
         crate::daemon::control::entities::begin_package_entity_fanout(&daemon, &mut state);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while crate::daemon::control::entities::plugin_entity_cleanup_pending(&state)
             || daemon.runtime().unwrap().has_package_entity_fanout()
         {
@@ -7999,7 +7999,7 @@ return botster.register({ handlers = {{
                 "the sequence-1 mutation is superseded"
             );
         }
-        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        let drain_deadline = Instant::now() + TEST_HANG_GUARD;
         while daemon.runtime().unwrap().host_executor().outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -8016,7 +8016,7 @@ return botster.register({ handlers = {{
                 "snapshot_seq": 2, "id": "entity-1"}),
             None,
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         loop {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             if bridge.pending_publish_count() == 0
@@ -8176,7 +8176,7 @@ return botster.register({
         state: &mut DaemonControlState,
         mut reply_rx: crate::daemon::control::message::ControlReplyReceiver,
     ) -> DaemonTransportResult<DaemonResponse> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let mut response = None;
         loop {
             drive_ready_test_turn(daemon, state);
@@ -8274,7 +8274,7 @@ return botster.register({
             },
         );
         // timer: deadline — the test hang guard; progress arrives as owner work.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let mut drive = |daemon: &mut HubDaemon, state: &mut DaemonControlState| {
             collect_entity_test_host_completions(daemon, state);
             if let Some(item) = state.owner_ready.pop_next() {
@@ -8374,7 +8374,7 @@ return botster.register({
             "contended-ping",
         );
         // timer: deadline — the test hang guard; progress arrives as owner work.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.signal_request_waits.is_empty() {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(
@@ -8482,7 +8482,7 @@ return botster.register({
             ));
         }
         // timer: deadline — the test hang guard; progress arrives as owner work.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.signal_request_waits.len() < 2 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(Instant::now() < deadline, "both requests must park");
@@ -8600,7 +8600,7 @@ return botster.register({
             &mut state,
             item,
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let mut causal_filled = false;
         while !state.plugin_entities.causal_waiters.contains(&waiter) {
             if !causal_filled
@@ -8770,7 +8770,7 @@ return botster.register({ handlers = {{
                 .maintenance
                 .wakes
                 .mark(MaintenanceSliceKind::PackageEventDelivery);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             loop {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 let runtime = daemon.runtime().unwrap();
@@ -9602,14 +9602,14 @@ return botster.register({tools = {{
                                 );
                                 runtime
                                     .publish_routed_envelope(envelope)
-                                    .wait(Duration::from_secs(5))
+                                    .wait(TEST_HANG_GUARD)
                                     .unwrap()
                                     .unwrap();
                             }
                             drop(runtime.submit_core(move |_| {
                                 entered_tx.send(()).unwrap();
                                 release_rx
-                                    .recv_timeout(Duration::from_secs(10))
+                                    .recv_timeout(TEST_HANG_GUARD)
                                     .expect("the fixture releases Core");
                             }));
                             let probe: Box<dyn Fn(crate::owner_identity::WaiterId) -> bool + Send> =
@@ -9649,9 +9649,9 @@ return botster.register({tools = {{
             })
             .unwrap();
         let (bridge, retains_waiter, callback_usage, callback_owners, control) =
-            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            started_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         let stop = StopServe(control);
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         let mut client =
             UnixStream::connect(&config.transports.local_socket.as_ref().unwrap().path).unwrap();
         client
@@ -9755,7 +9755,7 @@ return botster.register({tools = {{
                 "acknowledged"
             );
         }
-        let retirement_deadline = Instant::now() + Duration::from_secs(2);
+        let retirement_deadline = Instant::now() + TEST_HANG_GUARD;
         while waiters.iter().any(|waiter| retains_waiter(*waiter)) {
             assert!(
                 Instant::now() < retirement_deadline,
@@ -9847,9 +9847,7 @@ return botster.register({tools = {{
                 runtime.bind_host_owner_wake(control);
                 drop(runtime.submit_core(move |_| {
                     first_entered_tx.send(()).unwrap();
-                    release_first_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .unwrap();
+                    release_first_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
                 }));
                 let bridge = runtime.coordination_bridge();
                 let response_first = bridge.test_queue_pending(
@@ -9866,9 +9864,7 @@ return botster.register({tools = {{
                 let runtime = daemon.runtime().unwrap();
                 drop(runtime.submit_core(move |_| {
                     second_entered_tx.send(()).unwrap();
-                    release_second_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .unwrap();
+                    release_second_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
                 }));
                 let response_second = bridge.test_queue_pending(
                     crate::lua_runtime::PendingCoordinationOperation::Drain {
@@ -9898,12 +9894,10 @@ return botster.register({tools = {{
             })
             .unwrap();
         let (bridge, retains_waiter, response_first, response_second) =
-            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            started_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         let waiters = bridge.test_admitted_waiters();
         assert_eq!(waiters.len(), 2);
-        first_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        first_entered_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         assert!(matches!(
             response_first.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -9913,17 +9907,15 @@ return botster.register({tools = {{
             Err(mpsc::TryRecvError::Empty)
         ));
         first_gate.0.take().unwrap().send(()).unwrap();
-        second_entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
+        second_entered_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         assert!(
             first_disposed_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(TEST_HANG_GUARD)
                 .unwrap()
                 .starts_with("botster-hub-host")
         );
         assert!(matches!(
-            response_first.recv_timeout(Duration::from_secs(5)),
+            response_first.recv_timeout(TEST_HANG_GUARD),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
         assert!(matches!(
@@ -9938,15 +9930,15 @@ return botster.register({tools = {{
         second_gate.0.take().unwrap().send(()).unwrap();
         assert!(
             second_disposed_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(TEST_HANG_GUARD)
                 .unwrap()
                 .starts_with("botster-hub-host")
         );
         assert!(matches!(
-            response_second.recv_timeout(Duration::from_secs(5)),
+            response_second.recv_timeout(TEST_HANG_GUARD),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
-        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        finished_rx.recv_timeout(TEST_HANG_GUARD).unwrap();
         owner.join().unwrap();
         assert!(waiters.iter().all(|waiter| !retains_waiter(*waiter)));
         drop(retains_waiter);
@@ -10000,7 +9992,7 @@ return botster.register({tools = {{
         );
         // Two seconds is a test safety bound for gate entry.
         assert!(
-            crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+            crate::lua_runtime::wait_for_test_plugin_invocation_gate(TEST_HANG_GUARD),
             "the controlled plugin worker must enter the gate"
         );
         assert!(
@@ -10019,7 +10011,7 @@ return botster.register({tools = {{
             "connection-status",
             "7",
         );
-        let status_deadline = Instant::now() + Duration::from_secs(2);
+        let status_deadline = Instant::now() + TEST_HANG_GUARD;
         let status = loop {
             drive_ready_test_turn(&mut daemon, &mut state);
             match status_reply.try_recv() {
@@ -10172,7 +10164,7 @@ return botster.register({tools = {{
             ));
         }
         assert!(
-            crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+            crate::lua_runtime::wait_for_test_plugin_invocation_gate(TEST_HANG_GUARD),
             "the controlled plugin worker must enter the gate"
         );
 
@@ -10253,7 +10245,7 @@ return botster.register({tools = {{
             control_tx.clone(),
             sibling_status,
         ));
-        let sibling_deadline = Instant::now() + Duration::from_secs(2);
+        let sibling_deadline = Instant::now() + TEST_HANG_GUARD;
         while state.pending_requests.len() > core_capacity {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state,));
             assert!(
@@ -10277,7 +10269,7 @@ return botster.register({tools = {{
             .expect("sibling status disconnect is clean");
 
         crate::lua_runtime::release_test_plugin_invocation_gate();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !state.pending_requests.is_empty() {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state,));
             assert!(
@@ -10492,7 +10484,7 @@ return botster.register({tools = {{
                     grant_id: None,
                 },
             );
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             let response = loop {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 match reply_rx.try_recv() {
@@ -10568,7 +10560,7 @@ return botster.register({tools = {{
                 Duration::from_secs(2)
             ));
             crate::lua_runtime::release_test_plugin_invocation_gate();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while !state.plugin_controls.has_capacity_waiters() {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 assert!(
@@ -10687,7 +10679,7 @@ return botster.register({tools = {{
                 receive_test_control_reply(reply_rx).expect("the daemon admits the subscriber");
             assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
             assert!(state.entity_subscriptions.contains_key(peer));
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             let frame = loop {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 if let Ok(frame) = receiver.try_recv() {
@@ -10809,7 +10801,7 @@ return botster.register({tools = {{
                 assert!(admitted.ok);
                 crate::daemon::control::entities::begin_package_entity_fanout(&daemon, &mut state);
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while !state.plugin_entities.has_retained_snapshot_payload() {
                 if let Ok(reply) = entity_reply.try_recv() {
                     panic!(
@@ -11089,7 +11081,7 @@ return botster.register({tools = {{
                 },
             );
             assert_eq!(state.budget.outstanding(), baseline + 1);
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while !crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO)
                 || daemon.runtime().unwrap().host_executor().outstanding() != 0
             {
@@ -11133,7 +11125,7 @@ return botster.register({tools = {{
 
             crate::lua_runtime::release_test_plugin_invocation_gate();
             drop(reply_rx);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while state.budget.outstanding() != baseline {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 assert!(
@@ -11255,7 +11247,7 @@ return botster.register({tools = {{
             replies.push(reply_rx);
         }
         assert_eq!(state.pending_requests.len(), 2);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         while !drive_ready_test_turn(&mut daemon, &mut state) {
             assert!(
                 Instant::now() < deadline,
@@ -13164,7 +13156,7 @@ return botster.register({tools = {{
         let crate::daemon::control::pending::ControlStep::Pending(mut pending) = step else {
             panic!("attach waits on a Core turn");
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
         let response = loop {
             if let Some(runtime) = daemon.runtime() {
                 // Collect registered Core identities before polling their returned values.
