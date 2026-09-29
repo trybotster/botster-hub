@@ -473,7 +473,12 @@ impl KitHub {
             receiver: frame_rx,
             frames: Vec::new(),
         });
-        self.await_reply(reply)
+        let response = self.await_reply(reply)?;
+        if response.error.is_some() {
+            // A refused subscription delivers no frames; keep none of it.
+            self.entity_subscriptions.pop();
+        }
+        Ok(response)
     }
 
     /// Every entity frame the kit's subscriptions to `entity_type` have

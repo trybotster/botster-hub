@@ -605,13 +605,16 @@ impl HubCapabilityRuntime {
         plugin_key: &PluginKey,
         now_ms: u64,
     ) -> Result<(), CapabilityRuntimeError> {
-        let due = self
+        let mut due = self
             .timers
             .iter()
             .filter(|(_, timer)| &timer.plugin_key == plugin_key && timer.next_fire_ms <= now_ms)
-            .map(|(resource_id, _)| resource_id.clone())
+            .map(|(resource_id, timer)| (timer.next_fire_ms, resource_id.clone()))
             .collect::<Vec<_>>();
         self.ensure_event_capacity(plugin_key, due.len())?;
+        // Fire in deadline order; timers with one deadline fire in resource-id order.
+        due.sort();
+        let due = due.into_iter().map(|(_, resource_id)| resource_id);
 
         for resource_id in due {
             let mut remove = false;

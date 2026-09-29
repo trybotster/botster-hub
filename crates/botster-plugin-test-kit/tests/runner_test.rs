@@ -14,7 +14,7 @@ fn the_fixture_specs_pass_against_the_real_hub() {
         &crate_path("fixtures"),
         &crate_path("specs/kit_fixture_spec.lua"),
     );
-    assert_eq!(outcomes.len(), 9, "{outcomes:?}");
+    assert_eq!(outcomes.len(), 11, "{outcomes:?}");
     let failures: Vec<_> = outcomes
         .iter()
         .filter(|outcome| outcome.failure.is_some())
@@ -52,4 +52,15 @@ fn a_spec_that_does_not_parse_is_one_failure() {
     std::fs::remove_dir_all(&directory).expect("remove temp dir");
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert!(outcomes[0].failure.is_some());
+}
+
+/// The README's example runs green, so the README does not drift.
+#[test]
+fn the_readme_example_spec_passes() {
+    let outcomes = run_spec_file(
+        &crate_path("fixtures"),
+        &crate_path("specs/readme_example_spec.lua"),
+    );
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].failure, None, "{outcomes:?}");
 }
