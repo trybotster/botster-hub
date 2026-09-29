@@ -450,8 +450,22 @@ setup_mbx() {
   [ "${BOTSTERQ_MBX:-$mbx_default}" = 1 ] || return 0
   mbx_bin=$(command -v mbx 2>/dev/null) || return 0
   shim_dir="$state/mbx-shim"
-  mkdir -p "$shim_dir"
-  [ "$(readlink "$shim_dir/cargo" 2>/dev/null)" = "$mbx_bin" ] || ln -sfn "$mbx_bin" "$shim_dir/cargo"
+  mkdir -p "$shim_dir/.mbx"
+  # .mbx/cargo is mbx itself under the name cargo. The `cargo` in the shim directory is a
+  # small wrapper: mbx does not understand rustup's `cargo +<toolchain>` directive (it
+  # fails with "no such command"), so the wrapper turns a leading +toolchain into
+  # RUSTUP_TOOLCHAIN and then runs mbx.
+  [ "$(readlink "$shim_dir/.mbx/cargo" 2>/dev/null)" = "$mbx_bin" ] || ln -sfn "$mbx_bin" "$shim_dir/.mbx/cargo"
+  wrapper='#!/bin/sh
+case "${1-}" in
+  +*) RUSTUP_TOOLCHAIN=${1#+}; export RUSTUP_TOOLCHAIN; shift ;;
+esac
+exec "$(dirname "$0")/.mbx/cargo" "$@"'
+  if [ "$(cat "$shim_dir/cargo" 2>/dev/null)" != "$wrapper" ]; then
+    rm -f "$shim_dir/cargo"
+    printf '%s\n' "$wrapper" >"$shim_dir/cargo"
+    chmod +x "$shim_dir/cargo"
+  fi
   export MBX_CACHE_DIR=${MBX_CACHE_DIR:-$state/mbx-cache}
   export MBX_TARGET_VIEWS=0
   export BOTSTERQ_MBX_SHIM_DIR="$shim_dir"
