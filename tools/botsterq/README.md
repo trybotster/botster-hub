@@ -114,6 +114,14 @@ botsterq slots 3         # change it (kept across server restarts)
   finds an artifact fresh reads it without rewriting it, so on this Mac a reused artifact carries
   no last-use time and a time-based sweep deletes exactly the shapes the cycle just used. Time
   and size based sweeping (`--time`, `--maxsize`) use the same file times.
+- Removed queued jobs: task-spooler never ends a `ts -w` waiter for a job that was removed from
+  the queue, so `botsterq` records those waiters (`run/<token>.waitfor.<id>`, one per admission or
+  run that waits for job `<id>`) and, when it removes a queued job (`botsterq cancel <id>`, or the
+  run being interrupted), marks it (`run/<token>.removed`, its run then exits 130) and releases
+  the recorded waiters, each only if its command line is exactly `ts -w <id>`. A cancel in the
+  millisecond between starting a waiter and writing its record misses that waiter, and a run
+  killed with SIGKILL leaves its records behind (small files). A job removed by a plain `ts -r`
+  is not released.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
