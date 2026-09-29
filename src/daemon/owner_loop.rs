@@ -8457,6 +8457,118 @@ return botster.register({
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A parked control request holds no row, so the connection limit is
+    /// checked again at admission. Two requests park with one slot free; the
+    /// slot is taken; after the release one is admitted and the other gets the
+    /// typed limit refusal. The connection never holds more than its limit.
+    #[test]
+    fn a_contended_plugin_control_request_rechecks_the_connection_limit() {
+        let root = unique_package_control_dir("control-admission-limit");
+        let package_dir = root.join("owner-publisher");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-publisher",
+            serde_json::json!({
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+return botster.register({
+  tools = {{
+    name = "owner-publisher.ping", description = "Ping.",
+    input_schema = { type = "object" }, handler = "ping",
+    call = function() return { ok = true } end,
+  }},
+})
+"#,
+        )
+        .unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-publisher".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        let limit = botster_hub_client::MAX_OUTSTANDING_REQUESTS;
+        state
+            .plugin_controls
+            .test_occupy_connection("limit-connection", limit - 1);
+        daemon
+            .runtime()
+            .unwrap()
+            .set_test_forced_admission(Some(crate::runtime::ForcedAdmission::LockBusy));
+        let mut replies = Vec::new();
+        for index in 0..2 {
+            replies.push(start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::PluginMcpCallTool {
+                    name: "owner-publisher.ping".into(),
+                    arguments: serde_json::json!({}),
+                },
+                "limit-connection",
+                &format!("limit-ping-{index}"),
+            ));
+        }
+        // timer: deadline — the test hang guard; progress arrives as owner work.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.signal_request_waits.len() < 2 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(Instant::now() < deadline, "both requests must park");
+        }
+        assert_eq!(
+            state
+                .plugin_controls
+                .test_connection_rows("limit-connection"),
+            limit - 1
+        );
+        daemon.runtime().unwrap().set_test_forced_admission(None);
+        daemon
+            .runtime()
+            .unwrap()
+            .owner_signal()
+            .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        mark_signaled_requests(&mut state);
+        let mut outcomes = Vec::new();
+        while outcomes.len() < 2 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                state
+                    .plugin_controls
+                    .test_connection_rows("limit-connection")
+                    <= limit,
+                "the connection limit holds across the wait"
+            );
+            for reply_rx in &mut replies {
+                if let Ok(reply) = reply_rx.try_recv() {
+                    let response = reply.into_parts().0.unwrap();
+                    outcomes.push(response.error.map(|error| error.code));
+                }
+            }
+            assert!(Instant::now() < deadline, "both requests must finish");
+            thread::yield_now();
+        }
+        outcomes.sort();
+        assert_eq!(
+            outcomes,
+            vec![None, Some("plugin_control_limit".to_string())],
+            "one request takes the last slot; the other is refused typed"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn refused_entity_admission_retires_with_reserved_host_capacity() {
         let _gate_owner = ControlledPluginGateGuard::acquire();
