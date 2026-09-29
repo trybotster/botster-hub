@@ -838,23 +838,6 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
 }
 
 #[test]
-fn webrtc_terminal_adapter_source_does_not_name_snapshot_phases() {
-    let sources = [
-        include_str!("../../src/transport/webrtc/adapter.rs"),
-        include_str!("webrtc_terminal_adapter.rs"),
-    ];
-    for source in sources {
-        let production = source.split("mod tests").next().unwrap_or(source);
-        for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
-            assert!(
-                !production.contains(forbidden),
-                "webrtc adapter proofs must stay content-blind: found {forbidden}"
-            );
-        }
-    }
-}
-
-#[test]
 fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub("whc");

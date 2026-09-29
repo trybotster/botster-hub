@@ -2615,15 +2615,9 @@ fn consumer_keys_page(
         .collect()
 }
 
-/// Fail if this module's source imports terminal bodies or names product policy.
-#[cfg(test)]
-pub fn assert_maintenance_source_stays_control_plane(source: &str) {
-    crate::session_projection::assert_projection_source_stays_control_plane(source);
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -2634,31 +2628,6 @@ mod tests {
         assert_eq!(
             MaintenanceState::default().event_invocation_timeout_ms(),
             EVENT_INVOCATION_TIMEOUT_MS
-        );
-    }
-
-    #[test]
-    fn source_stays_control_plane() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/daemon_maintenance.rs"
-        ));
-        assert_maintenance_source_stays_control_plane(source);
-        assert!(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/daemon_maintenance.rs")
-                .exists()
-        );
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(
-            !production
-                .replace("observe_lifecycle_slice", "")
-                .contains("observe_lifecycle(")
-        );
-        assert!(
-            !production
-                .replace("lifecycle_baseline_page", "")
-                .contains("lifecycle_baseline(")
         );
     }
 

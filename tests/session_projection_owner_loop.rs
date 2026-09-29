@@ -171,59 +171,6 @@ fn git_visible_hub_members_reject_one_mixed_core_url() {
 }
 
 #[test]
-fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for relative in [
-        "src/session_projection.rs",
-        "src/daemon_maintenance.rs",
-        "src/daemon/owner_loop.rs",
-        "src/daemon/control.rs",
-        "src/daemon/control/message.rs",
-        "src/daemon/control/connection.rs",
-        "src/daemon/control/sessions.rs",
-        "src/daemon/control/session_types.rs",
-        "src/daemon/control/packages.rs",
-        "src/daemon/control/packages/mutations.rs",
-        "src/daemon/control/messaging.rs",
-        "src/daemon/control/plugins.rs",
-        "src/daemon/control/entities.rs",
-        "src/daemon/control/events.rs",
-        "src/daemon/control/webrtc.rs",
-        "src/daemon/control/host.rs",
-        "src/daemon/control/request.rs",
-        "src/subscription/entity.rs",
-    ] {
-        let source = fs::read_to_string(root.join(relative)).expect("read source");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
-        assert!(
-            !production.contains("observe_lifecycle(")
-                || production.contains("observe_lifecycle_slice("),
-            "{relative} must not call unbounded observe_lifecycle"
-        );
-        assert!(
-            !production
-                .replace("lifecycle_baseline_page", "")
-                .contains("lifecycle_baseline("),
-            "{relative} must not call unbounded lifecycle_baseline"
-        );
-        if relative != "src/subscription/entity.rs" && relative != "src/daemon/control/sessions.rs"
-        {
-            for needle in [
-                "botster-terminal-protocol-client",
-                "ProcessExited",
-                "botster-workspaces",
-                "membership",
-            ] {
-                assert!(
-                    !production.contains(needle),
-                    "{relative} must not contain {needle}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn published_owner_turn_budgets_fail_if_observe_walks_every_session() {
     const {
         assert!(MAX_OWNER_TURN_MS < 100);

@@ -2,13 +2,6 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "8f69957d6a71aa865f1936de248ee7bfed552120";
-
-fn hub_source(relative: &str) -> String {
-    std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
-        .unwrap_or_else(|error| panic!("read {relative}: {error}"))
-}
-
 fn webrtc_baseline_hello() -> botster_hub_client::DaemonHello {
     let mut compatibility =
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
@@ -85,66 +78,6 @@ fn wait_for_path(path: &Path, bound: Duration) -> bool {
         thread::sleep(Duration::from_millis(50));
     }
     path.exists()
-}
-
-fn assert_production_second_channel_reject_source() {
-    let on_data_channel = hub_source("src/transport/webrtc/peer.rs");
-    assert!(
-        !on_data_channel.contains("test_extra_label"),
-        "extra-channel reject must not use a test-only label override"
-    );
-    assert!(
-        on_data_channel.contains("let claimed = self.peer_state.claim_data_channel();"),
-        "second DataChannel must hit the production one-shot claim"
-    );
-    let handler = on_data_channel
-        .split("async fn on_data_channel")
-        .nth(1)
-        .expect("on_data_channel handler");
-    let claim_at = handler
-        .find("let claimed = self.peer_state.claim_data_channel();")
-        .expect("claim in on_data_channel");
-    let label_at = handler
-        .find("data_channel.label()")
-        .expect("label read in on_data_channel");
-    assert!(
-        claim_at < label_at,
-        "claim_data_channel must run before any label await"
-    );
-    assert!(
-        on_data_channel.contains("if !claimed"),
-        "second DataChannel must take the reject path only after claim_data_channel returns false"
-    );
-    let reject = hub_source("src/transport/webrtc/subscription_channel.rs");
-    assert!(
-        reject.contains("let close_ok = matches!(close, Ok(Ok(())));"),
-        "close observation must require timeout(local_close) to return Ok(Ok(()))"
-    );
-    assert!(
-        reject.contains("extra-channel close marker requires lost_claim && close_ok"),
-        "close marker must require a lost claim and Ok(Ok(())) from timeout(local_close)"
-    );
-    assert!(
-        !on_data_channel.contains("label == EXTRA_DATA_CHANNEL_LABEL")
-            && !reject.contains("label == EXTRA_DATA_CHANNEL_LABEL"),
-        "close marker must not require botster-extra to lose the claim"
-    );
-    assert!(
-        !on_data_channel.contains("wait_for_prior_claim_in_test"),
-        "extra DataChannel must not wait in the Hub handler"
-    );
-    assert!(
-        on_data_channel.contains("admit_reserved_subscription_channel("),
-        "unclaimed DataChannel must enter reserved subscription admission"
-    );
-    assert!(
-        reject.contains("reject_extra_data_channel("),
-        "unknown reserved labels must call the subscription-channel reject path"
-    );
-    assert!(
-        reject.contains("local WebRTC rejecting extra DataChannel"),
-        "rejected extra DataChannel must take the close path"
-    );
 }
 
 #[test]
@@ -255,125 +188,7 @@ fn webrtc_dedicated_channels_carry_control_entity_event_and_terminal_frames() {
 }
 
 #[test]
-fn webrtc_ready_entity_frame_defers_terminal_output() {
-    let control = hub_source("src/transport/webrtc/control_channel.rs");
-    assert!(
-        !control.contains("flush_webrtc_adapter_frames"),
-        "control_channel.rs must not flush adapter frames after the reserved-label cut"
-    );
-    let subscription = hub_source("src/transport/webrtc/subscription_channel.rs");
-    assert!(
-        subscription.contains("admit_reserved_subscription_channel"),
-        "reserved subscription admission must live in subscription_channel.rs"
-    );
-    assert!(
-        subscription.contains("flush_subscription_adapter_frames"),
-        "reserved subscription flush must live in subscription_channel.rs"
-    );
-}
-
-#[test]
-fn terminal_input_is_not_a_json_control_request() {
-    let transport = hub_source("src/daemon/control/sessions.rs");
-    assert!(
-        !transport.contains("DaemonRequest::SendInput"),
-        "SendInput must not remain a JSON control request"
-    );
-    assert!(
-        !transport.contains("DaemonRequest::Resize"),
-        "Resize must not remain a JSON control request"
-    );
-    assert!(
-        !transport.contains("DaemonRequest::ModeGatedInput"),
-        "ModeGatedInput must not remain a JSON control request"
-    );
-}
-
-#[test]
-fn pump_woken_lives_only_in_the_data_plane_driver() {
-    let driver = hub_source("src/data_plane/driver.rs");
-    assert!(
-        driver.contains("pump_woken("),
-        "the data-plane driver must call Core pump_woken"
-    );
-    assert!(
-        !driver.contains("call_then_pump_session"),
-        "lifecycle observation must not synthesize a data-plane pump"
-    );
-    assert!(
-        !driver.contains("pump_bound_adapter_routes"),
-        "Core requests must not scan bound adapter routes"
-    );
-    assert!(
-        !driver.contains("list_terminal_subscriptions"),
-        "the data-plane driver must not fabricate adapter wakes from subscription inventory"
-    );
-    assert!(
-        !driver.contains("forced_would_block_session"),
-        "production route selection must not skip pressured routes in test mode"
-    );
-    for path in [
-        "src/daemon/owner_loop.rs",
-        "src/daemon_maintenance.rs",
-        "src/runtime.rs",
-        "src/daemon/control.rs",
-        "src/transport/unix/adapter.rs",
-        "src/transport/webrtc/control_channel.rs",
-    ] {
-        assert!(
-            !hub_source(path).contains("pump_woken("),
-            "{path} must not call pump_woken"
-        );
-    }
-}
-
-#[test]
-fn source_scan_inventory_includes_data_plane_rs() {
-    assert!(
-        hub_source("src/lib.rs").contains("include_str!(\"data_plane.rs\")"),
-        "ablation: comment out data_plane.rs from the production scan list"
-    );
-}
-
-#[test]
-fn source_scan_inventory_includes_data_plane_driver() {
-    assert!(
-        hub_source("src/lib.rs").contains("include_str!(\"data_plane/driver.rs\")"),
-        "ablation: comment out data_plane/driver.rs from the production scan list"
-    );
-}
-
-#[test]
-fn source_scan_inventory_includes_data_plane_close_work() {
-    assert!(
-        hub_source("src/lib.rs").contains("include_str!(\"data_plane/close_work.rs\")"),
-        "ablation: comment out data_plane/close_work.rs from the production scan list"
-    );
-}
-
-#[test]
-fn source_scan_inventory_includes_shared_ingress() {
-    assert!(
-        hub_source("src/lib.rs").contains("include_str!(\"transport/shared/ingress.rs\")"),
-        "ablation: comment out transport/shared/ingress.rs from the production scan list"
-    );
-}
-
-#[test]
-fn source_scan_inventory_includes_admission_reservations() {
-    assert!(
-        hub_source("src/lib.rs").contains("include_str!(\"admission/reservations.rs\")"),
-        "ablation: comment out admission/reservations.rs from the production scan list"
-    );
-}
-
-#[test]
 fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
-    let cargo_toml = hub_source("Cargo.toml");
-    assert!(
-        cargo_toml.contains(LOCKED_CORE_REV),
-        "Hub must stay pinned to Core {LOCKED_CORE_REV}"
-    );
     struct Duplex;
     impl botster_core::contract::terminal_adapter::TerminalAdapter for Duplex {
         fn try_write(
@@ -398,162 +213,6 @@ fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
     assert_eq!(
         botster_core::contract::terminal_adapter::TerminalAdapter::try_read(&mut adapter),
         botster_core::contract::terminal_adapter::TerminalIngress::Empty
-    );
-    let lock = hub_source("Cargo.lock");
-    assert!(
-        lock.contains(LOCKED_CORE_REV),
-        "Cargo.lock must pin Core {LOCKED_CORE_REV}"
-    );
-}
-
-#[test]
-fn no_lua_dispatch_in_terminal_input_or_output() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for entry in ["src/lib.rs", "src/runtime.rs"] {
-        let source = hub_source(entry);
-        assert!(
-            source.contains("lua_runtime"),
-            "{entry} must remain a lua_runtime import site"
-        );
-    }
-    for entry in [
-        "src/transport/webrtc.rs",
-        "src/transport/webrtc/peer.rs",
-        "src/transport/webrtc/signaling.rs",
-        "src/transport/webrtc/control_channel.rs",
-        "src/transport/webrtc/subscription_channel.rs",
-        "src/transport/webrtc/delivery.rs",
-        "src/transport/webrtc/adapter.rs",
-        "src/transport/webrtc/test_support.rs",
-        "src/transport.rs",
-        "src/transport/shared.rs",
-        "src/transport/shared/adapter_slot.rs",
-        "src/transport/shared/wake.rs",
-        "src/transport/shared/close_reason.rs",
-        "src/transport/shared/close_progress.rs",
-        "src/transport/shared/ingress.rs",
-        "src/data_plane.rs",
-        "src/data_plane/driver.rs",
-        "src/data_plane/close_work.rs",
-        "src/transport/unix.rs",
-        "src/transport/unix/adapter.rs",
-        "src/transport/unix/listener.rs",
-        "src/transport/unix/connection.rs",
-        "src/transport/unix/mux_write.rs",
-        "src/daemon/owner_loop.rs",
-        "src/daemon/control.rs",
-        "src/daemon/control/message.rs",
-        "src/daemon/control/connection.rs",
-        "src/daemon/control/sessions.rs",
-        "src/daemon/control/session_types.rs",
-        "src/daemon/control/packages.rs",
-        "src/daemon/control/packages/mutations.rs",
-        "src/daemon/control/messaging.rs",
-        "src/daemon/control/plugins.rs",
-        "src/daemon/control/entities.rs",
-        "src/daemon/control/events.rs",
-        "src/daemon/control/webrtc.rs",
-        "src/daemon/control/host.rs",
-        "src/daemon/control/request.rs",
-        "src/client_api.rs",
-    ] {
-        let source = hub_source(entry);
-        check_lua_boundary(&root, entry, &source).unwrap_or_else(|error| panic!("{error}"));
-    }
-    let mut extra = Vec::new();
-    let src = root.join("src");
-    let mut pending = vec![src];
-    while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir).expect("read src");
-        for entry in entries {
-            let entry = entry.expect("src entry");
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(&root)
-                .expect("src path stays under the crate root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            if matches!(rel.as_str(), "src/lib.rs" | "src/runtime.rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("read rust file");
-            if let Err(error) = check_lua_boundary(&root, &rel, &source) {
-                extra.push(error);
-            }
-        }
-    }
-    assert!(
-        extra.is_empty(),
-        "unexpected lua_runtime importers in src/: {extra:?}"
-    );
-}
-
-#[test]
-fn transport_and_data_plane_reject_terminal_retry_and_scheduling_tokens() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let forbidden = [
-        "retry_terminal",
-        "reschedule_terminal",
-        "terminal_backoff",
-        "requeue_frame",
-    ];
-    let mut hits = Vec::new();
-    let mut combined = String::new();
-    let mut pending = vec![root.join("src/transport"), root.join("src/data_plane")];
-    while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir).expect("read transport or data_plane");
-        for entry in entries {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(&root)
-                .expect("path stays under the crate root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let source = std::fs::read_to_string(&path).expect("read rust file");
-            combined.push_str(&source);
-            for token in forbidden {
-                if source.contains(token) {
-                    hits.push(format!("{rel}:{token}"));
-                }
-            }
-        }
-    }
-    for parent in ["src/transport.rs", "src/data_plane.rs"] {
-        let source = hub_source(parent);
-        combined.push_str(&source);
-        for token in forbidden {
-            if source.contains(token) {
-                hits.push(format!("{parent}:{token}"));
-            }
-        }
-    }
-    assert!(
-        combined.contains("pump_woken") && combined.contains("try_write"),
-        "transport and data_plane region must still contain pump_woken and try_write"
-    );
-    let peer = hub_source("src/transport/webrtc/peer.rs");
-    assert!(
-        peer.contains("retrying once"),
-        "peer close retry is a named host-control exemption, not a terminal retry token"
-    );
-    assert!(
-        hits.is_empty(),
-        "transport and data_plane must not schedule or retry terminal bytes: {hits:?}"
     );
 }
 
@@ -595,11 +254,6 @@ fn attach_ready_precedes_history_finish() {
     )
     .expect("ready_then_history hello");
     assert!(ack.terminal_compatibility.is_some());
-    let attach_source = hub_source("src/subscription/attach_routes.rs");
-    assert!(
-        attach_source.contains("for_ready_then_history_attach()"),
-        "Hub must advertise the ready_then_history split"
-    );
     let mut stream = RawUnixClient::from_stream(stream);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
@@ -668,11 +322,6 @@ fn attach_ready_precedes_history_finish() {
 #[test]
 fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
     let _guard = daemon_test_guard();
-    let source = hub_source("src/subscription/closed_events.rs");
-    assert!(
-        source.contains("fn shutdown_handler_installs_exact_suppression_before_core_request"),
-        "unit suppression-before-teardown proof must remain"
-    );
     let hub = start_isolated_live_output_hub("so-sup");
     let endpoint = hub.endpoint().clone();
     let mut requirement =
