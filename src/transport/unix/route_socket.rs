@@ -25,47 +25,45 @@ use crate::transport::shared::ingress::IngressStore;
 use crate::transport::unix::UnixTerminalAdapterHandle;
 use crate::transport::unix::mux_write::{UnixInbound, read_async_inbound};
 
-const ROUTE_DIR_SUFFIX: &str = ".routes";
+/// Route sockets live under `/tmp`, not next to the control socket: a Unix
+/// socket path is limited to about 100 bytes, and the data directory can eat
+/// most of that.
+const ROUTE_DIR_PARENT: &str = "/tmp";
 const ROUTE_NAME_ENTROPY_BYTES: usize = 8;
+const ROUTE_DIR_ENTROPY_BYTES: usize = 4;
 
-/// The private directory holding route sockets. Created fresh at daemon
-/// start with mode 0700 and removed at drop.
+/// The private directory holding route sockets. Created at daemon start with
+/// mode 0700 under an unpredictable name, and removed at drop.
 pub(crate) struct RouteSocketDir {
     path: PathBuf,
 }
 
 impl RouteSocketDir {
-    /// Create `<socket path>.routes`, discarding what a crashed Hub left.
-    pub(crate) fn create(socket_path: &Path) -> DaemonTransportResult<Self> {
-        let mut name = socket_path
-            .file_name()
-            .ok_or(DaemonTransportError::Protocol(
-                "socket path has no file name",
-            ))?
-            .to_os_string();
-        name.push(ROUTE_DIR_SUFFIX);
-        let path = socket_path.with_file_name(name);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                // SAFETY: `geteuid` has no preconditions.
-                let uid = unsafe { libc::geteuid() };
-                if !metadata.file_type().is_dir() || metadata.uid() != uid {
-                    return Err(DaemonTransportError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "route socket directory is not a directory owned by this user",
-                    )));
-                }
-                fs::remove_dir_all(&path).map_err(DaemonTransportError::Io)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DaemonTransportError::Io(error)),
-        }
+    /// Create `/tmp/br-<uid>-<random>`. The name is unpredictable, so no
+    /// other user can pre-create it; a directory that already exists fails
+    /// the start.
+    pub(crate) fn create() -> DaemonTransportResult<Self> {
+        // SAFETY: `geteuid` has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let mut entropy = [0_u8; ROUTE_DIR_ENTROPY_BYTES];
+        getrandom::fill(&mut entropy).map_err(|_| {
+            DaemonTransportError::Io(std::io::Error::other("route directory entropy failed"))
+        })?;
+        let suffix: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = Path::new(ROUTE_DIR_PARENT).join(format!("br-{uid}-{suffix}"));
         // The mode is applied at creation, so no other user can ever enter
         // the directory. The umask can only narrow it.
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .map_err(DaemonTransportError::Io)?;
+        let metadata = fs::symlink_metadata(&path).map_err(DaemonTransportError::Io)?;
+        if !metadata.file_type().is_dir() || metadata.uid() != uid {
+            return Err(DaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "route socket directory is not a directory owned by this user",
+            )));
+        }
         Ok(Self { path })
     }
 
@@ -267,12 +265,6 @@ mod tests {
         )
     }
 
-    fn unique_socket_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bsr-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("test dir");
-        dir.join("hub.sock")
-    }
-
     /// One bound route: its adapter, handle, and a client-side stream.
     struct Route {
         adapter: crate::transport::unix::UnixTerminalAdapter,
@@ -282,7 +274,7 @@ mod tests {
     }
 
     async fn connected_route(name: &str) -> Route {
-        let dir = RouteSocketDir::create(&unique_socket_path(name)).expect("route dir");
+        let dir = RouteSocketDir::create().expect("route dir");
         let mux = UnixConnectionMux::new();
         let (adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");
@@ -303,20 +295,23 @@ mod tests {
     }
 
     #[test]
-    fn the_route_directory_is_private_and_recreated_fresh() {
-        let socket = unique_socket_path("dir");
-        let dir = RouteSocketDir::create(&socket).expect("create");
-        let mode = fs::metadata(dir.path())
+    fn the_route_directory_is_private_short_and_removed_at_drop() {
+        let first = RouteSocketDir::create().expect("create");
+        let second = RouteSocketDir::create().expect("create another");
+        assert_ne!(first.path(), second.path(), "names are unpredictable");
+        let mode = fs::metadata(first.path())
             .expect("metadata")
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "no access for group or others: {mode:o}");
-        fs::write(dir.path().join("stale"), b"x").expect("leftover");
-        let path = dir.path().to_owned();
-        std::mem::forget(dir);
-        let fresh = RouteSocketDir::create(&socket).expect("recreate");
-        assert_eq!(fresh.path(), path);
-        assert!(!path.join("stale").exists(), "a crashed Hub's leftovers go");
+        let path = first.path().to_owned();
+        let listener_path_len = path.as_os_str().len() + 1 + 2 * ROUTE_NAME_ENTROPY_BYTES;
+        assert!(
+            listener_path_len < 100,
+            "route socket paths stay short: {listener_path_len}"
+        );
+        drop(first);
+        assert!(!path.exists(), "the directory goes with the Hub");
     }
 
     #[tokio::test]
@@ -369,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_connection_within_the_handshake_window_closes_the_route() {
-        let dir = RouteSocketDir::create(&unique_socket_path("late")).expect("route dir");
+        let dir = RouteSocketDir::create().expect("route dir");
         let mux = UnixConnectionMux::new();
         let (_adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");

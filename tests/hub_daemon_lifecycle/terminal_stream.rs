@@ -84,9 +84,14 @@ impl RawSocket {
         &mut self,
         timeout: Option<Duration>,
     ) -> DaemonTransportResult<Option<DaemonUnixMuxFrame>> {
-        self.stream
-            .set_read_timeout(timeout)
-            .expect("set raw client read timeout");
+        if let Err(error) = self.stream.set_read_timeout(timeout) {
+            // macOS refuses a timeout on a socket the Hub already shut down.
+            return Err(if error.kind() == std::io::ErrorKind::InvalidInput {
+                DaemonTransportError::ClientDisconnected
+            } else {
+                DaemonTransportError::Io(error)
+            });
+        }
         match self.frames.read_frame(&mut self.stream) {
             Ok(frame) => Ok(Some(frame)),
             Err(DaemonTransportError::Io(error))
