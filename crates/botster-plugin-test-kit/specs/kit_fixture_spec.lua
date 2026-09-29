@@ -102,3 +102,10 @@ kit.test("distinct large integers are unequal for eq and match", function(t)
   t:eq(pcall(function() t:match({ n = { low } }, { n = { high } }) end), false)
   t:eq(pcall(function() t:eq(low, low) end), true)
 end)
+
+kit.test("a consumer that loads before its producer receives the producer's events", function(t)
+  local consumer = t:load("kit-fixture-consumer") -- subscribes to kit-fixture; kit-fixture is not loaded yet
+  local producer = t:load("kit-fixture")
+  t:eq(producer:call_tool("kit-fixture.note", { key = "late" }).result.emitted, true)
+  t:eq(consumer:call_tool("kit-fixture-consumer.seen", {}).result.items[1], "late")
+end)

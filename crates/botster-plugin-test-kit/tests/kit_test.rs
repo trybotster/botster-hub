@@ -413,3 +413,37 @@ fn logs_are_readable_while_the_hub_mirrors_them() {
         assert_eq!(logs.records.len(), 150, "read {read}");
     }
 }
+
+/// A package that subscribes to an event of a package that is not loaded yet
+/// still loads. It receives the events once the producer loads and emits.
+/// Before P10 this load failed and the load order was a contract.
+#[test]
+fn a_consumer_that_loads_before_its_producer_receives_the_producer_events() {
+    let mut kit = start("consumer-first");
+    let consumer = kit
+        .enable_package(&fixture("kit-fixture-consumer"))
+        .expect("enable settles");
+    assert!(
+        consumer.error.is_none(),
+        "the consumer loads before the producer: {consumer:?}"
+    );
+    let producer = kit
+        .enable_package(&fixture("kit-fixture"))
+        .expect("enable settles");
+    assert!(producer.error.is_none(), "{producer:?}");
+
+    let noted = kit
+        .call_tool("kit-fixture.note", serde_json::json!({ "key": "late" }))
+        .expect("call settles");
+    assert_eq!(
+        noted.plugin_tool_result,
+        serde_json::json!({ "emitted": true })
+    );
+    let seen = kit
+        .call_tool("kit-fixture-consumer.seen", serde_json::json!({}))
+        .expect("call settles");
+    assert_eq!(
+        seen.plugin_tool_result,
+        serde_json::json!({ "items": ["late"] })
+    );
+}
