@@ -25,25 +25,18 @@ use crate::spawn_targets::{SpawnTarget, list_spawn_targets};
 
 mod bounded_catalog;
 
-#[allow(dead_code)] // The full-definition counting seed will use this storage term.
 mod content_budget;
 
-#[allow(dead_code)] // The admitted full-definition parser will use this counting seed.
 mod definition_budget;
 
-#[allow(dead_code)] // The full-definition materialization permit will own these errors.
 mod materialization_error;
 
-#[allow(dead_code)] // The charged materialization caller is not connected yet.
 mod materialization_walk;
 
-#[allow(dead_code)] // The charged materialization boundary owns this model.
 mod materialization_timeline;
 
-#[allow(dead_code)] // The full-definition counting walk will supply scratch events.
 mod scratch_budget;
 
-#[allow(dead_code)] // The full-definition counting seed will dispatch its tagged fields here.
 mod tagged_budget;
 
 /// Package-, device-, or repo-provided session type definition.
@@ -1279,7 +1272,6 @@ struct SourceSessionType {
 
 /// The pinned Vec push rule can hold the old and new buffers together.
 /// Apply this term to each collection, never to the combined logical input.
-#[allow(dead_code)]
 fn vector_growth_peak<T>(len: usize) -> Option<usize> {
     if len == 0 {
         return Some(0);
@@ -1296,7 +1288,6 @@ fn vector_growth_peak<T>(len: usize) -> Option<usize> {
 }
 
 /// Bound one owned definition clone while its source remains live.
-#[allow(dead_code)]
 fn definition_clone_peak(definition: &PackageSessionType) -> Option<usize> {
     let PackageSessionType {
         id,
@@ -1355,22 +1346,6 @@ fn definition_clone_peak(definition: &PackageSessionType) -> Option<usize> {
     Some(bytes)
 }
 
-/// Charge the selected source clone before `SourceSessionType::clone`.
-/// The definition term includes every environment and nested string field.
-#[allow(dead_code)]
-fn source_clone_peak(source: &SourceSessionType) -> Option<usize> {
-    let SourceSessionType {
-        rank,
-        source: source_kind,
-        source_name,
-        root,
-        session_type,
-        available,
-    } = source;
-    let _ = (rank, available);
-    source_parts_clone_peak(source_kind, source_name, root, session_type)
-}
-
 fn source_parts_clone_peak(
     source_kind: &str,
     source_name: &str,
@@ -1386,14 +1361,12 @@ fn source_parts_clone_peak(
 
 /// Fund the source vector and each source clone before allocating either one.
 /// The parent remains open while the caller builds all source families.
-#[allow(dead_code)]
 struct ChargedSourceBuilder<'a> {
     sources: Vec<SourceSessionType>,
     parent: &'a mut crate::lua_memory::LuaCallbackCharge,
     reserved: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> ChargedSourceBuilder<'a> {
     fn new(parent: &'a mut crate::lua_memory::LuaCallbackCharge) -> Self {
         Self {
@@ -1604,20 +1577,17 @@ impl<'a> ChargedSourceBuilder<'a> {
     }
 }
 
-#[allow(dead_code)]
 struct ChargedSourceSessionTypes {
     sources: Vec<SourceSessionType>,
     // Source rows drop before their storage charge.
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
-#[allow(dead_code)]
 enum ChargedSourceResolveFailure {
     Capacity,
     Semantic(ChargedSessionTypeFailure),
 }
 
-#[allow(dead_code)] // The charged Host constructor will consume this selection.
 impl ChargedSourceSessionTypes {
     fn resolve<'a>(
         &'a self,
@@ -1685,7 +1655,6 @@ impl ChargedSourceSessionTypes {
     }
 }
 
-#[allow(dead_code)]
 enum ChargedSourceLoadFailure {
     Capacity(&'static str),
     Read(ChargedRepoReadFailure),
@@ -1836,7 +1805,6 @@ impl ChargedSourceLoadFailure {
 
 /// Build the same package, device, and enabled repo source set under one parent.
 /// Winner selection and materialization must use this product before activation.
-#[allow(dead_code)]
 fn load_charged_sources(
     records: &crate::packages::PackageRegistry,
     state: &HubState,
@@ -3071,14 +3039,12 @@ where
 }
 
 /// Copy definition and admitted request values under one environment allowance.
-#[allow(dead_code)] // The charged Host materializer consumes this product.
 enum ChargedEnvironmentFailure<'a> {
     InvalidName,
     NotAdmitted(&'a str),
     Capacity(&'static str),
 }
 
-#[allow(dead_code)] // The charged Host materializer converts this descriptor.
 impl ChargedEnvironmentFailure<'_> {
     fn into_charged(
         self,
@@ -3107,7 +3073,6 @@ impl ChargedEnvironmentFailure<'_> {
     }
 }
 
-#[allow(dead_code)] // The charged Host materializer consumes this product.
 fn charged_effective_environment<'a>(
     parent: &mut crate::lua_memory::LuaCallbackCharge,
     definition: &PackageSessionType,
@@ -4040,19 +4005,16 @@ struct ChargedRepoFileBytes {
 }
 
 /// The typed tree retains its allowance after the read buffer is destroyed.
-#[allow(dead_code)]
 struct ChargedRepoDefinitions {
     definitions: Vec<PackageSessionType>,
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
-#[allow(dead_code)]
 enum ChargedRepoParseFailure {
     Capacity(&'static str),
     Invalid(materialization_error::ChargedMaterializationError),
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 enum ChargedRepoReadFailure {
     Capacity(&'static str),
@@ -4063,7 +4025,6 @@ enum ChargedRepoReadFailure {
 
 /// Count the full schema before the allocating Serde pass.
 /// The source-vector and Host-product peaks still need the same parent.
-#[allow(dead_code)]
 fn parse_repo_file_charged(
     file: ChargedRepoFileBytes,
     parent: &mut crate::lua_memory::LuaCallbackCharge,
@@ -4097,7 +4058,6 @@ fn parse_repo_file_charged(
 
 /// Read at most the existing repo limit under one open callback parent.
 /// The charged materializer will use this instead of the uncharged loader.
-#[allow(dead_code)]
 fn read_repo_file_charged(
     root: &Path,
     parent: &mut crate::lua_memory::LuaCallbackCharge,
