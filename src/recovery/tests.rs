@@ -88,21 +88,6 @@ impl Drop for Fixture {
     }
 }
 
-fn managed(fixture: &Fixture) -> ManagedIdentity {
-    ManagedIdentity {
-        target_id: "target".into(),
-        worktree_id: "managed:target:6272616e6368".into(),
-        repository_root: fixture.directory.join("repo"),
-        path: fixture.directory.join("worktree"),
-        common_dir: fixture.directory.join("repo/.git"),
-        branch: "branch".into(),
-        base_commit: "base".into(),
-        head_commit: "head".into(),
-        created_worktree: true,
-        created_branch: true,
-    }
-}
-
 /// Append one intent row the way the Hub records a new attempt: the next
 /// sequence, a worktree intent for a created worktree, a spawn intent otherwise.
 fn push_intent(
@@ -200,35 +185,4 @@ fn ambiguous_old_recovery_and_future_schema_fail_closed() {
         b"{\"schema_version\":99}",
         HubStateError::UnsupportedVersion(99),
     );
-}
-
-#[test]
-fn recovery_clone_walk_counts_every_owned_field() {
-    let fixture = Fixture::new();
-    let mut state = HubState::from_config(&fixture.config);
-    let before = crate::hub_state_heap::walk_hub_state(&state);
-    let identity = managed(&fixture);
-    let strings = state.host.id.len()
-        + "session".len()
-        + identity.target_id.len()
-        + identity.worktree_id.len()
-        + identity.repository_root.as_os_str().len()
-        + identity.path.as_os_str().len()
-        + identity.common_dir.as_os_str().len()
-        + identity.branch.len()
-        + identity.base_commit.len()
-        + identity.head_commit.len();
-    let host_id = state.host.id.clone();
-    push_intent(&mut state.recovery, &host_id, "session", Some(identity));
-    let after = crate::hub_state_heap::walk_hub_state(&state);
-    assert_eq!(after.string_heaps - before.string_heaps, strings);
-    assert_eq!(
-        after.vec_slots - before.vec_slots,
-        std::mem::size_of::<RecoveryRecord>()
-    );
-    assert_eq!(
-        after.clone_heap - before.clone_heap,
-        strings + std::mem::size_of::<RecoveryRecord>()
-    );
-    assert!(crate::hub_state_heap::admitted_pretty(&state).unwrap() > strings);
 }

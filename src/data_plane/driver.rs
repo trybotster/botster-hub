@@ -144,9 +144,6 @@ impl CoreRequest {
     }
 }
 
-#[cfg(feature = "allocation-oracle")]
-pub(crate) mod allocation_oracle;
-
 #[cfg(test)]
 pub(crate) mod local_reply_tests;
 

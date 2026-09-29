@@ -63,7 +63,7 @@ pub(crate) struct JsonAdmission {
     pub stack_cap: usize,
     /// Peak live Lua refs for the oracle/tests. Kept in every build so admission
     /// layout stays identical when those readers are cfg'd out.
-    #[cfg_attr(not(any(test, feature = "allocation-oracle")), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub live_refs_peak: usize,
 }
 
@@ -73,7 +73,7 @@ pub(crate) struct PrepaidScratch {
 }
 
 impl JsonAdmission {
-    #[cfg(any(test, feature = "allocation-oracle"))]
+    #[cfg(test)]
     pub(crate) fn prepaid(
         &self,
         memory: &Arc<LuaMemoryAccount>,

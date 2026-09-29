@@ -201,10 +201,6 @@ fn feature_only(path: &str, root: &std::path::Path) -> Result<bool, String> {
             "src/lib.rs",
             "#[cfg(feature = \"test-internals\")]\npub mod test_internals;",
         ),
-        "src/data_plane/driver/allocation_oracle.rs" => (
-            "src/data_plane/driver.rs",
-            "#[cfg(feature = \"allocation-oracle\")]\npub(crate) mod allocation_oracle;",
-        ),
         _ => return Ok(false),
     };
     let declaration = std::fs::read_to_string(root.join(owner))
