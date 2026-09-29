@@ -440,10 +440,10 @@ impl UnixRouteClient {
         loop {
             let mut ended = Vec::new();
             for (route, stream) in &mut self.streams {
-                stream
+                match stream
                     .set_read_timeout(Some(ROUTE_POLL_SLICE))
-                    .unwrap_or_else(|error| panic!("set route read timeout: {error}"));
-                match stream.read_frame() {
+                    .and_then(|()| stream.read_frame())
+                {
                     Ok(frame) => frames.push(frame),
                     Err(DaemonTransportError::Io(error))
                         if matches!(

@@ -723,10 +723,17 @@ impl DaemonRouteStream {
         self.stream.try_clone().map_err(normalize_socket_io_error)
     }
 
+    /// Bound reads. macOS refuses a timeout on a socket the Hub has already
+    /// shut down (`EINVAL`); that is the route's end, reported as a
+    /// disconnect.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
-        self.stream
-            .set_read_timeout(timeout)
-            .map_err(normalize_socket_io_error)
+        self.stream.set_read_timeout(timeout).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                DaemonTransportError::ClientDisconnected
+            } else {
+                normalize_socket_io_error(error)
+            }
+        })
     }
 
     /// Read the next terminal frame. A timeout keeps any partial frame for
