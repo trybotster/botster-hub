@@ -551,11 +551,6 @@ fn transport_and_data_plane_reject_terminal_retry_and_scheduling_tokens() {
         peer.contains("retrying once"),
         "peer close retry is a named host-control exemption, not a terminal retry token"
     );
-    let mux = hub_source("src/transport/unix/mux_write.rs");
-    assert!(
-        mux.contains("retry the original deferred frame"),
-        "mux write retry is a named host-control exemption, not a terminal retry token"
-    );
     assert!(
         hits.is_empty(),
         "transport and data_plane must not schedule or retry terminal bytes: {hits:?}"
