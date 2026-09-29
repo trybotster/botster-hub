@@ -101,7 +101,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             startup_paths: runtime.startup_materialization_paths(),
             state: runtime.state(),
             package_records: pending.package_records,
-            plugin_key: pending.plugin_key,
             session_type_id: pending.session_type_id,
             request: pending.request,
         },
@@ -395,9 +394,11 @@ impl SessionTypeSpawnOperation {
                                     self.phase = Phase::HostReceipt;
                                     return ControlPoll::Pending;
                                 }
-                                Err(crate::session_types::ChargedMaterializationFailure::Semantic(
-                                    failure,
-                                )) => {
+                                Err(
+                                    crate::session_types::ChargedMaterializationFailure::Semantic(
+                                        failure,
+                                    ),
+                                ) => {
                                     if let Some(response) = self.plugin_response.take() {
                                         let (error, variable, lua_render) = failure.into_parts();
                                         let delivery = AdmittedSpawnDelivery::refused(
@@ -410,12 +411,11 @@ impl SessionTypeSpawnOperation {
                                         }
                                     }
                                 }
-                                Err(crate::session_types::ChargedMaterializationFailure::Capacity(
-                                    reason,
-                                )
-                                | crate::session_types::ChargedMaterializationFailure::Unavailable(
-                                    reason,
-                                )) => {
+                                Err(
+                                    crate::session_types::ChargedMaterializationFailure::Capacity(
+                                        reason,
+                                    ),
+                                ) => {
                                     self.send_unavailable(reason);
                                 }
                             }

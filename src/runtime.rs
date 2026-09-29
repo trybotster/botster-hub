@@ -578,7 +578,6 @@ impl AdmittedSpawnDelivery {
 pub(crate) struct PendingSessionTypeSpawn {
     #[cfg(test)]
     _dispose_probe: Option<TerminalSpawnerProbe>,
-    pub(crate) plugin_key: PluginKey,
     pub(crate) session_type_id: String,
     pub(crate) request: SessionTypeRequest,
     /// The committed registry the admitting call read; resolution and the
@@ -5209,7 +5208,6 @@ impl HubSessionTypeSpawner {
             .lock()
             .unwrap()
             .try_push_back(PendingSessionTypeSpawn {
-                plugin_key: PluginKey("terminal-spawner".into()),
                 session_type_id: "plain".into(),
                 request: SessionTypeRequest {
                     environment: BTreeMap::from([("PAYLOAD".into(), "spawn payload".repeat(128))]),
@@ -5456,7 +5454,7 @@ impl HubSessionTypeSpawner {
                 "plugin package lacks session_type_spawn capability",
             ));
         }
-        let (mut parent, plugin_key, session_type_id, request) = input.into_parts();
+        let (mut parent, _, session_type_id, request) = input.into_parts();
         let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
             .ok_or(std::borrow::Cow::Borrowed(
                 crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
@@ -5473,7 +5471,6 @@ impl HubSessionTypeSpawner {
         let item = PendingSessionTypeSpawn {
             #[cfg(test)]
             _dispose_probe: None,
-            plugin_key,
             session_type_id,
             request,
             package_records,
