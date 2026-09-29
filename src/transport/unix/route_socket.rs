@@ -175,7 +175,9 @@ impl RouteListener {
 
 /// Serve one route socket until the route ends.
 ///
-/// Waits for the client, then runs the output writer and the input reader
+/// Waits for `written` (the Attach response is on the control socket), then
+/// for the client within [`DAEMON_HANDSHAKE_TIMEOUT`]. Then runs the output
+/// writer and the input reader
 /// side by side. Either side ending ends the route's socket: the writer at
 /// the route's close, the reader when the client leaves or breaks the
 /// protocol. A client that leaves is a lost connection for this route only.
@@ -184,7 +186,20 @@ pub(crate) async fn serve_route_socket(
     handle: UnixTerminalAdapterHandle,
     route: String,
     generation: u64,
+    written: tokio::sync::oneshot::Receiver<()>,
 ) {
+    // The client cannot know the path before the response reaches it, so the
+    // connect window opens when the response is written. A response that
+    // never gets written (its sender dropped) ends the route.
+    tokio::select! {
+        written = written => {
+            if written.is_err() {
+                handle.close_from_host();
+                return;
+            }
+        }
+        () = handle.closed() => return,
+    }
     let accepted = tokio::select! {
         accepted = tokio::time::timeout(DAEMON_HANDSHAKE_TIMEOUT, listener.listener.accept()) => accepted,
         () = handle.closed() => return,
@@ -329,11 +344,14 @@ mod tests {
         let (adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");
         let path = listener.path().to_owned();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        written_tx.send(()).expect("the response is written");
         tokio::spawn(serve_route_socket(
             listener,
             handle.clone(),
             "sub".to_string(),
             1,
+            written_rx,
         ));
         let stream = UnixStream::connect(&path).expect("connect route socket");
         Route {
@@ -493,11 +511,14 @@ mod tests {
         let mux = UnixConnectionMux::new();
         let (_adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        written_tx.send(()).expect("the response is written");
         tokio::spawn(serve_route_socket(
             listener,
             handle.clone(),
             "sub".to_string(),
             1,
+            written_rx,
         ));
         tokio::time::timeout(
             DAEMON_HANDSHAKE_TIMEOUT + Duration::from_secs(3),
@@ -506,5 +527,53 @@ mod tests {
         .await
         .expect("an unconnected route closes");
         assert_eq!(fs::read_dir(dir.path()).expect("read dir").count(), 0);
+    }
+
+    /// The connect window opens when the Attach response is written, not when
+    /// the route task starts: a delayed control write cannot use it up.
+    #[tokio::test]
+    async fn the_connect_window_opens_only_when_the_response_is_written() {
+        let dir = RouteSocketDir::create(&unique_socket_path()).expect("route dir");
+        let mux = UnixConnectionMux::new();
+        let (_adapter, handle) = mux.create_adapter();
+        let listener = dir.bind().expect("bind route socket");
+        let path = listener.path().to_owned();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(serve_route_socket(
+            listener,
+            handle.clone(),
+            "sub".to_string(),
+            1,
+            written_rx,
+        ));
+        tokio::time::sleep(DAEMON_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(!handle.is_closed(), "the window has not opened yet");
+        written_tx.send(()).expect("the response is written");
+        let stream = UnixStream::connect(&path).expect("connect after the delayed write");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
+            .await
+            .expect("the client that connected then left ends the route");
+    }
+
+    /// A response that is never written (its signal is dropped) ends the route.
+    #[tokio::test]
+    async fn a_response_that_is_never_written_ends_the_route() {
+        let dir = RouteSocketDir::create(&unique_socket_path()).expect("route dir");
+        let mux = UnixConnectionMux::new();
+        let (_adapter, handle) = mux.create_adapter();
+        let listener = dir.bind().expect("bind route socket");
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(serve_route_socket(
+            listener,
+            handle.clone(),
+            "sub".to_string(),
+            1,
+            written_rx,
+        ));
+        drop(written_tx);
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
+            .await
+            .expect("an unwritten response releases the route");
     }
 }
