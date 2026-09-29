@@ -544,24 +544,18 @@ pub(crate) fn event_mux_frame(
 pub(crate) mod mux_write_resume_tests {
     use super::{
         MuxWrite, MuxWriteState, PENDING_RESPONSE_BYTE_CAPACITY, PendingMuxBytes, PendingMuxClass,
-        PendingMuxFrame, event_mux_frame, flush_pending_responses, flush_unix_mux_writes,
-        resume_pending_mux_write, write_frame_bytes_resumable,
+        event_mux_frame, flush_pending_responses, flush_unix_mux_writes,
+        write_frame_bytes_resumable,
     };
     use crate::client_api_dto::response::daemon_response_base;
-    use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
-    use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
+    use crate::transport::unix::UnixConnectionMux;
     use botster_hub_client::{
         DaemonEvent, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, ServerFrame,
-        TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, UnixTerminalContainerHeader,
-        encode_server_frame,
+        TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, encode_server_frame,
     };
-    use botster_terminal_protocol::{
-        RouteId, RoutedTerminalFrame, encode_output, encode_process_exit,
-    };
+    use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
     use std::io;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::sync::mpsc;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
     use tokio::io::AsyncWrite;

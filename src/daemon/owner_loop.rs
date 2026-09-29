@@ -2654,7 +2654,6 @@ mod tests {
     use crate::HubStateStore;
     use crate::PackageState;
     use crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY;
-    use crate::admission::unix_hello::UnixTerminalAdmission;
     use crate::client_api_dto::response::{daemon_events, daemon_response_base};
     use crate::daemon::control::message::{daemon_delivery_kind, egress_write_class};
     use crate::daemon::control::{
@@ -2668,14 +2667,11 @@ mod tests {
         write_hello, write_request,
     };
     use botster_core::RequestId;
-    use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
         ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonRequest, DaemonResponse,
         DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, PROTOCOL, ServerFrame,
-        encode_client_frame, write_client_frame,
+        write_client_frame,
     };
-    use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
-    use std::io::Write;
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
