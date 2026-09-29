@@ -12,7 +12,6 @@ fn owner_takes_legacy_then_admitted_from_one_charged_fifo() {
     let (admitted_sender, admitted_receiver) = spawn_reply_channel(channel_charge).unwrap();
     let item = |response, parent| PendingSessionTypeSpawn {
         _dispose_probe: None,
-        plugin_key: PluginKey("plugin".into()),
         session_type_id: "worker".into(),
         request: SessionTypeRequest::default(),
         package_records: package_view_for_test(Vec::new()),
