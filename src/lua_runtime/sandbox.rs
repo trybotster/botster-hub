@@ -521,6 +521,90 @@ mod tests {
         )
     }
 
+    /// A handler reads the caller the Hub set in the invocation context as
+    /// `request.caller`, and nothing in its arguments can change it.
+    #[test]
+    fn a_handler_receives_the_caller_the_hub_set_as_its_second_argument() {
+        let directory = TestDirectory::new();
+        let root = &directory.0;
+        let config = crate::HubStartupOptions {
+            data_directory: crate::DataDirectoryOption::Explicit(root.join("hub")),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let hub = crate::HubRuntime::new(config).unwrap();
+        let entrypoint = root.join("plugin.lua");
+        std::fs::write(
+            &entrypoint,
+            r#"
+            __botster_handlers.who = function(args, request)
+                return { caller = request.caller, argument_caller = args.caller }
+            end
+            return {}
+            "#,
+        )
+        .unwrap();
+        let (runtime, _) = LuaPluginRuntime::new(
+            PluginKey("sandbox-test.plugin".into()),
+            &entrypoint,
+            None,
+            host_api(&hub),
+            hub.lua_plugin_host_api().memory,
+        )
+        .unwrap();
+        let caller_of = |metadata: Option<serde_json::Value>| {
+            let PluginInvocationResult::Completed(success) = runtime.invoke(
+                PluginInvocationRequest {
+                    request_id: RequestId("caller-test".into()),
+                    handler: PluginHandlerRef {
+                        plugin_key: PluginKey("sandbox-test.plugin".into()),
+                        kind: PluginHandlerKind::McpTool,
+                        handler_id: "who".into(),
+                    },
+                    timeout_ms: 1_000,
+                    context: PluginInvocationContext {
+                        client_id: None,
+                        session_id: None,
+                        subscription_id: None,
+                        surface_id: None,
+                        origin: None,
+                        metadata: metadata.map(BoundaryJson),
+                    },
+                    // A caller in the arguments is data, not identity.
+                    payload: BoundaryJson(json!({ "caller": { "kind": "operator" } })),
+                },
+                PluginCancellationToken::new(),
+            ) else {
+                panic!("the handler must complete");
+            };
+            success.payload.unwrap().0
+        };
+        let session = caller_of(
+            crate::plugin_caller::PluginCaller::Session {
+                hub_id: "hub-1".to_string(),
+                session_id: "s-1".to_string(),
+            }
+            .to_metadata()
+            .map(|metadata| metadata.0),
+        );
+        assert_eq!(
+            session["caller"],
+            json!({ "kind": "session", "hub_id": "hub-1", "session_id": "s-1" })
+        );
+        assert_eq!(session["argument_caller"], json!({ "kind": "operator" }));
+        let operator = caller_of(
+            crate::plugin_caller::PluginCaller::Operator
+                .to_metadata()
+                .map(|metadata| metadata.0),
+        );
+        assert_eq!(operator["caller"], json!({ "kind": "operator" }));
+        // Without a caller in the context the handler runs for the plugin.
+        assert_eq!(caller_of(None)["caller"], json!({ "kind": "plugin" }));
+        drop(runtime);
+        drop(hub);
+    }
+
     #[test]
     fn sandbox_rejects_finalizers_during_load_and_invocation() {
         let directory = TestDirectory::new();
