@@ -86,7 +86,15 @@ with_admission_lock() {
 ADMISSION_PERL='
   use Fcntl qw(:flock);
   use POSIX qw(:signal_h);
-  my ($lockfile, $cancel) = splice(@ARGV, 0, 2);
+  my ($lockfile, $cancel, $out, $pidfile) = splice(@ARGV, 0, 4);
+  # `run` finds this process by the pid file (it may be signalled before `run`
+  # knows the pid of its background job); the file goes away with the process.
+  if (open(my $pf, ">", $pidfile)) { print $pf "$$\n"; close $pf; }
+  END { unlink $pidfile if defined $pidfile; }
+  # A cancelled run leaves the marker; this process then cleans up after itself
+  # (its output file and the marker) and does no admission.
+  sub cancelled { return 0 unless -e $cancel; unlink $cancel, $out; return 1; }
+  exit 130 if cancelled();
   open(my $lock, ">>", $lockfile) or die "botsterq: open lock: $!\n";
   unless (flock($lock, LOCK_EX | LOCK_NB)) {
     # The lock is held: about to block. The test hook announces this through a
@@ -96,7 +104,7 @@ ADMISSION_PERL='
     }
     flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
   }
-  exit 130 if -e $cancel;
+  exit 130 if cancelled();
   my $term = POSIX::SigSet->new(SIGTERM);
   my $old = POSIX::SigSet->new;
   sigprocmask(SIG_BLOCK, $term, $old);
@@ -393,6 +401,8 @@ cmd_run() {
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
   export BOTSTERQ_OWNER=$$
   id=
+  admission_started=
+  admission_over=
   admitting=
   interrupted() {
     trap - INT TERM HUP
@@ -400,15 +410,24 @@ cmd_run() {
     # A run still inside admission: TERM its admission process (only one that
     # waits for an exclusive job acts on it), and let it end before the job is
     # resolved by its token.
-    if [ -n "${admitting:-}" ]; then
-      # The marker first (an admission that gets the lock after this ends
-      # itself), then TERM to the admission process: it ends at once while it
-      # waits for the lock, or forwards TERM to the admission it started and
-      # waits for it. Nothing survives it.
+    if [ -n "${admission_started:-}" ] && [ -z "${admission_over:-}" ]; then
+      # The marker first: an admission that gets going after this ends itself
+      # and removes its own files. $admitting is the pid of the admission this
+      # run has not reaped yet (so it cannot have been reused): TERM ends it at
+      # once while it waits for the lock, or it forwards TERM to the admission
+      # it started and waits for it; then its files go. Without a pid the
+      # admission was just forked and finds the marker on its own.
       : >"$state/run/$token.admitcancel"
-      kill -TERM "$admitting" 2>/dev/null || true
-      wait "$admitting" 2>/dev/null || true
-      rm -f "$state/run/$token.admitted" "$state/run/$token.admit" "$state/run/$token.admitcancel"
+      if [ -n "$admitting" ]; then
+        kill -TERM "$admitting" 2>/dev/null || true
+        wait "$admitting" 2>/dev/null || true
+        rm -f "$state/run/$token.admitted" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
+      fi
+    fi
+    # Admission already over: its output files are this run's to remove (the
+    # interrupt can land between the end of the admission and the normal removal).
+    if [ -n "${admission_over:-}" ]; then
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
     fi
     # The signal may arrive before the admitted id is stored; the token names
     # the job either way, so resolve its id and stop it.
@@ -424,15 +443,14 @@ cmd_run() {
   # Admission runs in the background (its result goes to a file), so a cancel
   # that arrives while it waits for an exclusive job is handled at once.
   admitted_file="$state/run/$token.admitted"
-  perl -e "$ADMISSION_PERL" "$state/admission.lock" "$state/run/$token.admitcancel" \
+  admission_started=1
+  perl -e "$ADMISSION_PERL" "$state/admission.lock" "$state/run/$token.admitcancel" "$admitted_file" "$state/run/$token.admitpid" \
     "$self" __admit2 "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" &
   admitting=$!
   wait "$admitting" || true
-  # Admission is over: the pid is gone (and may be reused), so a later interrupt
-  # must not signal it.
-  admitting=
+  admission_over=1; admitting=
   id=$(cat "$admitted_file" 2>/dev/null || true)
-  rm -f "$admitted_file" "$state/run/$token.admit" "$state/run/$token.admitcancel"
+  rm -f "$admitted_file" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
   [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!

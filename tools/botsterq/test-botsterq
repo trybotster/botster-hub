@@ -241,6 +241,8 @@ wait "$H1" "$H2" "$HO1"
   && [ ! -e "$work/HO2.ran" ] && [ -e "$work/HO1.ran" ] \
   && pass "cancelling a run that waits at the admission lock exits 130 at once, never starts, leaves nothing behind" \
   || fail "cancel at the lock" "cancel=$codeHO2 (${cancel_elapsed}s) lock_waiters=$waiters_after admit_files=$admit_files HO2.ran=$([ -e "$work/HO2.ran" ] && echo yes || echo no) HO1.ran=$([ -e "$work/HO1.ran" ] && echo yes || echo no) err=$(cat "$work/HO2.err")"
+leftover=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+[ "$leftover" = 0 ] && pass "no admission file remains after the runs end" || fail "admission files" "$leftover left: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
 
 # 8f. Several waiters behind the holder start in the order they arrived. The
 #     order among waiters at the lock is the kernel's flock wakeup order, which
@@ -302,8 +304,9 @@ rm -f "$BOTSTERQ_HOME/events.log"
 #     delays after they start, so the signal lands while the run waits for the
 #     lock, while the admission runs and after the job started. Each `run` ends;
 #     a command that had started is gone (its pid is dead); no admission process
-#     waits at the lock; and the queue drains (a job that was enqueued in the
-#     instant of the cancel is skipped at its start, because its `run` is gone).
+#     waits at the lock; no admission file is left; and the queue drains (a job
+#     that was enqueued in the instant of the cancel is skipped at its start,
+#     because its `run` is gone).
 "$Q" slots 2 >/dev/null
 j=0
 while [ "$j" -lt 30 ]; do
@@ -323,14 +326,15 @@ until [ "$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || 
 done
 left_jobs=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')
 left_waiters=$(lock_waiters)
+left_files=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
 alive=0
 for f in "$work"/J*.pid; do
   [ -f "$f" ] || continue
   kill -0 "$(cat "$f")" 2>/dev/null && alive=$((alive + 1))
 done
-[ "$left_waiters" = 0 ] && [ "$left_jobs" = 0 ] && [ "$alive" = 0 ] \
-  && pass "30 runs cancelled at increasing delays leave no lock waiter, no job and no live command" \
-  || fail "cancel at every stage" "lock_waiters=$left_waiters jobs=$left_jobs live_commands=$alive"
+[ "$left_waiters" = 0 ] && [ "$left_jobs" = 0 ] && [ "$alive" = 0 ] && [ "$left_files" = 0 ] \
+  && pass "30 runs cancelled at increasing delays leave no lock waiter, no job, no live command and no admission file" \
+  || fail "cancel at every stage" "lock_waiters=$left_waiters jobs=$left_jobs live_commands=$alive admission_files=$left_files: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
 
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null

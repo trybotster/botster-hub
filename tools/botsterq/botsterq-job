@@ -246,7 +246,13 @@ def main():
     try:
         os.kill(int(owner), 0)
     except ProcessLookupError:
-        sys.exit(130)  # its `botsterq run` is gone: do not start
+        # Its `botsterq run` is gone: do not start. Its cancel marker (left for
+        # this supervisor by a cancel that found no pid yet) goes with it.
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        sys.exit(130)
     # Under the job lock: a cancel that came first left a marker (consume it and
     # do not start); otherwise publish this process for any later cancel.
     with open(joblock, "a") as lock:
