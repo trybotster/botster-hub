@@ -584,6 +584,7 @@ mod tests {
     use crate::daemon::owner_loop::TEST_HANG_GUARD;
     use crate::lua_memory::LuaMemoryLimits;
     use std::sync::mpsc;
+    use std::thread;
 
     fn memory() -> Arc<LuaMemoryAccount> {
         LuaMemoryAccount::new(LuaMemoryLimits {
@@ -958,5 +959,37 @@ mod tests {
         // A restarted Hub draws again, so its log ids cannot repeat the
         // previous process's.
         assert_ne!(random_boot_id(), random_boot_id());
+    }
+
+    /// The read takes the lock and waits for it; it never refuses. A helper
+    /// holds the lock, a reader starts and signals, the lock is released, and
+    /// the read returns the record. Under the old `try_lock` read the reader
+    /// gets `Busy` at once, because it reaches the lock before the release.
+    #[test]
+    fn a_read_waits_for_the_lock_instead_of_refusing() {
+        let (book, _memory) = book();
+        assert!(matches!(
+            append(&book, "kept", 1_000),
+            AppendOutcome::Accepted { .. }
+        ));
+        let held = book.shared.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                started_tx.send(()).expect("the test is waiting");
+                book.read("p", 0)
+            });
+            // timer: deadline — a hang guard for a reader thread that never starts.
+            started_rx
+                .recv_timeout(TEST_HANG_GUARD)
+                .expect("the reader starts");
+            drop(held);
+            let page = reader
+                .join()
+                .expect("the reader joins")
+                .expect("the read waits for the lock and succeeds");
+            assert_eq!(page.records.len(), 1);
+            assert_eq!(page.records[0].message, "kept");
+        });
     }
 }
