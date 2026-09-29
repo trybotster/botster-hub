@@ -13,4 +13,5 @@ pub use botster_hub::plugin_test_kit::{
 };
 pub use botster_hub_client::{DaemonRequest, DaemonResponse};
 
+pub mod e2e;
 pub mod spec;
