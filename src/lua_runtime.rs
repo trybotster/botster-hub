@@ -1851,7 +1851,28 @@ impl PluginRuntime for LuaPluginRuntime {
                 request.context.origin.as_deref(),
                 Some(PACKAGE_EVENT_INVOCATION_ORIGIN | SESSION_FAMILY_INVOCATION_ORIGIN)
             );
-        let outcome = match function.call::<Value>(payload) {
+        let handler_request = match lua.create_table() {
+            Ok(table) => table,
+            Err(error) => {
+                return failed(
+                    request,
+                    PluginInvocationFailureKind::HandlerFailed,
+                    format!("failed to build the handler request: {error}"),
+                );
+            }
+        };
+        let caller = crate::plugin_caller::PluginCaller::from_context(&request.context);
+        if let Err(error) = lua
+            .to_value(&caller.to_json())
+            .and_then(|caller| handler_request.raw_set("caller", caller))
+        {
+            return failed(
+                request,
+                PluginInvocationFailureKind::HandlerFailed,
+                format!("failed to encode the handler caller: {error}"),
+            );
+        }
+        let outcome = match function.call::<Value>((payload, handler_request)) {
             Ok(_) if acknowledge_event => {
                 PluginInvocationResult::Completed(PluginInvocationSuccess {
                     request_id: request.request_id,
