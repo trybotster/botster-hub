@@ -14,8 +14,8 @@ use botster_hub_client::{DaemonRequest, DaemonResponse};
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, Scope, SerializeOptions, Table, Value};
 
 use crate::{
-    EnvelopeId, EnvelopeTarget, KitError, KitHub, KitOptions, RegistrySessionState, SessionId,
-    SessionLifecycleRecord, SessionLifecycleState, session_record,
+    EnvelopeId, EnvelopeTarget, KitCaller, KitError, KitHub, KitOptions, RegistrySessionState,
+    SessionId, SessionLifecycleRecord, SessionLifecycleState, session_record,
 };
 
 /// The result of one `kit.test`.
@@ -226,6 +226,27 @@ pub(crate) fn unsupported_error(feature: &str, gate: &str) -> mlua::Error {
     mlua::Error::runtime(format!(
         "unsupported_by_kit: {feature} is not supported by the kit yet (gate {gate})"
     ))
+}
+
+/// `{ kind = "operator" }` or `{ [kind = "session",] session_id, hub_id? }`.
+/// `hub_id` defaults to the kit Hub's own id.
+fn caller_from_lua(description: &Table) -> mlua::Result<KitCaller> {
+    let kind: Option<String> = description.get("kind")?;
+    match kind.as_deref() {
+        Some("operator") => Ok(KitCaller::Operator),
+        Some("session") | None => {
+            let session_id: String = description
+                .get("session_id")
+                .map_err(|_| mlua::Error::runtime("a session caller needs a string session_id"))?;
+            Ok(KitCaller::Session {
+                hub_id: description.get::<Option<String>>("hub_id")?,
+                session_id,
+            })
+        }
+        Some(other) => Err(mlua::Error::runtime(format!(
+            "unknown caller kind {other:?}; use operator or session"
+        ))),
+    }
 }
 
 fn session_from_lua(description: &Table) -> mlua::Result<SessionLifecycleRecord> {
@@ -548,22 +569,26 @@ fn plugin_table<'scope, 'env>(
         scope.create_function(
             move |lua, (_, tool, arguments, options): (Value, String, Value, Option<Table>)| {
                 let _ = &tool_name;
+                let mut caller = None;
                 if let Some(options) = options {
-                    // The Hub has no verified caller for plugin tools yet.
-                    for feature in ["caller", "token"] {
-                        if !matches!(options.get::<Value>(feature)?, Value::Nil) {
-                            return unsupported(lua, feature, "G1");
-                        }
+                    // A raw credential needs the Hub's credential path, which
+                    // the kit does not have yet (gate G1).
+                    if !matches!(options.get::<Value>("token")?, Value::Nil) {
+                        return unsupported(lua, "token", "G1");
+                    }
+                    if let Value::Table(description) = options.get::<Value>("caller")? {
+                        caller = Some(caller_from_lua(&description)?);
                     }
                 }
                 let arguments = match arguments {
                     Value::Nil => serde_json::json!({}),
                     other => json_of(lua, other)?,
                 };
-                let response = kit
-                    .borrow_mut()
-                    .call_tool(&tool, arguments)
-                    .map_err(kit_error)?;
+                let response = match caller {
+                    Some(caller) => kit.borrow_mut().call_tool_as(caller, &tool, arguments),
+                    None => kit.borrow_mut().call_tool(&tool, arguments),
+                }
+                .map_err(kit_error)?;
                 response_table(lua, &response)
             },
         )?,

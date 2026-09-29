@@ -14,7 +14,7 @@ fn the_fixture_specs_pass_against_the_real_hub() {
         &crate_path("fixtures"),
         &crate_path("specs/kit_fixture_spec.lua"),
     );
-    assert_eq!(outcomes.len(), 12, "{outcomes:?}");
+    assert_eq!(outcomes.len(), 13, "{outcomes:?}");
     let failures: Vec<_> = outcomes
         .iter()
         .filter(|outcome| outcome.failure.is_some())
