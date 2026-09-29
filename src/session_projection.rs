@@ -41,6 +41,35 @@ pub struct SessionProjection {
 }
 
 impl SessionProjection {
+    /// An upper bound on the bytes `project_entity` allocates for one record,
+    /// computed from the record without allocating. Callers fund a copy with
+    /// this bound before they make it.
+    #[must_use]
+    pub fn entity_bound_bytes(record: &SessionLifecycleRecord) -> usize {
+        // The three fixed state strings ("starting", "running", "exited",
+        // "failed", "stopping", "stale", and the lifecycle class) each fit 16.
+        const STATE_STRINGS: usize = 3 * 16;
+        let metadata = &record.metadata.entries;
+        let value_bytes = |key: &str| metadata.get(key).map_or(0, String::len);
+        let failure = match &record.lifecycle {
+            Some(SessionLifecycleState::Failed { reason }) => reason.len(),
+            _ => 0,
+        };
+        // Traits parse from a JSON array of strings. Each element is at least
+        // three bytes of JSON and becomes one `String` header of 24 bytes.
+        let traits = value_bytes("botster.session_type.traits");
+        std::mem::size_of::<DaemonSessionEntity>()
+            + STATE_STRINGS
+            + record.session.session_id.0.len()
+            + failure
+            + value_bytes("botster.session_type.id")
+            + value_bytes("botster.session_type.source")
+            + value_bytes("botster.session_type.role")
+            + value_bytes("botster.session_type.interaction")
+            + value_bytes("botster.session_type.lifecycle")
+            + traits * 13
+    }
+
     /// Project one Core record into the Hub session entity shape.
     #[must_use]
     pub fn project_entity(record: &SessionLifecycleRecord) -> DaemonSessionEntity {
