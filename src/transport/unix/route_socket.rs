@@ -33,30 +33,57 @@ const ROUTE_NAME_ENTROPY_BYTES: usize = 8;
 const ROUTE_DIR_ENTROPY_BYTES: usize = 4;
 
 /// The private directory holding route sockets. Created at daemon start with
-/// mode 0700 under an unpredictable name, and removed at drop.
+/// mode 0700, and removed at drop.
 pub(crate) struct RouteSocketDir {
     path: PathBuf,
 }
 
 impl RouteSocketDir {
-    /// Create `/tmp/br-<uid>-<random>`. The name is unpredictable, so no
-    /// other user can pre-create it; a directory that already exists fails
-    /// the start.
-    pub(crate) fn create() -> DaemonTransportResult<Self> {
+    /// Create the route directory for the Hub that owns `socket_path`.
+    ///
+    /// The name is `/tmp/br-<uid>-<hash of the socket path>`, so the next
+    /// start of the same Hub finds and sweeps what a crash left behind. The
+    /// caller holds the socket owner lock, so no other Hub of this user uses
+    /// that name. A path at that name that is not a directory of this user
+    /// (another user created it, or it is a symlink) is left alone and a
+    /// random name is used instead, so nobody can block the start.
+    pub(crate) fn create(socket_path: &Path) -> DaemonTransportResult<Self> {
         // SAFETY: `geteuid` has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        let mut entropy = [0_u8; ROUTE_DIR_ENTROPY_BYTES];
-        getrandom::fill(&mut entropy).map_err(|_| {
-            DaemonTransportError::Io(std::io::Error::other("route directory entropy failed"))
-        })?;
-        let suffix: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
-        let path = Path::new(ROUTE_DIR_PARENT).join(format!("br-{uid}-{suffix}"));
+        let preferred = Path::new(ROUTE_DIR_PARENT).join(format!(
+            "br-{uid}-{:08x}",
+            path_hash(socket_path.as_os_str().as_encoded_bytes())
+        ));
+        match fs::symlink_metadata(&preferred) {
+            Ok(metadata) if metadata.file_type().is_dir() && metadata.uid() == uid => {
+                fs::remove_dir_all(&preferred).map_err(DaemonTransportError::Io)?;
+            }
+            _ => {}
+        }
         // The mode is applied at creation, so no other user can ever enter
         // the directory. The umask can only narrow it.
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(DaemonTransportError::Io)?;
+        match fs::DirBuilder::new().mode(0o700).create(&preferred) {
+            Ok(()) => Self::verified(preferred, uid),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut entropy = [0_u8; ROUTE_DIR_ENTROPY_BYTES];
+                getrandom::fill(&mut entropy).map_err(|_| {
+                    DaemonTransportError::Io(std::io::Error::other(
+                        "route directory entropy failed",
+                    ))
+                })?;
+                let suffix: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+                let random = Path::new(ROUTE_DIR_PARENT).join(format!("br-{uid}-r{suffix}"));
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&random)
+                    .map_err(DaemonTransportError::Io)?;
+                Self::verified(random, uid)
+            }
+            Err(error) => Err(DaemonTransportError::Io(error)),
+        }
+    }
+
+    fn verified(path: PathBuf, uid: u32) -> DaemonTransportResult<Self> {
         let metadata = fs::symlink_metadata(&path).map_err(DaemonTransportError::Io)?;
         if !metadata.file_type().is_dir() || metadata.uid() != uid {
             return Err(DaemonTransportError::Io(std::io::Error::new(
@@ -93,6 +120,16 @@ impl RouteSocketDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// FNV-1a: stable across runs and Rust versions, unlike `DefaultHasher`.
+fn path_hash(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 impl Drop for RouteSocketDir {
@@ -274,7 +311,7 @@ mod tests {
     }
 
     async fn connected_route(name: &str) -> Route {
-        let dir = RouteSocketDir::create().expect("route dir");
+        let dir = RouteSocketDir::create(&unique_socket_path()).expect("route dir");
         let mux = UnixConnectionMux::new();
         let (adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");
@@ -294,11 +331,19 @@ mod tests {
         }
     }
 
+    fn unique_socket_path() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        PathBuf::from(format!(
+            "/nonexistent/route-socket-test-{}-{}/hub.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     #[test]
     fn the_route_directory_is_private_short_and_removed_at_drop() {
-        let first = RouteSocketDir::create().expect("create");
-        let second = RouteSocketDir::create().expect("create another");
-        assert_ne!(first.path(), second.path(), "names are unpredictable");
+        let socket = unique_socket_path();
+        let first = RouteSocketDir::create(&socket).expect("create");
         let mode = fs::metadata(first.path())
             .expect("metadata")
             .permissions()
@@ -312,6 +357,55 @@ mod tests {
         );
         drop(first);
         assert!(!path.exists(), "the directory goes with the Hub");
+    }
+
+    /// The name follows the socket path, so a restart finds and sweeps what
+    /// a crash left behind.
+    #[test]
+    fn a_restart_sweeps_the_previous_runs_leftovers() {
+        let socket = unique_socket_path();
+        let first = RouteSocketDir::create(&socket).expect("create");
+        let path = first.path().to_owned();
+        fs::write(path.join("leftover"), b"x").expect("leftover");
+        std::mem::forget(first);
+        let second = RouteSocketDir::create(&socket).expect("recreate");
+        assert_eq!(
+            second.path(),
+            path,
+            "the name is deterministic per socket path"
+        );
+        assert!(
+            !path.join("leftover").exists(),
+            "the sweep removes leftovers"
+        );
+        let other = RouteSocketDir::create(&unique_socket_path()).expect("another hub");
+        assert_ne!(
+            other.path(),
+            second.path(),
+            "another socket path, another directory"
+        );
+    }
+
+    /// A path at the preferred name that this user does not own as a
+    /// directory is never entered or removed; a random name takes over.
+    #[test]
+    fn a_squatted_preferred_name_falls_back_to_a_random_directory() {
+        let socket = unique_socket_path();
+        let preferred = RouteSocketDir::create(&socket).expect("create");
+        let path = preferred.path().to_owned();
+        drop(preferred);
+        std::os::unix::fs::symlink("/nonexistent", &path).expect("squat with a symlink");
+        let fallback = RouteSocketDir::create(&socket).expect("fallback");
+        assert_ne!(fallback.path(), path);
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("squatter stays")
+                .file_type()
+                .is_symlink(),
+            "the squatter is left alone"
+        );
+        drop(fallback);
+        fs::remove_file(&path).expect("clean up the squatter");
     }
 
     #[tokio::test]
@@ -364,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_connection_within_the_handshake_window_closes_the_route() {
-        let dir = RouteSocketDir::create().expect("route dir");
+        let dir = RouteSocketDir::create(&unique_socket_path()).expect("route dir");
         let mux = UnixConnectionMux::new();
         let (_adapter, handle) = mux.create_adapter();
         let listener = dir.bind().expect("bind route socket");
