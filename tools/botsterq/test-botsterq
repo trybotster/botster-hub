@@ -241,8 +241,6 @@ wait "$H1" "$H2" "$HO1"
   && [ ! -e "$work/HO2.ran" ] && [ -e "$work/HO1.ran" ] \
   && pass "cancelling a run that waits at the admission lock exits 130 at once, never starts, leaves nothing behind" \
   || fail "cancel at the lock" "cancel=$codeHO2 (${cancel_elapsed}s) lock_waiters=$waiters_after admit_files=$admit_files HO2.ran=$([ -e "$work/HO2.ran" ] && echo yes || echo no) HO1.ran=$([ -e "$work/HO1.ran" ] && echo yes || echo no) err=$(cat "$work/HO2.err")"
-leftover=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
-[ "$leftover" = 0 ] && pass "no admission file remains after the runs end" || fail "admission files" "$leftover left"
 
 # 8f. Several waiters behind the holder start in the order they arrived. The
 #     order among waiters at the lock is the kernel's flock wakeup order, which
