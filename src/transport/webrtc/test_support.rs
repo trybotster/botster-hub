@@ -964,7 +964,6 @@ impl PeerHarness {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: Instant::now(),
             },
         );
         let deadline = Instant::now() + Duration::from_secs(15);

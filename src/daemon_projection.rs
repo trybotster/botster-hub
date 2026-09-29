@@ -791,7 +791,6 @@ pub(crate) fn daemon_status_from_status(
     lifecycle_counters: DaemonLifecycleCounters,
     software: DaemonSoftwareIdentity,
     installation: DaemonInstallationIdentity,
-    observability: botster_hub_client::DaemonObservabilityCounters,
     retention: Option<botster_hub_client::DaemonRetentionAccounting>,
     compatibility: DaemonCompatibility,
 ) -> DaemonStatus {
@@ -832,7 +831,6 @@ pub(crate) fn daemon_status_from_status(
             .collect(),
         lifecycle_counters,
         live_attach_occupancy: Vec::new(),
-        observability,
         retention,
         quarantines: Vec::new(),
         local_webrtc_terminal_records: Vec::new(),
@@ -1777,7 +1775,6 @@ mod tests {
             counters,
             software.clone(),
             installation.clone(),
-            botster_hub_client::DaemonObservabilityCounters::default(),
             None,
             DaemonCompatibility::current(),
         );

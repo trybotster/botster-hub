@@ -5,8 +5,6 @@
 //! the session it proves. This module never decides who a caller is: it only
 //! turns a refusal from the owner into a 401.
 
-use std::time::Instant;
-
 use botster_core::SessionId;
 use botster_hub_client::{DaemonResponse, ServerFrame};
 use serde_json::{Value, json};
@@ -125,7 +123,6 @@ impl CallerChannel<'_> {
                 proven,
                 request: Box::new(request),
                 reply_tx,
-                enqueued_at: Instant::now(),
             })
             .map_err(|error| match error {
                 TrySendError::Full(_) => CallFailure::Busy,
@@ -643,7 +640,6 @@ mod tests {
                 proven: None,
                 request: Box::new(CallerRequest::Whoami),
                 reply_tx: filler_reply,
-                enqueued_at: Instant::now(),
             })
             .expect("the first message fits");
         let (dispatched, _) = served(&control_tx, &body("ping", json!({}))).await;

@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm};
@@ -480,7 +480,6 @@ where
                         response_delivery_rx,
                         grant_id: Some(peer_state.grant_id.clone()),
                         client_id: Some(format!("botster-hub-webrtc-{}", peer_state.grant_id)),
-                        enqueued_at: Instant::now(),
                     })
                     .await
             }
@@ -1011,6 +1010,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
+    use std::time::Instant;
     use tokio::sync::mpsc as tokio_mpsc;
     use webrtc::data_channel::RTCDataChannelInit;
     use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelMessage};

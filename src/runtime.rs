@@ -185,7 +185,6 @@ pub struct HubRuntime {
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     /// Cross-thread wakes for owner work; producers raise, the owner waits.
     owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
-    event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     causal_queue: CausalOwnerQueue,
     direct_family_cleanup: std::cell::RefCell<Option<HostPackageCleanup>>,
@@ -751,7 +750,6 @@ impl HubRuntime {
                 Arc::clone(&owner_signal),
             ),
         );
-        let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
         let clock = crate::hub_clock::HubClock::system();
         Ok(Self {
@@ -816,7 +814,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             owner_signal,
-            event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -956,7 +953,6 @@ impl HubRuntime {
                 Arc::clone(&owner_signal),
             ),
         );
-        let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
         let clock = crate::hub_clock::HubClock::system();
         let mut runtime = Self {
@@ -1021,7 +1017,6 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             owner_signal,
-            event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -1230,16 +1225,6 @@ impl HubRuntime {
             }
         }
         panic!("the Core request queue must fill while the data plane is blocked");
-    }
-
-    #[must_use]
-    pub fn event_plane_counters(&self) -> &Arc<crate::event_plane_counters::EventPlaneCounters> {
-        &self.event_plane_counters
-    }
-
-    #[must_use]
-    pub fn event_plane_counters_snapshot(&self) -> botster_hub_client::DaemonObservabilityCounters {
-        self.event_plane_counters.snapshot()
     }
 
     #[must_use]

@@ -1373,11 +1373,6 @@ fn a_failed_compensation_quarantines_the_package() {
         },
     );
     assert!(runtime.stranded_packages().contains("producer"));
-    assert_eq!(
-        runtime.event_plane_counters().events_stranded(),
-        0,
-        "stranded events are counted when the unload retires them"
-    );
     let mut cleanup = host.into_cleanup();
     let unload = cleanup
         .event_plane_unloads
@@ -1390,7 +1385,6 @@ fn a_failed_compensation_quarantines_the_package() {
     work.run(&runtime.package_event_router)
         .expect("the unload runs");
     assert_eq!(queued(&runtime), 0);
-    assert_eq!(runtime.event_plane_counters().events_stranded(), 1);
     assert!(
         runtime
             .plugin_lifecycle()

@@ -29,7 +29,7 @@ use crate::daemon::control::dispatch_control_message;
 #[cfg(test)]
 use crate::daemon::control::handle_control_message;
 use crate::daemon::control::message::{
-    ControlMessage, ControlReplySender, ControlSender, DaemonDeliveryKind, EgressWriteClass,
+    ControlMessage, ControlReplySender, ControlSender, DaemonDeliveryKind,
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon_maintenance::{
@@ -858,11 +858,6 @@ fn run_owner_maintenance_slice(
         }
     }
     state.maintenance.last_owner_turn = started.elapsed();
-    if let Some(runtime) = daemon.runtime() {
-        runtime.event_plane_counters().record_owner_turn(
-            u64::try_from(state.maintenance.last_owner_turn.as_micros()).unwrap_or(u64::MAX),
-        );
-    }
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
     state.lifecycle_counters.lifecycle_resync_reads = state.maintenance.resync_reads;
@@ -1707,19 +1702,10 @@ fn dispose_terminal_host_slice(
 pub(crate) fn record_egress_write_failure(
     diagnostics: &mut DaemonEgressDiagnostics,
     counters: &mut DaemonLifecycleCounters,
-    runtime: Option<&crate::HubRuntime>,
     delivery_kind: DaemonDeliveryKind,
-    write_class: EgressWriteClass,
 ) {
     diagnostics.record_write_failure(delivery_kind);
     counters.stalled_writes = counters.stalled_writes.saturating_add(1);
-    if write_class == EgressWriteClass::Timeout
-        && let Some(runtime) = runtime
-    {
-        runtime
-            .event_plane_counters()
-            .record_stalled_write_timeout();
-    }
 }
 
 pub(crate) fn send_control_response(
@@ -1778,7 +1764,6 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: Instant::now(),
             });
         }
     });
@@ -2638,7 +2623,7 @@ mod tests {
     use crate::PackageState;
     use crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY;
     use crate::client_api_dto::response::{daemon_events, daemon_response_base};
-    use crate::daemon::control::message::{daemon_delivery_kind, egress_write_class};
+    use crate::daemon::control::message::daemon_delivery_kind;
     use crate::daemon::control::{
         ControlMessage, DaemonObservability, attach_bind_operator_error, handle_control_request,
     };
@@ -2788,7 +2773,6 @@ mod tests {
                                             response_delivery_rx: None,
                                             grant_id: None,
                                             client_id: None,
-                                            enqueued_at: Instant::now(),
                                         })
                                         .unwrap();
                                 }
@@ -2903,7 +2887,6 @@ mod tests {
                                             response_delivery_rx: None,
                                             grant_id: None,
                                             client_id: None,
-                                            enqueued_at: Instant::now(),
                                         }
                                     ));
                                 }
@@ -6527,39 +6510,15 @@ mod tests {
 
         let mut diagnostics = DaemonEgressDiagnostics::default();
         let mut counters = DaemonLifecycleCounters::default();
-        let data_directory = std::env::temp_dir().join(format!(
-            "hub-t4-egress-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let config = crate::HubStartupOptions {
-            host: crate::HostIdentityOptions {
-                id: "t4-egress".to_string(),
-                display_name: "T4 Egress".to_string(),
-                fingerprint: None,
-            },
-            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
-            ..crate::HubStartupOptions::default()
-        }
-        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
-        .expect("config");
-        let runtime = crate::HubRuntime::new(config).expect("runtime");
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
-            Some(&runtime),
             DaemonDeliveryKind::Terminal,
-            EgressWriteClass::Other,
         );
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
-            Some(&runtime),
             daemon_delivery_kind(&control),
-            EgressWriteClass::Timeout,
         );
         let rows = diagnostics.diagnostics();
 
@@ -6575,70 +6534,6 @@ mod tests {
         assert!(!debug.contains("session-redacted"));
         assert!(!debug.contains("subscription-redacted"));
         assert_eq!(counters.stalled_writes, 2);
-        let observability = runtime.event_plane_counters_snapshot();
-        assert_eq!(observability.stalled_write_timeouts, 1);
-        let _ = std::fs::remove_dir_all(data_directory);
-    }
-
-    #[test]
-    fn write_deadline_error_increments_t4_while_other_write_failure_does_not() {
-        let timeout_error = DaemonTransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "daemon client write deadline elapsed",
-        ));
-        let other_error = DaemonTransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "broken pipe",
-        ));
-        let timeout_class = egress_write_class(&timeout_error);
-        let other_class = egress_write_class(&other_error);
-        assert_eq!(timeout_class, EgressWriteClass::Timeout);
-        assert_eq!(other_class, EgressWriteClass::Other);
-
-        let mut diagnostics = DaemonEgressDiagnostics::default();
-        let mut counters = DaemonLifecycleCounters::default();
-        let data_directory = std::env::temp_dir().join(format!(
-            "hub-t4-class-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let config = crate::HubStartupOptions {
-            host: crate::HostIdentityOptions {
-                id: "t4-class".to_string(),
-                display_name: "T4 Class".to_string(),
-                fingerprint: None,
-            },
-            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
-            ..crate::HubStartupOptions::default()
-        }
-        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
-        .expect("config");
-        let runtime = crate::HubRuntime::new(config).expect("runtime");
-        record_egress_write_failure(
-            &mut diagnostics,
-            &mut counters,
-            Some(&runtime),
-            DaemonDeliveryKind::Control,
-            other_class,
-        );
-        record_egress_write_failure(
-            &mut diagnostics,
-            &mut counters,
-            Some(&runtime),
-            DaemonDeliveryKind::Control,
-            timeout_class,
-        );
-        assert_eq!(counters.stalled_writes, 2);
-        assert_eq!(
-            runtime
-                .event_plane_counters_snapshot()
-                .stalled_write_timeouts,
-            1
-        );
-        let _ = std::fs::remove_dir_all(data_directory);
     }
 
     #[test]
@@ -8064,7 +7959,6 @@ return botster.register({
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: Some(client_id.to_string()),
-                enqueued_at: Instant::now(),
             },
         );
         reply_rx
@@ -8699,11 +8593,13 @@ return botster.register({ handlers = {{
             loop {
                 drive_ready_test_turn(&mut daemon, &mut state);
                 let runtime = daemon.runtime().unwrap();
-                if runtime
-                    .event_plane_counters()
-                    .snapshot()
-                    .event_handler_completed_ok
-                    == expected as u64
+                if state
+                    .maintenance
+                    .event_outcomes
+                    .iter()
+                    .filter(|outcome| outcome.is_none())
+                    .count()
+                    == expected
                     && runtime.causal_operation_count() == 0
                     && !runtime.entity_publish_retirement_pending()
                     && state.maintenance.event_in_flight.is_empty()
@@ -9118,14 +9014,14 @@ return botster.register({ handlers = {} })
 
     /// Delivers one `worktree_created` event and drives owner turns until its
     /// handler reaches a terminal outcome and every publication retires.
-    /// Returns the event-plane counters at that point. Any terminal outcome
-    /// ends the loop, so a failed or timed-out handler is reported at once.
+    /// Returns how the handler ended. Any terminal outcome ends the loop, so a
+    /// failed or timed-out handler is reported at once.
     fn drive_one_publishing_event(
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
         wakes: &mut TestOwnerWakes,
         hang_guard: Duration,
-    ) -> botster_hub_client::DaemonObservabilityCounters {
+    ) -> Vec<Option<botster_core::PluginInvocationFailureKind>> {
         use crate::package_event_router::{EventPlaneStatus, HUB_EVENT_OWNER};
         assert_eq!(
             daemon
@@ -9151,7 +9047,7 @@ return botster.register({ handlers = {} })
             hang_guard,
             |daemon, state| {
                 let runtime = daemon.runtime().unwrap();
-                handler_terminal_count(&runtime.event_plane_counters().snapshot()) == 1
+                state.maintenance.event_outcomes.len() == 1
                     && runtime.causal_operation_count() == 0
                     && !runtime.entity_publish_retirement_pending()
                     && state.maintenance.event_in_flight.is_empty()
@@ -9163,26 +9059,17 @@ return botster.register({ handlers = {} })
                 let runtime = daemon.runtime().unwrap();
                 format!(
                     "causal_operations={} publish_retirement_pending={} event_in_flight={} \
-                     pending_retirements={} budget_outstanding={} counters={:?}",
+                     pending_retirements={} budget_outstanding={} outcomes={:?}",
                     runtime.causal_operation_count(),
                     runtime.entity_publish_retirement_pending(),
                     state.maintenance.event_in_flight.len(),
                     state.maintenance.pending_retirements.len(),
                     state.budget.outstanding(),
-                    runtime.event_plane_counters().snapshot(),
+                    state.maintenance.event_outcomes,
                 )
             },
         );
-        daemon.runtime().unwrap().event_plane_counters().snapshot()
-    }
-
-    fn handler_terminal_count(counters: &botster_hub_client::DaemonObservabilityCounters) -> u64 {
-        counters.event_handler_completed_ok
-            + counters.event_handler_failed
-            + counters.event_handler_timed_out
-            + counters.event_handler_cancelled
-            + counters.event_handler_backpressured
-            + counters.event_handler_worker_stopped
+        state.maintenance.event_outcomes.clone()
     }
 
     #[test]
@@ -9634,15 +9521,27 @@ return botster.register({ handlers = {} })
 
     /// (completed_ok, failed, timed_out, cancelled, backpressured, worker_stopped)
     fn handler_outcomes(
-        counters: &botster_hub_client::DaemonObservabilityCounters,
-    ) -> (u64, u64, u64, u64, u64, u64) {
+        outcomes: &[Option<botster_core::PluginInvocationFailureKind>],
+    ) -> (usize, usize, usize, usize, usize, usize) {
+        use botster_core::PluginInvocationFailureKind as Kind;
+        let count = |wanted: &dyn Fn(&Kind) -> bool| {
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_ref().is_some_and(wanted))
+                .count()
+        };
         (
-            counters.event_handler_completed_ok,
-            counters.event_handler_failed,
-            counters.event_handler_timed_out,
-            counters.event_handler_cancelled,
-            counters.event_handler_backpressured,
-            counters.event_handler_worker_stopped,
+            outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+            count(&|kind| matches!(kind, Kind::HandlerFailed | Kind::CompletionTooLarge)),
+            count(&|kind| *kind == Kind::TimedOut),
+            count(&|kind| *kind == Kind::Cancelled),
+            count(&|kind| *kind == Kind::Backpressured),
+            count(&|kind| {
+                matches!(
+                    kind,
+                    Kind::WorkerStopped | Kind::WorkerCrashed | Kind::WorkerKilled
+                )
+            }),
         )
     }
 
@@ -9655,12 +9554,12 @@ return botster.register({ handlers = {} })
         // event deadline, so the handler gets the shared test hang guard.
         state.maintenance.test_event_invocation_timeout_ms =
             Some(u64::try_from(TEST_HANG_GUARD.as_millis()).unwrap());
-        let counters =
+        let outcomes =
             drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
         assert_eq!(
-            handler_outcomes(&counters),
+            handler_outcomes(&outcomes),
             (1, 0, 0, 0, 0, 0),
-            "{counters:?}"
+            "{outcomes:?}"
         );
         let runtime = daemon.runtime().unwrap();
         assert_eq!(runtime.test_resync_lease_count("resync-probe.item"), 0);
@@ -9680,12 +9579,12 @@ return botster.register({ handlers = {} })
             .unwrap()
             .entity_publish_bridge()
             .reject_next_publish();
-        let counters =
+        let outcomes =
             drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
         assert_eq!(
-            handler_outcomes(&counters),
+            handler_outcomes(&outcomes),
             (0, 1, 0, 0, 0, 0),
-            "{counters:?}"
+            "{outcomes:?}"
         );
         let runtime = daemon.runtime().unwrap();
         assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
@@ -9700,12 +9599,12 @@ return botster.register({ handlers = {} })
             start_publishing_event_daemon("expired-live-event", 512);
         // A zero deadline is already expired when Core admits the invocation.
         state.maintenance.test_event_invocation_timeout_ms = Some(0);
-        let counters =
+        let outcomes =
             drive_one_publishing_event(&mut daemon, &mut state, &mut wakes, TEST_HANG_GUARD);
         assert_eq!(
-            handler_outcomes(&counters),
+            handler_outcomes(&outcomes),
             (0, 0, 1, 0, 0, 0),
-            "{counters:?}"
+            "{outcomes:?}"
         );
         let runtime = daemon.runtime().unwrap();
         assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
@@ -9814,7 +9713,6 @@ return botster.register({
                     response_delivery_rx: None,
                     grant_id: None,
                     client_id: None,
-                    enqueued_at: Instant::now(),
                 });
             }
         }
@@ -11537,7 +11435,6 @@ return botster.register({tools = {{
                     response_delivery_rx: None,
                     grant_id: None,
                     client_id: None,
-                    enqueued_at: Instant::now(),
                 },
             ));
             replies.push(reply_rx);
@@ -12089,15 +11986,6 @@ return botster.register({tools = {{
         })
     }
 
-    fn quarantines_not_durable(daemon: &HubDaemon) -> u64 {
-        daemon
-            .runtime()
-            .expect("runtime")
-            .event_plane_counters()
-            .snapshot()
-            .package_quarantines_not_durable
-    }
-
     fn resolve_package_quarantine(
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
@@ -12136,7 +12024,6 @@ return botster.register({tools = {{
             durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
             Some(true)
         );
-        assert_eq!(quarantines_not_durable(&daemon), 0);
         daemon.stop();
         drop(state);
 
@@ -12364,7 +12251,6 @@ return botster.register({tools = {{
             )),
             "{rows:?}"
         );
-        assert_eq!(quarantines_not_durable(&daemon), 1);
 
         let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
         assert_eq!(
@@ -12652,7 +12538,6 @@ return botster.register({tools = {{
             durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
             Some(false)
         );
-        assert_eq!(quarantines_not_durable(&daemon), 1);
 
         let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
         assert_eq!(
@@ -12691,7 +12576,6 @@ return botster.register({tools = {{
             durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
             Some(false)
         );
-        assert_eq!(quarantines_not_durable(&daemon), 1);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

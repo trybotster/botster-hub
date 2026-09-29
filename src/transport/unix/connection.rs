@@ -36,7 +36,7 @@ use crate::admission::unix_hello::{UnixTerminalAdmission, unix_hello_admission};
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{
-    ControlMessage, ControlReplyReceiver, ControlSender, control_reply_channel, egress_write_class,
+    ControlMessage, ControlReplyReceiver, ControlSender, control_reply_channel,
 };
 use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::daemon::control::reply::ControlReply;
@@ -435,7 +435,6 @@ pub(crate) async fn handle_connection_async(
                         response_delivery_rx,
                         grant_id: None,
                         client_id: Some(client_id.clone()),
-                        enqueued_at: Instant::now(),
                     })
                     .await
             }
@@ -516,10 +515,7 @@ async fn deliver_completed_request(
         flush_pending_responses(write_half, mux, mux_write, Instant::now(), event_mailbox).await
     {
         cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
-        let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
-            delivery_kind,
-            write_class: egress_write_class(&error),
-        });
+        let _ = control_tx.try_send(ControlMessage::EgressWriteFailed { delivery_kind });
         mux.close_all();
         return Err(error);
     }

@@ -861,7 +861,6 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: std::time::Instant::now(),
             },
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

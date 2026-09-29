@@ -1266,7 +1266,7 @@ impl HostMutationContinuation {
                     rollbacks,
                 };
                 if let Err(reason) = durable {
-                    record_quarantine_not_durable(daemon, &failure.effect, &reason);
+                    record_quarantine_not_durable(&failure.effect, &reason);
                 }
                 retain_compensation_failure(state, waiter_id, failure, permit)
             }
@@ -1515,7 +1515,6 @@ fn submit_package_quarantine(
     let Some(runtime) = daemon.runtime() else {
         release_document(state, waiter_id);
         let poll = retain_package_recovery(
-            daemon,
             state,
             waiter_id,
             PackageCompensationFailure {
@@ -1568,7 +1567,7 @@ fn submit_package_quarantine(
             *next_phase = later_phase;
             ControlPoll::Pending
         }
-        Err(failure) => retain_unsubmitted_quarantine(daemon, state, waiter_id, failure),
+        Err(failure) => retain_unsubmitted_quarantine(state, waiter_id, failure),
     }
 }
 
@@ -1578,7 +1577,6 @@ fn submit_package_quarantine(
 /// record: a submission record refuses all Host work, and the operator
 /// resolve must still reach these packages to unload them.
 fn retain_unsubmitted_quarantine(
-    daemon: &HubDaemon,
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
     failure: HostSubmissionFailure,
@@ -1614,7 +1612,6 @@ fn retain_unsubmitted_quarantine(
     });
     release_document(state, waiter_id);
     let poll = retain_package_recovery(
-        daemon,
         state,
         waiter_id,
         PackageCompensationFailure {
@@ -1687,7 +1684,7 @@ fn submit_package_quarantine_record(
     };
     if let Some(reason) = refusal {
         release_document(state, waiter_id);
-        record_quarantine_not_durable(daemon, &failure.effect, reason);
+        record_quarantine_not_durable(&failure.effect, reason);
         return retain_compensation_failure(state, waiter_id, failure, permit);
     }
     let runtime = daemon.runtime().expect("the state authority has a runtime");
@@ -1728,13 +1725,8 @@ fn compensation_message(rollbacks: &[PackageRollbackFailure]) -> String {
         .join("; ")
 }
 
-/// The quarantine lasts only until the Hub restarts: count it and log why.
-fn record_quarantine_not_durable(daemon: &HubDaemon, effect: &PackageRuntimeEffect, reason: &str) {
-    if let Some(runtime) = daemon.runtime() {
-        runtime
-            .event_plane_counters()
-            .record_package_quarantine_not_durable();
-    }
+/// The quarantine lasts only until the Hub restarts: log why.
+fn record_quarantine_not_durable(effect: &PackageRuntimeEffect, reason: &str) {
     crate::hub_log::hub_log!(
         "package_quarantine_not_durable packages={} reason={reason}",
         effect.package_names().join(",")
@@ -1770,15 +1762,14 @@ fn retain_compensation_failure(
 }
 
 /// No compensation or quarantine phase can run: retain the recovery in
-/// memory only, and count it as not durable.
+/// memory only. The quarantine is not durable.
 fn retain_package_recovery(
-    daemon: &HubDaemon,
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
     failure: PackageCompensationFailure,
     permit: HostWorkPermit,
 ) -> ControlPoll {
-    record_quarantine_not_durable(daemon, &failure.effect, "no compensation phase could run");
+    record_quarantine_not_durable(&failure.effect, "no compensation phase could run");
     retain_compensation_failure(state, waiter_id, failure, permit)
 }
 

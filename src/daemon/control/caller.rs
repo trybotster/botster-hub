@@ -28,7 +28,6 @@ pub(crate) fn handle(
         proven,
         request,
         reply_tx,
-        enqueued_at,
     } = message
     else {
         unreachable!("caller owner received a non-caller control message");
@@ -61,7 +60,6 @@ pub(crate) fn handle(
         request::CallerAdmission {
             request: request.into_daemon_request(),
             reply_tx,
-            enqueued_at,
             caller,
         },
     )

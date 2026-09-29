@@ -119,8 +119,8 @@ history. Neither is current binary-history contract authority.
 
 Protocol 11 adds the operator `resolve_quarantine` request (response kind
 `quarantine_resolved`), Status `quarantines` (repository session-type roots
-and packages, with `durable` and `loaded`), and the package event-plane
-counters in `observability`.
+and packages, with `durable` and `loaded`), and (removed later) the package
+event-plane counters in `observability`.
 
 Version 0.1.52 carries protocol version 14 / conformance revision 53. Revision
 53 adds the optional plugin logs `log_id`: a different `log_id` means a new

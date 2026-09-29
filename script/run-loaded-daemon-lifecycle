@@ -65,7 +65,7 @@ validate_inputs() {
     invalid=1
   fi
   case "$TEST_TARGET" in
-    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-plugin-resource-bounds|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|event-plane-saturation|full-suite-contention) ;;
+    lifecycle-suite|focused-metadata-owned-shutdown|focused-occupied-web-port|focused-session-entity-resize|focused-process-ownership|focused-connection-lifecycle|focused-plugin-resource-bounds|focused-stalled-attach|focused-fast-exit-attach-diagnostic|focused-oversized-webrtc|focused-cli-smoke|focused-operator-console|focused-lua-worker-suite|focused-lua-session-worker-callers|full-suite-contention) ;;
     *) log "invalid test_target: $TEST_TARGET"; invalid=1 ;;
   esac
   if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || ((10#$REPETITIONS < 1 || 10#$REPETITIONS > 100)); then
@@ -80,28 +80,6 @@ validate_inputs() {
     log "focused-plugin-resource-bounds requires stress_profile=none"
     invalid=1
   fi
-  if [[ "$TEST_TARGET" == event-plane-saturation && "$STRESS_PROFILE" != none ]]; then
-    log "event-plane-saturation requires stress_profile=none"
-    invalid=1
-  fi
-  EVENT_PLANE_PHASE=${BOTSTER_EVENT_PLANE_PHASE:-}
-  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
-    case "$EVENT_PLANE_PHASE" in
-      calibration|acceptance) ;;
-      *)
-        log "event-plane-saturation requires BOTSTER_EVENT_PLANE_PHASE=calibration or acceptance"
-        invalid=1
-        ;;
-    esac
-    if [[ "$EVENT_PLANE_PHASE" == acceptance ]]; then
-      if [[ ! "${BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
-        log "acceptance requires BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT as a lowercase 40-character SHA"
-        invalid=1
-      fi
-    fi
-    admit_event_plane_runner || invalid=1
-  fi
-
   resolve_run_timeout
   {
     printf 'validated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -111,12 +89,6 @@ validate_inputs() {
     printf 'stress_profile=%s\n' "$STRESS_PROFILE"
     printf 'run_timeout_seconds=%s\n' "$RUN_TIMEOUT_SECONDS"
     printf 'run_timeout_max=%s\n' "$RUN_TIMEOUT_MAX"
-    if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
-      printf 'event_plane_phase=%s\n' "$EVENT_PLANE_PHASE"
-      if [[ -n "${BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT:-}" ]]; then
-        printf 'event_plane_calibration_commit=%s\n' "$BOTSTER_EVENT_PLANE_CALIBRATION_COMMIT"
-      fi
-    fi
   } >> "$ARTIFACT_DIR/metadata.txt"
 
   if ((invalid != 0)); then
@@ -126,74 +98,9 @@ validate_inputs() {
   printf 'validation_status=valid\n' >> "$ARTIFACT_DIR/metadata.txt"
 }
 
-event_plane_os_release_file() {
-  printf '%s\n' "${BOTSTER_EVENT_PLANE_OS_RELEASE_FILE:-/etc/os-release}"
-}
-
-event_plane_os_field() {
-  local key=$1
-  local file
-  file=$(event_plane_os_release_file)
-  if [[ ! -r "$file" ]]; then
-    printf 'unknown\n'
-    return
-  fi
-  awk -F= -v key="$key" '
-    $1 == key {
-      value = $2
-      gsub(/\r/, "", value)
-      gsub(/^"/, "", value)
-      gsub(/"$/, "", value)
-      print value
-      exit
-    }
-  ' "$file"
-  if [[ $? -ne 0 ]]; then
-    printf 'unknown\n'
-  fi
-}
-
-admit_event_plane_runner() {
-  local uname_s uname_m os_id os_version cpus
-  uname_s=$(runner_platform)
-  uname_m=$(uname -m 2>/dev/null || printf 'unknown')
-  os_id=$(event_plane_os_field ID)
-  os_version=$(event_plane_os_field VERSION_ID)
-  cpus=$(runner_cpu_count | tr -d '[:space:]')
-  [[ -n "$os_id" ]] || os_id=unknown
-  [[ -n "$os_version" ]] || os_version=unknown
-  [[ -n "$cpus" ]] || cpus=unknown
-  {
-    printf 'runner_uname_s=%s\n' "$uname_s"
-    printf 'runner_uname_m=%s\n' "$uname_m"
-    printf 'runner_os_id=%s\n' "$os_id"
-    printf 'runner_os_version_id=%s\n' "$os_version"
-    printf 'runner_logical_cpus=%s\n' "$cpus"
-    printf 'event_plane_runner_label=%s\n' "botster-ubuntu-24.04-16core"
-  } >> "$ARTIFACT_DIR/metadata.txt"
-  if [[ "$uname_s" != Linux || "$uname_m" != x86_64 || "$os_id" != ubuntu || "$os_version" != 24.04 || "$cpus" != 16 ]]; then
-    log "event-plane-saturation requires Linux x64 Ubuntu 24.04 with exactly 16 logical CPUs (observed uname_s=$uname_s uname_m=$uname_m os_id=$os_id os_version_id=$os_version logical_cpus=$cpus)"
-    printf 'event_plane_runner_admission=fail\n' >> "$ARTIFACT_DIR/metadata.txt"
-    return 1
-  fi
-  printf 'event_plane_runner_admission=pass\n' >> "$ARTIFACT_DIR/metadata.txt"
-  return 0
-}
-
-# Event-plane saturation needs 2 * (30s warm-up + 600s window) plus fleet
-# setup. The workflow default of 900 seconds must not win for that target.
 resolve_run_timeout() {
   RUN_TIMEOUT_SECONDS=${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-$DEFAULT_RUN_TIMEOUT_SECONDS}
   RUN_TIMEOUT_MAX=1800
-  if [[ "$TEST_TARGET" == event-plane-saturation ]]; then
-    RUN_TIMEOUT_MAX=3600
-    if [[ -z "${BOTSTER_LOADED_RUN_TIMEOUT_SECONDS:-}" ]] \
-      || ((10#$BOTSTER_LOADED_RUN_TIMEOUT_SECONDS < 3600)); then
-      RUN_TIMEOUT_SECONDS=3600
-    else
-      RUN_TIMEOUT_SECONDS=$BOTSTER_LOADED_RUN_TIMEOUT_SECONDS
-    fi
-  fi
 }
 
 validate_linux_runner() {
@@ -1117,12 +1024,6 @@ main() {
       ;;
     focused-lua-session-worker-callers)
       test_command=(./test.sh --test hub_lua_runtime_test session_type -- --nocapture)
-      ;;
-    event-plane-saturation)
-      export BOTSTER_EVENT_PLANE_PHASE="${BOTSTER_EVENT_PLANE_PHASE:?event-plane-saturation requires BOTSTER_EVENT_PLANE_PHASE}"
-      export BOTSTER_EVENT_PLANE_ARTIFACT_DIR="${BOTSTER_EVENT_PLANE_ARTIFACT_DIR:-$ARTIFACT_DIR}"
-      export SUBJECT_SHA="$SUBJECT_SHA"
-      test_command=(./test.sh --test hub_daemon_lifecycle_test event_plane_saturation_campaign -- --exact --ignored --nocapture)
       ;;
     full-suite-contention)
       test_command=(./test.sh)

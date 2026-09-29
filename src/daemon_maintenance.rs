@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use botster_core::SessionId;
 use botster_core::{
     BoundaryJson, PluginAdmissionResult, PluginCompletion, PluginHandlerKind, PluginHandlerRef,
-    PluginInvocationClass, PluginInvocationContext, PluginInvocationFailureKind,
-    PluginInvocationRequest, PluginInvocationResult, RequestId,
+    PluginInvocationClass, PluginInvocationContext, PluginInvocationRequest,
+    PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
     LifecycleBaselineBudget, LifecycleBaselineStop, ObserveLifecycleBudget,
@@ -666,6 +666,9 @@ pub struct MaintenanceState {
     /// Test only: session-family frames offered to plugin admission.
     #[cfg(test)]
     pub(crate) family_admission_attempts: u64,
+    /// Test only: how each event handler ended, in order (`None` is success).
+    #[cfg(test)]
+    pub(crate) event_outcomes: Vec<Option<botster_core::PluginInvocationFailureKind>>,
     /// Where lifecycle pages come from. Chosen at construction.
     #[cfg(feature = "plugin-test-kit")]
     lifecycle_source: LifecycleSource,
@@ -1796,10 +1799,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         // Only the consumer generation the delivery matched may handle it.
         let handler = match runtime.package_event_handler(&delivery) {
             Ok(handler) => handler,
-            Err(refusal) => {
-                runtime
-                    .event_plane_counters()
-                    .record_delivery_refusal(refusal);
+            Err(_refusal) => {
                 let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
                     queue_event_retirement(runtime, state, flight);
@@ -1862,9 +1862,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     scope_id,
                     identity: crate::package_event_router::LeaseIdentity::EventInFlight,
                 });
-                runtime
-                    .event_plane_counters()
-                    .record_delivery_refusal(refusal);
+                let _ = refusal;
                 let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
                     queue_event_retirement(runtime, state, flight);
@@ -2092,39 +2090,12 @@ fn apply_plugin_completion(
         PluginInvocationResult::Completed(success) => success.request_id.clone(),
         PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
     };
+    #[cfg(test)]
     if state.event_in_flight.contains_key(&request_id.0) {
-        match &completion.result {
-            PluginInvocationResult::Completed(_) => {
-                runtime.event_plane_counters().record_handler_completed_ok();
-            }
-            PluginInvocationResult::Failed(failure) => match failure.kind {
-                PluginInvocationFailureKind::TimedOut => {
-                    runtime.event_plane_counters().record_handler_timed_out();
-                }
-                PluginInvocationFailureKind::HandlerFailed
-                | PluginInvocationFailureKind::CompletionTooLarge => {
-                    // Oversized results use the existing handler failure counter.
-                    runtime.event_plane_counters().record_handler_failed();
-                }
-                PluginInvocationFailureKind::Cancelled => {
-                    runtime.event_plane_counters().record_handler_cancelled();
-                }
-                PluginInvocationFailureKind::Backpressured => {
-                    runtime
-                        .event_plane_counters()
-                        .record_handler_backpressured();
-                }
-                // A crashed or killed plugin process also ended the worker
-                // before the handler completed.
-                PluginInvocationFailureKind::WorkerStopped
-                | PluginInvocationFailureKind::WorkerCrashed
-                | PluginInvocationFailureKind::WorkerKilled => {
-                    runtime
-                        .event_plane_counters()
-                        .record_handler_worker_stopped();
-                }
-            },
-        }
+        state.event_outcomes.push(match &completion.result {
+            PluginInvocationResult::Completed(_) => None,
+            PluginInvocationResult::Failed(failure) => Some(failure.kind.clone()),
+        });
     }
     if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
         if !retire_event_holder(runtime, &mut flight) {
@@ -2617,6 +2588,7 @@ fn consumer_keys_page(
 
 #[cfg(test)]
 mod tests {
+    use botster_core::PluginInvocationFailureKind;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5522,12 +5494,10 @@ return botster.register({})
         drain_event_flights(&timeout_runtime, &mut timeout_state);
         crate::lua_runtime::TEST_EVENT_HANDLER_HOLD_MS
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        let timeout_snap = timeout_runtime.event_plane_counters_snapshot();
-        assert_eq!(timeout_snap.event_handler_timed_out, 1);
-        assert_eq!(timeout_snap.event_handler_failed, 0);
-        assert_eq!(timeout_snap.event_handler_cancelled, 0);
-        assert_eq!(timeout_snap.event_handler_backpressured, 0);
-        assert_eq!(timeout_snap.event_handler_worker_stopped, 0);
+        assert_eq!(
+            timeout_state.event_outcomes,
+            vec![Some(PluginInvocationFailureKind::TimedOut)]
+        );
 
         let (fail_registry, fail_root) = install_lua_event_plugin("t1-fail", fail_lua);
         let (mut fail_runtime, fail_dir) = event_delivery_runtime("t1-fail");
@@ -5539,10 +5509,10 @@ return botster.register({})
         run_package_event_delivery_slice(&fail_runtime, &mut fail_state);
         assert_eq!(fail_state.event_in_flight.len(), 1);
         drain_event_flights(&fail_runtime, &mut fail_state);
-        let fail_snap = fail_runtime.event_plane_counters_snapshot();
-        assert_eq!(fail_snap.event_handler_timed_out, 0);
-        assert_eq!(fail_snap.event_handler_failed, 1);
-        assert_eq!(fail_snap.event_handler_cancelled, 0);
+        assert_eq!(
+            fail_state.event_outcomes,
+            vec![Some(PluginInvocationFailureKind::HandlerFailed)]
+        );
 
         let _ = std::fs::remove_dir_all(timeout_root);
         let _ = std::fs::remove_dir_all(timeout_dir);
@@ -5600,12 +5570,10 @@ return botster.register({})
             &mut state,
             &event_failure_completion(&request_id.0, PluginInvocationFailureKind::TimedOut),
         );
-        let snap = runtime.event_plane_counters_snapshot();
-        assert_eq!(snap.event_handler_timed_out, 1);
-        assert_eq!(snap.event_handler_failed, 0);
-        assert_eq!(snap.event_handler_cancelled, 0);
-        assert_eq!(snap.event_handler_backpressured, 0);
-        assert_eq!(snap.event_handler_worker_stopped, 0);
+        assert_eq!(
+            state.event_outcomes,
+            vec![Some(PluginInvocationFailureKind::TimedOut)]
+        );
         assert!(state.event_in_flight.is_empty());
 
         ingress_worktree_created(&runtime);
@@ -5632,10 +5600,13 @@ return botster.register({})
             &mut state,
             &event_failure_completion(&request_id.0, PluginInvocationFailureKind::HandlerFailed),
         );
-        let snap = runtime.event_plane_counters_snapshot();
-        assert_eq!(snap.event_handler_timed_out, 1);
-        assert_eq!(snap.event_handler_failed, 1);
-        assert_eq!(snap.event_handler_cancelled, 0);
+        assert_eq!(
+            state.event_outcomes,
+            vec![
+                Some(PluginInvocationFailureKind::TimedOut),
+                Some(PluginInvocationFailureKind::HandlerFailed)
+            ]
+        );
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }
