@@ -57,6 +57,7 @@ fn loopback(port: u16) -> SocketAddr {
 /// Bind the listener. `configured` pins a port: if that port cannot be
 /// bound, this fails, because the operator asked for exactly that port.
 pub(crate) fn bind(data_directory: &Path, configured: Option<u16>) -> io::Result<BoundMcpHttp> {
+    fs::create_dir_all(data_directory)?;
     let path = endpoint_path(data_directory);
     let recorded = read_recorded_port(&path);
     let (listener, port_changed) = match (configured, recorded) {

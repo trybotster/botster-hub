@@ -1362,6 +1362,20 @@ fn serve_daemon_inner(
         TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
     };
     let session_worker = crate::runtime::session_worker_path(&config);
+    // MCP over HTTP binds before any session can spawn, so every spawn issues
+    // the endpoint URL. A Hub that cannot bind loopback still serves the rest.
+    let mut config = config;
+    let mcp_http = match crate::transport::http_mcp::listener::bind(&config.data_directory, None)
+    {
+        Ok(bound) => {
+            config.mcp_url = Some(bound.endpoint.url());
+            Some(bound)
+        }
+        Err(error) => {
+            eprintln!("botster-hub mcp http listener unavailable: {error}");
+            None
+        }
+    };
     let mut daemon = HubDaemon::start(config)?;
     if let Some(runtime) = daemon.runtime() {
         runtime.bind_data_plane_owner_wake(control_tx.clone());
@@ -1408,6 +1422,11 @@ fn serve_daemon_inner(
         shutdown_tx.subscribe(),
         Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
     ))];
+    if let Some(bound) = mcp_http {
+        connection_tasks.push(
+            transport_runtime.spawn(bound.serve(control_tx.clone(), shutdown_tx.subscribe())),
+        );
+    }
     #[cfg(test)]
     let (selected, stopped) = match terminal_test {
         Some(test) => {
@@ -7000,6 +7019,7 @@ mod tests {
             client_id: None,
             grant_id: None,
             transport_request_id: None,
+            caller: crate::daemon::control::Caller::Operator,
         };
         state.current_waiter_id = daemon
             .runtime()
@@ -12901,6 +12921,7 @@ return botster.register({tools = {{
             client_id: Some("reconcile-client".to_string()),
             grant_id: None,
             transport_request_id: None,
+            caller: crate::daemon::control::Caller::Operator,
         };
         state.current_waiter_id = state.waiter_ids.next();
         let step = handle_control_request(

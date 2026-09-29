@@ -7,6 +7,7 @@
 
 use std::time::Instant;
 
+use botster_core::SessionId;
 use botster_hub_client::{DaemonResponse, ServerFrame};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::error::TrySendError;
@@ -23,6 +24,7 @@ use crate::mcp::{
     native_call, native_tool_descriptors, parse_inbound, plugin_tool_descriptors,
     plugin_tool_result, tool_call_response,
 };
+use crate::HubClientError;
 use crate::session_credential::CallerToken;
 use crate::transport::http_mcp::wire::Refusal;
 
@@ -61,16 +63,48 @@ struct CallerChannel<'a> {
 }
 
 impl CallerChannel<'_> {
-    /// One request to the owner. The queue is never waited on: a full queue
-    /// is `Busy`, so a connection cannot park behind the owner.
+    /// One request to the owner. Requests that reach Core prove the token in
+    /// their own Core submission. The others (status, the session list,
+    /// plugin tools) are preceded by a proof: a `Whoami`, whose proven
+    /// session travels with them.
     async fn call(
         &self,
         request: CallerRequest,
+    ) -> Result<DaemonTransportResult<DaemonResponse>, CallFailure> {
+        let proven = if request.proves_in_core() {
+            None
+        } else {
+            Some(self.prove().await?)
+        };
+        self.send(request, proven).await
+    }
+
+    /// The session the token proves, from a `Whoami` the owner answers.
+    async fn prove(&self) -> Result<SessionId, CallFailure> {
+        let response = self
+            .send(CallerRequest::Whoami, None)
+            .await?
+            .map_err(|_| CallFailure::Stopped)?;
+        response
+            .coordination
+            .and_then(|coordination| coordination.identity)
+            .and_then(|identity| identity.caller_session_id)
+            .map(SessionId)
+            .ok_or(CallFailure::Unauthenticated)
+    }
+
+    /// One message to the owner. The queue is never waited on: a full queue
+    /// is `Busy`, so a connection cannot park behind the owner.
+    async fn send(
+        &self,
+        request: CallerRequest,
+        proven: Option<SessionId>,
     ) -> Result<DaemonTransportResult<DaemonResponse>, CallFailure> {
         let (reply_tx, reply_rx) = control_reply_channel();
         self.control_tx
             .try_send(ControlMessage::CallerRequest {
                 token: self.token.clone(),
+                proven,
                 request: Box::new(request),
                 reply_tx,
                 enqueued_at: Instant::now(),
@@ -104,15 +138,23 @@ impl CallerChannel<'_> {
                 }
             }
         };
-        if response
-            .as_ref()
-            .ok()
-            .and_then(|response| response.error.as_ref())
-            .is_some_and(|error| error.code == CALLER_UNAUTHENTICATED)
-        {
+        if refused_token(&response) {
             return Err(CallFailure::Unauthenticated);
         }
         Ok(response)
+    }
+}
+
+/// True when the owner refused the bearer token: as a typed response, or as
+/// the client API error a Core submission returns when its proof fails.
+fn refused_token(response: &DaemonTransportResult<DaemonResponse>) -> bool {
+    match response {
+        Ok(response) => response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == CALLER_UNAUTHENTICATED),
+        Err(DaemonTransportError::Client(HubClientError::CallerUnauthenticated { .. })) => true,
+        Err(_) => false,
     }
 }
 

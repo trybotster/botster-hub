@@ -19,7 +19,7 @@ use crate::client_api_dto::plugin::{
 };
 use crate::client_api_dto::response::daemon_coordination;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
-use crate::daemon::control::{DaemonObservability, request_id};
+use crate::daemon::control::{Caller, DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::{HubClientRequest, HubClientResponseBody};
@@ -78,32 +78,65 @@ pub(crate) fn handle_runtime(
     );
     let packages = daemon.package_registry().clone();
     let caller = observability.caller.clone();
+    let hub_id = status.host_id.clone();
+    let caller_session = caller.session_id();
+    let token = match &caller {
+        Caller::Token(token) => Some(token.clone()),
+        Caller::Operator | Caller::Proven(_) => None,
+    };
     let Some(runtime) = daemon.runtime_mut() else {
         return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     };
 
     match request {
-        DaemonRequest::Whoami => ControlStep::ready(daemon_coordination(
-            DaemonResponseKind::Identity,
-            daemon_coordination_identity(match caller {
-                Some(session_id) => DaemonIdentity {
-                    client_id: format!("http-mcp:{}", session_id.0),
-                    role: "session".to_string(),
-                    identity_source: "caller_token".to_string(),
-                    caller_session_id: Some(session_id.0),
-                    host_id: status.host_id.clone(),
-                    host_display_name: status.host_display_name.clone(),
-                },
-                None => DaemonIdentity {
-                    client_id: "botster-hub-daemon-socket".to_string(),
-                    role: "local_operator".to_string(),
-                    identity_source: "local_operator".to_string(),
-                    caller_session_id: None,
-                    host_id: status.host_id.clone(),
-                    host_display_name: status.host_display_name.clone(),
-                },
-            }),
-        )),
+        DaemonRequest::Whoami => {
+            let identity = move |session_id: Option<SessionId>| {
+                let (host_id, host_display_name) = (hub_id.clone(), status.host_display_name.clone());
+                daemon_coordination(
+                    DaemonResponseKind::Identity,
+                    daemon_coordination_identity(match session_id {
+                        Some(session_id) => DaemonIdentity {
+                            client_id: format!("http-mcp:{}", session_id.0),
+                            role: "session".to_string(),
+                            identity_source: "caller_token".to_string(),
+                            caller_session_id: Some(session_id.0),
+                            host_id,
+                            host_display_name,
+                        },
+                        None => DaemonIdentity {
+                            client_id: "botster-hub-daemon-socket".to_string(),
+                            role: "local_operator".to_string(),
+                            identity_source: "local_operator".to_string(),
+                            caller_session_id: None,
+                            host_id,
+                            host_display_name,
+                        },
+                    }),
+                )
+            };
+            match token {
+                // A session proves its token in Core; the identity is the
+                // session that proof names.
+                Some(token) => {
+                    let step = api.handle_request_for_owner(
+                        runtime,
+                        &packages,
+                        HubClientRequest::VerifyCaller {
+                            request_id: request_id("daemon-mcp-whoami"),
+                            token,
+                        },
+                        state.current_waiter_id.expect("owner waiter is assigned"),
+                    );
+                    defer_client_step(step, move |body| {
+                        let HubClientResponseBody::CallerVerified(session_id) = body else {
+                            return Err(DaemonTransportError::UnexpectedResponse);
+                        };
+                        Ok(identity(Some(session_id)))
+                    })
+                }
+                None => ControlStep::ready(identity(caller_session)),
+            }
+        }
         DaemonRequest::PostMessage {
             target_session_id,
             envelope_id,
@@ -115,11 +148,10 @@ pub(crate) fn handle_runtime(
                     envelope_id
                         .unwrap_or_else(|| format!("hub-message-{}-{now}", target_session_id)),
                 ),
-                EndpointId(
-                    caller
-                        .map(|session_id| format!("session:{}", session_id.0))
-                        .unwrap_or_else(|| "operator".to_string()),
-                ),
+                EndpointId(match &caller_session {
+                    Some(session_id) => crate::routed_endpoint::session_endpoint(&hub_id, &session_id.0),
+                    None => crate::routed_endpoint::operator_endpoint(&hub_id),
+                }),
                 vec![EnvelopeTarget::Session {
                     session_id: SessionId(target_session_id),
                 }],
@@ -136,21 +168,22 @@ pub(crate) fn handle_runtime(
                 HubClientRequest::PublishRoutedEnvelope {
                     request_id: request_id("daemon-mcp-post-message"),
                     envelope,
+                    caller: token,
                 },
                 state.current_waiter_id.expect("owner waiter is assigned"),
             );
-            defer_client_step(step, |body| {
+            defer_client_step(step, move |body| {
                 let HubClientResponseBody::RoutedEnvelopePublish(publish) = body else {
                     return Err(DaemonTransportError::UnexpectedResponse);
                 };
                 Ok(daemon_coordination(
                     DaemonResponseKind::MessagePosted,
-                    daemon_coordination_publish(publish.deliveries),
+                    daemon_coordination_publish(publish.deliveries, &hub_id),
                 ))
             })
         }
         DaemonRequest::ReceiveMessages { after, limit } => {
-            let Some(caller_session_id) = caller else {
+            let Some(caller_session_id) = caller_session else {
                 return ControlStep::ready(caller_required("receive_messages"));
             };
             let step = api.handle_request_for_owner(
@@ -163,6 +196,7 @@ pub(crate) fn handle_runtime(
                     },
                     after: after.map(EnvelopeCursor),
                     limit: limit.clamp(1, 128),
+                    caller: token,
                 },
                 state.current_waiter_id.expect("owner waiter is assigned"),
             );
@@ -177,7 +211,7 @@ pub(crate) fn handle_runtime(
             })
         }
         DaemonRequest::AckMessage { envelope_id } => {
-            let Some(caller_session_id) = caller else {
+            let Some(caller_session_id) = caller_session else {
                 return ControlStep::ready(caller_required("ack_message"));
             };
             let step = api.handle_request_for_owner(
@@ -189,16 +223,17 @@ pub(crate) fn handle_runtime(
                         session_id: caller_session_id,
                     },
                     envelope_id: EnvelopeId(envelope_id),
+                    caller: token,
                 },
                 state.current_waiter_id.expect("owner waiter is assigned"),
             );
-            defer_client_step(step, |body| {
+            defer_client_step(step, move |body| {
                 let HubClientResponseBody::RoutedEnvelopeAck(ack) = body else {
                     return Err(DaemonTransportError::UnexpectedResponse);
                 };
                 Ok(daemon_coordination(
                     DaemonResponseKind::MessageAcked,
-                    daemon_coordination_ack(ack.state),
+                    daemon_coordination_ack(ack.state, &hub_id),
                 ))
             })
         }
@@ -213,6 +248,7 @@ pub(crate) fn handle_runtime(
                     data: data.into_bytes(),
                     readiness: ReadinessEvidence::default(),
                     now_seconds: now,
+                    caller: token,
                 },
                 state.current_waiter_id.expect("owner waiter is assigned"),
             );

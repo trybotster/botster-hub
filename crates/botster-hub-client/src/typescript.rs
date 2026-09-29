@@ -972,10 +972,21 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_interface(
         &mut output,
+        "DaemonEndpointRef",
+        &[
+            ("kind", "string"),
+            ("hub_id", "string | null"),
+            ("session_id", "string | null"),
+            ("plugin_key", "string | null"),
+            ("raw", "string | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
         "DaemonEnvelope",
         &[
             ("envelope_id", "string"),
-            ("source", "string"),
+            ("source", "DaemonEndpointRef"),
             ("content_type", "string"),
             ("body", "string"),
             ("created_at", "number"),

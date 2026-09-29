@@ -89,6 +89,7 @@ pub mod process_exit;
 pub mod profile;
 pub(crate) mod recovery;
 pub mod runtime;
+pub(crate) mod routed_endpoint;
 pub mod session_credential;
 mod session_projection;
 pub mod session_types;
@@ -123,7 +124,7 @@ pub use crate::transport::unix::connection::{
 pub use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
-    DaemonCapability, DaemonCompatibility, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
+    DaemonCapability, DaemonCompatibility, DaemonCoordination, DaemonEndpointRef, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
     DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
     DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
