@@ -290,16 +290,11 @@ async fn read_route_input(
                     continue;
                 }
                 let mut bytes = frame.body;
-                loop {
-                    match handle.try_push_ingress(bytes) {
-                        IngressStore::Full(returned) => {
-                            bytes = returned;
-                            handle.ingress_room().await;
-                        }
-                        IngressStore::Stored | IngressStore::Closed | IngressStore::Malformed => {
-                            break;
-                        }
-                    }
+                // A full ingress pauses this socket's reads until Core frees
+                // room or the route closes; other routes are unaffected.
+                while let IngressStore::Full(returned) = handle.try_push_ingress(bytes) {
+                    bytes = returned;
+                    handle.ingress_room().await;
                 }
             }
             // Requests and Hello belong on the control socket.
@@ -320,6 +315,15 @@ mod tests {
 
     use super::*;
     use crate::transport::unix::UnixConnectionMux;
+
+    /// Entries in a route directory other than its owner file.
+    fn route_sockets_in(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != OWNER_FILE)
+            .count()
+    }
 
     fn frame(route: &str, marker: &str) -> RoutedTerminalFrame {
         RoutedTerminalFrame::new(
@@ -526,7 +530,7 @@ mod tests {
         )
         .await
         .expect("an unconnected route closes");
-        assert_eq!(fs::read_dir(dir.path()).expect("read dir").count(), 0);
+        assert_eq!(route_sockets_in(dir.path()), 0);
     }
 
     /// The connect window opens when the Attach response is written, not when
