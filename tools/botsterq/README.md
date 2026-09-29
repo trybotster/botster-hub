@@ -67,7 +67,14 @@ botsterq slots 3         # change it (kept across server restarts)
   three waiters, but not promised by the platform. `botsterq slots N` refuses at once
   while that wait holds the lock. Cancelling a `run` that waits, at the lock or for the
   exclusive job, ends it at once with exit 130: its command never starts and it leaves
-  no admission process behind. A cancel that lands in the
+  no admission process behind. How a cancel reaches the admission: `run` holds a cancel
+  fifo (`~/.botsterq/run/<token>.admitcancel`) open for writing and sends a cancel as one
+  byte; it stores and signals no pid. The admission process (a small perl event loop)
+  waits in `select` for the lock, which its own child takes, or for a cancel, and then for
+  its admission child or a cancel; it signals only those two children, which it has not
+  reaped, so a reused pid cannot be hit. If `run` dies without a chance to clean up (a
+  SIGKILL), the fifo reports end of file, and the admission cancels itself and removes its
+  own fifo and output file. A cancel that lands in the
   instant an admission finishes can leave a queued job for a run that is gone; the job
   is skipped when its turn comes, because its `run` process no longer exists, and never
   starts its command. The admission files (`*.admit*`) of a cancelled run do not
