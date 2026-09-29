@@ -762,7 +762,7 @@ Plan Review `finding_1787278903_320205` found that sections 5F, 5G.3, 5G.6, 7, a
 
 The report must state plainly that the Hub workflow executes no client or package code, and that the cited revisions are the merged state that makes the boundary claim true rather than artifacts this campaign ran. That satisfies the ticket's requirement to use all five main revisions without pretending the campaign executed them.
 
-The JSON keeps the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json@2a61d032` for both blocks, under `executed_revisions` and `cited_prerequisite_revisions`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`.
+The JSON keeps the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json@2a61d032` for both blocks, under `executed_revisions` and `cited_prerequisite_revisions`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json@2a61d032`.
 
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
