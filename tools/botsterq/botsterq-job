@@ -261,7 +261,12 @@ def enforce_target_cap(events, token):
             log_event(events, "clean_skipped", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", "candidate directory cannot be kept"])
             return
     try:
-        cleaned = subprocess.run(["cargo", "clean", "--target-dir", target]).returncode
+        # The real cargo, not the mbx shim (mbx has its own `clean`).
+        clean_env = dict(os.environ)
+        shim = clean_env.get("BOTSTERQ_MBX_SHIM_DIR")
+        if shim:
+            clean_env["PATH"] = os.pathsep.join(part for part in clean_env.get("PATH", "").split(os.pathsep) if part != shim)
+        cleaned = subprocess.run(["cargo", "clean", "--target-dir", target], env=clean_env).returncode
     except OSError:
         cleaned = 127
     if kept:
