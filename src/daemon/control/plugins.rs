@@ -412,6 +412,8 @@ pub(crate) fn handle_runtime(
                 crate::McpCallRequest { name, arguments },
                 request_id,
                 None,
+                // The Hub socket is the local operator's.
+                crate::plugin_caller::PluginCaller::Operator,
             ) {
                 Ok(request) => request,
                 Err(error) => return ControlStep::ready(daemon_plugin_tool_error(error)),
