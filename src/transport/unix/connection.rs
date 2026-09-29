@@ -469,6 +469,7 @@ async fn deliver_completed_request(
     event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
     completed: CompletedRequest,
 ) -> DaemonTransportResult<Option<ConnectionTerminalReason>> {
+    let mut route_written = None;
     match completed.response {
         ControlReply::Typed {
             response,
@@ -476,7 +477,7 @@ async fn deliver_completed_request(
             delivery,
         } => {
             let mut response = (*response)?;
-            open_route_socket(&mut response, mux)?;
+            route_written = open_route_socket(&mut response, mux)?;
             cleanup.apply_subscription_change(
                 completed.projection.attached_subscription_change(&response),
             );
@@ -525,6 +526,11 @@ async fn deliver_completed_request(
         mux.close_all();
         return Err(error);
     }
+    // The response naming the route socket is on the control socket: the
+    // client's connect window opens now.
+    if let Some(written) = route_written {
+        let _ = written.send(());
+    }
     if let Err(error) = flush_unix_mux_writes(write_half, mux, mux_write, event_mailbox).await {
         cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
         mux.close_all();
@@ -539,31 +545,37 @@ async fn deliver_completed_request(
 
 /// Give a bound route its own socket: bind it, name it in the response, and
 /// serve it until the route ends. A route that already ended gets no socket.
+///
+/// Returns the signal that starts the client's connect window. Send it once
+/// the response is fully on the control socket; a dropped signal (the write
+/// failed) ends the route.
 fn open_route_socket(
     response: &mut DaemonResponse,
     mux: &UnixConnectionMux,
-) -> DaemonTransportResult<()> {
+) -> DaemonTransportResult<Option<oneshot::Sender<()>>> {
     if response.kind != DaemonResponseKind::TerminalAttached {
-        return Ok(());
+        return Ok(None);
     }
     let Some(attach) = response.terminal_attach.as_mut() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(route_dir) = mux.route_dir() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(handle) = mux.live_handle_for_route(&attach.subscription_id, attach.generation) else {
-        return Ok(());
+        return Ok(None);
     };
     let listener = route_dir.bind()?;
     attach.route_socket = Some(listener.path().to_string_lossy().into_owned());
+    let (written_tx, written_rx) = oneshot::channel();
     tokio::spawn(serve_route_socket(
         listener,
         handle,
         attach.subscription_id.clone(),
         attach.generation,
+        written_rx,
     ));
-    Ok(())
+    Ok(Some(written_tx))
 }
 
 fn too_many_requests_response(request_id: &str, request: &DaemonRequest) -> DaemonResponse {
