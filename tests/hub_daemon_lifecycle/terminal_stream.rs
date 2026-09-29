@@ -116,6 +116,9 @@ pub(crate) struct RawUnixClient {
     control: RawSocket,
     route_sockets: BTreeMap<String, RawSocket>,
     read_timeout: Cell<Option<Duration>>,
+    /// Connect the route socket each Attach names. Off, the route socket
+    /// is never connected.
+    connect_routes: bool,
     ids: RequestIdSequence,
     routes: BTreeMap<String, u64>,
     operation_ids: RouteOperationIds,
@@ -139,11 +142,41 @@ impl RawUnixClient {
             control: RawSocket::new(stream),
             route_sockets: BTreeMap::new(),
             read_timeout: Cell::new(None),
+            connect_routes: true,
             ids: RequestIdSequence::new(),
             routes: BTreeMap::new(),
             operation_ids: RouteOperationIds::default(),
             entity_frames: Vec::new(),
         }
+    }
+
+    /// Never connect the route sockets that Attach responses name.
+    pub(crate) fn without_route_sockets(mut self) -> Self {
+        self.connect_routes = false;
+        self
+    }
+
+    /// End the control connection and leave the route sockets open.
+    pub(crate) fn close_control(&mut self) {
+        let _ = self.control.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Whether `route`'s socket reaches end of stream within `timeout`,
+    /// discarding any frames that arrive first.
+    pub(crate) fn route_socket_reaches_eof(&mut self, route: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let socket = self
+            .route_sockets
+            .get_mut(route)
+            .unwrap_or_else(|| panic!("route {route} has no open route socket"));
+        while Instant::now() < deadline {
+            match socket.read_within(Some(Duration::from_millis(100))) {
+                Ok(_) => {}
+                Err(DaemonTransportError::ClientDisconnected) => return true,
+                Err(error) => panic!("route socket {route} failed: {error}"),
+            }
+        }
+        false
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
@@ -243,7 +276,9 @@ impl RawUnixClient {
         if let Some(attach) = &response.terminal_attach {
             self.routes
                 .insert(attach.subscription_id.clone(), attach.generation);
-            if let Some(path) = &attach.route_socket {
+            if self.connect_routes
+                && let Some(path) = &attach.route_socket
+            {
                 let stream = UnixStream::connect(path).expect("connect route socket");
                 self.route_sockets
                     .insert(attach.subscription_id.clone(), RawSocket::new(stream));

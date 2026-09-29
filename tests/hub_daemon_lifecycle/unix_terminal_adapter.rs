@@ -1439,6 +1439,88 @@ fn reader_pause_shorter_than_the_deadline_stays_attached() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+/// Route sockets, plan test 1: an idle route on the same client stays open
+/// while a sibling route floods and the client keeps reading, past the
+/// reader deadline. Each route has its own socket, so the flood cannot
+/// stall the idle route.
+#[test]
+fn idle_route_stays_open_while_a_sibling_route_floods() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("irf");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "irf-idle", "irf-idle-sub", "exec cat", &mut envelopes, &mut events);
+    spawn_and_bind(&mut client, "irf-flood", "irf-flood-sub", "yes idle-route-flood", &mut envelopes, &mut events);
+    let bound = Instant::now();
+
+    // timer: deadline — the client reads the flood past D plus slack; an idle route that shared the flood's fate would be stalled by then.
+    let window_end = bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5);
+    let flooded = drain_terminal_until(&mut client, window_end, &mut events);
+    assert!(flooded > 0, "the flood route must deliver output");
+    assert!(
+        no_terminal_subscription_closed(&events, "irf-idle", Some("irf-idle-sub"), None),
+        "the idle route must not close while a sibling floods: {events:?}"
+    );
+    assert!(route_is_occupied(&mut sibling, "irf-idle", "irf-idle-sub"), "the idle route must stay attached");
+    assert!(route_is_occupied(&mut sibling, "irf-flood", "irf-flood-sub"), "the flood route must stay attached");
+    drop(client);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), "irf-idle");
+    shutdown_short_lived_session(hub.endpoint(), "irf-flood");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// Route sockets, plan test 7: ending the control connection ends every
+/// route socket it owned.
+#[test]
+fn control_connection_death_ends_its_route_sockets() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("cds");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "cds-session", "cds-sub", "exec cat", &mut envelopes, &mut events);
+    client.close_control();
+    assert!(
+        client.route_socket_reaches_eof("cds-sub", Duration::from_secs(10)),
+        "the route socket must end when its control connection ends"
+    );
+    drop(client);
+    shutdown_short_lived_session(hub.endpoint(), "cds-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// Route sockets, plan test 4: a client that attaches and never connects
+/// the route socket loses the route after the handshake window; the session
+/// survives.
+#[test]
+fn route_whose_socket_is_never_connected_is_released() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("rnc");
+    let mut client =
+        RawUnixClient::connect_unix_terminal_adapter(hub.endpoint()).without_route_sockets();
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "rnc-session", "rnc-sub", "exec cat", &mut envelopes, &mut events);
+    // timer: deadline — the Hub's 2 s handshake window plus slack for the route release to reach the occupancy view.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while route_is_occupied(&mut sibling, "rnc-session", "rnc-sub") {
+        assert!(
+            Instant::now() < deadline,
+            "an unconnected route socket must release the route"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(session_is_listed(&mut sibling, "rnc-session"), "the session survives");
+    drop(client);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), "rnc-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 #[test]
 fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
