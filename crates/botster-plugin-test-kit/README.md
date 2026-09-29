@@ -88,8 +88,10 @@ the plugin read that clock.
 | `p:routed(session_id)` | Routed envelopes that Core holds for a session. Reading does not acknowledge them. |
 | `p:logs()` / `p:tools()` | Structured logs of the plugin, and the tool descriptors that the Hub lists. |
 
-Load a producer package before a consumer that subscribes to its events. The Hub
-refuses a subscription to an event that no loaded package has declared.
+A package may subscribe to an event of a package that is not loaded yet. The
+subscription waits and receives nothing until that package loads and declares
+the event, whatever the load order. A subscription to an event that the loaded
+producer does not declare is refused when the producer loads.
 
 ## What the kit refuses, and why
 
