@@ -51,7 +51,6 @@ pub(crate) fn handle(
         response_delivery_rx,
         grant_id,
         client_id,
-        enqueued_at,
     } = message
     else {
         unreachable!("request owner received a non-request control message");
@@ -64,11 +63,6 @@ pub(crate) fn handle(
                 "the daemon is finishing accepted requests before shutdown",
             )),
             response_delivery_rx,
-        );
-    }
-    if let Some(runtime) = daemon.runtime() {
-        runtime.event_plane_counters().record_ready_operation_wait(
-            u64::try_from(enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
     }
     // Late WebRTC Requests after PeerClosed must not create durable ownership or run

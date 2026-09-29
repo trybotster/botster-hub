@@ -1660,7 +1660,6 @@ fn local_webrtc_late_attach_after_peer_closed_does_not_recreate_state() {
             response_delivery_rx: None,
             grant_id: Some(grant_id.clone()),
             client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
-            enqueued_at: Instant::now(),
         },
     );
 
@@ -1733,7 +1732,6 @@ fn local_webrtc_late_spawn_after_peer_closed_does_not_create_session() {
             response_delivery_rx: None,
             grant_id: Some(grant_id.clone()),
             client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
-            enqueued_at: Instant::now(),
         },
     );
 

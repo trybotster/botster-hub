@@ -1305,7 +1305,6 @@ mod tests {
                     response_delivery_rx: None,
                     grant_id: None,
                     client_id: None,
-                    enqueued_at: Instant::now(),
                 },
             ));
         }

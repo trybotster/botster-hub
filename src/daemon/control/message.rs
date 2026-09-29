@@ -1,7 +1,6 @@
 //! Control vocabulary imported by Unix and WebRTC transports.
 
 use std::sync::mpsc;
-use std::time::Instant;
 
 use botster_hub_client::{DaemonHubUpdate, DaemonRequest, DaemonResponse};
 use tokio::net::UnixStream as TokioUnixStream;
@@ -10,7 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc as tokio_mpsc, oneshot};
 use crate::admission::connection_budget::ChannelClass;
 use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
 use crate::daemon::control::reply::{ControlReply, RetainedPluginResult};
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon::error::DaemonTransportResult;
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord};
 
@@ -73,21 +72,6 @@ pub(crate) fn control_reply_channel() -> (ControlReplySender, ControlReplyReceiv
     (ControlReplySender(Some(sender)), receiver)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EgressWriteClass {
-    Timeout,
-    Other,
-}
-
-pub(crate) fn egress_write_class(error: &DaemonTransportError) -> EgressWriteClass {
-    match error {
-        DaemonTransportError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
-            EgressWriteClass::Timeout
-        }
-        _ => EgressWriteClass::Other,
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     /// The data-plane thread recorded one or more coalesced progress facts.
@@ -134,14 +118,12 @@ pub(crate) enum ControlMessage {
         grant_id: Option<String>,
         /// Stable Core client identity for one transport connection.
         client_id: Option<String>,
-        enqueued_at: Instant,
     },
     HubUpdateCheckCompleted {
         update: DaemonHubUpdate,
     },
     EgressWriteFailed {
         delivery_kind: DaemonDeliveryKind,
-        write_class: EgressWriteClass,
     },
     /// A transport dropped retained plugin-result storage and released byte capacity.
     PluginResultCapacityReleased,

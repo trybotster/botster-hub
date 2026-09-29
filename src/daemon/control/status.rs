@@ -426,28 +426,10 @@ fn capture_seed(
         egress,
         lifecycle: state.lifecycle_counters.clone(),
         installation_home,
-        counters: daemon
-            .runtime()
-            .expect("the admitted daemon is running")
-            .event_plane_counters()
-            .clone(),
         retention: None,
         occupancy: Vec::new(),
         terminal_records: Vec::new(),
         quarantines: Vec::new(),
-        reservation_faults: {
-            let executor = daemon
-                .runtime()
-                .expect("the admitted daemon is running")
-                .host_executor();
-            crate::status_response::ReservationFaults {
-                staging_funding: executor.outstanding_holder_faults(
-                    crate::host_executor::ReservationHolder::StagingFunding,
-                ),
-                entity_work: executor
-                    .outstanding_holder_faults(crate::host_executor::ReservationHolder::EntityWork),
-            }
-        },
     });
     input
 }
@@ -894,7 +876,6 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: Instant::now(),
             },
         ));
         reply_rx
@@ -1610,7 +1591,6 @@ mod tests {
                     response_delivery_rx: None,
                     grant_id: None,
                     client_id: None,
-                    enqueued_at: Instant::now(),
                 },
             ));
             let entry = state.pending_requests.values().next().unwrap();
@@ -1756,7 +1736,6 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: Instant::now(),
             }
         ));
         // The parked update check is answered when shutdown starts, before
@@ -1986,7 +1965,6 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: None,
-                enqueued_at: Instant::now(),
             }
         ));
         assert_update_reply_is_daemon_shutdown(&mut update_rx);
