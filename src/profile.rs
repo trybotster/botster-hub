@@ -196,6 +196,14 @@ fn default_capability_grants() -> Vec<Capability> {
             scope: Some("session_type_managed_git_spawn".to_string()),
         },
         Capability {
+            surface: CapabilitySurface::SessionActions,
+            scope: Some("session_read".to_string()),
+        },
+        Capability {
+            surface: CapabilitySurface::SessionActions,
+            scope: Some("session_read:any".to_string()),
+        },
+        Capability {
             surface: CapabilitySurface::Mcp,
             scope: None,
         },
