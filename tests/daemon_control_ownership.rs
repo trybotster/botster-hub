@@ -522,6 +522,7 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
         &["SubscribeEntities", "UnsubscribeEntities"],
     ),
     ("src/daemon/control/request.rs", &["Request"]),
+    ("src/daemon/control/caller.rs", &["CallerRequest"]),
     ("src/daemon/control/host.rs", &["HubUpdateCheckCompleted"]),
     ("src/daemon/control/webrtc.rs", &["LocalWebrtcPeerClosed"]),
 ];

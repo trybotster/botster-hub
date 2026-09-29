@@ -10,6 +10,7 @@ use botster_hub_client::{
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_hub_update;
+use crate::daemon::control::Caller;
 use crate::daemon::control::attach_bind_operator_error;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
@@ -43,6 +44,69 @@ pub(crate) fn handle(
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
     message: ControlMessage,
+) -> bool {
+    handle_as(
+        daemon,
+        state,
+        transport_handle,
+        control_tx,
+        message,
+        Caller::Operator,
+    )
+}
+
+/// A request from an HTTP MCP session, ready to enter the ordinary request
+/// path as the caller its token proved (`caller.rs` decides who that is).
+pub(crate) struct CallerAdmission {
+    pub(crate) request: DaemonRequest,
+    pub(crate) reply_tx: ControlReplySender,
+    pub(crate) enqueued_at: Instant,
+    pub(crate) caller: Caller,
+}
+
+pub(crate) fn admit_caller_request(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_handle: &tokio::runtime::Handle,
+    control_tx: ControlSender,
+    admission: CallerAdmission,
+) -> bool {
+    let CallerAdmission {
+        request,
+        reply_tx,
+        enqueued_at,
+        caller,
+    } = admission;
+    let admitted = ControlMessage::Request {
+        request: Box::new(request),
+        transport_request_id: None,
+        reply_tx,
+        response_delivery_rx: None,
+        grant_id: None,
+        client_id: caller
+            .session_id()
+            .map(|session| format!("http-mcp:{}", session.0)),
+        enqueued_at: enqueued_at.min(Instant::now()),
+    };
+    handle_as(
+        daemon,
+        state,
+        transport_handle,
+        control_tx,
+        admitted,
+        caller,
+    )
+}
+
+/// Admit one request that runs as `caller`: the operator for every socket and
+/// WebRTC client, a session for an HTTP MCP request.
+pub(crate) fn handle_as(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_handle: &tokio::runtime::Handle,
+    control_tx: ControlSender,
+    message: ControlMessage,
+    caller: Caller,
 ) -> bool {
     let ControlMessage::Request {
         request,
@@ -136,12 +200,14 @@ pub(crate) fn handle(
             client_id: None,
             grant_id: None,
             transport_request_id,
+            caller,
         }
     } else {
         DaemonObservability {
             client_id: client_id.clone(),
             grant_id: grant_id.clone(),
             transport_request_id,
+            caller,
         }
     };
     let must_finish = request_must_finish(&request);

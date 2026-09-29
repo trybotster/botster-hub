@@ -111,6 +111,26 @@ The current primitive inventory is `button`, `empty_state`, `form`, `metric`,
 `toolbar`. The current core contract fixture does not include `list` or an
 `action_bar` alias; downstream renderers should not hand-author those shapes.
 
+## Coordination requests and the session caller
+
+`whoami`, `post_message`, `receive_messages`, and `ack_message` name no caller.
+A socket or WebRTC client is the operator: its posts are labelled `operator`,
+`whoami` reports `local_operator`, and `receive_messages` and `ack_message` are
+refused with `caller_required`, because the operator has no inbox.
+
+A session reaches the same requests over HTTP MCP with its bearer token
+(`BOTSTER_MCP_TOKEN`, sent as `Authorization: Bearer <token>` to
+`BOTSTER_MCP_URL`). The daemon derives the caller from the token; a client can
+never assert one. The token proves the session in the same Core submission that
+carries out the request. See the README section "Agent-facing MCP over HTTP".
+
+A received envelope's `source` is structured, never endpoint text:
+`{ kind, hub_id, session_id, plugin_key, raw }`, where `kind` is `session`,
+`operator`, `plugin`, or `other`. A session is always named with its hub.
+Delivery `target` labels for sessions also carry the hub:
+`hub:<hub_id>/session:<id>`. Clients read the fields and never parse endpoint
+strings.
+
 ## Compatibility Handshake
 
 Clients should check hub compatibility before depending on request-specific
