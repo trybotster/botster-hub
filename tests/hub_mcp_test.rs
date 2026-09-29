@@ -322,6 +322,8 @@ fn mcp_http_request(data_dir: &Path, token: &str, request: &Value) -> Vec<u8> {
         .expect("the recorded MCP port is a number");
     let body = serde_json::to_string(request).expect("serialize MCP request");
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to MCP");
+    // timer: deadline — hang guard for a daemon that never answers or closes;
+    // expiry ends the read, so the status assertion below fails the test.
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("set MCP read deadline");
@@ -682,6 +684,92 @@ fn mcp_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
         String::from_utf8_lossy(&daemon_output.stdout).contains("event=stopped"),
         "daemon should shut down cleanly"
     );
+}
+
+/// A package whose one MCP tool returns the caller it was given.
+fn write_caller_probe_package(name: &str) -> PathBuf {
+    let root = std::env::current_dir()
+        .expect("current dir")
+        .join(unique_test_dir(name));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create caller probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "caller_probe.who",
+      description = "Report the caller an MCP tool call carries.",
+      handler = "who",
+      call = function(arguments, request)
+        return { kind = request.caller.kind, session_id = request.caller.session_id, hub_id = request.caller.hub_id }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write caller probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        json!({
+            "name": "caller-probe",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write caller probe manifest");
+    root
+}
+
+#[test]
+fn a_plugin_tool_called_over_http_sees_the_session_and_its_hub_as_its_caller() {
+    let _guard = mcp_daemon_test_guard();
+    let data_dir = unique_test_dir("plugin-caller");
+    let _ = fs::remove_dir_all(&data_dir);
+    let daemon = start_cli_daemon(&data_dir);
+    let package = write_caller_probe_package("plugin-caller-package");
+    let enabled = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("packages")
+        .arg("enable")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("--path")
+        .arg(&package)
+        .output()
+        .expect("run botster-hub packages enable --path");
+    assert!(
+        enabled.status.success(),
+        "enable caller probe failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+
+    let output = run_mcp_serve_with_session(
+        &data_dir,
+        Some("probe-session"),
+        &[
+            initialize_request(1),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "whoami", "arguments": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": { "name": "caller_probe.who", "arguments": {} } }),
+        ],
+    );
+    let messages = parse_mcp_output(output, "plugin caller");
+    shutdown_cli_daemon(&data_dir, daemon);
+
+    let hub_id = &messages[1]["result"]["structuredContent"]["identity"]["host_id"];
+    let caller = &messages[2]["result"]["structuredContent"];
+    assert_eq!(messages[2]["result"]["isError"], false, "{}", messages[2]);
+    assert_eq!(caller["kind"], "session");
+    assert_eq!(caller["session_id"], "probe-session");
+    assert_eq!(&caller["hub_id"], hub_id, "the caller names its hub");
 }
 
 #[test]
