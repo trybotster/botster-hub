@@ -88,6 +88,82 @@ pub(crate) fn egress_write_class(error: &DaemonTransportError) -> EgressWriteCla
     }
 }
 
+/// What a session may ask over HTTP MCP. The type is the allow-list: no
+/// other `DaemonRequest` can arrive with a session's authority. It names no
+/// caller; the owner derives the caller from the message's verified token.
+#[derive(Debug)]
+pub(crate) enum CallerRequest {
+    Status,
+    ListSessions,
+    Whoami,
+    PostMessage {
+        target_session_id: String,
+        envelope_id: Option<String>,
+        body: String,
+    },
+    ReceiveMessages {
+        after: Option<u64>,
+        limit: usize,
+    },
+    AckMessage {
+        envelope_id: String,
+    },
+    NotifySession {
+        session_id: String,
+        data: String,
+    },
+    PluginMcpListTools,
+    PluginMcpCallTool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+impl CallerRequest {
+    /// True when the operation proves the bearer token itself, inside the
+    /// Core submission that carries it out. The others (status, the session
+    /// list, plugin tools) do not touch Core, so the HTTP task proves the
+    /// token first with a `Whoami` and sends the proven session with them.
+    pub(crate) fn proves_in_core(&self) -> bool {
+        matches!(
+            self,
+            Self::Whoami
+                | Self::PostMessage { .. }
+                | Self::ReceiveMessages { .. }
+                | Self::AckMessage { .. }
+                | Self::NotifySession { .. }
+        )
+    }
+
+    pub(crate) fn into_daemon_request(self) -> DaemonRequest {
+        match self {
+            Self::Status => DaemonRequest::Status,
+            Self::ListSessions => DaemonRequest::ListSessions,
+            Self::Whoami => DaemonRequest::Whoami,
+            Self::PostMessage {
+                target_session_id,
+                envelope_id,
+                body,
+            } => DaemonRequest::PostMessage {
+                target_session_id,
+                envelope_id,
+                body,
+            },
+            Self::ReceiveMessages { after, limit } => {
+                DaemonRequest::ReceiveMessages { after, limit }
+            }
+            Self::AckMessage { envelope_id } => DaemonRequest::AckMessage { envelope_id },
+            Self::NotifySession { session_id, data } => {
+                DaemonRequest::NotifySession { session_id, data }
+            }
+            Self::PluginMcpListTools => DaemonRequest::PluginMcpListTools,
+            Self::PluginMcpCallTool { name, arguments } => {
+                DaemonRequest::PluginMcpCallTool { name, arguments }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
     /// The data-plane thread recorded one or more coalesced progress facts.
@@ -134,6 +210,17 @@ pub(crate) enum ControlMessage {
         grant_id: Option<String>,
         /// Stable Core client identity for one transport connection.
         client_id: Option<String>,
+        enqueued_at: Instant,
+    },
+    /// A request from a session over HTTP MCP, with the bearer token it
+    /// presented. `proven` is set only for requests that do not prove the
+    /// token in Core themselves (see `CallerRequest::proves_in_core`), and
+    /// only by the HTTP task after a `Whoami` proved it.
+    CallerRequest {
+        token: crate::session_credential::CallerToken,
+        proven: Option<botster_core::SessionId>,
+        request: Box<CallerRequest>,
+        reply_tx: ControlReplySender,
         enqueued_at: Instant,
     },
     HubUpdateCheckCompleted {

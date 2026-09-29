@@ -1,5 +1,6 @@
 //! Control-plane dispatchers.
 
+pub(crate) mod caller;
 pub(crate) mod connection;
 pub(crate) mod coordination;
 pub(crate) mod entities;
@@ -22,7 +23,9 @@ pub(crate) mod sessions;
 pub(crate) mod status;
 pub(crate) mod webrtc;
 
-use botster_core::RequestId;
+use botster_core::{RequestId, SessionId};
+
+use crate::session_credential::CallerToken;
 use botster_hub_client::{
     DaemonDiagnostic, DaemonOperatorError, DaemonQuarantineTarget, DaemonRequest, DaemonResponse,
     DaemonResponseKind,
@@ -42,6 +45,32 @@ pub(crate) struct DaemonObservability {
     pub(crate) client_id: Option<String>,
     pub(crate) grant_id: Option<String>,
     pub(crate) transport_request_id: Option<String>,
+    /// Who asks. Only the owner sets it.
+    pub(crate) caller: Caller,
+}
+
+/// The authority a request runs with.
+#[derive(Clone)]
+pub(crate) enum Caller {
+    /// A socket or WebRTC client: the operator. It has no inbox.
+    Operator,
+    /// A session's bearer token, not yet proven. The operation proves it in
+    /// the same Core submission that carries it out, so the proof and the
+    /// effect see one Core state.
+    Token(CallerToken),
+    /// A session that an earlier step proved (see `CallerRequest::proves_in_core`).
+    Proven(SessionId),
+}
+
+impl Caller {
+    /// The session this caller names or is, if any.
+    pub(crate) fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::Operator => None,
+            Self::Token(token) => Some(SessionId(token.session_id().to_string())),
+            Self::Proven(session_id) => Some(session_id.clone()),
+        }
+    }
 }
 
 pub(crate) fn request_id(value: &str) -> RequestId {
@@ -68,6 +97,26 @@ pub(crate) fn attach_bind_operator_error(code: &'static str, message: &str) -> D
         operation: "attach".to_string(),
         message: message.to_string(),
         diagnostics: vec![DaemonDiagnostic::action_failure("attach", message)],
+    });
+    if let Some(error) = &response.error {
+        response.diagnostics = error.diagnostics.clone();
+    }
+    response
+}
+
+/// A refusal that names its operation, for requests that are not attaches.
+pub(crate) fn operator_refusal(
+    code: &'static str,
+    operation: &'static str,
+    message: &str,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: format!("daemon-{operation}"),
+        operation: operation.to_string(),
+        message: message.to_string(),
+        diagnostics: vec![DaemonDiagnostic::action_failure(operation, message)],
     });
     if let Some(error) = &response.error {
         response.diagnostics = error.diagnostics.clone();
@@ -110,6 +159,9 @@ pub(crate) fn dispatch_control_message(
         }
         message @ ControlMessage::Request { .. } => {
             request::handle(daemon, state, transport_handle, control_tx, message)
+        }
+        message @ ControlMessage::CallerRequest { .. } => {
+            caller::handle(daemon, state, transport_handle, control_tx, message)
         }
         ControlMessage::HubUpdateCheckCompleted { update } => {
             host::hub_update_check_completed(state, update)

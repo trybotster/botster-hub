@@ -919,6 +919,16 @@ pub(crate) fn daemon_operator_error_from_client(
             operation: operation_label(operation).to_string(),
             message,
         },
+        crate::HubClientError::CallerUnauthenticated {
+            request_id,
+            operation,
+        } => DaemonOperatorError {
+            code: "caller_unauthenticated".to_string(),
+            request_id: request_id.0,
+            operation: operation_label(operation).to_string(),
+            message: "the bearer token does not identify a running session".to_string(),
+            diagnostics: Vec::new(),
+        },
     }
 }
 
@@ -1150,6 +1160,7 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::PublishRoutedEnvelope => "publish_routed_envelope",
         crate::HubClientOperation::DrainRoutedEnvelopes => "drain_routed_envelopes",
         crate::HubClientOperation::AcknowledgeRoutedEnvelope => "acknowledge_routed_envelope",
+        crate::HubClientOperation::VerifyCaller => "verify_caller",
         crate::HubClientOperation::ReadScreen => "read_screen",
         crate::HubClientOperation::ReadModeFlags => "read_mode_flags",
         crate::HubClientOperation::CaptureSnapshot => "capture_snapshot",
