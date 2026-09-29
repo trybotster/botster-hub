@@ -354,8 +354,15 @@ mod unix_route_smokes {
         });
         let stale_input =
             encode_input_with_operation_id(&raw_input(b"h-s4-stale-generation\r"), 1);
+        // A detached route's socket is gone, so its stale generation cannot
+        // be sent at all. A retired generation sent on a live route's socket
+        // is discarded for that key only.
+        assert!(
+            !client.has_route_socket(subscription_a),
+            "a detached route keeps no socket"
+        );
         client
-            .send_terminal_bytes_at_generation(subscription_a, generation_a, &stale_input)
+            .send_terminal_bytes_at_generation(subscription_b, generation_a, &stale_input)
             .expect("send H-S4 stale-generation input");
         set_marker(&mut client, subscription_b, "echo:h-s4-after-detach");
         let operation_id = client
