@@ -29,7 +29,14 @@
 //!
 //! Accepted residual risks (user decision 2026-09-28): a free-text field
 //! inside a dialog echoes like a composer, and a vim-style normal mode treats
-//! `z` and `x` as commands.
+//! `z` and `x` as commands. Two more, named here because they are not covered
+//! by a guard: a human who types between the probe and its erase leaves `zx`
+//! inside the draft (the stray-probe cleanup only sees a trailing `zx`; the
+//! window is at most [`ECHO_DEADLINE`] plus the erase round trip, and the
+//! human's input aborts the attempt at once); and a probe that wraps at the
+//! last column moves to another row, so it does not count as an echo: the
+//! machine then types nothing more, and a later attempt erases the stray `zx`
+//! it finds before the cursor.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -295,13 +302,28 @@ fn erase_bytes(kitty_enabled: bool) -> Vec<u8> {
     }
 }
 
+/// The ring text as a terminal may safely receive it. The text comes from a
+/// plugin, so no byte of it may act as terminal input: a CR would submit, an
+/// ESC could open a sequence or end the paste early (`ESC [ 201 ~`). Line
+/// breaks and tabs become spaces; every other control character (C0, DEL, C1)
+/// is dropped, so the paste-end sequence loses its ESC and stays plain text.
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|letter| match letter {
+            '\n' | '\r' | '\t' => Some(' '),
+            letter if letter.is_control() => None,
+            letter => Some(letter),
+        })
+        .collect()
+}
+
 /// The ring: bracketed paste when the session has it on, then a CR, in one write.
 fn delivery_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.len() + 14);
     if bracketed_paste {
         bytes.extend_from_slice(b"\x1b[200~");
     }
-    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(safe_text(text).as_bytes());
     if bracketed_paste {
         bytes.extend_from_slice(b"\x1b[201~");
     }
