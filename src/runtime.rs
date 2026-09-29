@@ -200,11 +200,19 @@ pub struct HubRuntime {
 /// What an entity provider admission on the Host worker needs.
 pub(crate) struct ProviderAdmission {
     pub(crate) lifecycle: HubPluginLifecycle,
+    signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     #[cfg(test)]
     pub(crate) forced: Arc<Mutex<Option<(Option<String>, ForcedAdmission)>>>,
 }
 
 impl ProviderAdmission {
+    /// The plugin-engine epoch. Read it before an attempt: Core arms its retry
+    /// wake on a refusal, so a release after this read moves the epoch.
+    pub(crate) fn engine_seen(&self) -> crate::daemon::owner_signal::Seen {
+        self.signal
+            .seen(crate::daemon::owner_signal::SignalKey::PluginEngine)
+    }
+
     pub(crate) fn try_admit(
         self,
         class: PluginInvocationClass,
@@ -4136,6 +4144,7 @@ impl HubRuntime {
     pub(crate) fn plugin_provider_admission(&self) -> ProviderAdmission {
         ProviderAdmission {
             lifecycle: self.plugin_lifecycle().clone(),
+            signal: Arc::clone(&self.owner_signal),
             #[cfg(test)]
             forced: Arc::clone(&self.forced_admission),
         }
