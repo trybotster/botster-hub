@@ -193,6 +193,7 @@ mod modules;
 mod registration_tests;
 pub(crate) mod result;
 mod session_type_spawn;
+mod sessions;
 use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
@@ -697,6 +698,7 @@ struct LuaHostApi {
     causal_scopes: Arc<CausalScopeTable>,
     memory: Arc<LuaMemoryAccount>,
     logs: Arc<crate::plugin_logs::PluginLogBook>,
+    sessions: Arc<crate::session_view::SessionView>,
 }
 
 /// Validate the event name before the body without copying its Rust bytes.
@@ -857,6 +859,7 @@ fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> 
 pub struct LuaPluginHostApi {
     pub(crate) memory: Arc<LuaMemoryAccount>,
     pub(crate) logs: Arc<crate::plugin_logs::PluginLogBook>,
+    pub(crate) sessions: Arc<crate::session_view::SessionView>,
     pub capabilities: SharedHubCapabilityRuntime,
     pub coordination: HubCoordinationBridge,
     pub entity_publish: HubEntityPublishBridge,
@@ -1205,6 +1208,7 @@ mod state_owner_tests {
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
             logs: api.logs,
+            sessions: api.sessions,
         };
         let entrypoint = directory.0.join("plugin.lua");
         std::fs::write(
@@ -1590,6 +1594,7 @@ impl LuaPluginRuntime {
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
             logs: api.logs,
+            sessions: api.sessions,
         };
         // Lua reports errors against this name. An `@` name is a file name,
         // so errors read `plugin.lua:3: ...`, relative to the package root.
@@ -2211,6 +2216,8 @@ fn install_botster_api(
         ),
     )?;
 
+    let sessions_state = host_api.spawn_targets.clone();
+    let sessions_packages = Arc::clone(&host_api.package_registry);
     let capabilities_table = lua.create_table()?;
     let timer_capabilities = host_api.capabilities.clone();
     let timer_plugin_key = plugin_key.clone();
@@ -2263,6 +2270,16 @@ fn install_botster_api(
     capabilities_table.set(
         "worktrees",
         worktrees_table(lua, host_api.worktrees, host_api.spawn_targets)?,
+    )?;
+    capabilities_table.set(
+        "sessions",
+        sessions::table(
+            lua,
+            plugin_key.0.clone(),
+            host_api.sessions,
+            sessions_packages,
+            sessions_state,
+        )?,
     )?;
     capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;

@@ -1270,6 +1270,7 @@ fn run_baseline_slice(
             }
             // The durable record set is read now, so a record committed during
             // the baseline is derived into the rows as they are ingested.
+            state.projection.attach_view(runtime.session_view());
             state.projection.sync_restart_ids(
                 runtime
                     .state_publication()

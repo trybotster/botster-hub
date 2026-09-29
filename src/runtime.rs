@@ -133,6 +133,8 @@ pub struct HubRuntime {
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
     /// Per-plugin structured log records (`botster.log`, `ReadPluginLogs`).
     plugin_logs: Arc<crate::plugin_logs::PluginLogBook>,
+    /// The session rows plugin threads read; the owner writes them.
+    session_view: Arc<crate::session_view::SessionView>,
     #[cfg(test)]
     lua_plugin_runtimes:
         std::sync::Arc<Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>>,
@@ -763,6 +765,7 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             startup_materialization_paths,
+            session_view: Arc::new(crate::session_view::SessionView::default()),
             plugin_logs: Arc::new(crate::plugin_logs::PluginLogBook::new(Arc::clone(
                 &lua_memory,
             ))),
@@ -965,6 +968,7 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             startup_materialization_paths,
+            session_view: Arc::new(crate::session_view::SessionView::default()),
             plugin_logs: Arc::new(crate::plugin_logs::PluginLogBook::new(Arc::clone(
                 &lua_memory,
             ))),
@@ -1142,6 +1146,10 @@ impl HubRuntime {
 
     /// Return Host primitives that retain this Hub's shared Lua memory account.
     #[must_use]
+    pub(crate) fn session_view(&self) -> &Arc<crate::session_view::SessionView> {
+        &self.session_view
+    }
+
     pub(crate) fn plugin_logs(&self) -> &Arc<crate::plugin_logs::PluginLogBook> {
         &self.plugin_logs
     }
@@ -1150,6 +1158,7 @@ impl HubRuntime {
         LuaPluginHostApi {
             memory: Arc::clone(&self.lua_memory),
             logs: Arc::clone(&self.plugin_logs),
+            sessions: Arc::clone(&self.session_view),
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
