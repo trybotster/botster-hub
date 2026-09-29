@@ -1869,7 +1869,8 @@ The Hub guarantees that every route socket reaches end of stream after its
 route ends, on every path: `Detach`, a Core close (including a stalled reader
 and a session end), the control connection's death, and daemon shutdown. A
 frame that was mid-write at the close is finished for at most 2 seconds,
-then the socket closes anyway. **Client rule:** on
+then the socket closes anyway; a client that had not read that frame sees end
+of stream inside it and discards the partial frame. **Client rule:** on
 `TerminalSubscriptionClosed`, keep reading that route socket to end of stream
 before treating the route as finished. The event and the socket are
 independent streams, so frames after the event are valid and the event may
