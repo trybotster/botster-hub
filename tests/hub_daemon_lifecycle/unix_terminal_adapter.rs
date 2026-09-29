@@ -1472,6 +1472,20 @@ fn idle_route_stays_open_while_a_sibling_route_floods() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+/// The running Hub's control socket file is private to its owner.
+#[test]
+fn control_socket_file_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("csm");
+    let mode = std::fs::metadata(&hub.endpoint().socket_path)
+        .expect("control socket metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "control socket mode was {mode:o}");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
 /// Route sockets, plan test 7: ending the control connection ends every
 /// route socket it owned.
 #[test]
