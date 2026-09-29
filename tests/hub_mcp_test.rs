@@ -164,6 +164,38 @@ fn signal_daemon_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Resul
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
+    // End the caller sessions this test spawned first: a session outlives
+    // its daemon, so a daemon shutdown alone would leave their workers.
+    let spawned: Vec<String> = {
+        let mut tokens = CALLER_TOKENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("caller token map");
+        let keys: Vec<_> = tokens
+            .keys()
+            .filter(|(directory, _)| directory == data_dir)
+            .cloned()
+            .collect();
+        for key in &keys {
+            tokens.remove(key);
+        }
+        keys.into_iter().map(|(_, session_id)| session_id).collect()
+    };
+    for session_id in spawned {
+        let ended = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("sessions")
+            .arg("shutdown")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg(&session_id)
+            .output()
+            .expect("run botster-hub sessions shutdown");
+        assert!(
+            ended.status.success(),
+            "shutdown {session_id} failed: {}",
+            String::from_utf8_lossy(&ended.stderr)
+        );
+    }
     let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
