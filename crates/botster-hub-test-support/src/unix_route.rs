@@ -431,6 +431,12 @@ impl UnixRouteClient {
             .write_frame(route, generation, 0, body)
     }
 
+    /// Whether this client still holds an open socket for `route`.
+    #[must_use]
+    pub fn has_route_socket(&self, route: &str) -> bool {
+        self.streams.contains_key(route)
+    }
+
     fn route_stream(&mut self, route: &str) -> &mut DaemonRouteStream {
         self.streams
             .get_mut(route)
