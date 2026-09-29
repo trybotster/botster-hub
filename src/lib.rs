@@ -88,6 +88,7 @@ pub(crate) mod plugin_response;
 pub mod process_exit;
 pub mod profile;
 pub(crate) mod recovery;
+pub(crate) mod routed_endpoint;
 pub mod runtime;
 pub mod session_credential;
 mod session_projection;
@@ -123,8 +124,8 @@ pub use crate::transport::unix::connection::{
 pub use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use botster_hub_client::{
     DaemonApp, DaemonAppLaunchTarget, DaemonAttachOccupancy, DaemonAvailablePackage,
-    DaemonCapability, DaemonCompatibility, DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck,
-    DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
+    DaemonCapability, DaemonCompatibility, DaemonCoordination, DaemonEndpointRef, DaemonEnvelope,
+    DaemonEnvelopeAck, DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonEvent, DaemonHubUpdate,
     DaemonHubUpdateExecution, DaemonHubUpdateExecutionState, DaemonHubUpdateScope,
     DaemonHubUpdateState, DaemonIdentity, DaemonInstallationDiagnostic, DaemonInstallationIdentity,
     DaemonInstallationMode, DaemonModeFlags, DaemonNotify, DaemonOperatorError, DaemonPackage,
@@ -193,10 +194,8 @@ pub use lua_runtime::{
 pub use maintenance::{
     SourceUpdateRefusal, installation_identity, software_identity, source_update_refusal,
 };
-pub use mcp::{
-    McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
-    McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,
-};
+pub use mcp::{McpCallRequest, McpToolDescriptor, McpToolError, McpToolResult};
+pub use transport::http_mcp::audit::log_path as tool_audit_log_path;
 pub use package_event_router::{EventPlaneStatus, PackageEventRouter};
 pub use packages::{
     AvailablePackage, AvailablePackageState, HubEmittedEvent, HubPackageEvents, HubPackageManifest,
