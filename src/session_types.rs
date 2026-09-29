@@ -517,6 +517,7 @@ struct MaterializationConfigView<'a> {
     initial_rows: u16,
     initial_cols: u16,
     local_socket: Option<&'a Path>,
+    mcp_url: Option<&'a str>,
 }
 
 impl<'a> From<&'a HubConfig> for MaterializationConfigView<'a> {
@@ -531,6 +532,7 @@ impl<'a> From<&'a HubConfig> for MaterializationConfigView<'a> {
                 .local_socket
                 .as_ref()
                 .map(|socket| socket.path.as_path()),
+            mcp_url: config.mcp_url.as_deref(),
         }
     }
 }
@@ -545,6 +547,8 @@ pub(crate) struct StartupMaterializationPaths {
     /// Inherited Botster names, captured once. A charged spawn copies them
     /// only after its charge admits the copy.
     inherited_names: std::sync::Arc<[String]>,
+    /// The daemon's MCP endpoint, captured once with the paths above.
+    mcp_url: Option<std::sync::Arc<str>>,
 }
 
 impl StartupMaterializationPaths {
@@ -575,6 +579,7 @@ impl StartupMaterializationPaths {
             hub_socket,
             hub_bin,
             inherited_names: inherited_botster_names().into(),
+            mcp_url: config.mcp_url.as_deref().map(std::sync::Arc::from),
         }
     }
 }
@@ -593,6 +598,9 @@ struct ChargedMaterializationConfig {
     hub_bin_text: Option<String>,
     /// Shared with the startup capture; cloning the Arc allocates nothing.
     inherited_names: std::sync::Arc<[String]>,
+    /// Shared with the startup capture as well: an `Arc::clone` allocates
+    /// nothing, and its bytes are counted with the credential.
+    mcp_url: Option<std::sync::Arc<str>>,
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
@@ -649,6 +657,7 @@ impl ChargedMaterializationConfig {
             hub_socket_text,
             hub_bin_text,
             inherited_names: std::sync::Arc::clone(&startup_paths.inherited_names),
+            mcp_url: startup_paths.mcp_url.clone(),
             _storage: storage,
         })
     }
@@ -660,6 +669,7 @@ impl ChargedMaterializationConfig {
             initial_rows: self.initial_rows,
             initial_cols: self.initial_cols,
             local_socket: self.local_socket.as_deref(),
+            mcp_url: self.mcp_url.as_deref(),
         }
     }
 
@@ -2028,6 +2038,7 @@ fn materialize_ordinary_charged(
         initial_rows: config.initial_rows,
         initial_cols: config.initial_cols,
         inherited_names: &config.inherited_names,
+        mcp_url: config.mcp_url.as_deref(),
         entropy: crate::session_credential::os_entropy,
     })
     .map_err(ChargedMaterializationFailure::Capacity);
@@ -2212,6 +2223,7 @@ fn materialize_session_type_from_resolved(
     crate::session_credential::issue(
         &mut spawn_request,
         &mut metadata,
+        config.mcp_url,
         crate::session_credential::os_entropy,
     )
     .map_err(credential_unavailable)?;
@@ -2351,6 +2363,7 @@ pub(crate) fn materialize_managed_session_type(
     crate::session_credential::issue(
         &mut spawn_request,
         &mut metadata,
+        config.mcp_url.as_deref(),
         crate::session_credential::os_entropy,
     )
     .map_err(credential_unavailable)?;
@@ -3670,6 +3683,8 @@ struct FinalMaterializationInputs<'a> {
     initial_cols: u16,
     /// Inherited names to unset. Production passes the daemon's snapshot.
     inherited_names: &'a [String],
+    /// The daemon's MCP endpoint, issued with the token.
+    mcp_url: Option<&'a str>,
     /// Source of the caller credential's secret. Production passes the OS.
     entropy: crate::session_credential::Entropy,
 }
@@ -3691,6 +3706,7 @@ fn charged_final_materialization(
         initial_rows,
         initial_cols,
         inherited_names,
+        mcp_url,
         entropy,
     } = inputs;
     let mut cwd_count = CountFormattedBytes(0);
@@ -3726,7 +3742,7 @@ fn charged_final_materialization(
         .checked_mul(std::mem::size_of::<SpawnEnvironmentVariable>())
         .ok_or("output environment vector overflow")?;
     let credential_bytes =
-        charged_credential_bytes(&prefix.session_id.0, metadata.value.entries.len())
+        charged_credential_bytes(&prefix.session_id.0, metadata.value.entries.len(), mcp_url)
             .ok_or("output credential size overflow")?;
     let context_key_bytes = context
         .value
@@ -3805,9 +3821,11 @@ fn charged_final_materialization(
     let mut request_id = String::with_capacity(request_id_bytes);
     request_id.push_str("session-type-");
     request_id.push_str(&context_id);
-    // One more slot than the environment: the caller credential's token,
+    // More slots than the environment: the credential's token and URL,
     // counted in charged_credential_bytes.
-    let mut variables = Vec::with_capacity(environment.len() + 1);
+    let mut variables = Vec::with_capacity(
+        environment.len() + crate::session_credential::credential_variable_slots(mcp_url),
+    );
     variables.extend(
         environment
             .into_iter()
@@ -3831,7 +3849,7 @@ fn charged_final_materialization(
         }),
     };
     // Admitted by the grow above; issued before any reservation exists.
-    crate::session_credential::issue(&mut spawn_request, &mut metadata, entropy)
+    crate::session_credential::issue(&mut spawn_request, &mut metadata, mcp_url, entropy)
         .map_err(|_| "credential entropy unavailable")?;
     let output_copies = parent
         .split_fixed(copy_bytes)
@@ -4442,15 +4460,22 @@ fn charged_unset_bytes(names: &[String]) -> Option<usize> {
 }
 
 /// Retained bytes the caller credential adds to a charged spawn: its strings,
-/// the token's environment slot, and the metadata map's growth by one entry.
-fn charged_credential_bytes(session_id: &str, metadata_entries: usize) -> Option<usize> {
+/// the environment slots for the token (and the URL), and the metadata map's
+/// growth by one entry.
+fn charged_credential_bytes(
+    session_id: &str,
+    metadata_entries: usize,
+    mcp_url: Option<&str>,
+) -> Option<usize> {
     let grown = crate::lua_memory::layout::btree_nodes_checked::<String, String>(
         metadata_entries.checked_add(1)?,
     )?;
     let current =
         crate::lua_memory::layout::btree_nodes_checked::<String, String>(metadata_entries)?;
-    crate::session_credential::credential_string_bytes(session_id)?
-        .checked_add(std::mem::size_of::<SpawnEnvironmentVariable>())?
+    let slots = crate::session_credential::credential_variable_slots(mcp_url)
+        .checked_mul(std::mem::size_of::<SpawnEnvironmentVariable>())?;
+    crate::session_credential::credential_string_bytes(session_id, mcp_url)?
+        .checked_add(slots)?
         .checked_add(grown.checked_sub(current)?)
 }
 
@@ -5449,6 +5474,7 @@ mod source_selection_tests {
             "charged-explicit",
             per_callback_bytes,
             inherited_names,
+            None,
             entropy,
         );
         (memory, ordinary, charged)
@@ -5460,6 +5486,7 @@ mod source_selection_tests {
         session_id: &str,
         per_callback_bytes: usize,
         inherited_names: &[String],
+        mcp_url: Option<&str>,
         entropy: crate::session_credential::Entropy,
     ) -> (
         std::sync::Arc<LuaMemoryAccount>,
@@ -5554,6 +5581,7 @@ mod source_selection_tests {
             initial_rows: config.session_defaults.initial_rows,
             initial_cols: config.session_defaults.initial_cols,
             inherited_names,
+            mcp_url,
             entropy,
         });
         (memory, ordinary, charged, usage_before_grow)
@@ -5587,9 +5615,8 @@ mod source_selection_tests {
     fn take_credential(materialized: &mut MaterializedSessionType) {
         let variables = &mut materialized.spawn_request.environment.variables;
         let before = variables.len();
-        variables.retain(|variable| {
-            variable.name != crate::session_credential::SESSION_TOKEN_ENVIRONMENT
-        });
+        variables
+            .retain(|variable| variable.name != crate::session_credential::MCP_TOKEN_ENVIRONMENT);
         assert!(before - variables.len() == 1, "exactly one token variable");
         assert!(
             materialized
@@ -5614,7 +5641,7 @@ mod source_selection_tests {
             .environment
             .variables
             .iter()
-            .find(|variable| variable.name == crate::session_credential::SESSION_TOKEN_ENVIRONMENT)
+            .find(|variable| variable.name == crate::session_credential::MCP_TOKEN_ENVIRONMENT)
             .expect("a token variable");
         let metadata = &charged.materialized.metadata.entries;
         let (key, digest) = metadata
@@ -5633,7 +5660,7 @@ mod source_selection_tests {
             + std::mem::size_of::<SpawnEnvironmentVariable>()
             + node_growth;
         assert_eq!(
-            charged_credential_bytes(&spawn.session_id.0, entries_before),
+            charged_credential_bytes(&spawn.session_id.0, entries_before, None),
             Some(retained)
         );
         // The token's slot was reserved with the environment, not grown into.
@@ -5692,6 +5719,7 @@ mod source_selection_tests {
                 id,
                 64 * 1024,
                 &[],
+                None,
                 crate::session_credential::test_entropy::fixed,
             );
             let usage = memory.usage().1;
@@ -5701,6 +5729,50 @@ mod source_selection_tests {
         assert_eq!(
             grow_for(long) - grow_for(short),
             COPIES_OF_THE_ID_IN_THE_GROW * extra
+        );
+    }
+
+    /// The endpoint URL is charged with the credential. The expected charge
+    /// is measured from the output, not taken from `charged_credential_bytes`:
+    /// the URL's name and value at their retained capacities, and one more
+    /// environment slot.
+    #[test]
+    fn charged_endpoint_url_is_charged_at_its_retained_size() {
+        let url = "http://127.0.0.1:47001/mcp";
+        let usage_with = |mcp_url: Option<&str>| {
+            let (memory, _, charged, _) = charged_final_fixture_for(
+                "charged-explicit",
+                64 * 1024,
+                &[],
+                mcp_url,
+                crate::session_credential::test_entropy::fixed,
+            );
+            let charged = charged.unwrap();
+            let usage = memory.usage().1;
+            let variable = charged
+                .materialized
+                .spawn_request
+                .environment
+                .variables
+                .iter()
+                .find(|variable| variable.name == crate::session_credential::MCP_URL_ENVIRONMENT)
+                .map(|variable| (variable.name.capacity(), variable.value.capacity()));
+            drop(charged);
+            assert_eq!(memory.usage().1, 0);
+            (usage, variable)
+        };
+        let (without, absent) = usage_with(None);
+        let (with, present) = usage_with(Some(url));
+        assert!(absent.is_none());
+        let (name_capacity, value_capacity) = present.expect("the URL is issued");
+        assert_eq!(
+            name_capacity,
+            crate::session_credential::MCP_URL_ENVIRONMENT.len()
+        );
+        assert_eq!(value_capacity, url.len());
+        assert_eq!(
+            with - without,
+            name_capacity + value_capacity + std::mem::size_of::<SpawnEnvironmentVariable>()
         );
     }
 
