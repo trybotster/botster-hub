@@ -170,8 +170,14 @@ def log_event(events, kind, token, info):
             os.write(fd, line.encode())
         finally:
             os.close(fd)
-    except Exception:
-        pass
+    except Exception as error:
+        # A missing record makes `botsterq audit` blind to this job, so say so
+        # (once per line; never fail the job).
+        try:
+            print(f"botsterq: cannot write the events log ({error}); audit will not see this {kind}",
+                  file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 def install_test_faults():
@@ -221,10 +227,17 @@ def hold_for_test(name):
 
 
 def main():
-    pidfile, marker, joblock, owner, grace, run_limit = sys.argv[1:7]
-    if sys.argv[7] != "--":
-        sys.exit("botsterq-job: usage error")
-    command = sys.argv[8:]
+    if len(sys.argv) > 6 and sys.argv[6] == "--":
+        # The shape of a `botsterq run` from before the deadline existed: no
+        # run limit (an install must not break a run that is already waiting).
+        pidfile, marker, joblock, owner, grace = sys.argv[1:6]
+        run_limit = "0"
+        command = sys.argv[7:]
+    else:
+        pidfile, marker, joblock, owner, grace, run_limit = sys.argv[1:7]
+        if len(sys.argv) < 8 or sys.argv[7] != "--":
+            sys.exit("botsterq-job: usage error")
+        command = sys.argv[8:]
     grace = float(grace)
     run_limit = float(run_limit)
     pgid = os.getpgrp()
