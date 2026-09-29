@@ -711,6 +711,34 @@ lines=$(grep -c "above the 0.001 GB cap" "$work/capover.err")
   && pass "over the target cap: cargo clean runs before the command, one message, an events line; other worktrees untouched" \
   || fail "cap over" "out=$(cat "$work/capover.out") lines=$lines B=$([ -e "$work/capB/target/debug/big" ] && echo kept || echo GONE) events=$(cat "$BOTSTERQ_HOME/events.log" 2>/dev/null | tr '\t' ' ')"
 
+# 19c. A running job in the same directory protects the target. A long job is
+#      running in a directory whose target is over the cap: a second job that
+#      starts there must not clean it (the first job is using those artifacts);
+#      it prints why and logs clean_skipped. Once the first job has ended, the
+#      next job cleans.
+make_project "$work/capD"
+"$Q" slots 2 >/dev/null
+rm -f "$BOTSTERQ_HOME/events.log"
+( cd "$work/capD" && "$Q" run --label CapLong -- sh -c 'touch "$0/capd.long.up"; test -e target/debug/big && sleep 3; test -e target/debug/big && echo kept > "$0/capd.long.after"' "$work" >/dev/null 2>&1 ) &
+CAPLONG=$!
+await_file "$work/capd.long.up"
+( cd "$work/capD" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapSecond -- sh -c 'test -e target/debug/big && echo kept' >"$work/capsecond.out" 2>"$work/capsecond.err" )
+wait "$CAPLONG"
+[ "$(cat "$work/capsecond.out")" = kept ] && [ "$(cat "$work/capd.long.after" 2>/dev/null)" = kept ] \
+  && grep -q "cargo clean skipped: job(s) .* are running in this directory" "$work/capsecond.err" \
+  && grep -q "^clean_skipped	" "$BOTSTERQ_HOME/events.log" \
+  && pass "a running job in the same directory protects the target: the second job skips the clean, says why, and logs clean_skipped" \
+  || fail "cap skipped for a running job" "second=$(cat "$work/capsecond.out") first_after=$(cat "$work/capd.long.after" 2>/dev/null) err=$(cat "$work/capsecond.err") events=$(tr '\t' ' ' <"$BOTSTERQ_HOME/events.log")"
+( cd "$work/capD" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapThird -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capthird.out" 2>&1 )
+[ "$(tail -1 "$work/capthird.out")" = cleaned ] && pass "after that job ended, the next job over the cap cleans" || fail "cap after the long job" "$(cat "$work/capthird.out")"
+
+# 19d. When the running-job list cannot be read the clean is skipped too, with
+#      the reason, rather than guessing that nobody else is running.
+make_project "$work/capE"
+( cd "$work/capE" && BOTSTERQ_TEST_FAIL_JOB_LIST=1 BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapNoList -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capnolist.out" 2>"$work/capnolist.err" )
+[ "$(cat "$work/capnolist.out")" = kept ] && grep -q "cargo clean skipped: the running-job list cannot be read" "$work/capnolist.err" \
+  && pass "an unreadable running-job list skips the clean and says so" || fail "cap without the job list" "out=$(cat "$work/capnolist.out") err=$(cat "$work/capnolist.err")"
+
 # 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.
 leaked() { ps -axo pid=,command= | grep -F -- "botsterq-job $BOTSTERQ_HOME/" | grep -v grep; }
