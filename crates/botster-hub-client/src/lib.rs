@@ -4,7 +4,7 @@
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
 //!
-//! # Host-control protocol 12
+//! # Host-control protocol 13
 //!
 //! Every frame on the Unix socket is one length-prefixed container:
 //!
@@ -36,7 +36,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use botster_ui_contract::{
@@ -55,7 +55,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
@@ -686,6 +686,73 @@ pub fn write_unix_terminal_frame(
     stream.write_all(body).map_err(normalize_socket_io_error)
 }
 
+/// One attached route's own socket: terminal frames in both directions.
+///
+/// The control connection carries no terminal frames. A client that stops
+/// reading a route stalls only that route.
+#[derive(Debug)]
+pub struct DaemonRouteStream {
+    stream: UnixStream,
+    frames: DaemonUnixFrameReader,
+}
+
+impl DaemonRouteStream {
+    /// Connect to the socket an `Attach` response named. The Hub accepts one
+    /// connection, so connect once, promptly.
+    pub fn connect(attach: &DaemonTerminalAttach) -> DaemonTransportResult<Self> {
+        let path = attach
+            .route_socket
+            .as_deref()
+            .ok_or(DaemonTransportError::Protocol(
+                "attach response has no route socket",
+            ))?;
+        let stream = UnixStream::connect(path).map_err(normalize_socket_io_error)?;
+        Ok(Self::from_stream(stream))
+    }
+
+    #[must_use]
+    pub fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            frames: DaemonUnixFrameReader::new(),
+        }
+    }
+
+    /// A second handle to the same socket, for a writer thread.
+    pub fn try_clone_stream(&self) -> DaemonTransportResult<UnixStream> {
+        self.stream.try_clone().map_err(normalize_socket_io_error)
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(normalize_socket_io_error)
+    }
+
+    /// Read the next terminal frame. A timeout keeps any partial frame for
+    /// the next read; end of stream is the route's end.
+    pub fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
+        match self.frames.read_frame(&mut self.stream)? {
+            DaemonUnixMuxFrame::Terminal(frame) => Ok(frame),
+            DaemonUnixMuxFrame::Server(_) => Err(DaemonTransportError::Protocol(
+                "control frame on a route socket",
+            )),
+        }
+    }
+
+    /// Write one opaque terminal input frame for this route. `stream_epoch`
+    /// is reserved for the input direction and must be 0.
+    pub fn write_frame(
+        &mut self,
+        route: &str,
+        generation: u64,
+        stream_epoch: u32,
+        body: &[u8],
+    ) -> DaemonTransportResult<()> {
+        write_unix_terminal_frame(&mut self.stream, route, generation, stream_epoch, body)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonEndpoint {
     pub socket_path: PathBuf,
@@ -763,7 +830,6 @@ pub struct DaemonConnection {
     ids: RequestIdSequence,
     outstanding: Vec<u64>,
     parked_responses: Vec<(u64, DaemonResponse)>,
-    skipped_terminal: Vec<DaemonUnixTerminalFrame>,
     skipped_events: Vec<DaemonEvent>,
     skipped_entity_frames: Vec<DaemonEntityFrame>,
     required_features: Vec<String>,
@@ -830,7 +896,6 @@ impl DaemonConnection {
             ids: RequestIdSequence::new(),
             outstanding: Vec::new(),
             parked_responses: Vec::new(),
-            skipped_terminal: Vec::new(),
             skipped_events: Vec::new(),
             skipped_entity_frames: Vec::new(),
             required_features,
@@ -927,7 +992,11 @@ impl DaemonConnection {
                         "unexpected hello ack after the handshake",
                     ));
                 }
-                DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
+                DaemonUnixMuxFrame::Terminal(_) => {
+                    return Err(DaemonTransportError::Protocol(
+                        "terminal frame on the control socket",
+                    ));
+                }
             }
         }
     }
@@ -940,6 +1009,12 @@ impl DaemonConnection {
 
     fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
         let frame = self.frames.read_frame(&mut self.reader)?;
+        if matches!(frame, DaemonUnixMuxFrame::Terminal(_)) {
+            // Terminal frames travel on each route's own socket.
+            return Err(DaemonTransportError::Protocol(
+                "terminal frame on the control socket",
+            ));
+        }
         if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
             && let Some(id) = parse_request_id(request_id)
         {
@@ -977,11 +1052,6 @@ impl DaemonConnection {
             return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Entity {
                 entity: self.skipped_entity_frames.remove(0),
             }));
-        }
-        if !self.skipped_terminal.is_empty() {
-            return Ok(DaemonUnixMuxFrame::Terminal(
-                self.skipped_terminal.remove(0),
-            ));
         }
         let frame = self.read_next_frame()?;
         if let DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) = &frame {
@@ -1023,27 +1093,6 @@ impl DaemonConnection {
             }
             Err(error) => Err(error),
         }
-    }
-
-    /// Write one opaque terminal input frame for one route on this muxed connection.
-    ///
-    /// This is not a control request. Hub does not send a paired response;
-    /// results arrive on the terminal stream. `stream_epoch` is reserved for
-    /// the input direction and must be 0; Hub validates only the route and the
-    /// fixed generation.
-    pub fn send_terminal_frame(
-        &mut self,
-        route: &str,
-        generation: u64,
-        stream_epoch: u32,
-        body: &[u8],
-    ) -> DaemonTransportResult<()> {
-        write_unix_terminal_frame(&mut self.stream, route, generation, stream_epoch, body)
-    }
-
-    /// Opaque terminal frames skipped while waiting for a host response.
-    pub fn take_skipped_terminal(&mut self) -> Vec<DaemonUnixTerminalFrame> {
-        std::mem::take(&mut self.skipped_terminal)
     }
 
     /// Host events skipped while waiting for a host response.
@@ -1131,7 +1180,11 @@ impl DaemonConnection {
                         "unexpected hello ack after the handshake",
                     ));
                 }
-                DaemonUnixMuxFrame::Terminal(frame) => self.skipped_terminal.push(frame),
+                DaemonUnixMuxFrame::Terminal(_) => {
+                    return Err(DaemonTransportError::Protocol(
+                        "terminal frame on the control socket",
+                    ));
+                }
             }
         }
     }
@@ -1150,111 +1203,6 @@ impl DaemonConnection {
             self.parked_responses.push((id, response));
         }
         Ok(())
-    }
-
-    /// Receive the next unsolicited terminal frame without sending a control request.
-    ///
-    /// Returns frames already skipped while waiting for a response first. Does
-    /// not write to the socket.
-    pub fn next_terminal(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
-        if !self.skipped_terminal.is_empty() {
-            return Ok(self.skipped_terminal.remove(0));
-        }
-        loop {
-            match self.read_next_frame()? {
-                DaemonUnixMuxFrame::Terminal(frame) => return Ok(frame),
-                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
-                    self.skipped_events.push(event);
-                }
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
-                    self.skipped_entity_frames.push(frame);
-                }
-                DaemonUnixMuxFrame::Server(ServerFrame::Response {
-                    request_id,
-                    response,
-                }) => self.park_response(&request_id, response)?,
-                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
-                    self.closed = Some(reason.clone());
-                    return Err(DaemonTransportError::ClosedByHub(reason));
-                }
-                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
-                    return Err(DaemonTransportError::Protocol(
-                        "unexpected hello ack after the handshake",
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Receive the next unsolicited terminal frame, or `None` when `timeout` elapses.
-    ///
-    /// Does not write a control request. Restores the previous socket read timeout.
-    /// `timeout` is an absolute deadline: skipped host events do not restart it.
-    /// A timeout keeps any partial frame for the next read.
-    pub fn poll_terminal(
-        &mut self,
-        timeout: Duration,
-    ) -> DaemonTransportResult<Option<DaemonUnixTerminalFrame>> {
-        if !self.skipped_terminal.is_empty() {
-            return Ok(Some(self.skipped_terminal.remove(0)));
-        }
-        let deadline = Instant::now() + timeout;
-        let previous = self
-            .stream
-            .read_timeout()
-            .map_err(normalize_socket_io_error)?;
-        let result = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break Ok(None);
-            }
-            if let Err(error) = self.set_read_timeout(Some(remaining)) {
-                break Err(error);
-            }
-            match self.read_next_frame() {
-                Ok(DaemonUnixMuxFrame::Terminal(frame)) => break Ok(Some(frame)),
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event { event })) => {
-                    self.skipped_events.push(event);
-                }
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame })) => {
-                    self.skipped_entity_frames.push(frame);
-                }
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response {
-                    request_id,
-                    response,
-                })) => {
-                    if let Err(error) = self.park_response(&request_id, response) {
-                        break Err(error);
-                    }
-                }
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Close { reason })) => {
-                    self.closed = Some(reason.clone());
-                    break Err(DaemonTransportError::ClosedByHub(reason));
-                }
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. })) => {
-                    break Err(DaemonTransportError::Protocol(
-                        "unexpected hello ack after the handshake",
-                    ));
-                }
-                Err(DaemonTransportError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(error) => break Err(error),
-            }
-        };
-        let restore = self.set_read_timeout(previous);
-        match result {
-            Ok(value) => {
-                restore?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = restore;
-                Err(error)
-            }
-        }
     }
 }
 
@@ -2664,6 +2612,11 @@ pub struct DaemonTerminalAttach {
     pub subscription_id: String,
     /// Core-minted route generation at attach.
     pub generation: u64,
+    /// Path of this route's own socket for terminal frames in both
+    /// directions. The client connects once; the Hub unlinks the path at
+    /// accept. `None` when the route ended before the response was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_socket: Option<String>,
 }
 
 impl DaemonTerminalAttach {
@@ -2677,7 +2630,15 @@ impl DaemonTerminalAttach {
             session_id: session_id.into(),
             subscription_id: subscription_id.into(),
             generation,
+            route_socket: None,
         }
+    }
+
+    /// The same attach, with the route socket path filled in.
+    #[must_use]
+    pub fn with_route_socket(mut self, route_socket: impl Into<String>) -> Self {
+        self.route_socket = Some(route_socket.into());
+        self
     }
 }
 
@@ -4750,7 +4711,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_response_parks_out_of_order_responses_and_skips_other_frames() {
+    fn wait_response_parks_out_of_order_responses_and_skips_events() {
         let (mut server, client) = UnixStream::pair().expect("pair unix streams");
         let mut connection = test_connection(client);
         let first = connection
@@ -4765,7 +4726,6 @@ mod tests {
             let mut frames = DaemonUnixFrameReader::new();
             let first_id = expect_request(&mut frames, &mut server, &DaemonRequest::Status);
             let second_id = expect_request(&mut frames, &mut server, &DaemonRequest::ListSessions);
-            write_unix_terminal_frame(&mut server, "route", 5, 0, b"opaque").expect("terminal");
             write_server_frame(
                 &mut server,
                 &ServerFrame::Event {
@@ -4807,7 +4767,6 @@ mod tests {
         assert_eq!(connection.outstanding_request_ids(), &[] as &[u64]);
         let response = connection.wait_response(second).expect("parked second");
         assert_eq!(response.kind, DaemonResponseKind::Sessions);
-        assert_eq!(connection.take_skipped_terminal().len(), 1);
         assert_eq!(connection.take_skipped_events().len(), 1);
         assert!(matches!(
             connection.wait_response(999),
@@ -5238,70 +5197,47 @@ mod tests {
     }
 
     #[test]
-    fn poll_terminal_keeps_a_split_frame_and_returns_none_on_timeout() {
+    fn route_stream_keeps_a_split_frame_across_a_read_timeout() {
         let (mut server, client) = UnixStream::pair().expect("pair");
-        let mut connection = test_connection(client);
+        let mut route = DaemonRouteStream::from_stream(client);
+        route
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .expect("bound the read");
         let frame = encode_unix_terminal_frame("sub", 1, 0, b"a").expect("encode");
         server.write_all(&frame[..9]).expect("write prefix");
-        assert!(
-            connection
-                .poll_terminal(Duration::from_millis(30))
-                .expect("prefix poll")
-                .is_none()
-        );
+        assert!(matches!(
+            route.read_frame(),
+            Err(DaemonTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
         server.write_all(&frame[9..]).expect("write suffix");
-        let decoded = connection
-            .poll_terminal(Duration::from_secs(1))
-            .expect("suffix poll")
-            .expect("terminal frame");
+        route
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound the read");
+        let decoded = route.read_frame().expect("terminal frame");
         assert_eq!(decoded.route, "sub");
         assert_eq!(decoded.body, b"a");
+        drop(server);
+        assert!(matches!(
+            route.read_frame(),
+            Err(DaemonTransportError::ClientDisconnected)
+        ));
     }
 
+    /// A terminal frame on the control socket is a protocol violation: routes
+    /// have their own sockets.
     #[test]
-    fn poll_terminal_deadline_covers_continuous_nonterminal_events() {
+    fn a_terminal_frame_on_the_control_socket_is_a_protocol_error() {
         let (mut server, client) = UnixStream::pair().expect("pair");
         let mut connection = test_connection(client);
-        let event = DaemonEvent::PackageEvent {
-            subscription_id: "sub".to_string(),
-            owner: "owner".to_string(),
-            name: "ready".to_string(),
-            payload: serde_json::json!({ "ok": true }),
-        };
-        let server_handle = thread::spawn(move || {
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_millis(600) {
-                if write_server_frame(
-                    &mut server,
-                    &ServerFrame::Event {
-                        event: event.clone(),
-                    },
-                )
-                .is_err()
-                {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            thread::sleep(Duration::from_millis(250));
-        });
-        let started = Instant::now();
-        let polled = connection
-            .poll_terminal(Duration::from_millis(80))
-            .expect("poll events-only stream");
-        assert!(polled.is_none(), "events must not count as terminal");
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "absolute deadline must not restart on events, elapsed={:?}",
-            started.elapsed()
-        );
-        assert!(
-            !server_handle.is_finished(),
-            "poll must return while the event writer is still alive"
-        );
-        assert!(!connection.take_skipped_events().is_empty());
-        drop(connection);
-        let _ = server_handle.join();
+        write_unix_terminal_frame(&mut server, "route", 5, 0, b"opaque").expect("terminal");
+        assert!(matches!(
+            connection.next_frame(),
+            Err(DaemonTransportError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -5610,7 +5546,7 @@ mod tests {
 
     #[test]
     fn protocol_twelve_rejects_protocol_eleven_and_pins_the_conformance_floor() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let protocol_eleven = DaemonCompatibilityRequirement {
@@ -5619,8 +5555,8 @@ mod tests {
             ..DaemonCompatibilityRequirement::current()
         };
         let error = ensure_compatible(&protocol_eleven, &DaemonCompatibility::current())
-            .expect_err("protocol-11 client must fail closed against protocol 12");
-        assert!(error.diagnostic.contains("unsupported protocol version 12"));
+            .expect_err("protocol-11 client must fail closed against protocol 13");
+        assert!(error.diagnostic.contains("unsupported protocol version 13"));
 
         let hub_at_fifty_two = DaemonCompatibility {
             conformance_fixture_revision: 52,
@@ -5690,7 +5626,7 @@ mod tests {
                 "| { frame: \"response\"; request_id: string; response: DaemonResponse }"
             )
         );
-        assert!(generated.contains("export const PROTOCOL_VERSION = 12;"));
+        assert!(generated.contains("export const PROTOCOL_VERSION = 13;"));
         assert!(generated.contains("export const MAX_OUTSTANDING_REQUESTS = 32;"));
     }
 
@@ -6295,7 +6231,7 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
     }
@@ -8670,7 +8606,7 @@ mod tests {
 
     #[test]
     fn protocol_twelve_and_conformance_fifty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let requirement = DaemonCompatibilityRequirement::current();
@@ -8724,7 +8660,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 12);
+        assert_eq!(stale.compatibility.protocol_version, 13);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -8734,7 +8670,7 @@ mod tests {
         // `ensure_compatible` compares protocol version with exact equality and
         // conformance revision with a floor. Protocol 11 is a cold cut, so the
         // default floor equals the current revision.
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(

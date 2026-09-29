@@ -1383,6 +1383,8 @@ fn serve_daemon_inner(
     let socket_path = socket_path(&config)?;
     let socket_owner = acquire_socket_owner_lock(&socket_path)?;
     prepare_socket_path(&socket_path, &socket_owner)?;
+    let route_dir =
+        Arc::new(crate::transport::unix::route_socket::RouteSocketDir::create(&socket_path)?);
     let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
     listener
         .set_nonblocking(true)
@@ -1421,6 +1423,7 @@ fn serve_daemon_inner(
                 .runtime()
                 .map(|runtime| runtime.close_work_source())
                 .unwrap_or_default(),
+            route_dir: Some(route_dir),
             ..PendingRuntimeState::default()
         },
         plugin_result_budget: crate::daemon::control::reply::RetainedPluginResultBudget::new(),
@@ -1760,6 +1763,8 @@ pub(crate) struct PendingRuntimeState {
     pub(crate) admission: AdmissionState,
     pub(crate) close_work: Arc<AtomicBool>,
     pub(crate) close_source: crate::data_plane::CloseWorkSource,
+    /// Where Unix route sockets are bound; set once at daemon start.
+    pub(crate) route_dir: Option<Arc<crate::transport::unix::route_socket::RouteSocketDir>>,
 }
 
 impl fmt::Debug for PendingRuntimeState {

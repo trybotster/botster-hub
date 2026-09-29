@@ -18,9 +18,9 @@ use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnect
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnosticKind, DaemonEndpoint,
     DaemonEntityFrame, DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse,
-    DaemonResponseKind, DaemonTerminalAttach, DaemonTransportError, DaemonUnixTerminalFrame,
-    FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS, connect_for_package_event_subscriptions,
-    ensure_compatible,
+    DaemonResponseKind, DaemonRouteStream, DaemonTerminalAttach, DaemonTransportError,
+    DaemonUnixTerminalFrame, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+    connect_for_package_event_subscriptions, ensure_compatible,
 };
 use botster_terminal_protocol::{AttachStateCode, TerminalFrame, decode_attach_state};
 use botster_terminal_protocol_client::{TerminalInputCommand, encode_terminal_input};
@@ -363,9 +363,11 @@ pub fn run_session_lifecycle_subscription_conformance(
         .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
     let route = terminal_attach_body(&attach)
         .map_err(|message| session_lifecycle_error("lifecycle attach", message))?;
+    let mut route_stream = DaemonRouteStream::connect(&route)
+        .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
     let mut operation_ids = InputOperationIds::default();
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -409,8 +411,8 @@ pub fn run_session_lifecycle_subscription_conformance(
             "subscriber resize sequences diverged",
         ));
     }
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -773,6 +775,13 @@ fn run_many_pty_client_attach_scenario(
             message,
         )
     })?;
+    let mut route_stream = DaemonRouteStream::connect(&route).map_err(|error| {
+        many_pty_error(
+            ManyPtyConformanceStage::Attach,
+            MANY_PTY_NOISY_SESSION_ID,
+            error.to_string(),
+        )
+    })?;
     if !attach.events.is_empty() {
         return Err(many_pty_error(
             ManyPtyConformanceStage::Attach,
@@ -846,8 +855,8 @@ fn run_many_pty_client_attach_scenario(
     }
 
     let mut operation_ids = InputOperationIds::default();
-    connection
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -1483,6 +1492,11 @@ pub fn run_client_conformance(
             operation: "attach",
             field: "terminal_attach",
         })?;
+    let mut route_stream =
+        DaemonRouteStream::connect(&route).map_err(|source| ConformanceError::Client {
+            operation: "route_socket",
+            source,
+        })?;
     if !attach.events.is_empty() {
         return Err(ConformanceError::MissingOutput {
             needle: "empty attach bodies",
@@ -1494,9 +1508,9 @@ pub fn run_client_conformance(
     let mut terminal_attached = false;
     let attached_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < attached_deadline {
-        terminal_attached |= take_attached_terminal_frame(&mut terminal)?;
+        terminal_attached |= take_attached_terminal_frame(&mut route_stream)?;
         append_read_screen(&mut terminal, &mut drain_output)?;
-        terminal_attached |= take_attached_terminal_frame(&mut terminal)?;
+        terminal_attached |= take_attached_terminal_frame(&mut route_stream)?;
         if terminal_attached && drain_output.contains(CONFORMANCE_READY) {
             break;
         }
@@ -1509,8 +1523,8 @@ pub fn run_client_conformance(
         });
     }
 
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -1520,8 +1534,8 @@ pub fn run_client_conformance(
             operation: "terminal_resize_frame",
             source,
         })?;
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -1539,8 +1553,8 @@ pub fn run_client_conformance(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -1559,8 +1573,8 @@ pub fn run_client_conformance(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    terminal
-        .send_terminal_frame(
+    route_stream
+        .write_frame(
             &route.subscription_id,
             route.generation,
             0,
@@ -4106,7 +4120,7 @@ if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
   process.exit(45);
 }
 
-// Host-control protocol 12 Unix framing: [u32 LE frame_len][u8 container][payload].
+// Host-control protocol 13 Unix framing: [u32 LE frame_len][u8 container][payload].
 const UNIX_CONTAINER_CONTROL = 1;
 
 function encodeControlFrame(frame) {
@@ -4183,7 +4197,7 @@ stream.write(encodeControlFrame({
     protocol: 'botster-hub-daemon-v1',
     compatibility: {
       protocol: 'botster-hub-daemon-v1',
-      protocol_version: 12,
+      protocol_version: 13,
       required_features: [],
       minimum_conformance_fixture_revision: 53,
       client_name: 'foreground-terminal-app-open-fixture',
@@ -4407,22 +4421,30 @@ fn frame_is_attached(frame: &DaemonUnixTerminalFrame) -> bool {
         .is_some_and(|state| state == AttachStateCode::Attached)
 }
 
-fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> Result<bool, ConformanceError> {
-    while let Some(frame) = terminal
-        .poll_terminal(Duration::from_millis(25))
-        .map_err(|source| ConformanceError::Client {
-            operation: "attach_wait",
-            source,
-        })?
-    {
-        if frame_is_attached(&frame) {
-            return Ok(true);
+fn take_attached_terminal_frame(stream: &mut DaemonRouteStream) -> Result<bool, ConformanceError> {
+    let client_error = |source| ConformanceError::Client {
+        operation: "attach_wait",
+        source,
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(25)))
+        .map_err(client_error)?;
+    loop {
+        match stream.read_frame() {
+            Ok(frame) if frame_is_attached(&frame) => return Ok(true),
+            Ok(_) => {}
+            Err(DaemonTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(DaemonTransportError::ClientDisconnected) => return Ok(false),
+            Err(source) => return Err(client_error(source)),
         }
     }
-    Ok(terminal
-        .take_skipped_terminal()
-        .iter()
-        .any(frame_is_attached))
 }
 
 fn request(
