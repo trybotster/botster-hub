@@ -235,7 +235,8 @@ fn event_plane_saturation_source_guards_hold() {
         router.contains("held_lock_try_ingress_returns_shed_busy_without_blocking"),
         "ShedBusy remains a focused in-process lane"
     );
-    let webrtc_src = fs::read_to_string(root.join("src/transport/webrtc/peer.rs")).expect("webrtc");
+    let webrtc_src =
+        fs::read_to_string(root.join("src/transport/webrtc/peer_tests.rs")).expect("webrtc");
     assert!(
         webrtc_src.contains("timeout fail-closed must sacrifice sibling peers"),
         "fail-closed blast-radius oracle must stay in the production test body"
