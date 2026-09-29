@@ -407,7 +407,7 @@ fn build_driver<'scope, 'env>(
             return Ok(Err(detail));
         }
         let name = package_name(&directory)?;
-        Ok(Ok(plugin_table(lua, scope, kit, watched, name)?))
+        Ok(Ok(plugin_table(lua, scope, kit, watched, name, directory)?))
     };
     let load = Arc::new(load);
 
@@ -559,9 +559,33 @@ fn plugin_table<'scope, 'env>(
     kit: &'env RefCell<KitHub>,
     watched: &'env RefCell<HashSet<String>>,
     name: String,
+    directory: PathBuf,
 ) -> mlua::Result<Table> {
     let p = lua.create_table()?;
     p.set("name", name.clone())?;
+
+    // Strict globals: every global name that the plugin's Lua uses but the
+    // sandbox does not define, as { file, line, column, name, write }. The
+    // sandbox's names are read from this kit Hub's real runtime.
+    p.set(
+        "undefined_globals",
+        scope.create_function(move |lua, _: Value| {
+            let defined = kit.borrow_mut().sandbox_globals().map_err(kit_error)?;
+            let found = crate::globals::undefined_globals_in_plugin(&directory, &defined)
+                .map_err(mlua::Error::runtime)?;
+            let list = lua.create_table()?;
+            for item in found {
+                let row = lua.create_table()?;
+                row.set("file", item.file.display().to_string())?;
+                row.set("line", item.usage.line)?;
+                row.set("column", item.usage.column)?;
+                row.set("name", item.usage.name)?;
+                row.set("write", item.usage.write)?;
+                list.push(row)?;
+            }
+            Ok(list)
+        })?,
+    )?;
 
     let tool_name = name.clone();
     p.set(

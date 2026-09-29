@@ -1,0 +1,10 @@
+{
+  "name": "kit-fixture-badglobal",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Plugin test kit fixture: calls an undefined global in a path no call reaches.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [{ "surface": "mcp" }],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+}
