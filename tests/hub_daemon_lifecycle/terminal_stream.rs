@@ -5,15 +5,16 @@
 //! typed [`RouteEvent`], remember the generation Core minted for each route
 //! the test attached, and read raw sockets with the length-prefixed reader.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEvent, DaemonRequest,
-    DaemonResponse, DaemonTransportResult, DaemonUnixFrameReader, DaemonUnixMuxFrame,
-    DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame, connect_and_hello_with_requirement,
-    write_client_frame, write_unix_terminal_frame,
+    DaemonResponse, DaemonTransportError, DaemonTransportResult, DaemonUnixFrameReader,
+    DaemonUnixMuxFrame, DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame,
+    connect_and_hello_with_requirement, write_client_frame, write_unix_terminal_frame,
 };
 pub(crate) use botster_hub_test_support::unix_route::{
     RouteEvent, RouteOperationIds, UnixRouteClient, bytes_contain, decode_route_event,
@@ -61,13 +62,56 @@ pub(crate) fn terminal_body_output(bytes: &[u8]) -> Option<Vec<u8>> {
     (frame.kind() == TerminalKind::Output).then(|| frame.body().to_vec())
 }
 
-/// A raw socket client for proofs that read every frame themselves.
-///
-/// One socket carries both directions; the length-prefixed reader keeps a
-/// partial frame across read timeouts.
-pub(crate) struct RawUnixClient {
+/// How long `read_frame` waits on one route socket before trying the next.
+const ROUTE_READ_SLICE: Duration = Duration::from_millis(2);
+
+/// One socket and the reader that keeps its partial frame across timeouts.
+struct RawSocket {
     stream: UnixStream,
     frames: DaemonUnixFrameReader,
+}
+
+impl RawSocket {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            frames: DaemonUnixFrameReader::new(),
+        }
+    }
+
+    /// One frame within `timeout` (`None` waits), or `Ok(None)` on timeout.
+    fn read_within(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> DaemonTransportResult<Option<DaemonUnixMuxFrame>> {
+        self.stream
+            .set_read_timeout(timeout)
+            .expect("set raw client read timeout");
+        match self.frames.read_frame(&mut self.stream) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(DaemonTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A raw socket client for proofs that read every frame themselves.
+///
+/// The control socket carries requests, responses, events, and entities;
+/// each attached route has its own socket for terminal frames. Nothing is
+/// read until a proof asks, so a proof that never reads leaves every socket
+/// to the kernel buffer. `read_frame` takes the next frame from any socket.
+pub(crate) struct RawUnixClient {
+    control: RawSocket,
+    route_sockets: BTreeMap<String, RawSocket>,
+    read_timeout: Cell<Option<Duration>>,
     ids: RequestIdSequence,
     routes: BTreeMap<String, u64>,
     operation_ids: RouteOperationIds,
@@ -88,8 +132,9 @@ impl RawUnixClient {
 
     pub(crate) fn from_stream(stream: UnixStream) -> Self {
         Self {
-            stream,
-            frames: DaemonUnixFrameReader::new(),
+            control: RawSocket::new(stream),
+            route_sockets: BTreeMap::new(),
+            read_timeout: Cell::new(None),
             ids: RequestIdSequence::new(),
             routes: BTreeMap::new(),
             operation_ids: RouteOperationIds::default(),
@@ -97,21 +142,15 @@ impl RawUnixClient {
         }
     }
 
-    pub(crate) fn stream(&self) -> &UnixStream {
-        &self.stream
-    }
-
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
-        self.stream
-            .set_read_timeout(timeout)
-            .expect("set raw client read timeout");
+        self.read_timeout.set(timeout);
     }
 
     /// Write one correlated request and return its id.
     pub(crate) fn write_request(&mut self, request: &DaemonRequest) -> u64 {
         let request_id = self.ids.next();
         write_client_frame(
-            &mut self.stream,
+            &mut self.control.stream,
             &ClientFrame::Request {
                 request_id: request_id.to_string(),
                 request: request.clone(),
@@ -121,15 +160,63 @@ impl RawUnixClient {
         request_id
     }
 
-    /// Read one frame of any kind.
+    /// Read one frame of any kind from the control socket or any route
+    /// socket. A route socket that ended is dropped. A timeout is an error.
     pub(crate) fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
-        self.frames.read_frame(&mut self.stream)
+        let deadline = self
+            .read_timeout
+            .get()
+            .map(|timeout| Instant::now() + timeout);
+        loop {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if self.route_sockets.is_empty() {
+                // Nothing to interleave: wait on the control socket alone.
+                return match self
+                    .control
+                    .read_within(remaining.map(|r| r.max(Duration::from_millis(1))))?
+                {
+                    Some(frame) => Ok(frame),
+                    None => Err(timed_out()),
+                };
+            }
+            if let Some(frame) = self.control.read_within(Some(ROUTE_READ_SLICE))? {
+                return Ok(frame);
+            }
+            let mut ended = Vec::new();
+            let mut found = None;
+            for (route, socket) in &mut self.route_sockets {
+                match socket.read_within(Some(ROUTE_READ_SLICE)) {
+                    Ok(Some(frame)) => {
+                        found = Some(frame);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(DaemonTransportError::ClientDisconnected) => ended.push(route.clone()),
+                    Err(error) => return Err(error),
+                }
+            }
+            for route in ended {
+                self.route_sockets.remove(&route);
+            }
+            if let Some(frame) = found {
+                return Ok(frame);
+            }
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(timed_out());
+            }
+        }
     }
 
     fn note_attach(&mut self, response: &DaemonResponse) {
         if let Some(attach) = &response.terminal_attach {
             self.routes
                 .insert(attach.subscription_id.clone(), attach.generation);
+            if let Some(path) = &attach.route_socket {
+                let stream = UnixStream::connect(path).expect("connect route socket");
+                self.route_sockets
+                    .insert(attach.subscription_id.clone(), RawSocket::new(stream));
+            }
         }
     }
 
@@ -138,6 +225,14 @@ impl RawUnixClient {
             .routes
             .get(route)
             .unwrap_or_else(|| panic!("route {route} was not attached on this raw client"))
+    }
+
+    fn route_socket_mut(&mut self, route: &str) -> &mut UnixStream {
+        &mut self
+            .route_sockets
+            .get_mut(route)
+            .unwrap_or_else(|| panic!("route {route} has no open route socket"))
+            .stream
     }
 
     /// Send one request; collect terminal frames and host events that arrive
@@ -234,7 +329,7 @@ impl RawUnixClient {
         let generation = self.route_generation(route);
         let operation_id = self.operation_ids.assign(route, input);
         write_unix_terminal_frame(
-            &mut self.stream,
+            self.route_socket_mut(route),
             route,
             generation,
             0,
@@ -252,7 +347,7 @@ impl RawUnixClient {
         generation: u64,
         body: &[u8],
     ) {
-        write_unix_terminal_frame(&mut self.stream, route, generation, 0, body)
+        write_unix_terminal_frame(self.route_socket_mut(route), route, generation, 0, body)
             .expect("write unix terminal frame");
     }
 }
@@ -290,4 +385,11 @@ pub(crate) fn frames_output_bytes(frames: &[DaemonUnixTerminalFrame]) -> Vec<u8>
         .filter_map(frame_output_bytes)
         .flatten()
         .collect()
+}
+
+fn timed_out() -> DaemonTransportError {
+    DaemonTransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "raw client read timed out",
+    ))
 }
