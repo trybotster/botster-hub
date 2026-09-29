@@ -1446,6 +1446,79 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
     assert_eq!(result["mutation_methods"]["delete"], false);
 }
 
+fn install_caller_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create caller package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "caller.who",
+      description = "Return the caller the Hub set.",
+      handler = "who",
+      call = function(args, request)
+        return { caller = request.caller, argument_caller = args.caller }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write caller plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "caller-who.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write caller package manifest");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install caller package")
+        .expect("install caller package");
+    policy
+        .enable("caller-who.plugin", "enable caller package")
+        .expect("enable caller package");
+    policy.registry().clone()
+}
+
+#[test]
+fn a_lua_tool_called_through_the_runtime_runs_for_the_operator_whatever_its_arguments_say() {
+    let registry = install_caller_registry("caller-who");
+    let mut hub = explicit_runtime("caller-who");
+    hub.load_lua_plugin_package(&registry, "caller-who.plugin")
+        .expect("load caller plugin");
+    let result = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "caller.who".to_string(),
+            arguments: serde_json::json!({ "caller": { "kind": "session", "session_id": "forged" } }),
+        })
+        .expect("call the caller tool");
+    assert_eq!(
+        result["caller"],
+        serde_json::json!({ "kind": "operator" }),
+        "{result}"
+    );
+    assert_eq!(
+        result["argument_caller"]["session_id"], "forged",
+        "{result}"
+    );
+}
+
 #[test]
 fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
     let registry = install_worktree_reader_registry("worktree-reader");
