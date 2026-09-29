@@ -15,8 +15,12 @@ kit.test("a note reaches its downstream handler and an ended session leaves", fu
   t:session_upsert(kit.session({ id = "sess-a", state = "exited", code = 0 }))
   t:eq(p:db_get("family").items[4].lifecycle_class, "ended")
 
-  -- a caller identity is not supported yet: a typed refusal names the gate
-  local refused = p:call_tool("kit-fixture.read", { key = "x" }, { caller = { session_id = "sess-a" } })
+  -- call a tool as a session: the Hub sets request.caller, the plugin cannot forge it
+  local as_a = p:call_tool("kit-fixture.whoami", {}, { caller = { session_id = "sess-a" } })
+  t:eq(as_a.result.caller.session_id, "sess-a")
+
+  -- a raw credential is not supported yet: a typed refusal names the gate
+  local refused = p:call_tool("kit-fixture.read", { key = "x" }, { token = "raw-credential" })
   t:eq(refused.error.kind, "unsupported_by_kit")
   t:eq(refused.error.gate, "G1")
 end)

@@ -218,6 +218,18 @@ pub struct TimerFired {
     pub sequence: u64,
 }
 
+/// Who a kit tool call runs for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KitCaller {
+    /// The local operator, as over the Hub socket.
+    Operator,
+    /// A verified session. `hub_id` defaults to this Hub's own id.
+    Session {
+        hub_id: Option<String>,
+        session_id: String,
+    },
+}
+
 /// One kit-held entity subscription and the frames it has received.
 struct KitEntitySubscription {
     entity_type: String,
@@ -548,18 +560,39 @@ impl KitHub {
             .map_err(|error| KitError::Daemon(error.to_string()))
     }
 
-    /// A tool call as a chosen caller. The Hub has no verified caller for
-    /// plugin tools yet, so the kit refuses it (gate G1, platform slice 5).
+    /// The Hub id of this kit Hub, as `botster.hub.identity()` reports it.
+    #[must_use]
+    pub fn hub_id(&self) -> String {
+        self.daemon
+            .runtime()
+            .map(|runtime| runtime.state().host.id.clone())
+            .unwrap_or_default()
+    }
+
+    /// A tool call as a chosen caller (gate G1). The kit stands in for the
+    /// Hub's verified-caller path: the Hub sets `request.caller` in the
+    /// invocation context, exactly as it does for a verified session, and the
+    /// plugin cannot forge it. The kit does not verify credentials; a token
+    /// check needs the credential path (the collab writer's step).
     pub fn call_tool_as(
         &mut self,
-        _caller_session_id: &str,
-        _name: &str,
-        _arguments: serde_json::Value,
+        caller: KitCaller,
+        name: &str,
+        arguments: serde_json::Value,
     ) -> Result<DaemonResponse, KitError> {
-        Err(KitError::Unsupported {
-            feature: "caller",
-            gate: "G1",
-        })
+        let caller = match caller {
+            KitCaller::Operator => crate::plugin_caller::PluginCaller::Operator,
+            KitCaller::Session { hub_id, session_id } => {
+                crate::plugin_caller::PluginCaller::Session {
+                    hub_id: hub_id.unwrap_or_else(|| self.hub_id()),
+                    session_id,
+                }
+            }
+        };
+        self.state.plugin_controls.kit_caller = Some(caller);
+        let response = self.call_tool(name, arguments);
+        self.state.plugin_controls.kit_caller = None;
+        response
     }
 
     /// Events delivered to the kit observers. Each item is
