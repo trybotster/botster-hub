@@ -213,6 +213,40 @@ applicable. They do not include raw absolute worktree paths by default.
 `worktree_deleted` is the canonical successful delete event; the hub deletes the
 record and does not delete filesystem contents.
 
+## Sessions (read)
+
+`botster.capabilities.sessions` reads the Hub's sessions. The Hub owner answers
+each call from its own session projection; a call waits for that answer, and
+the owner never waits for the plugin. A session is named `{ hub_id, session_id
+}`. `hub_id` is optional and defaults to this Hub; any other Hub is refused with
+the error kind `remote_hub_unsupported`. A plain string is shorthand for a
+session id on this Hub.
+
+- `sessions.list({ owner = "any", hub_id?, after? })` returns
+  `{ ok = true, value = { sessions = rows, next_after = <session id or nil> } }`.
+  A page holds eight rows in session id order; pass `next_after` as `after` for
+  the next page.
+- `sessions.get({ session = { hub_id?, session_id } })` returns one row, or the
+  error kind `not_found`.
+- A row holds the `/session` entity fields (`registry_state`, `lifecycle`,
+  `lifecycle_class`, `session_type_id`, and the rest), with `session_id` and
+  `hub_id`.
+- Grants, on the `session_actions` surface: `session_read:any` reads every
+  session. `session_read` reads only sessions the plugin spawned; the Hub does
+  not record spawning plugins yet, so that width sees no rows and no cursor.
+  Without either grant, both calls return `capability_denied`.
+- While the Hub has no complete session baseline (at start and during baseline
+  recovery), both calls return the retryable error kind `unavailable` for every
+  grant width, never an empty list.
+- A busy owner returns the retryable kind `backpressured`; an owner that does
+  not answer in time returns `timed_out`.
+- Each call is charged to the plugin's callback memory before any copy is
+  made, and the charge is released when the call returns. When the account
+  cannot hold the call or its rows, the call returns `backpressured`. A page
+  ends early, with `next_after` set, when the next row would pass the one-callback
+  ceiling; a single row above that ceiling returns `quota_exceeded`. A session id
+  longer than 256 bytes returns `invalid_request`.
+
 ## Runtime Basics
 
 Every plugin receives these helpers with no grant. They run inside the plugin

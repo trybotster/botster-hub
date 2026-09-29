@@ -5368,6 +5368,14 @@ impl HubSessionTypeSpawner {
         )
     }
 
+    /// The Hub owner's control channel, or `None` before the owner runs.
+    pub(crate) fn owner_sender(&self) -> Option<crate::daemon::control::message::ControlSender> {
+        self.managed_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     fn bind_managed_owner_wake(&self, sender: crate::daemon::control::message::ControlSender) {
         *self
             .ordinary_owner_thread
