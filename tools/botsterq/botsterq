@@ -323,7 +323,10 @@ admit_locked() {
   TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
     python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" "$deadline" -- "$@" \
     </dev/null >&3 2>&4 &
-  read _ <"$enqueued" || true
+  # The reader must stay until ts has written: a TERM (the run was cancelled)
+  # must not end this read, or the ts client's hook blocks forever writing to a
+  # fifo nobody reads. TERM is ignored in this subshell only.
+  ( trap '' TERM; read _ <"$enqueued" ) || true
   rm -f "$enqueued"
   id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
   [ -n "$id" ] || { echo "botsterq: enqueued job not found" >&2; exit 1; }
