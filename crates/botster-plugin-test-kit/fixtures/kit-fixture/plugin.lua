@@ -87,6 +87,16 @@ return botster.register({
       end,
     },
     {
+      name = "kit-fixture.whoami",
+      description = "Return the caller the Hub set for this call.",
+      input_schema = { type = "object" },
+      handler = "whoami",
+      -- The Hub passes the caller in the second argument, as `request.caller`.
+      call = function(_, request)
+        return { caller = request.caller }
+      end,
+    },
+    {
       name = "kit-fixture.log_many",
       description = "Write many log records.",
       input_schema = {

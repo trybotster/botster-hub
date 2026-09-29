@@ -39,7 +39,10 @@ kit.test("a note reaches its downstream handler and an ended session leaves", fu
   t:session_upsert(kit.session({ id = "sess-a", state = "exited", code = 0 }))
   t:eq(p:db_get("family").items[4].lifecycle_class, "ended")
 
-  local refused = p:call_tool("kit-fixture.read", { key = "x" }, { caller = { session_id = "sess-a" } })
+  local as_a = p:call_tool("kit-fixture.whoami", {}, { caller = { session_id = "sess-a" } })
+  t:eq(as_a.result.caller.session_id, "sess-a")
+
+  local refused = p:call_tool("kit-fixture.read", { key = "x" }, { token = "raw-credential" })
   t:eq(refused.error.kind, "unsupported_by_kit")
   t:eq(refused.error.gate, "G1")
 end)
@@ -81,7 +84,7 @@ the plugin read that clock.
 
 | Verb | What it does |
 | --- | --- |
-| `p:call_tool(name, args, opts?)` | Returns `{ ok, error = { kind, message }, result, response }`. `ok` is false only when the Hub refuses the call. The tool's own return value is `result`. |
+| `p:call_tool(name, args, opts?)` | `opts.caller` runs the call as `{ kind = "operator" }` or as a session `{ session_id, hub_id? }`: the Hub sets `request.caller` (the handler's second argument) and the plugin cannot forge it. `hub_id` defaults to the kit Hub's own id. Without `caller` the call runs for the operator, as over the Hub socket. Returns `{ ok, error = { kind, message }, result, response }`. `ok` is false only when the Hub refuses the call. The tool's own return value is `result`. |
 | `p:db_get(key)` / `p:db()` | plugin_db payloads. |
 | `p:entities(type)` | Published entity frames of a type. The first call subscribes as a client does. Call it before the action to see every frame. A refused subscription raises. |
 | `p:emitted_events()` | Plugin-audience events that this plugin emitted, through the real event router. |
@@ -100,7 +103,7 @@ The kit does not fake what the Hub cannot do yet. It refuses with the typed erro
 
 | Gate | Refused | Waits for |
 | --- | --- | --- |
-| G1 | `p:call_tool(..., { caller = ... })` and `{ token = ... }` | The verified-caller model (platform slice 5). |
+| G1 (token) | `p:call_tool(..., { token = ... })`, a raw credential | The Hub's credential verification (collab writer). |
 | G2 | Lua timer callbacks (`advance` reports fired timers but runs no callback) | Platform slice 3. |
 | G3 | `t:double(...)` for HTTP, filesystem, and process backends | Platform slice 6. |
 | G4 | `p:views()` | Platform slice 4b. |

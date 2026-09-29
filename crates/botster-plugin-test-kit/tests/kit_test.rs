@@ -196,18 +196,64 @@ fn refusals_arrive_typed() {
         .expect("call settles");
     let error = unknown.error.expect("an unknown tool is refused");
     assert_eq!(error.code, "unknown_tool", "{error:?}");
+}
 
-    assert!(matches!(
-        kit.call_tool_as(
-            "sess-a",
-            "kit-fixture.read",
-            serde_json::json!({ "key": "x" })
+/// The Hub sets `request.caller`; the plugin cannot forge it. A plain kit call
+/// runs for the operator, as a call over the Hub socket does; `call_tool_as`
+/// stands in for a verified session and only for that one call.
+#[test]
+fn a_tool_runs_for_the_caller_the_hub_set() {
+    use botster_plugin_test_kit::KitCaller;
+    let mut kit = start("caller");
+    let response = kit
+        .enable_package(&fixture("kit-fixture"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    let hub_id = kit.hub_id();
+    assert!(!hub_id.is_empty());
+    let whoami = |kit: &mut KitHub, caller: Option<KitCaller>| {
+        let response = match caller {
+            Some(caller) => kit.call_tool_as(caller, "kit-fixture.whoami", serde_json::json!({})),
+            None => kit.call_tool("kit-fixture.whoami", serde_json::json!({})),
+        }
+        .expect("call settles");
+        assert!(response.error.is_none(), "{response:?}");
+        response.plugin_tool_result["caller"].clone()
+    };
+
+    assert_eq!(
+        whoami(&mut kit, None),
+        serde_json::json!({ "kind": "operator" })
+    );
+    assert_eq!(
+        whoami(
+            &mut kit,
+            Some(KitCaller::Session {
+                hub_id: None,
+                session_id: "sess-a".to_string()
+            })
         ),
-        Err(botster_plugin_test_kit::KitError::Unsupported {
-            feature: "caller",
-            gate: "G1",
-        })
-    ));
+        serde_json::json!({ "kind": "session", "hub_id": hub_id, "session_id": "sess-a" })
+    );
+    assert_eq!(
+        whoami(
+            &mut kit,
+            Some(KitCaller::Session {
+                hub_id: Some("hub-elsewhere".to_string()),
+                session_id: "sess-b".to_string()
+            })
+        ),
+        serde_json::json!({ "kind": "session", "hub_id": "hub-elsewhere", "session_id": "sess-b" })
+    );
+    assert_eq!(
+        whoami(&mut kit, Some(KitCaller::Operator)),
+        serde_json::json!({ "kind": "operator" })
+    );
+    // The chosen caller applies to one call only.
+    assert_eq!(
+        whoami(&mut kit, None),
+        serde_json::json!({ "kind": "operator" })
+    );
 }
 
 #[test]
