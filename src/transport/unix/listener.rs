@@ -1226,6 +1226,55 @@ mod tests {
         let _ = fs::remove_file(&socket);
     }
 
+    /// The bind helper restricts the socket even under a permissive umask. The
+    /// umask is process-wide, so the umask-0 case runs in a child process: this
+    /// test re-executes the test binary with a guard variable, and the sibling
+    /// test below does the work only inside that child.
+    #[test]
+    fn the_bound_control_socket_is_private_under_a_permissive_umask() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "transport::unix::listener::tests::permissive_umask_child_body",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("BOTSTER_UMASK_CHILD", "1")
+            .output()
+            .expect("run the child test process");
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(
+                "test transport::unix::listener::tests::permissive_umask_child_body ... ok"
+            ),
+            "the child test did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Runs only inside the child process of the test above.
+    #[test]
+    fn permissive_umask_child_body() {
+        if std::env::var_os("BOTSTER_UMASK_CHILD").is_none() {
+            return;
+        }
+        let socket = temp_socket_path("c");
+        // SAFETY: `umask` only swaps this child process's file-creation mask.
+        unsafe { libc::umask(0) };
+        let _listener = bind_control_socket(&socket).expect("bind the control socket");
+        let mode = fs::metadata(&socket)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o} under umask 0");
+        let _ = fs::remove_file(&socket);
+    }
+
     /// A rebound socket that cannot be restricted is removed, not served.
     #[test]
     fn a_rebound_socket_that_cannot_be_restricted_is_removed() {
