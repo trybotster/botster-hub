@@ -666,7 +666,7 @@ runtime=ready
 data_dir=resolved:$HOME/.botster/hub
 daemon=started
 protocol=botster-hub-daemon-v1
-protocol_version=13
+protocol_version=14
 conformance_fixture_revision=53
 package_count=2
 enabled_package_count=2
@@ -967,7 +967,19 @@ bearer_token_env_var = "BOTSTER_MCP_TOKEN"
 
 Run Codex with `--no-daemon` and its own `CODEX_HOME` when several sessions
 share a machine: the shared Codex app-server daemon keeps the environment of
-the session that started it, so its MCP calls carry that session's token.
+the session that started it, so its MCP calls carry that session's token. The
+per-session setup, exactly as the end-to-end proof runs it inside a Hub
+session:
+
+```sh
+CH="$(mktemp -d)"                       # this session's own CODEX_HOME
+cp "$HOME/.codex/auth.json" "$CH/"      # the user's login
+printf '[mcp_servers.botster]\nurl = "%s"\nbearer_token_env_var = "BOTSTER_MCP_TOKEN"\ndefault_tools_approval_mode = "approve"\n' \
+  "$BOTSTER_MCP_URL" > "$CH/config.toml"
+CODEX_HOME="$CH" codex --no-daemon exec --skip-git-repo-check "<prompt>" < /dev/null
+```
+
+`--no-daemon` is a top-level `codex` flag, so it goes before `exec`.
 
 The agent-side file belongs to the user's agent setup; the Hub only sets the
 two variables. A restarted session gets a new token, and its old token is

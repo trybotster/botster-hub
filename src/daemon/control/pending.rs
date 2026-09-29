@@ -557,7 +557,7 @@ pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     !matches!(
         request,
         DaemonRequest::ListSessions
-            | DaemonRequest::Whoami { .. }
+            | DaemonRequest::Whoami
             | DaemonRequest::ReadScreen { .. }
             | DaemonRequest::ReadModeFlags { .. }
             | DaemonRequest::CaptureSnapshot { .. }
