@@ -86,6 +86,7 @@ The repair changes no signature and no queue.
 Changed upstream files:
 
 - `src/peer_connection/handler/sctp.rs`: `forward_association_event` shared by `handle_read` and `resume_pending_reads`; the two terminal arms in `drain_stream`; the event forward after a resumed drain; the readiness wake in `poll_timeout`; and tests for the immediate drain with a reset that overtook its data, the parked drain with a reset deferred against parked data (payload sequence, cleared entry, the close forwarded without another datagram, the wake while that close waits, and the wake cleared once it is consumed), a stale parked entry for a missing stream, and an unrelated `ErrShortBuffer` that must still fail the read. The two drain tests run with a read budget above one.
+- Repair 4 (`rtc-sctp`) keeps a remotely reset stream registered until the peer answers our answering reset. The two drain tests therefore assert that the stream is still registered and that no close is reported after the drain, then deliver the peer's answer (`deliver_reset_answer`: the client flushes its reset, the server answers, the client reads the answer) and assert that the stream is gone and that the close is reported once. The wake assertions in the parked test are unchanged and still pass.
 - The immediate-path test asserts a data count and a close count on two separate queues. It does not prove public data-before-close ordering; that proof belongs to the peer-connection boundary and the real-peer tests.
 
 ## Repair 3: receive-side close barrier at the public queue boundary
