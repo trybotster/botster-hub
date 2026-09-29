@@ -89,6 +89,23 @@ botsterq slots 3         # change it (kept across server restarts)
   job really ran alone. The log has no rotation. It is evidence only for the jobs it
   recorded: a write failure makes the supervisor print a warning on stderr and the
   job disappears from the audit, so an empty result is not proof that a job ran alone.
+- Target cap: before a job's command starts, botsterq measures the `./target` of the job's
+  directory when that directory has a `Cargo.toml`. If it is above the cap, it runs
+  `cargo clean --target-dir target` there, in that job's slot, prints one line
+  (`botsterq: <dir>/target is N GB, above the C GB cap; running cargo clean ...`) and adds a
+  `clean` line to the events log. The cap is one setting, `BOTSTERQ_TARGET_CAP_GB`, default 15
+  (the value is PROVISIONAL, awaiting the user; a fresh full Hub build is about 7 to 8 GB; `0`
+  turns it off; the default lives in one line at the top of the `botsterq` script). Only the
+  job directory's own `./target` is ever cleaned: nothing happens without a `Cargo.toml`, and
+  nothing when `CARGO_TARGET_DIR` is set (the command builds elsewhere). The price is one cold
+  rebuild each time the cap is hit. It exists because unpruned worktree targets (15 to 40 GB each)
+  filled the disk three times in 24 hours (free space 4.9 GB and 9.6 GB).
+  Why not prune by age: `cargo sweep` (0.8.0) was measured on a Hub worktree with a build, a
+  clippy run, `cargo sweep --file`, and the same build again. It cleaned 1.1 GiB of 8.7 GB
+  (13 percent), and the next build recompiled 293 crates instead of none, because a build that
+  finds an artifact fresh reads it without rewriting it, so on this Mac a reused artifact carries
+  no last-use time and a time-based sweep deletes exactly the shapes the cycle just used. Time
+  and size based sweeping (`--time`, `--maxsize`) use the same file times.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
