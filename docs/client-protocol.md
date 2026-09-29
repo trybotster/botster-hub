@@ -1258,11 +1258,10 @@ below `first_available_seq` were evicted from the plugin's ring (256 records,
 512 KiB of record text per plugin, oldest first). An unknown package returns an
 empty page.
 
-The daemon never waits and never allocates unfunded memory for a read:
-- If the plugin is writing a record at that instant, it answers the retryable
-  operator error `plugin_logs_busy`.
-- If the Lua callback memory cannot fund the page copy, it answers the
-  retryable operator error `plugin_logs_capacity`.
+The daemon never allocates unfunded memory for a read: if the Lua callback
+memory cannot fund the page copy, it answers the retryable operator error
+`plugin_logs_capacity`. A read waits at most for a plugin's record write or the
+Hub log mirror's record copy, both bounded memory copies.
 
 Records are dropped when the package unloads. A failed reload keeps the records
 its entrypoint wrote, beside the serving version's, tagged with the failed
