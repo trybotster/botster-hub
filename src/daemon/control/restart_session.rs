@@ -100,6 +100,9 @@ pub(crate) fn handle_runtime(
     let Some(runtime) = daemon.runtime() else {
         return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     };
+    // The record of the previous run's reservation. Core's release frees that
+    // reservation itself, so the record only has to be retired afterwards.
+    let captured = runtime.session_reservations().capture(&session_id);
     let Some(release) = begin_release(runtime, waiter_id, &session_id) else {
         return refuse(
             "restart_not_ready",
@@ -139,6 +142,14 @@ pub(crate) fn handle_runtime(
                                 "session {session_id} still has a live process group from its previous run"
                             ),
                         ));
+                    }
+                    if let Some(captured) = captured {
+                        let reservations = runtime.session_reservations();
+                        if let crate::runtime::session_reservations::Removal::ReleaseNow(token) =
+                            reservations.removed(&session_id, captured)
+                        {
+                            reservations.retire(&session_id, token.identity());
+                        }
                     }
                     let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
                     let Some(runtime) = daemon.runtime_mut() else {
