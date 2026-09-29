@@ -201,6 +201,10 @@ fn feature_only(path: &str, root: &std::path::Path) -> Result<bool, String> {
             "src/lib.rs",
             "#[cfg(feature = \"test-internals\")]\npub mod test_internals;",
         ),
+        "src/plugin_test_kit.rs" => (
+            "src/lib.rs",
+            "#[cfg(feature = \"plugin-test-kit\")]\npub mod plugin_test_kit;",
+        ),
         _ => return Ok(false),
     };
     let declaration = std::fs::read_to_string(root.join(owner))
@@ -427,5 +431,20 @@ mod tests {
         let quoted = format!("const NOTE: &str = r#\"{gate}\"#;\npub mod test_internals;");
         assert!(!feature_gate_in_code(&quoted, gate).unwrap());
         assert!(feature_gate_in_code(gate, gate).unwrap());
+    }
+
+    /// The plugin test kit is compiled only under its feature, so it may
+    /// name the Lua runtime, and only while `lib.rs` still gates it.
+    #[test]
+    fn exempts_the_plugin_test_kit_only_behind_its_feature_gate() {
+        let source = "fn kit() { crate::lua_runtime::release_test_plugin_invocation_gate(); }\n";
+        let root = std::env::temp_dir().join(format!("guard-kit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let gated = "#[cfg(feature = \"plugin-test-kit\")]\npub mod plugin_test_kit;\n";
+        std::fs::write(root.join("src/lib.rs"), gated).unwrap();
+        assert!(check_lua_boundary(&root, "src/plugin_test_kit.rs", source).is_ok());
+        std::fs::write(root.join("src/lib.rs"), "pub mod plugin_test_kit;\n").unwrap();
+        assert!(check_lua_boundary(&root, "src/plugin_test_kit.rs", source).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
