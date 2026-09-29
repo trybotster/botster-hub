@@ -6,7 +6,7 @@
 
 pub use botster_hub::plugin_test_kit::{
     DEFAULT_STEP_DEADLINE, DaemonPluginLogs, DaemonSession, EnvelopeCursor, EnvelopeId,
-    EnvelopeTarget, HandlerHold, KitError, KitHub, KitOptions, OBSERVER_PACKAGE,
+    EnvelopeTarget, HandlerHold, KitCaller, KitError, KitHub, KitOptions, OBSERVER_PACKAGE,
     RegistrySessionState, RoutedEnvelope, RoutedEnvelopeDeliveryStateResult,
     RoutedEnvelopeDrainOutcome, SessionId, SessionLifecycleRecord, SessionLifecycleState,
     TimerFired, hold_handler, session_record,

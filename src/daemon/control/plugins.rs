@@ -63,6 +63,22 @@ pub(crate) struct PluginControlState {
     ready_waiters: BTreeSet<WaiterId>,
     by_waiter: BTreeMap<WaiterId, String>,
     capacity_waiters: BTreeSet<WaiterId>,
+    /// The plugin test kit's chosen caller for its next MCP tool call. The
+    /// Hub socket is the operator's; the kit stands in for a verified session.
+    #[cfg(feature = "plugin-test-kit")]
+    pub(crate) kit_caller: Option<crate::plugin_caller::PluginCaller>,
+}
+
+impl PluginControlState {
+    /// Who an MCP tool call over the Hub socket runs for.
+    fn mcp_call_caller(&self) -> crate::plugin_caller::PluginCaller {
+        #[cfg(feature = "plugin-test-kit")]
+        if let Some(caller) = &self.kit_caller {
+            return caller.clone();
+        }
+        // The Hub socket is the local operator's.
+        crate::plugin_caller::PluginCaller::Operator
+    }
 }
 
 impl std::fmt::Debug for PluginControlState {
@@ -412,8 +428,7 @@ pub(crate) fn handle_runtime(
                 crate::McpCallRequest { name, arguments },
                 request_id,
                 None,
-                // The Hub socket is the local operator's.
-                crate::plugin_caller::PluginCaller::Operator,
+                state.plugin_controls.mcp_call_caller(),
             ) {
                 Ok(request) => request,
                 Err(error) => return ControlStep::ready(daemon_plugin_tool_error(error)),
