@@ -590,7 +590,21 @@ fn plugin_table<'scope, 'env>(
                 kit.subscribe_entities(&entity_type).map_err(kit_error)?;
                 kit.settle().map_err(kit_error)?;
             }
-            let frames = kit.borrow().entity_frames(&entity_type);
+            // A client receives each frame inside `{ frame = "entity", entity }`.
+            // A spec reads the frame itself: `{ type, id, entity, ... }`.
+            let frames: Vec<serde_json::Value> = kit
+                .borrow()
+                .entity_frames(&entity_type)
+                .into_iter()
+                .map(|frame| match frame.get("entity") {
+                    Some(inner)
+                        if frame.get("frame").and_then(|kind| kind.as_str()) == Some("entity") =>
+                    {
+                        inner.clone()
+                    }
+                    _ => frame,
+                })
+                .collect();
             serialize(lua, &frames)
         })?,
     )?;
