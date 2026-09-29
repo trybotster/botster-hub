@@ -258,3 +258,68 @@ fn a_restart_runs_the_same_session_id_again_with_its_context_and_no_removal() {
     drop(sessions);
     shutdown_cli_daemon(&data_dir, child);
 }
+
+/// A restart whose session type is gone is refused naming the type. The
+/// session stays ended with its record, so the same restart succeeds once the
+/// type is back.
+#[test]
+fn a_restart_of_a_session_whose_type_is_gone_is_refused_and_can_be_retried() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("restart-type-gone");
+    let package_root = unique_test_dir("restart-type-gone-package");
+    write_session_type_context_package(&package_root);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let enable = |config: &botster_hub::HubConfig| {
+        let enabled = botster_hub::daemon_transport_request(
+            config,
+            botster_hub::DaemonRequest::EnablePackageLocalPath {
+                path: package_root.clone(),
+            },
+        )
+        .expect("enable session type package");
+        assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    };
+    enable(&config);
+    let mut sessions =
+        botster_hub_client::subscribe_entities(&socket_endpoint(&data_dir), "session", "restart-type-gone")
+            .expect("subscribe to sessions");
+    let session_id = "restart-type-gone-session";
+    let spawned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: session_id.to_string(),
+            request: botster_hub::DaemonSessionTypeRequest::default(),
+        },
+    )
+    .expect("spawn session type");
+    assert_eq!(spawned.kind, botster_hub::DaemonResponseKind::Spawned, "{spawned:?}");
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_restartable(frame, session_id)
+    });
+
+    let disabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::DisablePackage {
+            package_name: "runtime.session-type".to_string(),
+        },
+    )
+    .expect("disable the package");
+    assert_ne!(disabled.kind, botster_hub::DaemonResponseKind::OperatorError, "{disabled:?}");
+    assert_eq!(restart_refusal_code(&config, session_id), "session_type_unavailable");
+    let state = hub_state_json(&data_dir);
+    assert!(state["restart_records"].get(session_id).is_some(), "{state}");
+
+    enable(&config);
+    let restarted = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::RestartSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("retry the restart");
+    assert_eq!(restarted.kind, botster_hub::DaemonResponseKind::Spawned, "{restarted:?}");
+    drop(sessions);
+    shutdown_cli_daemon(&data_dir, child);
+}
