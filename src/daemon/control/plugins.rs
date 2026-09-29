@@ -411,12 +411,21 @@ pub(crate) fn handle_runtime(
             let Some(runtime) = daemon.runtime() else {
                 return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
             };
+            // The Hub socket is the local operator's; an HTTP MCP call is the
+            // session its bearer token proved, named with its hub. An
+            // unproven token never reaches here: it is refused with 401.
+            let caller = match observability.caller.session_id() {
+                Some(session_id) => crate::plugin_caller::PluginCaller::Session {
+                    hub_id: runtime.config().host.id.clone(),
+                    session_id: session_id.0,
+                },
+                None => crate::plugin_caller::PluginCaller::Operator,
+            };
             let request = match runtime.prepare_plugin_mcp_tool(
                 crate::McpCallRequest { name, arguments },
                 request_id,
                 None,
-                // The Hub socket is the local operator's.
-                crate::plugin_caller::PluginCaller::Operator,
+                caller,
             ) {
                 Ok(request) => request,
                 Err(error) => return ControlStep::ready(daemon_plugin_tool_error(error)),
