@@ -5270,6 +5270,23 @@ mod tests {
         ));
     }
 
+    /// The Hub closes a route socket while a frame the client had not read is
+    /// half written: end of stream inside the frame is the route's end.
+    #[test]
+    fn route_stream_reports_end_of_stream_inside_a_frame_as_a_disconnect() {
+        let (mut server, client) = UnixStream::pair().expect("pair");
+        let mut route = DaemonRouteStream::from_stream(client);
+        let frame = encode_unix_terminal_frame("sub", 1, 0, b"partial").expect("encode");
+        server
+            .write_all(&frame[..frame.len() - 3])
+            .expect("write most of the frame");
+        drop(server);
+        assert!(matches!(
+            route.read_frame(),
+            Err(DaemonTransportError::ClientDisconnected)
+        ));
+    }
+
     /// A terminal frame on the control socket is a protocol violation: routes
     /// have their own sockets.
     #[test]
