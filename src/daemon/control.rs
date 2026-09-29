@@ -169,16 +169,11 @@ pub(crate) fn dispatch_control_message(
         message @ ControlMessage::LocalWebrtcPeerClosed { .. } => {
             webrtc::handle_peer_closed(daemon, state, control_tx, message)
         }
-        ControlMessage::EgressWriteFailed {
-            delivery_kind,
-            write_class,
-        } => {
+        ControlMessage::EgressWriteFailed { delivery_kind } => {
             record_egress_write_failure(
                 &mut state.egress_diagnostics,
                 &mut state.lifecycle_counters,
-                daemon.runtime(),
                 delivery_kind,
-                write_class,
             );
             false
         }

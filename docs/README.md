@@ -7,7 +7,7 @@ Living documents:
 - `plans/readiness-and-flow-control.md`: the readiness and flow-control design.
 - `lua-plugin-abi.md`: the Lua plugin API.
 - `adr/`: decision records.
-- `event-plane-load-proof.md`, `hub-resource-proof.md`, `lifecycle-suite-harness.md`,
+- `hub-resource-proof.md`, `lifecycle-suite-harness.md`,
   `loaded-daemon-lifecycle-runner.md`: references for the proof scripts.
 
 Finished plans and reports were deleted. Git keeps every one of them. The last commit that contains

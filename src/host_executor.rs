@@ -1021,8 +1021,9 @@ impl HostExecutor {
         self.wake.capacity_pending.swap(false, Ordering::AcqRel)
     }
 
-    /// Refusals for an outstanding holder of `holder`. Status reports them
-    /// as observability counters; each refusal is also in the Hub log.
+    /// Test only: refusals for an outstanding holder of `holder`. Each is also
+    /// in the Hub log.
+    #[cfg(test)]
     pub(crate) fn outstanding_holder_faults(&self, holder: ReservationHolder) -> u64 {
         self.permits.outstanding_holder_faults[holder as usize].load(Ordering::Relaxed)
     }

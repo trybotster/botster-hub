@@ -63,7 +63,6 @@ mod daemon_projection;
 pub(crate) mod data_plane;
 pub(crate) mod entity_delivery;
 pub mod entrypoint_supervisor;
-pub(crate) mod event_plane_counters;
 pub(crate) mod host_disposal;
 pub(crate) mod host_executor;
 pub(crate) mod host_mutations;

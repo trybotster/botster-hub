@@ -746,7 +746,6 @@ impl KitHub {
                 response_delivery_rx: None,
                 grant_id: None,
                 client_id: Some("plugin-test-kit".to_string()),
-                enqueued_at: Instant::now(),
             },
         );
         reply_rx

@@ -5,7 +5,6 @@
 
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use botster_hub_client::{
     DaemonAttachOccupancy, DaemonDiagnostic, DaemonLifecycleCounters,
@@ -16,7 +15,6 @@ use serde::Serialize;
 
 use crate::HubDaemonStatus;
 use crate::bounded_json::{EncodeError, encoded_len};
-use crate::event_plane_counters::EventPlaneCounters;
 use crate::host_executor::{HostError, HostRetainedPrepared};
 
 pub(crate) struct StatusResponseInput {
@@ -37,21 +35,10 @@ pub(crate) struct StatusResponseSeed {
     pub(crate) egress: Vec<DaemonDiagnostic>,
     pub(crate) lifecycle: DaemonLifecycleCounters,
     pub(crate) installation_home: Option<PathBuf>,
-    pub(crate) counters: Arc<EventPlaneCounters>,
     pub(crate) retention: Option<DaemonRetentionAccounting>,
     pub(crate) occupancy: Vec<DaemonAttachOccupancy>,
     pub(crate) terminal_records: Vec<DaemonLocalWebrtcTerminalRecord>,
     pub(crate) quarantines: Vec<DaemonQuarantine>,
-    /// Retained-reservation invariant faults, read from the Host executor.
-    pub(crate) reservation_faults: ReservationFaults,
-}
-
-/// Invariant faults: a holder of this kind was still outstanding when new
-/// work of the kind was refused. Status never faults, so it has no count.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ReservationFaults {
-    pub(crate) staging_funding: u64,
-    pub(crate) entity_work: u64,
 }
 
 /// The reservation remains after inventory in field destruction order.
@@ -344,14 +331,6 @@ fn try_prepare(
         ],
     )
     .ok_or_else(too_large)?;
-    let (mut counters, counter_bytes) = seed
-        .counters
-        .bounded_snapshot(limit.checked_sub(typed).ok_or_else(too_large)?)
-        .ok_or_else(too_large)?;
-    counters.retained_reservation_outstanding_staging_funding =
-        seed.reservation_faults.staging_funding;
-    counters.retained_reservation_outstanding_entity_work = seed.reservation_faults.entity_work;
-    let typed = checked_live_bytes(limit, [typed, counter_bytes]).ok_or_else(too_large)?;
     let seed = input.seed.expect("the admitted input has a seed");
     let kind = if input.shutdown {
         DaemonResponseKind::Shutdown
@@ -366,7 +345,6 @@ fn try_prepare(
         seed.lifecycle,
         software,
         installation,
-        counters,
         seed.retention,
         compatibility,
     );
@@ -440,12 +418,10 @@ pub(crate) fn test_input(shutdown: bool) -> StatusResponseInput {
             },
             lifecycle: DaemonLifecycleCounters::default(),
             installation_home: None,
-            counters: Arc::new(EventPlaneCounters::new()),
             retention: None,
             occupancy: Vec::new(),
             terminal_records: Vec::new(),
             quarantines: Vec::new(),
-            reservation_faults: ReservationFaults::default(),
         }),
         core: None,
         request_id: "41".to_string(),
@@ -485,14 +461,12 @@ mod tests {
         let seed = input.seed.as_ref().unwrap();
         let identity =
             crate::maintenance::status_identity_prepared_bytes(None, usize::MAX).unwrap();
-        let (_, counters) = seed.counters.bounded_snapshot(usize::MAX).unwrap();
         let typed = checked_live_bytes(
             usize::MAX,
             [
                 live,
                 live,
                 identity,
-                counters,
                 size_of::<DaemonResponse>(),
                 size_of::<DaemonDiagnostic>(),
                 "connectedstatusshutdowncreatedrunningstoppedloadedinitialized".len(),
@@ -531,34 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_retained_reservation_faults_by_kind() {
-        let mut input = test_input(false);
-        input.seed.as_mut().unwrap().reservation_faults = ReservationFaults {
-            staging_funding: 2,
-            entity_work: 5,
-        };
-        let prepared = prepare(input, crate::host_executor::HOST_PREPARED_BYTE_CAPACITY);
-        let frame: botster_hub_client::ServerFrame =
-            serde_json::from_slice(prepared.encoded_frame.as_ref().expect("encoded response"))
-                .expect("decode response frame");
-        let botster_hub_client::ServerFrame::Response { response, .. } = frame else {
-            panic!("response frame");
-        };
-        let counters = response.status.expect("status is present").observability;
-        assert_eq!(counters.retained_reservation_outstanding_staging_funding, 2);
-        assert_eq!(counters.retained_reservation_outstanding_entity_work, 5);
-    }
-
-    #[test]
     fn encoded_status_preserves_frame_and_diagnostic_fields() {
         let input = test_input(false);
-        input.seed.as_ref().unwrap().counters.register_missing(
-            crate::event_plane_counters::AgeIdentity {
-                kind: botster_hub_client::DaemonQueueKind::Producer,
-                identity: "queue".to_string(),
-                generation: Some(3),
-            },
-        );
         let prepared = prepare(input, crate::host_executor::HOST_PREPARED_BYTE_CAPACITY);
         let frame: botster_hub_client::ServerFrame =
             serde_json::from_slice(prepared.encoded_frame.as_ref().expect("encoded response"))
@@ -576,7 +524,6 @@ mod tests {
         assert_eq!(status.session_count, 7);
         assert_eq!(status.host_display_name, "Host \"one\"");
         assert_eq!(status.recovered_sessions, ["recovered"]);
-        assert_eq!(status.observability.queue_ages[0].identity, "queue");
         assert_eq!(status.diagnostics.len(), 1);
         assert_eq!(response.diagnostics.len(), 2);
         assert!(!prepared.shutdown);

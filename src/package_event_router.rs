@@ -14,12 +14,8 @@ use serde_json::Value;
 
 use crate::config::PackageEventPlanePolicy;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::event_plane_counters::{
-    AgeIdentity, EventPlaneCounters, ProducerAgeList, ProducerAgeRef, QueueAgeMetric,
-};
 use crate::package_event_schema::{CompiledEventSchema, worktree_lifecycle_schema};
 use crate::subscription::package_events::ClientEventMailbox;
-use botster_hub_client::DaemonQueueKind;
 
 pub const HUB_EVENT_OWNER: &str = "hub";
 
@@ -280,8 +276,7 @@ impl EventOwnerWork {
             }
             let op = &self.identity.operation;
             if op.kind == OwnerOpKind::Unload {
-                self.retired_payloads =
-                    apply_unload(&mut inner, &router.counters, &op.owner, op.generation);
+                self.retired_payloads = apply_unload(&mut inner, &op.owner, op.generation);
                 if inner
                     .pending
                     .as_ref()
@@ -310,7 +305,7 @@ impl EventOwnerWork {
             Err(_) => return Err(EventOwnerWorkError::RouterPoisoned(self)),
         };
         let op = &self.identity.operation;
-        retire_destroyed_payloads(&mut inner, &router.counters, &op.owner, op.generation);
+        retire_destroyed_payloads(&mut inner, &op.owner, op.generation);
         drop(inner);
         Ok(EventOwnerCompletion {
             identity: self.identity,
@@ -405,7 +400,6 @@ struct Envelope {
     size: usize,
     enqueued_at: Instant,
     remaining_holders: usize,
-    producer_age_ref: Option<ProducerAgeRef>,
     retirement: Option<EnvelopeRetirement>,
 }
 
@@ -474,9 +468,6 @@ struct AdmittedHolder {
 struct ProducerOccupancy {
     events: usize,
     bytes: usize,
-    outstanding_prior: usize,
-    current_generation: u64,
-    current_cell: Option<Arc<QueueAgeMetric>>,
 }
 
 #[derive(Default)]
@@ -484,8 +475,6 @@ struct ConsumerQueue {
     events: usize,
     bytes: usize,
     copies: VecDeque<QueuedCopy>,
-    age_cell: Option<Arc<QueueAgeMetric>>,
-    generation: u64,
 }
 
 struct TokenBucket {
@@ -532,7 +521,6 @@ struct RouterInner {
     next_pull: u64,
     outstanding_pulls: HashSet<u64>,
     package_generation: HashMap<String, u64>,
-    producer_age_lists: HashMap<(String, u64), ProducerAgeList>,
     /// The one staged package generation that is admitted but not live.
     pending: Option<PendingGeneration>,
     /// Packages quarantined after a failed compensation whose unload has not
@@ -621,11 +609,9 @@ pub enum ActivationError {
 /// Worker unloads and replacement finalization use [`EventOwnerWork::run`].
 pub struct PackageEventRouter {
     inner: crate::daemon::owner_signal::SignalingMutex<RouterInner>,
-    counters: Arc<EventPlaneCounters>,
     /// Raised whenever a consumer copy becomes ready for delivery.
     owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     next_holder_key: AtomicU64,
-    fail_next_age_reserve: AtomicBool,
     policy: PackageEventPlanePolicy,
     #[cfg(test)]
     unload_test_probe: Mutex<Option<UnloadTestProbe>>,
@@ -659,29 +645,8 @@ impl PackageEventRouter {
         }
         let contract_name_counts = hub_contracts.keys().map(|name| (name.clone(), 1)).collect();
         let contracts = HashMap::from([(HUB_EVENT_OWNER.to_string(), hub_contracts)]);
-        let counters = Arc::new(EventPlaneCounters::new());
-        let hub_cell = Arc::new(QueueAgeMetric::new(0));
-        let hub_list =
-            ProducerAgeList::new(policy.producer_queue_max_events, 0, Arc::clone(&hub_cell));
-        counters.register_cell(
-            AgeIdentity {
-                kind: DaemonQueueKind::Producer,
-                identity: HUB_EVENT_OWNER.to_string(),
-                generation: Some(0),
-            },
-            Arc::clone(&hub_cell),
-        );
         let mut producer = HashMap::new();
-        producer.insert(
-            HUB_EVENT_OWNER.to_string(),
-            ProducerOccupancy {
-                current_generation: 0,
-                current_cell: Some(hub_cell),
-                ..ProducerOccupancy::default()
-            },
-        );
-        let mut producer_age_lists = HashMap::new();
-        producer_age_lists.insert((HUB_EVENT_OWNER.to_string(), 0), hub_list);
+        producer.insert(HUB_EVENT_OWNER.to_string(), ProducerOccupancy::default());
         Self {
             inner: crate::daemon::owner_signal::SignalingMutex::new(
                 RouterInner {
@@ -718,17 +683,14 @@ impl PackageEventRouter {
                     next_pull: 1,
                     outstanding_pulls: HashSet::new(),
                     package_generation: HashMap::new(),
-                    producer_age_lists,
                     pending: None,
                     stranded_owners: HashSet::new(),
                 },
                 Arc::clone(&owner_signal),
                 crate::daemon::owner_signal::SignalKey::EventRouter,
             ),
-            counters,
             owner_signal,
             next_holder_key: AtomicU64::new(1),
-            fail_next_age_reserve: AtomicBool::new(false),
             policy,
             #[cfg(test)]
             unload_test_probe: Mutex::new(None),
@@ -738,16 +700,6 @@ impl PackageEventRouter {
     #[must_use]
     pub const fn policy(&self) -> PackageEventPlanePolicy {
         self.policy
-    }
-
-    #[must_use]
-    pub fn counters(&self) -> &Arc<EventPlaneCounters> {
-        &self.counters
-    }
-
-    #[cfg(test)]
-    pub fn test_fail_next_age_reserve(&self) {
-        self.fail_next_age_reserve.store(true, Ordering::SeqCst);
     }
 
     pub fn current_package_generation(&self, owner: &str) -> Result<u64, EventPlaneStatus> {
@@ -790,7 +742,7 @@ impl PackageEventRouter {
         for owner in owners {
             let generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
             bind_registrations(&mut inner, &owner, generation);
-            commit_diagnostic_state(&mut inner, &self.counters, &owner, generation);
+            ensure_owner_queues(&mut inner, &owner);
         }
         Ok(())
     }
@@ -814,13 +766,7 @@ impl PackageEventRouter {
                 return Err(EventPlaneStatus::RejectedForeign);
             }
         }
-        commit_package_generation_locked(
-            &mut inner,
-            &self.counters,
-            owner,
-            contracts,
-            subscriptions,
-        )
+        commit_package_generation_locked(&mut inner, owner, contracts, subscriptions)
     }
 
     /// Unload the live generation and commit the replacement under one lock.
@@ -843,23 +789,15 @@ impl PackageEventRouter {
         }
         preview_package_replacement(&mut inner, owner, &contracts, &subscriptions)?;
         let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
-        let retired_payloads = apply_unload(&mut inner, &self.counters, owner, unload_generation);
-        let result = commit_package_generation_locked(
-            &mut inner,
-            &self.counters,
-            owner,
-            contracts,
-            subscriptions,
-        );
+        let retired_payloads = apply_unload(&mut inner, owner, unload_generation);
+        let result = commit_package_generation_locked(&mut inner, owner, contracts, subscriptions);
         drop(inner);
         if let Err(status) = &result {
             // The preview accepted this replacement, so its commit failing
             // after the unload is an invariant break.
-            self.counters.record_replacement_stranded();
             crate::hub_log::hub_log!(
-                "event_plane_replacement_stranded owner={owner} status={} total={}",
-                status.as_str(),
-                self.counters.replacements_stranded()
+                "event_plane_replacement_stranded owner={owner} status={}",
+                status.as_str()
             );
         }
         let mut work = EventOwnerWork::new(OwnerOp {
@@ -904,7 +842,6 @@ impl PackageEventRouter {
         }
         let mut inner = lock_inner(&self.inner).map_err(StageError::Rejected)?;
         if inner.pending.is_some() {
-            self.counters.record_stage_overlap();
             return Err(StageError::AlreadyStaged);
         }
         for contract in &contracts {
@@ -1003,14 +940,9 @@ impl PackageEventRouter {
             ..
         } = pending;
         let unload_generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
-        let retired_payloads = apply_unload(&mut inner, &self.counters, &owner, unload_generation);
-        let mut result = commit_package_generation_locked(
-            &mut inner,
-            &self.counters,
-            &owner,
-            contracts,
-            subscriptions,
-        );
+        let retired_payloads = apply_unload(&mut inner, &owner, unload_generation);
+        let mut result =
+            commit_package_generation_locked(&mut inner, &owner, contracts, subscriptions);
         drop(inner);
         drop(funding);
         if result.is_ok_and(|committed| committed != generation) {
@@ -1019,11 +951,9 @@ impl PackageEventRouter {
             result = Err(EventPlaneStatus::RejectedInvalid);
         }
         if let Err(status) = &result {
-            self.counters.record_replacement_stranded();
             crate::hub_log::hub_log!(
-                "event_plane_replacement_stranded owner={owner} status={} total={}",
-                status.as_str(),
-                self.counters.replacements_stranded()
+                "event_plane_replacement_stranded owner={owner} status={}",
+                status.as_str()
             );
         }
         let mut work = EventOwnerWork::new(OwnerOp {
@@ -1077,7 +1007,7 @@ impl PackageEventRouter {
         let plugin_key = subscription.plugin_key.clone();
         let status = subscribe_locked(&mut inner, subscription);
         if status == EventPlaneStatus::Accepted {
-            bind_consumer_cell(&mut inner, &self.counters, &plugin_key);
+            inner.consumers.entry(plugin_key).or_default();
         }
         status
     }
@@ -1128,16 +1058,7 @@ impl PackageEventRouter {
         payload: &Value,
         now: Instant,
     ) -> EventPlaneStatus {
-        let started = Instant::now();
-        self.counters.record_admission_attempt();
-        let status = self.try_ingress_now(caller_owner, name, payload, now);
-        if status != EventPlaneStatus::Accepted {
-            self.counters.record_ingress_status(status.index());
-        }
-        self.counters.record_admission_latency(
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        status
+        self.try_ingress_now(caller_owner, name, payload, now)
     }
 
     fn try_ingress_now(
@@ -1259,13 +1180,6 @@ impl PackageEventRouter {
         deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
         inner.next_envelope = next_envelope;
         let payload_arc: Arc<[u8]> = encoded.into();
-        let producer_age_ref = reserve_producer_age(
-            &mut inner,
-            &self.counters,
-            caller_owner,
-            now,
-            self.fail_next_age_reserve.swap(false, Ordering::SeqCst),
-        );
         inner.envelopes.insert(
             envelope_id,
             Envelope {
@@ -1277,41 +1191,15 @@ impl PackageEventRouter {
                 size,
                 enqueued_at: now,
                 remaining_holders: accepted.len(),
-                producer_age_ref,
                 retirement: None,
             },
         );
         inner.global_in_flight_bytes += size;
-        let (producer_cell, producer_events, producer_bytes, producer_generation, producer_prior) = {
-            let producer = inner.producer.entry(caller_owner.to_string()).or_default();
-            producer.events += 1;
-            producer.bytes += size;
-            (
-                producer.current_cell.clone(),
-                producer.events as u64,
-                producer.bytes as u64,
-                producer.current_generation,
-                producer.outstanding_prior as u64,
-            )
-        };
-        if let Some(cell) = producer_cell {
-            let oldest = inner
-                .producer_age_lists
-                .get(&(caller_owner.to_string(), producer_generation))
-                .map(ProducerAgeList::oldest_nanos)
-                .unwrap_or(u64::MAX);
-            cell.store(
-                producer_events,
-                oldest,
-                producer_prior,
-                false,
-                producer_bytes,
-            );
-        }
-        self.counters
-            .set_global_in_flight_bytes(inner.global_bytes() as u64);
+        let producer = inner.producer.entry(caller_owner.to_string()).or_default();
+        producer.events += 1;
+        producer.bytes += size;
         for subscription in accepted {
-            enqueue_consumer_copy(&mut inner, &self.counters, envelope_id, size, subscription);
+            enqueue_consumer_copy(&mut inner, envelope_id, size, subscription);
         }
         drop(inner);
         self.raise_delivery();
@@ -1416,15 +1304,12 @@ impl PackageEventRouter {
                     continue;
                 }
                 if expired {
-                    self.counters.record_router_queue_age_expiry();
                     retire_holder_locked(
                         &mut inner,
-                        &self.counters,
                         copy.envelope_id,
                         &copy.holder.plugin_key,
                         copy.holder.generation,
                     );
-                    update_consumer_age(&mut inner, &plugin_key, &self.counters);
                     continue;
                 }
                 if used_bytes + size > max_bytes && !ready.is_empty() {
@@ -1439,18 +1324,9 @@ impl PackageEventRouter {
                         queue.bytes += size;
                         queue.copies.push_front(copy);
                     }
-                    update_consumer_age(&mut inner, &plugin_key, &self.counters);
                     break;
                 }
                 used_bytes += size;
-                self.counters.record_delivery_attempt();
-                if let Some(envelope) = inner.live_envelope(copy.envelope_id) {
-                    self.counters.record_delivery_latency(
-                        u64::try_from(envelope.enqueued_at.elapsed().as_micros())
-                            .unwrap_or(u64::MAX),
-                    );
-                }
-                update_consumer_age(&mut inner, &plugin_key, &self.counters);
                 let (owner, name, payload, payload_json) = inner
                     .live_envelope(copy.envelope_id)
                     .map(|envelope| {
@@ -1513,7 +1389,6 @@ impl PackageEventRouter {
         let mut inner = lock_inner(&self.inner)?;
         Ok(retire_holder_locked(
             &mut inner,
-            &self.counters,
             envelope_id,
             plugin_key,
             generation,
@@ -1531,7 +1406,6 @@ impl PackageEventRouter {
         inner.outstanding_pulls.remove(&pull_id);
         Ok(retire_holder_locked(
             &mut inner,
-            &self.counters,
             envelope_id,
             plugin_key,
             generation,
@@ -1623,7 +1497,6 @@ impl PackageEventRouter {
         } else if was_empty {
             inner.mark_ready(&plugin_key);
         }
-        update_consumer_age(&mut inner, &plugin_key, &self.counters);
         drop(inner);
         if !engine_refused {
             self.raise_delivery();
@@ -1645,7 +1518,6 @@ impl PackageEventRouter {
         }
         retire_holder_locked(
             &mut inner,
-            &self.counters,
             delivery.envelope_id,
             &delivery.holder.plugin_key,
             delivery.holder.generation,
@@ -1714,20 +1586,6 @@ impl PackageEventRouter {
         lock_inner(&self.inner)
             .map(|inner| inner.outstanding_pulls.len())
             .unwrap_or(usize::MAX)
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn test_observability_snapshot(
-        &self,
-    ) -> botster_hub_client::DaemonObservabilityCounters {
-        self.counters.snapshot()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_refresh_consumer_age(&self, plugin_key: &str) {
-        let mut inner = lock_inner(&self.inner).expect("test refresh must lock");
-        update_consumer_age(&mut inner, plugin_key, &self.counters);
     }
 
     #[cfg(test)]
@@ -2364,7 +2222,6 @@ fn subscription_admission_status(
 
 fn commit_package_generation_locked(
     inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
     owner: &str,
     contracts: Vec<EmittedContract>,
     subscriptions: Vec<EventSubscription>,
@@ -2390,7 +2247,7 @@ fn commit_package_generation_locked(
             return Err(status);
         }
     }
-    commit_diagnostic_state(inner, counters, owner, generation);
+    ensure_owner_queues(inner, owner);
     Ok(generation)
 }
 
@@ -2640,12 +2497,7 @@ fn bump_package_generation(inner: &mut RouterInner, owner: &str) -> u64 {
     next
 }
 
-fn apply_unload(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    generation: u64,
-) -> Vec<RetiringPayload> {
+fn apply_unload(inner: &mut RouterInner, owner: &str, generation: u64) -> Vec<RetiringPayload> {
     if owner == HUB_EVENT_OWNER {
         return Vec::new();
     }
@@ -2699,9 +2551,7 @@ fn apply_unload(
     for identity in removed_client_ids {
         inner.client_by_id.remove(&identity);
     }
-    let retired_payloads = drop_queued_for_owner(inner, counters, owner, generation);
-    retire_owner_diagnostics(inner, counters, owner, generation);
-    retired_payloads
+    drop_queued_for_owner(inner, owner, generation)
 }
 
 fn unload_subscription_keys(inner: &RouterInner, owner: &str) -> BTreeSet<(String, String)> {
@@ -2808,7 +2658,6 @@ fn unload_removes_subscription(
 
 fn drop_queued_for_owner(
     inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
     owner: &str,
     generation: u64,
 ) -> Vec<RetiringPayload> {
@@ -2866,7 +2715,7 @@ fn drop_queued_for_owner(
             .iter()
             .filter(|copy| copy.holder.plugin_key == owner)
             .count();
-        counters.record_events_stranded(retired as u64);
+        crate::hub_log::hub_log!("event_plane_events_stranded owner={owner} events={retired}");
     }
     let mut retired_payloads = Vec::new();
     for copy in dropped {
@@ -2905,15 +2754,11 @@ fn drop_queued_for_owner(
             });
         }
     }
-    for plugin_key in changed_consumers {
-        update_consumer_age(inner, &plugin_key, counters);
-    }
     retired_payloads
 }
 
 fn retire_holder_locked(
     inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
     envelope_id: u64,
     plugin_key: &str,
     generation: u64,
@@ -2921,7 +2766,7 @@ fn retire_holder_locked(
     if !mark_holder_retired(inner, envelope_id, plugin_key, generation) {
         return false;
     }
-    retire_envelope_locked(inner, counters, envelope_id);
+    retire_envelope_locked(inner, envelope_id);
     true
 }
 
@@ -2955,11 +2800,7 @@ fn mark_holder_retired(
     true
 }
 
-fn retire_envelope_locked(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    envelope_id: u64,
-) {
+fn retire_envelope_locked(inner: &mut RouterInner, envelope_id: u64) {
     let Some(envelope) = inner.envelopes.remove(&envelope_id) else {
         return;
     };
@@ -2979,7 +2820,6 @@ fn retire_envelope_locked(
     }
     let owner = &envelope.owner;
     let size = envelope.size;
-    let age_ref = envelope.producer_age_ref;
     inner.global_in_flight_bytes = inner
         .global_in_flight_bytes
         .checked_sub(size)
@@ -2988,17 +2828,10 @@ fn retire_envelope_locked(
         producer.events = producer.events.saturating_sub(1);
         producer.bytes = producer.bytes.saturating_sub(size);
     }
-    retire_producer_age(inner, counters, owner, age_ref);
-    counters.set_global_in_flight_bytes(inner.global_bytes() as u64);
 }
 
 /// A restart reaches the same operation bucket even though its dispatch serial changes.
-fn retire_destroyed_payloads(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    generation: u64,
-) {
+fn retire_destroyed_payloads(inner: &mut RouterInner, owner: &str, generation: u64) {
     let cleanup = (owner.to_string(), generation);
     let Some(ids) = inner.retiring_by_cleanup.get(&cleanup) else {
         return;
@@ -3019,69 +2852,12 @@ fn retire_destroyed_payloads(
         .copied()
         .collect();
     for envelope_id in destroyed {
-        retire_envelope_locked(inner, counters, envelope_id);
-    }
-}
-
-fn reserve_producer_age(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    now: Instant,
-    force_fail: bool,
-) -> Option<ProducerAgeRef> {
-    let generation = inner
-        .producer
-        .get(owner)
-        .map(|occupancy| occupancy.current_generation)
-        .or_else(|| inner.package_generation.get(owner).copied())
-        .unwrap_or(0);
-    let key = (owner.to_string(), generation);
-    if force_fail {
-        if let Some(cell) = inner
-            .producer
-            .get(owner)
-            .and_then(|occupancy| occupancy.current_cell.clone())
-        {
-            cell.latch_invalid();
-        }
-        counters.record_age_sample_failure();
-        return None;
-    }
-    let Some(list) = inner.producer_age_lists.get_mut(&key) else {
-        if let Some(cell) = inner
-            .producer
-            .get(owner)
-            .and_then(|occupancy| occupancy.current_cell.clone())
-        {
-            cell.latch_invalid();
-        } else {
-            counters.register_missing(AgeIdentity {
-                kind: DaemonQueueKind::Producer,
-                identity: owner.to_string(),
-                generation: None,
-            });
-        }
-        counters.record_age_sample_failure();
-        return None;
-    };
-    let nanos = counters.nanos_of(now);
-    match list.push(nanos) {
-        Some(slot) => {
-            list.publish();
-            Some(ProducerAgeRef { generation, slot })
-        }
-        None => {
-            list.cell().latch_invalid();
-            counters.record_age_sample_failure();
-            None
-        }
+        retire_envelope_locked(inner, envelope_id);
     }
 }
 
 fn enqueue_consumer_copy(
     inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
     envelope_id: u64,
     size: usize,
     subscription: EventSubscription,
@@ -3093,166 +2869,25 @@ fn enqueue_consumer_copy(
     }
     inner.note_queued_copy(&subscription);
     let plugin_key = subscription.plugin_key.clone();
-    let became_ready;
-    let (front_id, count, bytes, cell, gate) = {
-        let consumer = inner
-            .consumers
-            .get_mut(&subscription.plugin_key)
-            .expect("consumer queue exists");
-        consumer.events += 1;
-        consumer.bytes += size;
-        became_ready = consumer.copies.is_empty();
-        consumer.copies.push_back(QueuedCopy {
-            envelope_id,
-            holder: subscription,
-        });
-        (
-            consumer.copies.front().map(|copy| copy.envelope_id),
-            consumer.events as u64,
-            consumer.bytes as u64,
-            consumer.age_cell.clone(),
-            consumer
-                .age_cell
-                .as_ref()
-                .map(|cell| cell.gate())
-                .unwrap_or(0),
-        )
-    };
+    let consumer = inner
+        .consumers
+        .get_mut(&subscription.plugin_key)
+        .expect("consumer queue exists");
+    consumer.events += 1;
+    consumer.bytes += size;
+    let became_ready = consumer.copies.is_empty();
+    consumer.copies.push_back(QueuedCopy {
+        envelope_id,
+        holder: subscription,
+    });
     if became_ready {
         inner.mark_ready(&plugin_key);
     }
-    let oldest = front_id
-        .and_then(|envelope_id| inner.live_envelope(envelope_id))
-        .map(|envelope| counters.nanos_of(envelope.enqueued_at))
-        .unwrap_or(u64::MAX);
-    if let Some(cell) = cell {
-        cell.store(count, oldest, gate, false, bytes);
-    } else {
-        counters.record_age_sample_failure();
-    }
 }
 
-fn update_consumer_age(inner: &mut RouterInner, plugin_key: &str, counters: &EventPlaneCounters) {
-    let front_id = inner
-        .consumers
-        .get(plugin_key)
-        .and_then(|queue| queue.copies.front().map(|copy| copy.envelope_id));
-    let oldest = front_id
-        .and_then(|envelope_id| inner.live_envelope(envelope_id))
-        .map(|envelope| counters.nanos_of(envelope.enqueued_at))
-        .unwrap_or(u64::MAX);
-    let Some(queue) = inner.consumers.get(plugin_key) else {
-        return;
-    };
-    let count = queue.events as u64;
-    let bytes = queue.bytes as u64;
-    let Some(cell) = queue.age_cell.clone() else {
-        counters.record_age_sample_failure();
-        return;
-    };
-    cell.store(count, oldest, cell.gate(), false, bytes);
-}
-
-fn retire_producer_age(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    age_ref: Option<ProducerAgeRef>,
-) {
-    let Some(age_ref) = age_ref else {
-        return;
-    };
-    let key = (owner.to_string(), age_ref.generation);
-    let Some(list) = inner.producer_age_lists.get_mut(&key) else {
-        return;
-    };
-    debug_assert_eq!(list.generation(), age_ref.generation);
-    list.remove(age_ref.slot);
-    list.publish();
-    let live = list.live();
-    let writes_closed = list.cell().is_write_closed();
-    let current_generation = inner
-        .producer
-        .get(owner)
-        .map(|occupancy| occupancy.current_generation)
-        .unwrap_or(age_ref.generation);
-    if age_ref.generation != current_generation
-        && let Some(occupancy) = inner.producer.get_mut(owner)
-    {
-        occupancy.outstanding_prior = occupancy.outstanding_prior.saturating_sub(1);
-        if let Some(cell) = occupancy.current_cell.as_ref() {
-            cell.store(
-                occupancy.events as u64,
-                inner
-                    .producer_age_lists
-                    .get(&(owner.to_string(), occupancy.current_generation))
-                    .map(ProducerAgeList::oldest_nanos)
-                    .unwrap_or(u64::MAX),
-                occupancy.outstanding_prior as u64,
-                false,
-                occupancy.bytes as u64,
-            );
-        }
-    }
-    // Unload closes the cell before the worker destroys payloads. Final retirement
-    // must remove the empty list even when no replacement generation exists.
-    if live == 0 && (age_ref.generation != current_generation || writes_closed) {
-        if let Some(list) = inner.producer_age_lists.remove(&key) {
-            list.cell().close_writes();
-        }
-        counters.retire_identity(&AgeIdentity {
-            kind: DaemonQueueKind::Producer,
-            identity: owner.to_string(),
-            generation: Some(age_ref.generation),
-        });
-    }
-}
-
-fn commit_diagnostic_state(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    generation: u64,
-) {
-    if let Some(occupancy) = inner.producer.get_mut(owner)
-        && occupancy.current_generation != generation
-    {
-        occupancy.outstanding_prior = occupancy.events;
-        if let Some(cell) = occupancy.current_cell.take() {
-            cell.close_writes();
-            counters.retire_identity(&AgeIdentity {
-                kind: DaemonQueueKind::Producer,
-                identity: owner.to_string(),
-                generation: Some(occupancy.current_generation),
-            });
-        }
-    }
-    let cell = Arc::new(QueueAgeMetric::new(generation));
-    let prior = inner
-        .producer
-        .get(owner)
-        .map(|occupancy| occupancy.outstanding_prior)
-        .unwrap_or(0);
-    cell.store(0, u64::MAX, prior as u64, false, 0);
-    let list = ProducerAgeList::new(
-        inner.policy.producer_queue_max_events,
-        generation,
-        Arc::clone(&cell),
-    );
-    inner
-        .producer_age_lists
-        .insert((owner.to_string(), generation), list);
-    let occupancy = inner.producer.entry(owner.to_string()).or_default();
-    occupancy.current_generation = generation;
-    occupancy.current_cell = Some(Arc::clone(&cell));
-    counters.register_cell(
-        AgeIdentity {
-            kind: DaemonQueueKind::Producer,
-            identity: owner.to_string(),
-            generation: Some(generation),
-        },
-        cell,
-    );
+/// Ensure the queues an owner's package generation can fill exist.
+fn ensure_owner_queues(inner: &mut RouterInner, owner: &str) {
+    inner.producer.entry(owner.to_string()).or_default();
     let mut plugin_keys: BTreeSet<String> = inner
         .subscriptions
         .get(owner)
@@ -3265,90 +2900,7 @@ fn commit_diagnostic_state(
         plugin_keys.insert(owner.to_string());
     }
     for plugin_key in plugin_keys {
-        bind_consumer_cell(inner, counters, &plugin_key);
-    }
-}
-
-fn bind_consumer_cell(inner: &mut RouterInner, counters: &EventPlaneCounters, plugin_key: &str) {
-    let generation = inner
-        .package_generation
-        .get(plugin_key)
-        .copied()
-        .or_else(|| {
-            inner
-                .consumers
-                .get(plugin_key)
-                .map(|queue| queue.generation)
-        })
-        .unwrap_or(0);
-    if inner
-        .consumers
-        .get(plugin_key)
-        .and_then(|queue| queue.age_cell.as_ref())
-        .is_some_and(|cell| cell.generation() == generation && !cell.is_write_closed())
-    {
-        return;
-    }
-    if let Some(queue) = inner.consumers.get(plugin_key)
-        && let Some(old) = queue.age_cell.as_ref()
-    {
-        counters.retire_cell(
-            &AgeIdentity {
-                kind: DaemonQueueKind::Consumer,
-                identity: plugin_key.to_string(),
-                generation: Some(queue.generation),
-            },
-            old,
-        );
-    }
-    let consumer_cell = Arc::new(QueueAgeMetric::new(generation));
-    counters.register_cell(
-        AgeIdentity {
-            kind: DaemonQueueKind::Consumer,
-            identity: plugin_key.to_string(),
-            generation: Some(generation),
-        },
-        Arc::clone(&consumer_cell),
-    );
-    let queue = inner.consumers.entry(plugin_key.to_string()).or_default();
-    queue.age_cell = Some(Arc::clone(&consumer_cell));
-    queue.generation = generation;
-    consumer_cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
-}
-
-fn retire_owner_diagnostics(
-    inner: &mut RouterInner,
-    counters: &EventPlaneCounters,
-    owner: &str,
-    generation: u64,
-) {
-    // Producer retirement names the exact generation, never the replacement cell.
-    counters.retire_identity(&AgeIdentity {
-        kind: DaemonQueueKind::Producer,
-        identity: owner.to_string(),
-        generation: Some(generation),
-    });
-    let producer_key = (owner.to_string(), generation);
-    if inner
-        .producer_age_lists
-        .get(&producer_key)
-        .is_some_and(|list| list.live() == 0)
-    {
-        inner.producer_age_lists.remove(&producer_key);
-    }
-    if let Some(queue) = inner.consumers.get_mut(owner)
-        && queue.generation <= generation
-        && let Some(cell) = queue.age_cell.as_ref()
-    {
-        counters.retire_identity(&AgeIdentity {
-            kind: DaemonQueueKind::Consumer,
-            identity: owner.to_string(),
-            generation: Some(queue.generation),
-        });
-        cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
-        if queue.copies.is_empty() {
-            cell.close_writes();
-        }
+        inner.consumers.entry(plugin_key).or_default();
     }
 }
 
@@ -4470,10 +4022,6 @@ mod tests {
         assert_router_indexes(&inner);
         let bytes: usize = inner.envelopes.values().map(|envelope| envelope.size).sum();
         assert_eq!(inner.global_bytes(), bytes);
-        assert_eq!(
-            router.counters.snapshot().global_in_flight_bytes,
-            bytes as u64
-        );
         for (owner, occupancy) in &inner.producer {
             let envelopes: Vec<_> = inner
                 .envelopes
@@ -5865,40 +5413,6 @@ mod tests {
     }
 
     #[test]
-    fn same_generation_consumer_rebind_keeps_the_new_diagnostic_cell() {
-        let router = router();
-        let mut inner = router.inner.lock().unwrap();
-        bind_consumer_cell(&mut inner, router.counters(), "consumer");
-        let old = inner.consumers["consumer"]
-            .age_cell
-            .as_ref()
-            .unwrap()
-            .clone();
-        old.store(2, 10, 0, false, 200);
-        old.close_writes();
-        bind_consumer_cell(&mut inner, router.counters(), "consumer");
-        let new = inner.consumers["consumer"].age_cell.as_ref().unwrap();
-        assert!(!Arc::ptr_eq(&old, new));
-        assert!(!new.is_write_closed());
-        assert_eq!(
-            old.sample(),
-            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
-        );
-        let rows: Vec<_> = router
-            .counters()
-            .snapshot()
-            .queue_ages
-            .into_iter()
-            .filter(|row| row.kind == DaemonQueueKind::Consumer && row.identity == "consumer")
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].state,
-            botster_hub_client::DaemonQueueAgeState::Empty
-        );
-    }
-
-    #[test]
     fn stale_unload_preserves_new_client_registration_and_consumer_cell() {
         let router = router();
         let mut contract = sample_contract("producer", "ready");
@@ -5936,9 +5450,22 @@ mod tests {
             .begin_package_generation("consumer")
             .expect("new consumer");
         subscribe(&router, "consumer", "producer", "ready");
-        let before = consumer_row(&router, "consumer");
+        let before = router
+            .snapshot()
+            .unwrap()
+            .consumer_events
+            .get("consumer")
+            .copied();
         run_unload(&router, "consumer", 1);
-        assert_eq!(consumer_row(&router, "consumer"), before);
+        assert_eq!(
+            router
+                .snapshot()
+                .unwrap()
+                .consumer_events
+                .get("consumer")
+                .copied(),
+            before
+        );
         run_unload(&router, "producer", 1);
         assert_eq!(router.test_client_holder_count("connection"), 1);
         assert_eq!(
@@ -5952,7 +5479,15 @@ mod tests {
         );
         assert!(mailbox.take_ready_event().is_some());
         assert!(mailbox.take_ready_event().is_none());
-        assert_eq!(consumer_row(&router, "consumer").queue_count, Some(1));
+        assert_eq!(
+            router
+                .snapshot()
+                .unwrap()
+                .consumer_events
+                .get("consumer")
+                .copied(),
+            Some(1)
+        );
         assert_router_accounting(&router);
         run_unload(&router, "producer", 2);
         assert_eq!(router.test_client_holder_count("connection"), 0);
@@ -6495,46 +6030,6 @@ mod tests {
             assert!(inner.admitted.is_empty());
             assert!(inner.envelopes.is_empty());
             assert!(inner.outstanding_pulls.is_empty());
-        }
-    }
-
-    #[test]
-    fn unload_releases_empty_and_destroyed_producer_age_lists() {
-        let router = router();
-        for generation in 1..=64 {
-            router
-                .try_register_contracts(vec![sample_contract("producer", "ready")])
-                .expect("generation");
-            // The consumer registers once. It survives every unload of the
-            // producer, so it never registers again.
-            if generation == 2 {
-                subscribe(&router, "consumer", "producer", "ready");
-            }
-            if generation % 2 == 0 {
-                assert_eq!(
-                    router.try_ingress(
-                        "producer",
-                        "ready",
-                        &serde_json::json!({"ok": true}),
-                        Instant::now()
-                    ),
-                    EventPlaneStatus::Accepted
-                );
-            }
-            run_unload(&router, "producer", generation);
-            assert_router_accounting(&router);
-            let inner = lock_inner(&router.inner).expect("retired age lists");
-            assert_eq!(
-                inner.producer_age_lists.len(),
-                1,
-                "only the Hub list remains"
-            );
-            assert!(
-                inner
-                    .producer_age_lists
-                    .contains_key(&(HUB_EVENT_OWNER.into(), 0))
-            );
-            assert!(inner.admitted.is_empty());
         }
     }
 
@@ -7517,190 +7012,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_snapshot_succeeds_while_inner_lock_is_held() {
-        let router = PackageEventRouter::new(PackageEventPlanePolicy::default());
-        router
-            .counters()
-            .record_ingress_status(EventPlaneStatus::ShedBusy.index());
-        let snapshot = router.test_with_inner_held(|| {
-            assert_eq!(
-                router.snapshot().expect_err("held inner is shed busy"),
-                EventPlaneStatus::ShedBusy
-            );
-            router.counters().snapshot()
-        });
-        assert_eq!(
-            snapshot.event_shed_by_reason.get("shed_busy").copied(),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn diagnostic_reserve_failure_does_not_change_acceptance() {
-        let router = router();
-        router
-            .try_register_contracts(vec![sample_contract("owner", "ready")])
-            .expect("register");
-        assert_eq!(
-            router.try_subscribe(EventSubscription {
-                plugin_key: "consumer".to_string(),
-                owner: "owner".to_string(),
-                name: "ready".to_string(),
-                handler_id: "handler".to_string(),
-                generation: 0,
-                event_generation: 0,
-                plugin_generation: 0,
-            }),
-            EventPlaneStatus::Accepted
-        );
-        let payload = serde_json::json!({"ok": true});
-        assert_eq!(
-            router.try_ingress("owner", "ready", &payload, Instant::now()),
-            EventPlaneStatus::Accepted
-        );
-        router.test_fail_next_age_reserve();
-        assert_eq!(
-            router.try_ingress("owner", "ready", &payload, Instant::now()),
-            EventPlaneStatus::Accepted
-        );
-        assert!(router.counters().snapshot().event_age_sample_failures >= 1);
-    }
-
-    #[test]
-    fn registry_lock_does_not_block_ingress_or_retirement() {
-        let router = router();
-        router
-            .try_register_contracts(vec![sample_contract("owner", "ready")])
-            .expect("register");
-        assert_eq!(
-            router.try_subscribe(EventSubscription {
-                plugin_key: "consumer".to_string(),
-                owner: "owner".to_string(),
-                name: "ready".to_string(),
-                handler_id: "handler".to_string(),
-                generation: 0,
-                event_generation: 0,
-                plugin_generation: 0,
-            }),
-            EventPlaneStatus::Accepted
-        );
-        let payload = serde_json::json!({"ok": true});
-        router.counters().test_with_registry_held(|| {
-            assert_eq!(
-                router.try_ingress("owner", "ready", &payload, Instant::now()),
-                EventPlaneStatus::Accepted
-            );
-            let mut batch = router
-                .pull_ready_batch(1, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
-                .expect("pull");
-            let delivery = batch.pop().expect("delivery");
-            router
-                .complete_pulled_delivery(delivery)
-                .unwrap_or_else(|_| panic!("retire while registry held"));
-        });
-    }
-
-    fn consumer_row(
-        router: &PackageEventRouter,
-        identity: &str,
-    ) -> botster_hub_client::DaemonQueueAgeObservation {
-        router
-            .counters()
-            .snapshot()
-            .queue_ages
-            .into_iter()
-            .find(|row| row.kind == DaemonQueueKind::Consumer && row.identity == identity)
-            .expect("consumer row")
-    }
-
-    #[test]
-    fn existing_consumer_age_store_is_allocation_free() {
-        let router = router();
-        router
-            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
-            .expect("register");
-        subscribe(&router, "consumer", "producer", "sample.ready");
-        assert_eq!(
-            router.try_ingress(
-                "producer",
-                "sample.ready",
-                &serde_json::json!({ "ok": true }),
-                Instant::now()
-            ),
-            EventPlaneStatus::Accepted
-        );
-        let guard = crate::event_plane_counters::alloc_scope::AllocGuard::enter();
-        router.test_refresh_consumer_age("consumer");
-        assert_eq!(
-            guard.count(),
-            0,
-            "refreshing an existing consumer age cell must not allocate"
-        );
-    }
-
-    #[test]
-    fn consumer_oldest_age_tracks_front_envelope_across_mutations() {
-        let router = router();
-        router
-            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
-            .expect("register");
-        subscribe(&router, "consumer", "producer", "sample.ready");
-        assert_eq!(
-            router.try_ingress(
-                "producer",
-                "sample.ready",
-                &serde_json::json!({ "ok": true }),
-                Instant::now()
-            ),
-            EventPlaneStatus::Accepted
-        );
-        thread::sleep(StdDuration::from_millis(3));
-        assert_eq!(
-            router.try_ingress(
-                "producer",
-                "sample.ready",
-                &serde_json::json!({ "ok": true }),
-                Instant::now()
-            ),
-            EventPlaneStatus::Accepted
-        );
-        let after_second = consumer_row(&router, "consumer");
-        assert_eq!(
-            after_second.state,
-            botster_hub_client::DaemonQueueAgeState::Usable
-        );
-        assert_eq!(after_second.queue_count, Some(2));
-        let oldest_after_second = after_second.oldest_age_us.expect("oldest after second");
-        assert!(
-            oldest_after_second >= 1_000,
-            "second enqueue must keep the first envelope age, got {oldest_after_second}"
-        );
-
-        let mut batch = router
-            .pull_ready_batch(1, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
-            .expect("pull");
-        let delivery = batch.pop().expect("first delivery");
-        let after_pull = consumer_row(&router, "consumer");
-        assert_eq!(after_pull.queue_count, Some(1));
-        let oldest_after_pull = after_pull.oldest_age_us.expect("oldest after pull");
-        assert!(
-            oldest_after_pull < oldest_after_second,
-            "pulling the front must expose the newer remaining envelope"
-        );
-        router
-            .requeue_delivery(delivery)
-            .unwrap_or_else(|_| panic!("requeue"));
-        let after_requeue = consumer_row(&router, "consumer");
-        assert_eq!(after_requeue.queue_count, Some(2));
-        let oldest_after_requeue = after_requeue.oldest_age_us.expect("oldest after requeue");
-        assert!(
-            oldest_after_requeue >= oldest_after_second.saturating_sub(2_000),
-            "requeue to the front must restore the older envelope age"
-        );
-    }
-
-    #[test]
-    fn consumer_expiry_and_byte_limit_requeue_refresh_oldest_age() {
+    fn consumer_expiry_and_byte_limit_requeue_keep_the_remaining_copies() {
         let policy = PackageEventPlanePolicy {
             queue_age: StdDuration::from_millis(1),
             consumer_queue_max_bytes: 64,
@@ -7725,12 +7037,15 @@ mod tests {
             .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
             .expect("expire pull");
         assert!(expired.is_empty(), "expired copies must not be delivered");
-        let after_expiry = consumer_row(&router, "consumer");
         assert_eq!(
-            after_expiry.state,
-            botster_hub_client::DaemonQueueAgeState::Empty
+            router
+                .snapshot()
+                .unwrap()
+                .consumer_events
+                .get("consumer")
+                .copied(),
+            Some(0)
         );
-        assert_eq!(after_expiry.queue_count, Some(0));
 
         let router = PackageEventRouter::new(PackageEventPlanePolicy::default());
         router
@@ -7756,18 +7071,19 @@ mod tests {
             ),
             EventPlaneStatus::Accepted
         );
-        let before = consumer_row(&router, "consumer");
-        let oldest_before = before.oldest_age_us.expect("oldest before byte cut");
         let batch = router
             .pull_ready_batch(8, 1, Instant::now(), StdDuration::from_millis(8))
             .expect("byte-limit pull");
         assert_eq!(batch.len(), 1, "first copy fills the byte budget");
-        let after_cut = consumer_row(&router, "consumer");
-        assert_eq!(after_cut.queue_count, Some(1));
-        let oldest_after_cut = after_cut.oldest_age_us.expect("oldest after byte cut");
-        assert!(
-            oldest_after_cut < oldest_before,
-            "byte-limit requeue must keep the remaining front envelope, not the pulled one"
+        assert_eq!(
+            router
+                .snapshot()
+                .unwrap()
+                .consumer_events
+                .get("consumer")
+                .copied(),
+            Some(1),
+            "the byte-limit requeue keeps the remaining copy queued"
         );
     }
 
@@ -7858,12 +7174,6 @@ mod tests {
         assert_eq!(
             baseline_events, 1,
             "one delivery is the occupancy that must stay net-zero across cycles"
-        );
-        let observ = router.test_observability_snapshot();
-        assert!(
-            observ.event_router_queue_age_expiries >= 1,
-            "pull_ready_batch must record router queue-age expiry when the preserved enqueued_at expires, got {}",
-            observ.event_router_queue_age_expiries
         );
     }
 
@@ -8000,7 +7310,6 @@ mod tests {
             matches!(overlap, Err(StageError::AlreadyStaged)),
             "{overlap:?}"
         );
-        assert_eq!(router.counters.stage_overlaps(), 1);
         assert_eq!(
             released.load(Ordering::SeqCst),
             1,

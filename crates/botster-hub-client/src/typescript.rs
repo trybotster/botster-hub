@@ -1582,7 +1582,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("stale_sessions", "string[]"),
             ("lifecycle_counters?", "DaemonLifecycleCounters"),
             ("live_attach_occupancy?", "DaemonAttachOccupancy[]"),
-            ("observability?", "DaemonObservabilityCounters"),
             ("retention?", "DaemonRetentionAccounting | null"),
             ("quarantines?", "DaemonQuarantine[]"),
             (
@@ -1741,80 +1740,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("entity_delivery_failures", "number"),
             ("stalled_writes", "number"),
         ],
-    );
-    emit_interface(
-        &mut output,
-        "DaemonObservabilityCounters",
-        &[
-            ("event_shed_by_reason?", "Record<string, number>"),
-            ("event_admission_attempts", "number"),
-            ("event_delivery_attempts", "number"),
-            ("event_admission_latency?", "DaemonLatencyHistogram"),
-            ("event_delivery_latency?", "DaemonLatencyHistogram"),
-            ("event_handler_timed_out", "number"),
-            ("event_handler_failed", "number"),
-            ("event_handler_cancelled", "number"),
-            ("event_handler_backpressured", "number"),
-            ("event_handler_worker_stopped", "number"),
-            ("event_handler_completed_ok", "number"),
-            ("event_router_queue_age_expiries", "number"),
-            ("event_mailbox_queue_age_expiries", "number"),
-            ("event_mailbox_overflow_gaps", "number"),
-            ("event_gaps", "number"),
-            ("event_age_sample_failures", "number"),
-            ("last_owner_turn_us", "number"),
-            ("max_owner_turn_us", "number"),
-            ("last_ready_operation_wait_us", "number"),
-            ("max_ready_operation_wait_us", "number"),
-            ("stalled_write_timeouts", "number"),
-            ("queue_ages?", "DaemonQueueAgeObservation[]"),
-            ("global_in_flight_bytes?", "number"),
-            ("event_replacements_stranded?", "number"),
-            ("event_deliveries_generation_unloaded?", "number"),
-            ("event_deliveries_package_unloaded?", "number"),
-            ("event_deliveries_handler_absent?", "number"),
-            ("event_stage_overlaps?", "number"),
-            ("events_stranded?", "number"),
-            ("package_quarantines_not_durable?", "number"),
-            (
-                "retained_reservation_outstanding_staging_funding?",
-                "number",
-            ),
-            ("retained_reservation_outstanding_entity_work?", "number"),
-        ],
-    );
-    emit_interface(
-        &mut output,
-        "DaemonLatencyHistogram",
-        &[
-            ("buckets?", "number[]"),
-            ("count", "number"),
-            ("sum_us", "number"),
-            ("max_us", "number"),
-        ],
-    );
-    emit_interface(
-        &mut output,
-        "DaemonQueueAgeObservation",
-        &[
-            ("kind", "DaemonQueueKind"),
-            ("identity", "string"),
-            ("producer_generation?", "number"),
-            ("state", "DaemonQueueAgeState"),
-            ("oldest_age_us?", "number"),
-            ("queue_count?", "number"),
-            ("queue_bytes?", "number"),
-        ],
-    );
-    emit_permissive_string_union(
-        &mut output,
-        "DaemonQueueKind",
-        &["producer", "consumer", "client_mailbox", "unknown"],
-    );
-    emit_permissive_string_union(
-        &mut output,
-        "DaemonQueueAgeState",
-        &["usable", "empty", "indeterminate", "unknown"],
     );
     emit_interface(
         &mut output,
@@ -2012,15 +1937,6 @@ fn emit_string_union(output: &mut String, name: &str, values: &[&str]) {
         let suffix = if index + 1 == values.len() { ";" } else { "" };
         line(output, &format!("  | \"{value}\"{suffix}"));
     }
-    line(output, "");
-}
-
-fn emit_permissive_string_union(output: &mut String, name: &str, values: &[&str]) {
-    line(output, &format!("export type {name} ="));
-    for value in values {
-        line(output, &format!("  | \"{value}\""));
-    }
-    line(output, "  | (string & {});");
     line(output, "");
 }
 

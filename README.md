@@ -190,9 +190,6 @@ and entity delivery pressure without exposing session or subscription ids.
 `DaemonStatus.live_attach_occupancy` names the Hub∪Core attach pairs a sibling
 client can use as exact occupancy proof after Unix EOF. The `attach_occupancy`
 feature token is required; an omitted field is not absence.
-`DaemonStatus.observability` publishes bounded event-plane counters, oldest-age
-observations, owner-turn duration, and ready-operation wait. Empty payloads omit
-the field. Saturation-time reads do not take the event-router lock.
 Steady-state entity reconciliation consumes the Core lifecycle journal on one
 shared 500 ms backstop and performs a filesystem-backed baseline only when the
 journal explicitly requires resynchronization.
@@ -444,9 +441,6 @@ prints an installation/version remediation when the prerequisite is missing.
 The committed counter, thread, idle, reload, disable, and post-down invariants
 and their macOS/Linux diagnostic recipes are documented in
 [`docs/hub-resource-proof.md`](docs/hub-resource-proof.md).
-Event-plane coexistence regression budgets, the paired enabled/decoupled
-saturation campaign, and the calibration-before-acceptance rule are documented
-in [`docs/event-plane-load-proof.md`](docs/event-plane-load-proof.md).
 
 The first test proves the persisted-package CLI path. The explicit-coordinate
 script rejects dirty or revision-mismatched repositories before starting a

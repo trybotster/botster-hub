@@ -20,9 +20,7 @@ use crate::config::PackageEventPlanePolicy;
 use crate::daemon::owner_signal::{
     OwnerLock, OwnerSignal, Parked, SignalKey, SignalingGuard, SignalingMutex, TryLock,
 };
-use crate::event_plane_counters::{AgeIdentity, EventPlaneCounters, QueueAgeMetric};
 use crate::package_event_router::{ClientEventHolder, EventPlaneStatus, PackageEventRouter};
-use botster_hub_client::DaemonQueueKind;
 
 pub const MAX_SUBJECTS_PER_SUBSCRIPTION: usize = 16;
 pub const MAX_SUBJECT_UTF8_BYTES: usize = 256;
@@ -179,8 +177,6 @@ pub(crate) struct ClientEventMailbox {
     event_max: usize,
     byte_max: usize,
     queue_age: std::time::Duration,
-    counters: Option<Arc<EventPlaneCounters>>,
-    age_cell: Arc<QueueAgeMetric>,
     identity: String,
     subscription_id: Option<String>,
     connection_pool: Option<Arc<ConnectionEventPool>>,
@@ -223,17 +219,15 @@ struct ConnectionResidency {
 impl ClientEventMailbox {
     #[cfg(test)]
     pub(crate) fn new(policy: PackageEventPlanePolicy) -> Self {
-        Self::new_with_counters(policy, None, "mailbox", None, None)
+        Self::with_pool(policy, "mailbox", None, None)
     }
 
-    fn new_with_counters(
+    fn with_pool(
         policy: PackageEventPlanePolicy,
-        counters: Option<Arc<EventPlaneCounters>>,
         identity: &str,
         connection_pool: Option<Arc<ConnectionEventPool>>,
         subscription_id: Option<String>,
     ) -> Self {
-        let age_cell = Arc::new(QueueAgeMetric::new(0));
         Self {
             inner: Mutex::new(MailboxInner {
                 events: VecDeque::new(),
@@ -246,48 +240,10 @@ impl ClientEventMailbox {
             event_max: policy.consumer_queue_max_events,
             byte_max: policy.consumer_queue_max_bytes,
             queue_age: policy.queue_age,
-            counters,
-            age_cell,
             identity: identity.to_string(),
             subscription_id,
             connection_pool,
             connection: None,
-        }
-    }
-
-    fn register_age(&self) {
-        if let Some(counters) = self.counters.as_ref() {
-            counters.register_cell(self.mailbox_identity(), Arc::clone(&self.age_cell));
-        }
-    }
-
-    fn mailbox_identity(&self) -> AgeIdentity {
-        AgeIdentity {
-            kind: DaemonQueueKind::ClientMailbox,
-            identity: self.identity.clone(),
-            generation: Some(0),
-        }
-    }
-
-    fn publish_age(&self, inner: &MailboxInner) {
-        let count = inner.events.len() as u64;
-        let oldest = inner
-            .events
-            .front()
-            .and_then(|event| {
-                self.counters
-                    .as_ref()
-                    .map(|counters| counters.nanos_of(event.enqueued_at))
-            })
-            .unwrap_or(u64::MAX);
-        let bytes = inner.bytes as u64;
-        self.age_cell.store(count, oldest, 0, false, bytes);
-    }
-
-    // The caller holds the mailbox lock or exclusive ownership during Drop.
-    fn retire_from_registry(&self) {
-        if let Some(counters) = &self.counters {
-            counters.retire_cell(&self.mailbox_identity(), &self.age_cell);
         }
     }
 
@@ -348,17 +304,11 @@ impl ClientEventMailbox {
         if connection_full {
             drop(residency);
             drop(inner);
-            if let Some(counters) = &self.counters {
-                counters.record_mailbox_overflow_gap();
-            }
             self.mark_gap(subscription_id, owner, name);
             return Err(EventPlaneStatus::ShedFull);
         }
         if inner.events.len() + 1 > self.event_max || inner.bytes + size > self.byte_max {
             drop(inner);
-            if let Some(counters) = &self.counters {
-                counters.record_mailbox_overflow_gap();
-            }
             self.mark_gap(subscription_id, owner, name);
             return Err(EventPlaneStatus::ShedFull);
         }
@@ -381,7 +331,6 @@ impl ClientEventMailbox {
             enqueued_at: Instant::now(),
             size,
         });
-        self.publish_age(&inner);
         drop(inner);
         self.signal_wake();
         Ok(())
@@ -468,13 +417,8 @@ impl ClientEventMailbox {
                 *bytes = bytes.saturating_sub(queued.size);
             }
         }
-        self.publish_age(&inner);
         if queued.enqueued_at.elapsed() > self.queue_age {
             drop(inner);
-            if let Some(counters) = &self.counters {
-                counters.record_mailbox_queue_age_expiry();
-                counters.record_event_gap();
-            }
             self.mark_gap(&queued.subscription_id, &queued.owner, &queued.name);
             return self.take_ready_event();
         }
@@ -530,7 +474,6 @@ impl ClientEventMailbox {
         drop(std::mem::take(&mut inner.events));
         inner.bytes = 0;
         slots.clear();
-        self.publish_age(&inner);
         if let Some(residency) = residency.as_mut() {
             residency.events = residency.events.saturating_sub(removed_events);
             residency.bytes = residency.bytes.saturating_sub(removed_bytes);
@@ -538,7 +481,6 @@ impl ClientEventMailbox {
                 residency.subscriptions.remove(subscription_id);
             }
         }
-        self.retire_from_registry();
         Ok(())
     }
 
@@ -572,12 +514,6 @@ impl ClientEventMailbox {
     pub(crate) fn test_with_slots_held<R>(&self, body: impl FnOnce() -> R) -> R {
         let _guard = self.slots.try_lock().expect("test hold must acquire slots");
         body()
-    }
-}
-
-impl Drop for ClientEventMailbox {
-    fn drop(&mut self) {
-        self.retire_from_registry();
     }
 }
 
@@ -1149,9 +1085,8 @@ impl ClientEventPlane {
         {
             return Err(ClientEventAdmitError::ConnectionCapacity.into());
         }
-        let mut mailbox = ClientEventMailbox::new_with_counters(
+        let mut mailbox = ClientEventMailbox::with_pool(
             policy,
-            Some(Arc::clone(router.counters())),
             &format!("{connection_id}/{subscription_id}"),
             Some(Arc::clone(&connection.pool)),
             Some(subscription_id.to_string()),
@@ -1164,7 +1099,6 @@ impl ClientEventPlane {
             active: AtomicBool::new(false),
         });
         slots.insert(Arc::from(subscription_id), Arc::clone(&slot));
-        mailbox.register_age();
         residency
             .subscriptions
             .insert(subscription_id.to_string(), (0, 0));
@@ -1565,58 +1499,6 @@ mod tests {
         assert!(mailbox.take_ready_event().is_none());
         plane.test_reclaim(&router);
         assert_pool_empty(&pool, 0);
-    }
-
-    #[test]
-    fn connection_cleanup_retires_diagnostics_only_after_mailbox_lock_release() {
-        let router = admitted_router(EventAudience::Clients);
-        let plane = ClientEventPlane::default();
-        plane
-            .try_subscribe(
-                "connection",
-                "sub",
-                "owner",
-                "ready",
-                Vec::new(),
-                PackageEventPlanePolicy::default(),
-                &router,
-            )
-            .unwrap();
-        let mailbox = plane.subscription_mailbox("connection", "sub").unwrap();
-        mailbox
-            .try_push("sub", "owner", "ready", json!({"value": 1}), 23)
-            .unwrap();
-        mailbox.test_with_inner_held(|| {
-            plane.test_close("connection", &router);
-            assert!(plane.test_has_cleanup());
-            assert!(mailbox.is_retired());
-            assert!(
-                !mailbox.age_cell.is_write_closed(),
-                "retirement must wait for the current metric writer"
-            );
-            assert!(
-                router
-                    .counters()
-                    .snapshot()
-                    .queue_ages
-                    .iter()
-                    .any(|row| row.identity == "connection/sub")
-            );
-        });
-        assert!(!plane.test_reclaim(&router));
-        assert!(mailbox.age_cell.is_write_closed());
-        assert_eq!(
-            mailbox.age_cell.sample(),
-            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
-        );
-        assert!(
-            !router
-                .counters()
-                .snapshot()
-                .queue_ages
-                .iter()
-                .any(|row| row.identity == "connection/sub")
-        );
     }
 
     #[test]
@@ -2152,202 +2034,5 @@ mod tests {
         assert_eq!(router.test_client_holder_count("conn-b"), 1);
         assert!(!plane.test_reclaim(&router));
         assert_eq!(router.test_client_holder_count("conn-b"), 0);
-    }
-
-    fn mailbox_row(
-        counters: &crate::event_plane_counters::EventPlaneCounters,
-        identity: &str,
-    ) -> botster_hub_client::DaemonQueueAgeObservation {
-        counters
-            .snapshot()
-            .queue_ages
-            .into_iter()
-            .find(|row| row.kind == DaemonQueueKind::ClientMailbox && row.identity == identity)
-            .expect("mailbox row")
-    }
-
-    #[test]
-    fn mailbox_pop_and_unsubscribe_keep_age_current() {
-        let router = admitted_router(EventAudience::Clients);
-        let plane = ClientEventPlane::default();
-        let policy = PackageEventPlanePolicy::default();
-        plane
-            .try_subscribe("conn", "sub", "owner", "ready", Vec::new(), policy, &router)
-            .expect("subscribe");
-        let mailbox = plane.mailbox("conn").expect("mailbox");
-        mailbox
-            .try_push("sub", "owner", "ready", json!({ "ok": true }), 8)
-            .expect("push");
-        let counters = router.counters();
-        let row = mailbox_row(counters, "conn/sub");
-        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Usable);
-        assert_eq!(row.queue_count, Some(1));
-        assert!(row.oldest_age_us.is_some());
-        match mailbox.take_ready_event() {
-            Some(DaemonEvent::PackageEvent { .. }) => {}
-            other => panic!("expected event: {other:?}"),
-        }
-        let row = mailbox_row(counters, "conn/sub");
-        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
-        assert_eq!(row.queue_count, Some(0));
-        assert!(row.oldest_age_us.is_none());
-        plane
-            .test_unsubscribe("conn", "sub", &router)
-            .expect("unsubscribe");
-        assert!(plane.mailbox("conn").is_none());
-        assert!(!counters.snapshot().queue_ages.iter().any(|row| {
-            row.kind == DaemonQueueKind::ClientMailbox && row.identity == "conn/sub"
-        }));
-        assert!(mailbox.age_cell.is_write_closed());
-        assert_eq!(
-            mailbox.age_cell.sample(),
-            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
-        );
-    }
-
-    #[test]
-    fn mailbox_expiry_and_connection_churn_bound_the_registry() {
-        let policy = PackageEventPlanePolicy {
-            queue_age: std::time::Duration::from_millis(1),
-            ..PackageEventPlanePolicy::default()
-        };
-        let router = PackageEventRouter::new(policy);
-        router
-            .try_register_contracts(vec![EmittedContract {
-                owner: "owner".into(),
-                name: "ready".into(),
-                audience: BTreeSet::from([EventAudience::Clients]),
-                schema: CompiledEventSchema::compile(&json!({
-                    "type": "object",
-                    "additionalProperties": true
-                }))
-                .expect("schema"),
-                package_generation: 1,
-            }])
-            .expect("register");
-        let plane = ClientEventPlane::default();
-        plane
-            .try_subscribe(
-                "conn-old",
-                "sub",
-                "owner",
-                "ready",
-                Vec::new(),
-                policy,
-                &router,
-            )
-            .expect("subscribe");
-        let mailbox = plane.mailbox("conn-old").expect("mailbox");
-        mailbox
-            .try_push("sub", "owner", "ready", json!({ "ok": true }), 8)
-            .expect("push");
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        match mailbox.take_ready_event() {
-            Some(DaemonEvent::EventGap { .. }) => {}
-            other => panic!("expired mailbox event must become a gap: {other:?}"),
-        }
-        let counters = router.counters();
-        let row = mailbox_row(counters, "conn-old/sub");
-        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
-        assert_eq!(row.queue_count, Some(0));
-        drop(mailbox);
-        plane.test_close("conn-old", &router);
-        plane.test_reclaim(&router);
-        assert!(plane.mailbox("conn-old").is_none());
-        for index in 0..8 {
-            let connection_id = format!("churn-{index}");
-            plane
-                .try_subscribe(
-                    &connection_id,
-                    "sub",
-                    "owner",
-                    "ready",
-                    Vec::new(),
-                    policy,
-                    &router,
-                )
-                .expect("churn subscribe");
-            plane.test_close(&connection_id, &router);
-            plane.test_reclaim(&router);
-        }
-        let mailbox_rows = |counters: &crate::event_plane_counters::EventPlaneCounters| {
-            counters
-                .snapshot()
-                .queue_ages
-                .into_iter()
-                .filter(|row| row.kind == DaemonQueueKind::ClientMailbox)
-                .collect::<Vec<_>>()
-        };
-        assert!(
-            mailbox_rows(counters).is_empty(),
-            "completed cleanup must remove retired mailbox rows: {:?}",
-            mailbox_rows(counters)
-        );
-        plane
-            .try_subscribe(
-                "conn-live",
-                "sub",
-                "owner",
-                "ready",
-                Vec::new(),
-                policy,
-                &router,
-            )
-            .expect("live subscribe");
-        let live_mailboxes = mailbox_rows(counters);
-        assert_eq!(
-            live_mailboxes.len(),
-            1,
-            "only the live mailbox must remain registered: {live_mailboxes:?}"
-        );
-        assert_eq!(live_mailboxes[0].identity, "conn-live/sub");
-    }
-
-    #[test]
-    fn delayed_mailbox_drop_does_not_retire_a_replacement_cell() {
-        let router = admitted_router(EventAudience::Clients);
-        let plane = ClientEventPlane::default();
-        let policy = PackageEventPlanePolicy::default();
-        plane
-            .try_subscribe(
-                "conn",
-                "sub-old",
-                "owner",
-                "ready",
-                Vec::new(),
-                policy,
-                &router,
-            )
-            .expect("old subscribe");
-        let old = plane.mailbox("conn").expect("old mailbox");
-        old.try_push("sub-old", "owner", "ready", json!({ "ok": true }), 8)
-            .expect("old push");
-        plane.test_close("conn", &router);
-        plane.test_reclaim(&router);
-        plane
-            .try_subscribe(
-                "conn",
-                "sub-new",
-                "owner",
-                "ready",
-                Vec::new(),
-                policy,
-                &router,
-            )
-            .expect("replacement subscribe");
-        let new = plane.mailbox("conn").expect("new mailbox");
-        new.try_push("sub-new", "owner", "ready", json!({ "ok": true }), 8)
-            .expect("new push");
-        drop(old);
-        let row = mailbox_row(router.counters(), "conn/sub-new");
-        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Usable);
-        assert_eq!(row.queue_count, Some(1));
-        assert!(row.oldest_age_us.is_some());
-        match new.take_ready_event() {
-            Some(DaemonEvent::PackageEvent {
-                subscription_id, ..
-            }) => assert_eq!(subscription_id, "sub-new"),
-            other => panic!("replacement mailbox must stay readable: {other:?}"),
-        }
     }
 }

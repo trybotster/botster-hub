@@ -275,15 +275,9 @@ outcomes/reasons, reconciliation wake/change/baseline/resync/drain work,
 entity delivery attempts/outcomes, and stalled writes. It never contains
 connection, session, subscription, path, command, or payload identifiers.
 
-`DaemonStatus.observability` is optional and omitted when empty. Conformance
-fixture revision 46 adds this field. Protocol version stays 7. The object
-carries event-plane shed/gap/latency/timeout counters, owner-turn and
-ready-operation-wait durations, `stalled_write_timeouts` as the timeout subset
-of `lifecycle_counters.stalled_writes`, and `queue_ages` rows. Each age row is
-a bounded diagnostic observation with distinct `usable`, `empty`, and
-`indeterminate` states. `queue_count` is present only on a validated bracket.
-`oldest_age_us`, `producer_generation`, and `queue_count` are optional on the
-wire. Unknown future `kind` and `state` values deserialize as `unknown`.
+`DaemonStatus.observability` was removed with the event-plane counters. Status
+carries `diagnostics` rows only; a client that still sends or reads the field
+ignores it.
 
 `DaemonStatus.live_attach_occupancy` is the public named occupancy oracle. A
 sibling Unix client reads it with only `botster-hub-client`. Each row is
@@ -1775,11 +1769,6 @@ the optional plugin logs `log_id` (below). Protocol 12 added:
 - the `ReadPluginLogs` request and its `PluginLogs` response (see "Plugin
   Logs"); each record carries its load's `generation` and its fields as
   `fields_json` text;
-- two `DaemonObservabilityCounters` fields, omitted when zero:
-  `retained_reservation_outstanding_staging_funding` and
-  `retained_reservation_outstanding_entity_work`. Each counts the times new
-  work of that kind was refused while a reservation of the same kind was still
-  outstanding (a retained-reservation invariant fault).
 
 Everything described under the earlier protocols below still applies.
 

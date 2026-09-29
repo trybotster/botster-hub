@@ -60,7 +60,6 @@ pub(crate) fn handle(
 pub(crate) struct CallerAdmission {
     pub(crate) request: DaemonRequest,
     pub(crate) reply_tx: ControlReplySender,
-    pub(crate) enqueued_at: Instant,
     pub(crate) caller: Caller,
 }
 
@@ -74,7 +73,6 @@ pub(crate) fn admit_caller_request(
     let CallerAdmission {
         request,
         reply_tx,
-        enqueued_at,
         caller,
     } = admission;
     let admitted = ControlMessage::Request {
@@ -86,7 +84,6 @@ pub(crate) fn admit_caller_request(
         client_id: caller
             .session_id()
             .map(|session| format!("http-mcp:{}", session.0)),
-        enqueued_at: enqueued_at.min(Instant::now()),
     };
     handle_as(
         daemon,
@@ -115,7 +112,6 @@ pub(crate) fn handle_as(
         response_delivery_rx,
         grant_id,
         client_id,
-        enqueued_at,
     } = message
     else {
         unreachable!("request owner received a non-request control message");
@@ -128,11 +124,6 @@ pub(crate) fn handle_as(
                 "the daemon is finishing accepted requests before shutdown",
             )),
             response_delivery_rx,
-        );
-    }
-    if let Some(runtime) = daemon.runtime() {
-        runtime.event_plane_counters().record_ready_operation_wait(
-            u64::try_from(enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
     }
     // Late WebRTC Requests after PeerClosed must not create durable ownership or run
