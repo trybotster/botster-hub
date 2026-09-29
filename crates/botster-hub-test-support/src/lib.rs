@@ -7025,11 +7025,17 @@ done
     }
 
     #[cfg(unix)]
+    // The fixture worker must keep naming itself as the session worker for as
+    // long as it lives. `exec /bin/sleep` replaced the script with `sleep` a few
+    // milliseconds after the pid file appeared, so the census (which recognizes
+    // the worker by its command line) saw a `sleep` and found no worker: the
+    // census tests failed whenever the exec won the race. The shell stays and runs
+    // sleep as its child.
     fn worker_sleep_binary(root: &Path) -> PathBuf {
         executable_script(
             root,
             SESSION_WORKER_NAME,
-            "#!/bin/sh\nexec /bin/sleep \"$@\"\n",
+            "#!/bin/sh\n/bin/sleep \"$@\"\nexit 0\n",
         )
     }
 
