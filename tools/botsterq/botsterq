@@ -89,6 +89,11 @@ ADMISSION_PERL='
   use Fcntl qw(:flock O_RDONLY O_NONBLOCK);
   use POSIX qw(:sys_wait_h);
   my ($lockfile, $cancelfifo, $out) = splice(@ARGV, 0, 3);
+  # Test hook: a fifo opened for writing and never written; its reader sees end of
+  # file exactly when this process ends (its own children close it), which is
+  # the event the SIGKILL test waits for instead of polling ps.
+  my $lifetime;
+  if (defined $ENV{BOTSTERQ_TEST_ADMISSION_LIFETIME}) { open($lifetime, ">", $ENV{BOTSTERQ_TEST_ADMISSION_LIFETIME}); }
   # Test hold: a fifo read before anything (the interrupt tests stop this
   # process just after its fork).
   if (defined $ENV{BOTSTERQ_TEST_ADMISSION_HOLD}) {
@@ -108,7 +113,7 @@ ADMISSION_PERL='
   die "botsterq: fork: $!\n" unless defined $waiter;
   if (!$waiter) {
     $0 = "botsterq-lock-waiter";
-    close $lock_r; close $hold_w; close $cf;
+    close $lock_r; close $hold_w; close $cf; close $lifetime if $lifetime;
     open(my $lock, ">>", $lockfile) or exit 1;
     unless (flock($lock, LOCK_EX | LOCK_NB)) {
       # The lock is held: about to block. The test hook announces this through
