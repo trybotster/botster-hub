@@ -35,6 +35,18 @@ case "$phase" in
   all|build|shared|lifecycle) ;;
   *) echo "unknown phase: $phase (all, build, shared or lifecycle)" >&2; exit 2 ;;
 esac
+# --phase and --candidate-dir belong before every other argument. Anywhere else
+# they would reach cargo test as ordinary arguments and the script would run the
+# whole gate (phase all), the worst silent outcome; refuse them instead.
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    --phase|--phase=*|--candidate-dir|--candidate-dir=*)
+      echo "test.sh: $arg must come before every other argument (usage: ./test.sh [--phase all|build|shared|lifecycle] [--candidate-dir <dir>] [cargo test arguments])" >&2
+      exit 2
+      ;;
+  esac
+done
 
 node packages/hub-test-support/scripts/sync-assets.mjs --check
 
