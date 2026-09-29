@@ -4794,9 +4794,13 @@ return botster.register({
     )
     .expect("call render-capacity refusal through daemon");
     assert_eq!(capacity.kind, botster_hub::DaemonResponseKind::OperatorError);
+    // The refusal text carries a 1.1 MB name. Materialization no longer copies and charges the
+    // request, so the Lua render is funded and Core's completion budget refuses the oversized
+    // result with its own typed failure. The render-capacity refusal itself is covered by
+    // `semantic_refusal_render_capacity_releases_the_message`.
     assert_eq!(
         capacity.error.as_ref().expect("capacity has an operator error").message,
-        "runtime error: Lua refusal render capacity exhausted",
+        "completion exceeded reserved byte budget",
     );
     // A UI action handler, not only an MCP tool, reaches the same owner path.
     let action = botster_hub::daemon_transport_request(

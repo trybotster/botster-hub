@@ -47,26 +47,6 @@ impl std::fmt::Display for CredentialUnavailable {
     }
 }
 
-/// Retained bytes the credential adds to a spawn request, for a charged
-/// caller: the token and its name in the environment, the URL and its name
-/// when there is one, and the digest and its key in the metadata. Each string is built at exact capacity. Vector slots
-/// and map nodes are the caller's to count, because only it knows their size.
-pub(crate) fn credential_string_bytes(session_id: &str, mcp_url: Option<&str>) -> Option<usize> {
-    token_len(session_id)?
-        .checked_add(MCP_TOKEN_ENVIRONMENT.len())?
-        .checked_add(HEX_DIGEST_BYTES)?
-        .checked_add(TOKEN_DIGEST_METADATA_KEY.len())?
-        .checked_add(mcp_url.map_or(Some(0), |url| {
-            url.len().checked_add(MCP_URL_ENVIRONMENT.len())
-        })?)
-}
-
-/// Environment variables the credential adds: the token, and the URL when
-/// the daemon serves MCP.
-pub(crate) fn credential_variable_slots(mcp_url: Option<&str>) -> usize {
-    1 + usize::from(mcp_url.is_some())
-}
-
 fn token_len(session_id: &str) -> Option<usize> {
     session_id.len().checked_add(1 + HEX_SECRET_BYTES)
 }
@@ -284,15 +264,6 @@ mod tests {
                 .any(|value| value.contains(secret)),
             "the raw secret must not reach persisted metadata"
         );
-        assert_eq!(
-            credential_string_bytes("session-a", None),
-            Some(
-                tokens[0].len()
-                    + MCP_TOKEN_ENVIRONMENT.len()
-                    + digest.len()
-                    + TOKEN_DIGEST_METADATA_KEY.len()
-            )
-        );
     }
 
     /// Issue a credential with the fixed test secret and return the token.
@@ -386,8 +357,6 @@ mod tests {
                 .count()
                 == 1
         );
-        assert_eq!(credential_variable_slots(Some(url)), 2);
-        assert_eq!(credential_variable_slots(None), 1);
     }
 
     #[test]
