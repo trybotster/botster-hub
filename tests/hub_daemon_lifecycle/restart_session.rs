@@ -322,7 +322,14 @@ fn a_restart_of_a_session_whose_type_is_gone_is_refused_and_can_be_retried() {
     let state = hub_state_json(&data_dir);
     assert!(state["restart_records"].get(session_id).is_some(), "{state}");
 
-    enable(&config);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackage {
+            package_name: "runtime.session-type".to_string(),
+        },
+    )
+    .expect("enable the package again");
+    assert_ne!(enabled.kind, botster_hub::DaemonResponseKind::OperatorError, "{enabled:?}");
     let restarted = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::RestartSession {
