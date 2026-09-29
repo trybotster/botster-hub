@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/rtc-0.21.0-rc.1", "vendor/rtc-sctp-0.21.0-rc.1"]
+exclude = ["vendor/rtc-0.21.0-rc.1"]
 members = [
   ".",
   "crates/botster-hub-client",
@@ -96,7 +96,8 @@ botster-ui-contract = { path = "crates/botster-ui-contract" }
 # vendor/README.md.
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
-rtc-sctp = { path = "vendor/rtc-sctp-0.21.0-rc.1" }
+rtc-sctp = { git = "file:///private/tmp/claude-501/-Users-jasonconigliari-botster-sessions-git-github-com-trybotster-botster-web-delivery-web-sonnet-20260928/b023fd46-c031-4570-9416-fc1cfc5fa6fc/scratchpad/rtc-fork-local.git", rev = "3a1d78830588e766d243655483e58d2455961239" }
+rtc-shared = { git = "file:///private/tmp/claude-501/-Users-jasonconigliari-botster-sessions-git-github-com-trybotster-botster-web-delivery-web-sonnet-20260928/b023fd46-c031-4570-9416-fc1cfc5fa6fc/scratchpad/rtc-fork-local.git", rev = "3a1d78830588e766d243655483e58d2455961239" }
 
 # The lifecycle harness verifies the candidate manifest (SHA-256 of the
 # ~110 MB Hub binary) on every IsolatedHub start. Unoptimized sha2 takes
