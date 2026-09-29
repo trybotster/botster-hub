@@ -1,54 +1,128 @@
 // Agent coordination over live sessions: identity injection and routed messages.
 
+/// A session's bearer token. It prints nothing, so a failing assertion can
+/// never put a credential into a test log.
+struct SessionToken(String);
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionToken(..)")
+    }
+}
+
+/// One HTTP reply, reduced to what the tests read.
+struct HttpReply {
+    status: u16,
+    body: String,
+}
+
+/// The daemon's MCP endpoint, from the file the daemon records in its data
+/// directory: `(port, url)`.
+fn mcp_endpoint(data_dir: &Path) -> (u16, String) {
+    let port = fs::read_to_string(data_dir.join("mcp-http.endpoint"))
+        .expect("the daemon records its MCP port")
+        .trim()
+        .parse::<u16>()
+        .expect("the recorded MCP port is a number");
+    (port, format!("http://127.0.0.1:{port}/mcp"))
+}
+
+/// Send one raw HTTP request to the daemon's MCP port and read the reply to
+/// the end of the connection. `head_lines` are the header lines, verbatim.
+fn mcp_http_raw(port: u16, head_lines: &[String], body: &str) -> HttpReply {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the MCP port");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set MCP read deadline");
+    let mut request = String::from("POST /mcp HTTP/1.1\r\n");
+    for line in head_lines {
+        request.push_str(line);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("write MCP head");
+    stream.write_all(body.as_bytes()).expect("write MCP body");
+    let mut reply = Vec::new();
+    // The daemon closes after a refusal, and the request asks for `close`
+    // otherwise, so the end of the stream ends the reply.
+    let _ = stream.read_to_end(&mut reply);
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    HttpReply {
+        status,
+        body: body.to_string(),
+    }
+}
+
+/// A standard MCP request from `token`'s session, with the given extra headers.
+fn mcp_http_post(
+    data_dir: &Path,
+    token: Option<&SessionToken>,
+    extra_headers: &[&str],
+    body: &str,
+) -> HttpReply {
+    let (port, _) = mcp_endpoint(data_dir);
+    let mut lines = vec![
+        format!("Host: 127.0.0.1:{port}"),
+        "Content-Type: application/json".to_string(),
+        format!("Content-Length: {}", body.len()),
+        "Connection: close".to_string(),
+    ];
+    if let Some(token) = token {
+        lines.push(format!("Authorization: Bearer {}", token.0));
+    }
+    lines.extend(extra_headers.iter().map(ToString::to_string));
+    mcp_http_raw(port, &lines, body)
+}
+
+/// One tool call as the session `token` names; the reply's `result`.
 fn coordination_mcp_call(
     data_dir: &Path,
-    caller_session_id: Option<&str>,
+    token: &SessionToken,
     tool: &str,
     arguments: serde_json::Value,
 ) -> serde_json::Value {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
-        .arg("mcp-serve")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .env_remove(botster_hub::session_types::SESSION_ID_ENVIRONMENT)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(caller_session_id) = caller_session_id {
-        command.env(
-            botster_hub::session_types::SESSION_ID_ENVIRONMENT,
-            caller_session_id,
-        );
-    }
-    let mut child = command.spawn().expect("spawn botster-hub mcp-serve");
-    {
-        let stdin = child.stdin.as_mut().expect("mcp stdin");
-        for request in [
-            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": { "name": tool, "arguments": arguments }
-            }),
-        ] {
-            writeln!(stdin, "{request}").expect("write MCP request");
-        }
-    }
-    let output = child.wait_with_output().expect("wait for mcp-serve");
-    assert!(
-        output.status.success(),
-        "mcp-serve failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments }
+    })
+    .to_string();
+    let reply = mcp_http_post(data_dir, Some(token), &[], &body);
+    assert_eq!(reply.status, 200, "tool {tool} was refused with {}", reply.status);
+    let message: serde_json::Value =
+        serde_json::from_str(&reply.body).expect("the MCP reply is JSON");
+    message["result"].clone()
+}
+
+/// Spawn a session whose command runs `command`, and read back its token and
+/// endpoint URL from its own environment through a FIFO.
+fn coordination_spawn_with_token(
+    data_dir: &Path,
+    session_id: &str,
+    command: &str,
+) -> (SessionToken, String) {
+    let fifo_dir = unique_short_test_dir("coord-token");
+    fs::create_dir_all(&fifo_dir).expect("create token fifo dir");
+    let fifo = fifo_dir.join(format!("{session_id}.fifo"));
+    make_fifo(&fifo);
+    coordination_spawn(
+        data_dir,
+        session_id,
+        &format!(
+            "printf '%s\\n%s' \"$BOTSTER_MCP_TOKEN\" \"$BOTSTER_MCP_URL\" > {}; {command}",
+            shell_quote(&fifo.display().to_string()),
+        ),
     );
-    let stdout = String::from_utf8(output.stdout).expect("mcp stdout is utf8");
-    let response = stdout
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP line is JSON"))
-        .find(|message| message["id"] == 2)
-        .expect("tools/call response");
-    response["result"].clone()
+    let text = read_fifo_to_end(&fifo);
+    let (token, url) = text.split_once('\n').expect("token and URL");
+    (SessionToken(token.to_string()), url.to_string())
 }
 
 fn coordination_spawn(data_dir: &Path, session_id: &str, command: &str) {
@@ -125,48 +199,22 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[test]
-fn spawned_sessions_carry_the_identity_that_mcp_serve_reports() {
+fn spawned_sessions_carry_the_identity_that_the_mcp_endpoint_reports() {
     let _guard = daemon_test_guard();
-    // Sessions reach the daemon through the absolute data directory, so it
-    // must keep the socket path under the Unix limit.
     let data_dir = unique_short_test_dir("coord-id");
     let daemon = start_cli_daemon(&data_dir);
-    let fifo_dir = unique_short_test_dir("coord-fifo");
-    fs::create_dir_all(&fifo_dir).expect("create fifo dir");
-
-    let requests = format!(
-        "{}\n{}\n",
-        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": { "name": "whoami", "arguments": {} }
-        }),
-    );
-    let fifo = fifo_dir.join("raw-identity.fifo");
-    make_fifo(&fifo);
-    // The session runs mcp-serve from its own environment, as an agent would.
-    coordination_spawn(
-        &data_dir,
-        "raw-identity",
-        &format!(
-            "printf '%s' {} | \"$BOTSTER_HUB_BIN\" mcp-serve --data-dir \"$BOTSTER_HUB_DATA_DIR\" > {}; exec cat",
-            shell_quote(&requests),
-            shell_quote(&fifo.display().to_string()),
-        ),
-    );
-    let output = read_fifo_to_end(&fifo);
-    let whoami = output
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP line is JSON"))
-        .find(|message| message["id"] == 2)
-        .unwrap_or_else(|| panic!("whoami response in {output:?}"));
-    let identity = &whoami["result"]["structuredContent"]["identity"];
+    let (token, url) = coordination_spawn_with_token(&data_dir, "raw-identity", "exec cat");
+    // The URL the session holds is the daemon's recorded endpoint.
+    assert_eq!(url, mcp_endpoint(&data_dir).1);
+    let whoami = coordination_mcp_call(&data_dir, &token, "whoami", serde_json::json!({}));
+    let identity = &whoami["structuredContent"]["identity"];
     assert_eq!(identity["caller_session_id"], "raw-identity", "{whoami}");
-    assert_eq!(
-        identity["identity_source"],
-        botster_hub::session_types::SESSION_ID_ENVIRONMENT
+    assert_eq!(identity["identity_source"], "caller_token");
+    assert_eq!(identity["role"], "session");
+    // A session is named with its hub: a bare session id means nothing across hubs.
+    assert!(
+        identity["host_id"].as_str().is_some_and(|host| !host.is_empty()),
+        "the identity names its hub"
     );
 
     coordination_shutdown_session(&data_dir, "raw-identity");
@@ -176,20 +224,21 @@ fn spawned_sessions_carry_the_identity_that_mcp_serve_reports() {
 #[test]
 fn mcp_messages_round_trip_between_live_sessions() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-round-trip");
+    let data_dir = unique_short_test_dir("coord-round-trip");
     let daemon = start_cli_daemon(&data_dir);
-    for session_id in ["session-alpha", "session-beta", "session-slow"] {
-        coordination_spawn(&data_dir, session_id, "exec cat");
-    }
+    let (alpha, _) = coordination_spawn_with_token(&data_dir, "session-alpha", "exec cat");
+    let (beta, _) = coordination_spawn_with_token(&data_dir, "session-beta", "exec cat");
+    let (slow, _) = coordination_spawn_with_token(&data_dir, "session-slow", "exec cat");
 
-    let identity = coordination_mcp_call(&data_dir, Some("session-alpha"), "whoami", serde_json::json!({}));
+    let identity = coordination_mcp_call(&data_dir, &alpha, "whoami", serde_json::json!({}));
     assert_eq!(
         identity["structuredContent"]["identity"]["caller_session_id"],
         "session-alpha"
     );
+    let hub_id = identity["structuredContent"]["identity"]["host_id"].clone();
     let posted = coordination_mcp_call(
         &data_dir,
-        Some("session-alpha"),
+        &alpha,
         "post_message",
         serde_json::json!({ "session_id": "session-beta", "envelope_id": "mcp-envelope-1", "body": "hello beta" }),
     );
@@ -199,30 +248,33 @@ fn mcp_messages_round_trip_between_live_sessions() {
     for (envelope_id, body) in [("mcp-slow-1", "slow one"), ("mcp-slow-2", "slow two")] {
         coordination_mcp_call(
             &data_dir,
-            Some("session-alpha"),
+            &alpha,
             "post_message",
             serde_json::json!({ "session_id": "session-slow", "envelope_id": envelope_id, "body": body }),
         );
     }
 
-    let received = coordination_mcp_call(&data_dir, Some("session-beta"), "receive_messages", serde_json::json!({}));
+    let received = coordination_mcp_call(&data_dir, &beta, "receive_messages", serde_json::json!({}));
     let message = &received["structuredContent"]["messages"][0];
     assert_eq!(message["envelope_id"], "mcp-envelope-1");
     assert_eq!(message["body"], "hello beta");
-    assert_eq!(message["source"], "session:session-alpha");
+    // The sender is derived from alpha's token, structured, and names its hub.
+    assert_eq!(message["source"]["kind"], "session");
+    assert_eq!(message["source"]["session_id"], "session-alpha");
+    assert_eq!(message["source"]["hub_id"], hub_id);
     let next_cursor = received["structuredContent"]["next_cursor"]
         .as_u64()
         .expect("receive response includes next cursor");
     let acked = coordination_mcp_call(
         &data_dir,
-        Some("session-beta"),
+        &beta,
         "ack_message",
         serde_json::json!({ "envelope_id": "mcp-envelope-1" }),
     );
     assert_eq!(acked["structuredContent"]["ack"]["status"], "acknowledged");
     let after = coordination_mcp_call(
         &data_dir,
-        Some("session-beta"),
+        &beta,
         "receive_messages",
         serde_json::json!({ "after": next_cursor }),
     );
@@ -232,9 +284,10 @@ fn mcp_messages_round_trip_between_live_sessions() {
         "an after-cursor drain does not redeliver the observed envelope"
     );
 
-    let slow = coordination_mcp_call(&data_dir, Some("session-slow"), "receive_messages", serde_json::json!({ "limit": 2 }));
+    let slow_messages =
+        coordination_mcp_call(&data_dir, &slow, "receive_messages", serde_json::json!({ "limit": 2 }));
     assert_eq!(
-        slow["structuredContent"]["messages"].as_array().map(Vec::len),
+        slow_messages["structuredContent"]["messages"].as_array().map(Vec::len),
         Some(2),
         "session-slow backlog stays independent from session-beta cursor and ack"
     );
@@ -245,15 +298,16 @@ fn mcp_messages_round_trip_between_live_sessions() {
 #[test]
 fn mcp_post_message_refuses_a_session_that_is_not_running() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-refusal");
+    let data_dir = unique_short_test_dir("coord-refusal");
     let daemon = start_cli_daemon(&data_dir);
+    let (alpha, _) = coordination_spawn_with_token(&data_dir, "session-alpha", "exec cat");
     coordination_spawn(&data_dir, "session-ended", "exec cat");
     coordination_shutdown_session(&data_dir, "session-ended");
 
     for target in ["session-missing", "session-ended"] {
         let refused = coordination_mcp_call(
             &data_dir,
-            Some("session-alpha"),
+            &alpha,
             "post_message",
             serde_json::json!({ "session_id": target, "body": "nobody reads this" }),
         );
@@ -270,12 +324,13 @@ fn mcp_post_message_refuses_a_session_that_is_not_running() {
 #[test]
 fn mcp_routed_envelopes_are_not_restart_durable_today() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-restart-loss");
+    let data_dir = unique_short_test_dir("coord-restart-loss");
     let daemon = start_cli_daemon(&data_dir);
-    coordination_spawn(&data_dir, "session-restart", "exec cat");
+    let (sender, _) = coordination_spawn_with_token(&data_dir, "session-sender", "exec cat");
+    let (target, url) = coordination_spawn_with_token(&data_dir, "session-restart", "exec cat");
     let posted = coordination_mcp_call(
         &data_dir,
-        Some("session-alpha"),
+        &sender,
         "post_message",
         serde_json::json!({ "session_id": "session-restart", "envelope_id": "mcp-restart-1", "body": "lost after restart" }),
     );
@@ -286,7 +341,15 @@ fn mcp_routed_envelopes_are_not_restart_durable_today() {
     shutdown_cli_daemon(&data_dir, daemon);
 
     let restarted = start_cli_daemon(&data_dir);
-    let received = coordination_mcp_call(&data_dir, Some("session-restart"), "receive_messages", serde_json::json!({}));
+    // Sessions hold the URL in their environment, so it must not move.
+    assert_eq!(mcp_endpoint(&data_dir).1, url, "the endpoint URL survives a restart");
+    // The same token still identifies the same session after the restart.
+    let identity = coordination_mcp_call(&data_dir, &target, "whoami", serde_json::json!({}));
+    assert_eq!(
+        identity["structuredContent"]["identity"]["caller_session_id"],
+        "session-restart"
+    );
+    let received = coordination_mcp_call(&data_dir, &target, "receive_messages", serde_json::json!({}));
     shutdown_cli_daemon(&data_dir, restarted);
     assert_eq!(
         received["structuredContent"]["messages"].as_array().map(Vec::len),
@@ -336,6 +399,7 @@ fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
             ("BOTSTER_SESSION_UUID", "leaked-session-uuid"),
             ("BOTSTER_CONTEXT_ID", "leaked-context"),
             ("BOTSTER_MCP_TOKEN", "leaked-token"),
+            ("BOTSTER_MCP_URL", "http://leaked.invalid/mcp"),
             // A credential under a name the test does not check one by one.
             ("BOTSTER_SYNTHETIC_SECRET", "leaked-synthetic-secret-3f9c1a"),
         ],
@@ -414,12 +478,25 @@ fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
             inherited.is_empty(),
             "{session_id} inherited the launcher's value of {inherited:?}"
         );
-        for name in ["BOTSTER_SESSION_UUID", "BOTSTER_MCP_TOKEN", "BOTSTER_SYNTHETIC_SECRET"] {
+        for name in ["BOTSTER_SESSION_UUID", "BOTSTER_SYNTHETIC_SECRET"] {
             assert!(
                 !environment.contains_key(name),
                 "{session_id} inherited {name}"
             );
         }
+        // The token and URL are the session's own, issued at spawn.
+        assert!(
+            environment
+                .get("BOTSTER_MCP_TOKEN")
+                .is_some_and(|token| token.starts_with(&format!("{session_id}."))),
+            "{session_id} does not hold its own BOTSTER_MCP_TOKEN"
+        );
+        assert!(
+            environment
+                .get("BOTSTER_MCP_URL")
+                .is_some_and(|url| url == &mcp_endpoint(&data_dir).1),
+            "{session_id} does not hold the daemon's BOTSTER_MCP_URL"
+        );
     }
     // A raw spawn has no context record, so no context id at all.
     assert!(
@@ -442,20 +519,21 @@ fn spawned_sessions_do_not_inherit_the_launchers_botster_environment() {
 #[test]
 fn mcp_receive_redelivers_until_ack_and_republish_is_idempotent() {
     let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("coordination-at-least-once");
+    let data_dir = unique_short_test_dir("coord-at-least-once");
     let daemon = start_cli_daemon(&data_dir);
-    coordination_spawn(&data_dir, "session-inbox", "exec cat");
+    let (sender, _) = coordination_spawn_with_token(&data_dir, "session-sender", "exec cat");
+    let (inbox, _) = coordination_spawn_with_token(&data_dir, "session-inbox", "exec cat");
     let post = |envelope_id: &str, body: &str| {
         coordination_mcp_call(
             &data_dir,
-            Some("session-sender"),
+            &sender,
             "post_message",
             serde_json::json!({ "session_id": "session-inbox", "envelope_id": envelope_id, "body": body }),
         )["structuredContent"]["publish"]["deliveries"][0]
             .clone()
     };
     let receive = || {
-        coordination_mcp_call(&data_dir, Some("session-inbox"), "receive_messages", serde_json::json!({}))
+        coordination_mcp_call(&data_dir, &inbox, "receive_messages", serde_json::json!({}))
             ["structuredContent"]["messages"]
             .as_array()
             .expect("messages array")
@@ -477,7 +555,7 @@ fn mcp_receive_redelivers_until_ack_and_republish_is_idempotent() {
 
     let acked = coordination_mcp_call(
         &data_dir,
-        Some("session-inbox"),
+        &inbox,
         "ack_message",
         serde_json::json!({ "envelope_id": "retry-1" }),
     );
@@ -493,24 +571,227 @@ fn mcp_receive_redelivers_until_ack_and_republish_is_idempotent() {
 }
 
 #[test]
+fn every_http_request_needs_a_token_that_proves_a_running_session() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("coord-auth");
+    let daemon = start_cli_daemon(&data_dir);
+    let (alpha, _) = coordination_spawn_with_token(&data_dir, "session-alpha", "exec cat");
+    let (beta, _) = coordination_spawn_with_token(&data_dir, "session-beta", "exec cat");
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "whoami", "arguments": {} }
+    })
+    .to_string();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    })
+    .to_string();
+
+    // No token: there is no operator over HTTP.
+    let missing = mcp_http_post(&data_dir, None, &[], &call);
+    assert_eq!(missing.status, 401);
+    assert!(missing.body.contains("caller_unauthenticated"));
+
+    // alpha's id with beta's secret, and an unknown session with a well-formed
+    // secret: both are refused with the same body, and neither is the operator.
+    let (_, beta_secret) = beta.0.rsplit_once('.').expect("token separator");
+    let forged = SessionToken(format!("session-alpha.{beta_secret}"));
+    let unknown = SessionToken(format!("session-nobody.{beta_secret}"));
+    let forged_reply = mcp_http_post(&data_dir, Some(&forged), &[], &call);
+    let unknown_reply = mcp_http_post(&data_dir, Some(&unknown), &[], &call);
+    assert_eq!(forged_reply.status, 401);
+    assert_eq!(unknown_reply.status, 401);
+    assert_eq!(forged_reply.body, unknown_reply.body, "no oracle for which sessions exist");
+    // Even initialize, which needs no owner work, proves the token first.
+    assert_eq!(mcp_http_post(&data_dir, Some(&forged), &[], &initialize).status, 401);
+
+    // Every refusal that names a token or a secret leaves them out of the reply.
+    for reply in [&missing, &forged_reply, &unknown_reply] {
+        assert!(!reply.body.contains(beta_secret), "a refusal repeats a secret");
+    }
+
+    // A malformed token never reaches Core.
+    let malformed = SessionToken("session-alpha.not-hex".to_string());
+    assert_eq!(mcp_http_post(&data_dir, Some(&malformed), &[], &call).status, 401);
+
+    // Cross-inbox: alpha cannot drain or ack beta's inbox, whatever it names.
+    coordination_mcp_call(
+        &data_dir,
+        &alpha,
+        "post_message",
+        serde_json::json!({ "session_id": "session-beta", "envelope_id": "cross-1", "body": "for beta" }),
+    );
+    let alpha_view = coordination_mcp_call(&data_dir, &alpha, "receive_messages", serde_json::json!({}));
+    assert_eq!(
+        alpha_view["structuredContent"]["messages"].as_array().map(Vec::len),
+        Some(0),
+        "alpha's inbox holds nothing of beta's"
+    );
+    let named = coordination_mcp_call(
+        &data_dir,
+        &alpha,
+        "receive_messages",
+        serde_json::json!({ "session_id": "session-beta" }),
+    );
+    assert_eq!(named["isError"], true, "a target inbox argument is refused: {named}");
+    let beta_view = coordination_mcp_call(&data_dir, &beta, "receive_messages", serde_json::json!({}));
+    assert_eq!(
+        beta_view["structuredContent"]["messages"][0]["source"]["session_id"],
+        "session-alpha",
+        "the sender is alpha's own session, derived from its token"
+    );
+
+    coordination_shutdown_session(&data_dir, "session-alpha");
+    coordination_shutdown_session(&data_dir, "session-beta");
+    shutdown_cli_daemon(&data_dir, daemon);
+}
+
+#[test]
+fn tool_calls_are_audited_by_verified_caller_target_and_outcome() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("coord-audit");
+    let daemon = start_cli_daemon(&data_dir);
+    let (alpha, _) = coordination_spawn_with_token(&data_dir, "session-alpha", "exec cat");
+    coordination_spawn(&data_dir, "session-beta", "exec cat");
+
+    let secret_body = "audit-body-must-not-be-logged";
+    coordination_mcp_call(
+        &data_dir,
+        &alpha,
+        "post_message",
+        serde_json::json!({ "session_id": "session-beta", "body": secret_body }),
+    );
+    coordination_mcp_call(
+        &data_dir,
+        &alpha,
+        "post_message",
+        serde_json::json!({ "session_id": "session-missing", "body": secret_body }),
+    );
+    // A call whose token proves nothing is refused, and logged without a caller.
+    let (_, alpha_secret) = alpha.0.rsplit_once('.').expect("token separator");
+    let forged = SessionToken(format!("session-beta.{alpha_secret}"));
+    let refused = mcp_http_post(
+        &data_dir,
+        Some(&forged),
+        &[],
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "whoami", "arguments": {} }
+        })
+        .to_string(),
+    );
+    assert_eq!(refused.status, 401);
+
+    let all = coordination_cli(&data_dir, &["audit", "tools"]);
+    let calls: Vec<serde_json::Value> = all
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("an audit line is JSON"))
+        .collect();
+    assert_eq!(calls.len(), 3, "one line per tool call");
+    // alpha posted to beta: caller alpha, target beta, ok.
+    assert_eq!(calls[0]["tool"], "post_message");
+    assert_eq!(calls[0]["caller"]["session_id"], "session-alpha");
+    assert_eq!(calls[0]["target"]["session_id"], "session-beta");
+    assert_eq!(calls[0]["outcome"], "ok");
+    assert_eq!(calls[0]["caller"]["hub_id"], calls[0]["target"]["hub_id"]);
+    // A refused post records its error code.
+    assert_eq!(calls[1]["target"]["session_id"], "session-missing");
+    assert_eq!(calls[1]["outcome"], "unknown_session");
+    // An unproven token is not a caller.
+    assert_eq!(calls[2]["tool"], "whoami");
+    assert!(calls[2]["caller"].is_null());
+    assert_eq!(calls[2]["outcome"], "caller_unauthenticated");
+
+    // Only the listed fields: no body, no token, no secret.
+    assert!(!all.contains(secret_body), "a message body is in the audit log");
+    assert!(!all.contains(alpha_secret), "a secret is in the audit log");
+    for call in &calls {
+        let mut fields: Vec<_> = call.as_object().expect("an object").keys().cloned().collect();
+        fields.sort();
+        assert_eq!(fields, ["caller", "outcome", "target", "tool", "ts_ms"]);
+    }
+
+    // The session filter keeps the calls a session made or received.
+    let beta_only = coordination_cli(&data_dir, &["audit", "tools", "--session", "session-beta"]);
+    assert_eq!(beta_only.lines().count(), 1, "beta was the target of one call");
+    let alpha_only = coordination_cli(&data_dir, &["audit", "tools", "--session", "session-alpha"]);
+    assert_eq!(alpha_only.lines().count(), 2, "alpha made two calls");
+
+    coordination_shutdown_session(&data_dir, "session-alpha");
+    coordination_shutdown_session(&data_dir, "session-beta");
+    shutdown_cli_daemon(&data_dir, daemon);
+}
+
+#[test]
+fn the_http_listener_refuses_browsers_and_oversized_or_odd_requests() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("coord-http-gates");
+    let daemon = start_cli_daemon(&data_dir);
+    let (alpha, _) = coordination_spawn_with_token(&data_dir, "session-alpha", "exec cat");
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "whoami", "arguments": {} }
+    })
+    .to_string();
+    let (port, _) = mcp_endpoint(&data_dir);
+
+    // A page in a browser always sends Origin; any Origin is refused.
+    let browser = mcp_http_post(&data_dir, Some(&alpha), &["Origin: http://evil.example"], &call);
+    assert_eq!(browser.status, 403);
+    // DNS rebinding: a Host that is not this listener.
+    let rebound = mcp_http_raw(
+        port,
+        &[
+            "Host: evil.example".to_string(),
+            "Content-Type: application/json".to_string(),
+            format!("Content-Length: {}", call.len()),
+            format!("Authorization: Bearer {}", alpha.0),
+            "Connection: close".to_string(),
+        ],
+        &call,
+    );
+    assert_eq!(rebound.status, 403);
+    // The body bound: a length over the limit is refused before any body.
+    let oversized = mcp_http_raw(
+        port,
+        &[
+            format!("Host: 127.0.0.1:{port}"),
+            "Content-Type: application/json".to_string(),
+            format!("Content-Length: {}", botster_hub_client::MAX_CONTROL_REQUEST_BYTES + 1),
+            format!("Authorization: Bearer {}", alpha.0),
+            "Connection: close".to_string(),
+        ],
+        "",
+    );
+    assert_eq!(oversized.status, 413);
+    // Chunked framing is refused.
+    let chunked = mcp_http_raw(
+        port,
+        &[
+            format!("Host: 127.0.0.1:{port}"),
+            "Content-Type: application/json".to_string(),
+            "Transfer-Encoding: chunked".to_string(),
+            format!("Authorization: Bearer {}", alpha.0),
+            "Connection: close".to_string(),
+        ],
+        "0\r\n\r\n",
+    );
+    assert_eq!(chunked.status, 411);
+    // The daemon still serves the right request after every refusal.
+    let ok = mcp_http_post(&data_dir, Some(&alpha), &[], &call);
+    assert_eq!(ok.status, 200);
+
+    coordination_shutdown_session(&data_dir, "session-alpha");
+    shutdown_cli_daemon(&data_dir, daemon);
+}
+
+#[test]
 fn a_session_credential_reaches_only_its_session() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("coord-cred");
-    let fifo_dir = unique_short_test_dir("coord-cred-fifo");
-    fs::create_dir_all(&fifo_dir).expect("create fifo dir");
     let daemon = start_cli_daemon(&data_dir);
-    let fifo = fifo_dir.join("token.fifo");
-    make_fifo(&fifo);
-    coordination_spawn(
-        &data_dir,
-        "cred-session",
-        &format!(
-            "printf '%s' \"$BOTSTER_SESSION_TOKEN\" > {}; exec cat",
-            shell_quote(&fifo.display().to_string())
-        ),
-    );
-    let token = read_fifo_to_end(&fifo);
-    let (session_id, secret) = token.rsplit_once('.').expect("token separator");
+    let (token, _) = coordination_spawn_with_token(&data_dir, "cred-session", "exec cat");
+    let (session_id, secret) = token.0.rsplit_once('.').expect("token separator");
     assert_eq!(session_id, "cred-session");
     assert_eq!(secret.len(), 64, "a 256-bit secret in hex");
     assert!(secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -535,9 +816,12 @@ fn a_session_credential_reaches_only_its_session() {
     ] {
         observed.push((
             tool,
-            coordination_mcp_call(&data_dir, Some("cred-session"), tool, arguments).to_string(),
+            coordination_mcp_call(&data_dir, &token, tool, arguments).to_string(),
         ));
     }
+    // A refused request repeats nothing of the token either.
+    let refused = mcp_http_post(&data_dir, None, &[], "{}");
+    observed.push(("a refused request", refused.body));
     coordination_shutdown_session(&data_dir, "cred-session");
     let output = shutdown_cli_daemon(&data_dir, daemon);
     observed.push(("daemon stdout", String::from_utf8_lossy(&output.stdout).into_owned()));
