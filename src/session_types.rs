@@ -46,9 +46,6 @@ mod scratch_budget;
 #[allow(dead_code)] // The full-definition counting seed will dispatch its tagged fields here.
 mod tagged_budget;
 
-#[cfg(feature = "allocation-oracle")]
-pub(crate) mod parser_probe;
-
 /// Package-, device-, or repo-provided session type definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageSessionType {

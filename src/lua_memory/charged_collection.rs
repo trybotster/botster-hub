@@ -54,7 +54,7 @@ impl<T> ChargedVecDeque<T> {
         self.buf.len()
     }
 
-    #[cfg(any(test, feature = "allocation-oracle"))]
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.buf.capacity()
     }
@@ -160,7 +160,7 @@ impl<T> ChargedVecDeque<T> {
         )
     }
 
-    #[cfg(any(test, feature = "allocation-oracle"))]
+    #[cfg(test)]
     pub(crate) fn charge_bytes(&self) -> usize {
         charge_bytes(self.capacity_charge.as_ref())
     }
@@ -338,7 +338,7 @@ impl<T> ChargedVec<T> {
         )
     }
 
-    #[cfg(any(test, feature = "allocation-oracle"))]
+    #[cfg(test)]
     pub(crate) fn charge_bytes(&self) -> usize {
         charge_bytes(self.capacity_charge.as_ref())
     }
@@ -453,7 +453,7 @@ fn next_capacity(current: usize) -> usize {
     }
 }
 
-#[cfg(any(test, feature = "allocation-oracle"))]
+#[cfg(test)]
 fn charge_bytes(charge: Option<&LuaCallbackCharge>) -> usize {
     charge.map(LuaCallbackCharge::bytes).unwrap_or(0)
 }

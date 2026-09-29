@@ -295,8 +295,3 @@ pub(crate) fn json_value_retained_bytes(value: &serde_json::Value) -> Option<usi
         }
     }
 }
-
-#[cfg(any(test, feature = "allocation-oracle"))]
-pub(crate) fn btree_nodes<K, V>(len: usize) -> usize {
-    btree_nodes_checked::<K, V>(len).unwrap_or(usize::MAX)
-}

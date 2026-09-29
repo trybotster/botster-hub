@@ -1012,7 +1012,6 @@ impl Budget {
     }
 }
 
-// These bounds depend on the versions checked by check-lua-memory-build-contract.
 // Recheck the messages when this schema or its validation helpers change.
 fn longest_text(values: &[&str]) -> usize {
     values.iter().map(|value| value.len()).max().unwrap_or(0)
