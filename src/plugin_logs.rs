@@ -10,8 +10,10 @@
 //! capacity) are charged to the callback account when the entry is created,
 //! and each record's text is charged before it is copied. A read copies its
 //! page under a charge that the caller carries until the reply retires.
-//! Plugin workers append under a short lock; the daemon owner reads with
-//! `try_lock` and never waits.
+//! Plugin workers append under a short lock, and the daemon owner reads under
+//! the same lock. No critical section runs plugin code or does I/O: each is a
+//! bounded memory copy (`append` and `read` below, the mirror's
+//! `next_mirror_line`), so waiting for it is bounded.
 //!
 //! The Hub log: the ring is also the Hub log's queue. One mirror thread keeps
 //! a cursor per plugin, copies one record at a time under a funded charge,
@@ -28,7 +30,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write as _;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 
@@ -191,8 +193,6 @@ pub(crate) struct LogPage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadError {
-    /// A plugin is appending right now; the caller may retry.
-    Busy,
     /// The callback account cannot fund the page copy right now.
     Capacity,
 }
@@ -421,14 +421,11 @@ impl PluginLogBook {
         })
     }
 
-    /// Copy the records after `after_seq` without ever waiting on a plugin.
-    /// The copy is funded before it is made; the page carries that charge.
+    /// Copy the records after `after_seq`. The lock is held only for the
+    /// bounded copy, and no plugin code runs under it. The copy is funded
+    /// before it is made; the page carries that charge.
     pub(crate) fn read(&self, plugin: &str, after_seq: u64) -> Result<LogPage, ReadError> {
-        let state = match self.shared.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return Err(ReadError::Busy),
-        };
+        let state = self.shared.lock();
         let Some(log) = state.logs.get(plugin) else {
             return Ok(LogPage {
                 records: Vec::new(),
@@ -955,12 +952,5 @@ mod tests {
         // A restarted Hub draws again, so its log ids cannot repeat the
         // previous process's.
         assert_ne!(random_boot_id(), random_boot_id());
-    }
-
-    #[test]
-    fn reads_never_wait_on_an_appending_plugin() {
-        let (book, _memory) = book();
-        let _held = book.shared.lock();
-        assert!(matches!(book.read("p", 0), Err(ReadError::Busy)));
     }
 }
