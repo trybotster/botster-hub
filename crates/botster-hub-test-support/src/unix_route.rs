@@ -7,7 +7,7 @@ use botster_core_test_support::route_observer::RouteObserver;
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest,
     DaemonResponse, DaemonResponseKind, DaemonRouteStream, DaemonTransportError,
-    DaemonTransportResult, DaemonUnixTerminalFrame,
+    DaemonTransportResult, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, ServerFrame,
 };
 use botster_terminal_protocol::{AttachStateCode, InputOutcome, TerminalFrame};
 use botster_terminal_protocol_client::{
@@ -269,6 +269,8 @@ pub struct UnixRouteClient {
     observers: BTreeMap<String, RouteObserver>,
     abandoned_inputs: VecDeque<AbandonedInput>,
     abandoned_input_count: u64,
+    /// Host events read from the control socket while polling routes.
+    polled_events: Vec<DaemonEvent>,
 }
 
 impl UnixRouteClient {
@@ -292,6 +294,7 @@ impl UnixRouteClient {
             observers: BTreeMap::new(),
             abandoned_inputs: VecDeque::with_capacity(MAX_ABANDONED_INPUTS),
             abandoned_input_count: 0,
+            polled_events: Vec::new(),
         }
     }
 
@@ -372,7 +375,9 @@ impl UnixRouteClient {
 
     /// Return host events that arrived while this client waited for a response.
     pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
-        self.inner.take_skipped_events()
+        let mut events = self.inner.take_skipped_events();
+        events.append(&mut self.polled_events);
+        events
     }
 
     /// Unresolved operations that recent successful detaches made unknown.
@@ -439,6 +444,15 @@ impl UnixRouteClient {
         let mut frames = Vec::new();
         loop {
             let mut ended = Vec::new();
+            // Host events (a route's close, lifecycle) arrive on the control
+            // socket; keep them for `take_skipped_events`.
+            match self.inner.poll_frame(ROUTE_POLL_SLICE) {
+                Ok(Some(DaemonUnixMuxFrame::Server(ServerFrame::Event { event }))) => {
+                    self.polled_events.push(event);
+                }
+                Ok(_) => {}
+                Err(error) => panic!("failed to poll the control socket: {error}"),
+            }
             for (route, stream) in &mut self.streams {
                 match stream
                     .set_read_timeout(Some(ROUTE_POLL_SLICE))
