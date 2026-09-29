@@ -1748,9 +1748,15 @@ success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
 
-## Host-control protocol 12
+## Host-control protocol 14
 
-`PROTOCOL_VERSION` is 12. It arrived at `CONFORMANCE_FIXTURE_REVISION` 52;
+`PROTOCOL_VERSION` is 14. Protocol 14 is a cold cut (a protocol-13 client fails
+closed at `ensure_compatible()`): the coordination requests `whoami`,
+`post_message`, `receive_messages` and `ack_message` no longer carry
+`caller_session_id`, and a received envelope's `source` is a structured
+`DaemonEndpointRef` (see "Coordination requests and the session caller").
+Protocol 13 belongs to the route-socket change. Protocol 12, below, arrived at
+`CONFORMANCE_FIXTURE_REVISION` 52;
 revision 53 adds the optional plugin logs `log_id` (below). Protocol 12 is a
 cold cut: a protocol-11 client fails closed at `ensure_compatible()`, with no
 negotiation and no fallback path. Protocol 12 adds:
