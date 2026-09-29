@@ -1730,10 +1730,19 @@ host `Drain` JSON request.
 
 ## Host-control protocol 13
 
-`PROTOCOL_VERSION` is 12. It arrived at `CONFORMANCE_FIXTURE_REVISION` 52;
-revision 53 adds the optional plugin logs `log_id` (below). Protocol 12 is a
-cold cut: a protocol-11 client fails closed at `ensure_compatible()`, with no
-negotiation and no fallback path. Protocol 12 adds:
+`PROTOCOL_VERSION` is 13 and `CONFORMANCE_FIXTURE_REVISION` stays 53. Protocol
+13 is a cold cut: a protocol-12 client fails closed at `ensure_compatible()`,
+with no negotiation and no fallback path. Protocol 13 gives each attached Unix
+terminal route its own socket. The control socket carries requests, responses,
+events, and entity frames only; a terminal frame on it is a protocol error.
+`Attach` names the route socket in `terminal_attach.route_socket` (see
+"Terminal routes"). A client that stops reading one route stalls only that
+route, through the kernel socket buffer.
+
+### Protocol 12
+
+Protocol 12 arrived at `CONFORMANCE_FIXTURE_REVISION` 52; revision 53 added
+the optional plugin logs `log_id` (below). Protocol 12 added:
 - the `ReadPluginLogs` request and its `PluginLogs` response (see "Plugin
   Logs"); each record carries its load's `generation` and its fields as
   `fields_json` text;
@@ -1788,7 +1797,7 @@ The Unix socket carries length-prefixed binary frames:
 
 `frame_len` counts the container byte plus the payload. Container 1 is
 control: the payload is one JSON `ClientFrame` or `ServerFrame`. Container 2
-is terminal:
+is terminal. It travels only on a route socket, never on the control socket:
 
 ```
 [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body]
@@ -1844,7 +1853,26 @@ base64-wraps, or inspects `TerminalBody` bytes.
 
 Unix `Attach` binds the connection's adapter in one Core turn and answers
 `DaemonResponseKind::TerminalAttached` with `terminal_attach { session_id,
-subscription_id, generation }`. WebRTC `Attach` answers
+subscription_id, generation, route_socket? }`.
+
+`route_socket` is the path of this route's own Unix socket. The client
+connects to it once, promptly: the Hub accepts exactly one connection within 2
+seconds of writing the response, then unlinks the path. There is no Hello on
+a route socket. It carries container 2 terminal frames in both directions,
+for this route only. If the client does not connect in time, the Hub closes
+the route as a lost connection. `route_socket` is absent when the route ended
+before the response was written; treat that route as already closed.
+
+The Hub guarantees that every route socket reaches end of stream after its
+route ends, on every path: `Detach`, a Core close (including a stalled reader
+and a session end), the control connection's death, and daemon shutdown. A
+frame that was mid-write at the close is finished for at most 2 seconds,
+then the socket closes anyway. **Client rule:** on
+`TerminalSubscriptionClosed`, keep reading that route socket to end of stream
+before treating the route as finished. The event and the socket are
+independent streams, so frames after the event are valid and the event may
+arrive before the last frames. A client that closes a route socket first
+ends only that route, as a lost connection, with no closed event. WebRTC `Attach` answers
 `DaemonResponseKind::TerminalReservation` with `terminal_reservation {
 session_id, subscription_id, peer_generation, label, expires_in_seconds }`.
 The reservation creates no Core route. The browser opens one reliable ordered
