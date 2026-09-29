@@ -69,7 +69,7 @@ the plugin read that clock.
 | `t:try_load(path)` | Like `load`, but returns `nil, { kind, message }` on a load error. |
 | `t:sessions_baseline(list)` | Supply one complete session baseline, as Core would. |
 | `t:session_upsert(session)` / `t:session_remove(id)` | Supply one journal change. The production consumers produce the `session_family` frames. |
-| `t:advance(ms)` | Move the clock. Returns the timers that became due, in deadline order. |
+| `t:advance(ms)` | Move the clock. Returns the timers that became due. Within one package they are in deadline order (resource id breaks ties); packages appear in the order they were loaded. |
 | `t:request(table)` | Send a `DaemonRequest` (a table with a `type` tag) through the production path. |
 | `t:receive_routed(session_id)` / `t:ack_routed(session_id, envelope_id)` | Receive routed envelopes as a target, and acknowledge them. |
 | `t:settle()` | Run the owner until it is idle. |
