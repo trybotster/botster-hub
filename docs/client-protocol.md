@@ -1859,8 +1859,10 @@ subscription_id, generation, route_socket? }`.
 connects to it once, promptly: the Hub accepts exactly one connection within 2
 seconds of writing the response, then unlinks the path. There is no Hello on
 a route socket. It carries container 2 terminal frames in both directions,
-for this route only. If the client does not connect in time, the Hub closes
-the route as a lost connection. `route_socket` is absent when the route ended
+for this route only. The two seconds start when the whole response is on the
+control socket. If the client does not connect in time, the Hub closes the
+route as a host-side close: `TerminalSubscriptionClosed` with reason
+`host_adapter_closed` on the control connection. `route_socket` is absent when the route ended
 before the response was written; treat that route as already closed.
 
 The Hub guarantees that every route socket reaches end of stream after its
@@ -1872,7 +1874,9 @@ then the socket closes anyway. **Client rule:** on
 before treating the route as finished. The event and the socket are
 independent streams, so frames after the event are valid and the event may
 arrive before the last frames. A client that closes a route socket first
-ends only that route, as a lost connection, with no closed event. WebRTC `Attach` answers
+ends only that route; the Hub reports it with `TerminalSubscriptionClosed`
+reason `host_adapter_closed` on the control connection, as for any host-side
+close of a live session's route. WebRTC `Attach` answers
 `DaemonResponseKind::TerminalReservation` with `terminal_reservation {
 session_id, subscription_id, peer_generation, label, expires_in_seconds }`.
 The reservation creates no Core route. The browser opens one reliable ordered

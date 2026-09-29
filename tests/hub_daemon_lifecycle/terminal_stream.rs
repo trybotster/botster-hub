@@ -156,6 +156,11 @@ impl RawUnixClient {
         self
     }
 
+    /// Close this client's end of `route`'s socket only.
+    pub(crate) fn close_route_socket(&mut self, route: &str) {
+        self.route_sockets.remove(route);
+    }
+
     /// End the control connection and leave the route sockets open.
     pub(crate) fn close_control(&mut self) {
         let _ = self.control.stream.shutdown(std::net::Shutdown::Both);
