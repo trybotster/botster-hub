@@ -23,6 +23,8 @@ pub(crate) enum ErrorKind {
     Cancelled,
     Unavailable,
     Failed,
+    /// A session or caller names a Hub other than this one.
+    RemoteHubUnsupported,
 }
 
 impl ErrorKind {
@@ -38,6 +40,7 @@ impl ErrorKind {
             Self::Cancelled => "cancelled",
             Self::Unavailable => "unavailable",
             Self::Failed => "failed",
+            Self::RemoteHubUnsupported => "remote_hub_unsupported",
         }
     }
 
