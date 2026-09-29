@@ -2101,6 +2101,7 @@ mod tests {
             client_id: None,
             grant_id: None,
             transport_request_id: None,
+            caller: crate::daemon::control::Caller::Operator,
         }
     }
 

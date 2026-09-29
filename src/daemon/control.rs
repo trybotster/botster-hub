@@ -24,6 +24,8 @@ pub(crate) mod status;
 pub(crate) mod webrtc;
 
 use botster_core::{RequestId, SessionId};
+
+use crate::session_credential::CallerToken;
 use botster_hub_client::{
     DaemonDiagnostic, DaemonOperatorError, DaemonQuarantineTarget, DaemonRequest, DaemonResponse,
     DaemonResponseKind,
@@ -43,9 +45,32 @@ pub(crate) struct DaemonObservability {
     pub(crate) client_id: Option<String>,
     pub(crate) grant_id: Option<String>,
     pub(crate) transport_request_id: Option<String>,
-    /// The session this request runs as. `None` is the operator. Only the
-    /// owner sets it, and only after verifying a session's bearer token.
-    pub(crate) caller: Option<SessionId>,
+    /// Who asks. Only the owner sets it.
+    pub(crate) caller: Caller,
+}
+
+/// The authority a request runs with.
+#[derive(Clone)]
+pub(crate) enum Caller {
+    /// A socket or WebRTC client: the operator. It has no inbox.
+    Operator,
+    /// A session's bearer token, not yet proven. The operation proves it in
+    /// the same Core submission that carries it out, so the proof and the
+    /// effect see one Core state.
+    Token(CallerToken),
+    /// A session that an earlier step proved (see `CallerRequest::proves_in_core`).
+    Proven(SessionId),
+}
+
+impl Caller {
+    /// The session this caller names or is, if any.
+    pub(crate) fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::Operator => None,
+            Self::Token(token) => Some(SessionId(token.session_id().to_string())),
+            Self::Proven(session_id) => Some(session_id.clone()),
+        }
+    }
 }
 
 pub(crate) fn request_id(value: &str) -> RequestId {

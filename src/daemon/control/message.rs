@@ -120,6 +120,21 @@ pub(crate) enum CallerRequest {
 }
 
 impl CallerRequest {
+    /// True when the operation proves the bearer token itself, inside the
+    /// Core submission that carries it out. The others (status, the session
+    /// list, plugin tools) do not touch Core, so the HTTP task proves the
+    /// token first with a `Whoami` and sends the proven session with them.
+    pub(crate) fn proves_in_core(&self) -> bool {
+        matches!(
+            self,
+            Self::Whoami
+                | Self::PostMessage { .. }
+                | Self::ReceiveMessages { .. }
+                | Self::AckMessage { .. }
+                | Self::NotifySession { .. }
+        )
+    }
+
     pub(crate) fn into_daemon_request(self) -> DaemonRequest {
         match self {
             Self::Status => DaemonRequest::Status,
@@ -197,11 +212,13 @@ pub(crate) enum ControlMessage {
         client_id: Option<String>,
         enqueued_at: Instant,
     },
-    /// A request from a session over HTTP MCP. The owner verifies the token
-    /// against the session's Core metadata in the same owner turn that admits
-    /// the request, so the verified session is the one the request runs as.
+    /// A request from a session over HTTP MCP, with the bearer token it
+    /// presented. `proven` is set only for requests that do not prove the
+    /// token in Core themselves (see `CallerRequest::proves_in_core`), and
+    /// only by the HTTP task after a `Whoami` proved it.
     CallerRequest {
         token: crate::session_credential::CallerToken,
+        proven: Option<botster_core::SessionId>,
         request: Box<CallerRequest>,
         reply_tx: ControlReplySender,
         enqueued_at: Instant,

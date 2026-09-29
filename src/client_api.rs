@@ -26,6 +26,7 @@ use botster_ui_contract::{
     PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest, UiActionResult, UiNode,
 };
 
+use crate::session_credential::CallerToken;
 use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::lifecycle::HubPluginLifecycleStatus;
 use crate::packages::{
@@ -617,6 +618,7 @@ impl HubClientApi {
                 data,
                 readiness,
                 now_seconds,
+                caller,
                 ..
             } => {
                 let request = GuardedWriteRequest {
@@ -628,10 +630,12 @@ impl HubClientApi {
                 };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
+                let unauthenticated = unauthenticated_error(&request_id, operation);
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        prove_caller(daemon, caller.as_ref(), &unauthenticated)?;
                         daemon
                             .guarded_write(request)
                             .map(|result| {
@@ -643,13 +647,17 @@ impl HubClientApi {
                     }),
                 )));
             }
-            HubClientRequest::PublishRoutedEnvelope { envelope, .. } => {
+            HubClientRequest::PublishRoutedEnvelope {
+                envelope, caller, ..
+            } => {
                 let respond = respond.clone();
                 let core_error = core_error.clone();
+                let unauthenticated = unauthenticated_error(&request_id, operation);
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        prove_caller(daemon, caller.as_ref(), &unauthenticated)?;
                         require_running_session_targets(daemon, &envelope.targets)
                             .map_err(&core_error)?;
                         daemon
@@ -669,14 +677,17 @@ impl HubClientApi {
                 target,
                 after,
                 limit,
+                caller,
                 ..
             } => {
                 let respond = respond.clone();
                 let core_error = core_error.clone();
+                let unauthenticated = unauthenticated_error(&request_id, operation);
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        prove_caller(daemon, caller.as_ref(), &unauthenticated)?;
                         daemon
                             .drain_routed_envelopes(
                                 botster_core_daemon::DrainRoutedEnvelopesRequest {
@@ -697,14 +708,17 @@ impl HubClientApi {
             HubClientRequest::AcknowledgeRoutedEnvelope {
                 target,
                 envelope_id,
+                caller,
                 ..
             } => {
                 let respond = respond.clone();
                 let core_error = core_error.clone();
+                let unauthenticated = unauthenticated_error(&request_id, operation);
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        prove_caller(daemon, caller.as_ref(), &unauthenticated)?;
                         daemon
                             .acknowledge_routed_envelope(
                                 botster_core_daemon::AcknowledgeRoutedEnvelopeRequest {
@@ -720,6 +734,20 @@ impl HubClientApi {
                                 ))
                             })
                             .map_err(&core_error)
+                    }),
+                )));
+            }
+            HubClientRequest::VerifyCaller { token, .. } => {
+                let respond = respond.clone();
+                let unauthenticated = unauthenticated_error(&request_id, operation);
+                return Ok(HubClientStep::Pending(HubClientPending::ticket(
+                    request_id,
+                    operation,
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
+                        prove_caller(daemon, Some(&token), &unauthenticated)?;
+                        Ok(respond(HubClientResponseBody::CallerVerified(SessionId(
+                            token.session_id().to_string(),
+                        ))))
                     }),
                 )));
             }
@@ -1176,6 +1204,7 @@ impl HubClientAdmission {
             | HubClientOperation::PublishRoutedEnvelope
             | HubClientOperation::DrainRoutedEnvelopes
             | HubClientOperation::AcknowledgeRoutedEnvelope
+            | HubClientOperation::VerifyCaller
             | HubClientOperation::ReadScreen
             | HubClientOperation::ReadModeFlags
             | HubClientOperation::CaptureSnapshot => self.allow_runtime,
@@ -1265,11 +1294,16 @@ pub enum HubClientRequest {
         data: Vec<u8>,
         readiness: ReadinessEvidence,
         now_seconds: u64,
+        /// The session's bearer token, when a session asks. Core checks it in
+        /// the same submission as the write. `None` is the operator.
+        caller: Option<CallerToken>,
     },
     /// Publish one routed envelope through core.
     PublishRoutedEnvelope {
         request_id: RequestId,
         envelope: RoutedEnvelope,
+        /// The session's bearer token, checked in the same Core submission.
+        caller: Option<CallerToken>,
     },
     /// Drain routed envelopes for one target through core cursor semantics.
     DrainRoutedEnvelopes {
@@ -1277,12 +1311,21 @@ pub enum HubClientRequest {
         target: EnvelopeTarget,
         after: Option<EnvelopeCursor>,
         limit: usize,
+        /// The session's bearer token, checked in the same Core submission.
+        caller: Option<CallerToken>,
     },
     /// Acknowledge one routed envelope target copy through core.
     AcknowledgeRoutedEnvelope {
         request_id: RequestId,
         target: EnvelopeTarget,
         envelope_id: EnvelopeId,
+        /// The session's bearer token, checked in the same Core submission.
+        caller: Option<CallerToken>,
+    },
+    /// Prove a session's bearer token against its Core metadata.
+    VerifyCaller {
+        request_id: RequestId,
+        token: CallerToken,
     },
     /// Request a screen read where the daemon API supports it.
     ReadScreen {
@@ -1377,6 +1420,7 @@ impl HubClientRequest {
             | Self::PublishRoutedEnvelope { request_id, .. }
             | Self::DrainRoutedEnvelopes { request_id, .. }
             | Self::AcknowledgeRoutedEnvelope { request_id, .. }
+            | Self::VerifyCaller { request_id, .. }
             | Self::ReadScreen { request_id, .. }
             | Self::ReadModeFlags { request_id, .. }
             | Self::CaptureSnapshot { request_id, .. }
@@ -1410,6 +1454,7 @@ impl HubClientRequest {
             Self::NotifySession { .. } => HubClientOperation::NotifySession,
             Self::PublishRoutedEnvelope { .. } => HubClientOperation::PublishRoutedEnvelope,
             Self::DrainRoutedEnvelopes { .. } => HubClientOperation::DrainRoutedEnvelopes,
+            Self::VerifyCaller { .. } => HubClientOperation::VerifyCaller,
             Self::AcknowledgeRoutedEnvelope { .. } => HubClientOperation::AcknowledgeRoutedEnvelope,
             Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
             Self::ReadModeFlags { .. } => HubClientOperation::ReadModeFlags,
@@ -1447,6 +1492,7 @@ pub enum HubClientOperation {
     PublishRoutedEnvelope,
     DrainRoutedEnvelopes,
     AcknowledgeRoutedEnvelope,
+    VerifyCaller,
     ReadScreen,
     ReadModeFlags,
     CaptureSnapshot,
@@ -1476,6 +1522,8 @@ pub struct HubClientResponse {
 /// Stable response body variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HubClientResponseBody {
+    /// The session a bearer token proved.
+    CallerVerified(SessionId),
     Status(HubClientStatus),
     Sessions(Vec<HubClientSession>),
     SessionLifecycleBaselinePage(SessionLifecycleBaselinePage),
@@ -2315,6 +2363,12 @@ pub enum HubClientError {
         code: String,
         message: String,
     },
+    /// A session's bearer token did not prove the session it names. Every
+    /// cause (unknown session, wrong secret, no digest) is this one error.
+    CallerUnauthenticated {
+        request_id: RequestId,
+        operation: HubClientOperation,
+    },
 }
 
 /// Result alias for client API requests.
@@ -2645,6 +2699,41 @@ fn session_type_client_metadata(mut metadata: CoreSessionMetadata) -> CoreSessio
 
 #[allow(dead_code)]
 fn _runtime_error_type_is_not_public_payload(_: HubRuntimeError) {}
+
+fn unauthenticated_error(request_id: &RequestId, operation: HubClientOperation) -> HubClientError {
+    HubClientError::CallerUnauthenticated {
+        request_id: request_id.clone(),
+        operation,
+    }
+}
+
+/// Prove a session's bearer token inside a Core submission, so the proof and
+/// the operation it authorizes see one Core state. `None` is the operator and
+/// needs none. The named session's metadata must hold the digest of the
+/// presented secret; a missing session, a missing digest, and a wrong secret
+/// all fail the same way.
+fn prove_caller(
+    daemon: &botster_core_daemon::CoreDaemon,
+    caller: Option<&CallerToken>,
+    unauthenticated: &HubClientError,
+) -> Result<(), HubClientError> {
+    let Some(token) = caller else {
+        return Ok(());
+    };
+    let session_id = SessionId(token.session_id().to_string());
+    let proven = match daemon.session_metadata(&session_id) {
+        Ok(Some(metadata)) => metadata
+            .entries
+            .get(crate::session_credential::TOKEN_DIGEST_METADATA_KEY)
+            .is_some_and(|digest| token.matches(digest)),
+        Ok(None) | Err(_) => false,
+    };
+    if proven {
+        Ok(())
+    } else {
+        Err(unauthenticated.clone())
+    }
+}
 
 /// Refuse an envelope for a session that Core does not hold as running.
 /// A queue for a missing session would never drain, so the sender learns now.

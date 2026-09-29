@@ -115,7 +115,7 @@ pub(crate) fn issue(
 /// it names and the SHA-256 of its secret. The secret itself is never kept,
 /// and `Debug` prints nothing of the token.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct CallerToken {
+pub struct CallerToken {
     session_id: String,
     secret_digest: [u8; 32],
 }

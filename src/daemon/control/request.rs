@@ -11,6 +11,7 @@ use botster_hub_client::{
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_hub_update;
 use crate::daemon::control::attach_bind_operator_error;
+use crate::daemon::control::Caller;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
     ControlStep, OwnerRequestCompletion, PendingControlRequest, READY_DEADLINE, READY_INITIAL,
@@ -44,19 +45,25 @@ pub(crate) fn handle(
     control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
-    handle_as(daemon, state, transport_handle, control_tx, message, None)
+    handle_as(
+        daemon,
+        state,
+        transport_handle,
+        control_tx,
+        message,
+        Caller::Operator,
+    )
 }
 
-/// Admit one request that runs as `caller`: `None` for the operator (every
-/// socket and WebRTC client), `Some` for a session whose token the owner
-/// verified in this turn.
+/// Admit one request that runs as `caller`: the operator for every socket and
+/// WebRTC client, a session for an HTTP MCP request.
 pub(crate) fn handle_as(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
     message: ControlMessage,
-    caller: Option<botster_core::SessionId>,
+    caller: Caller,
 ) -> bool {
     let ControlMessage::Request {
         request,
