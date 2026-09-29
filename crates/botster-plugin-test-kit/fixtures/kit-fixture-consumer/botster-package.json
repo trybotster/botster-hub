@@ -1,0 +1,13 @@
+{
+  "name": "kit-fixture-consumer",
+  "version": "1.0.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "description": "Plugin test kit fixture: subscribes to an event of another package.",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "mcp" },
+    { "surface": "plugin_db", "scope": "kit-fixture-consumer" }
+  ],
+  "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+}
