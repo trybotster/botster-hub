@@ -114,7 +114,14 @@ pub(crate) fn accept_connections(
     // startup deterministic, this closes the gap between binding the initial
     // listener and beginning to poll the accept loop.
     let socket_events = SocketPathEvents::new(&listener);
-    accept_connections_with_events(listener, control_tx, shutdown_rx, admission, socket_events)
+    accept_connections_with_events(
+        listener,
+        control_tx,
+        shutdown_rx,
+        admission,
+        socket_events,
+        current_uid(),
+    )
 }
 
 async fn accept_connections_with_events(
@@ -123,6 +130,7 @@ async fn accept_connections_with_events(
     mut shutdown_rx: watch::Receiver<bool>,
     admission: Arc<Semaphore>,
     socket_events: Result<SocketPathEvents, String>,
+    owner_uid: u32,
 ) {
     let watched_path = socket_events
         .as_ref()
@@ -152,7 +160,7 @@ async fn accept_connections_with_events(
                         // as strong as the directory and the umask around
                         // it. A peer of another user is refused before any
                         // frame is read.
-                        if !peer_is_owner(&stream) {
+                        if !peer_is_owner(&stream, owner_uid) {
                             eprintln!("botster-hub daemon refused a connection from another user");
                             continue;
                         }
@@ -606,12 +614,20 @@ enum RebindOutcome {
 }
 
 fn rebind_listener(listener: &mut TokioUnixListener, path: &Path) -> RebindOutcome {
+    rebind_listener_with(listener, path, restrict_socket_to_owner)
+}
+
+fn rebind_listener_with(
+    listener: &mut TokioUnixListener,
+    path: &Path,
+    restrict: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> RebindOutcome {
     if path.exists() {
         return RebindOutcome::PathPresent;
     }
     match TokioUnixListener::bind(path) {
         Ok(rebound) => {
-            if let Err(error) = restrict_socket_to_owner(path) {
+            if let Err(error) = restrict(path) {
                 // A socket that other users could open is worse than none.
                 eprintln!("botster-hub daemon socket rebind error: {error}");
                 let _ = fs::remove_file(path);
@@ -714,11 +730,31 @@ pub(crate) fn restrict_socket_to_owner(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
-/// Whether the peer of an accepted connection is this Hub's own user.
-fn peer_is_owner(stream: &TokioUnixStream) -> bool {
+/// Whether a peer's uid is the owner's.
+fn peer_uid_matches(peer_uid: u32, owner_uid: u32) -> bool {
+    peer_uid == owner_uid
+}
+
+/// Whether the peer of an accepted connection is the Hub's own user.
+fn peer_is_owner(stream: &TokioUnixStream, owner_uid: u32) -> bool {
     stream
         .peer_cred()
-        .is_ok_and(|credentials| credentials.uid() == current_uid())
+        .is_ok_and(|credentials| peer_uid_matches(credentials.uid(), owner_uid))
+}
+
+/// Bind the control socket for its owner only. `chmod` follows the bind at
+/// once; the window between them is closed by the peer check at accept, which
+/// refuses another user's connection whatever the file mode.
+pub(crate) fn bind_control_socket(
+    path: &Path,
+) -> DaemonTransportResult<std::os::unix::net::UnixListener> {
+    let listener =
+        std::os::unix::net::UnixListener::bind(path).map_err(DaemonTransportError::Io)?;
+    restrict_socket_to_owner(path).map_err(DaemonTransportError::Io)?;
+    listener
+        .set_nonblocking(true)
+        .map_err(DaemonTransportError::Io)?;
+    Ok(listener)
 }
 
 fn current_uid() -> u32 {
@@ -956,6 +992,7 @@ mod tests {
             shutdown_rx,
             Arc::new(Semaphore::new(1)),
             Ok(events),
+            current_uid(),
         ));
 
         // timer: deadline — bounds a lost kernel event; the rebind is signalled.
@@ -1002,6 +1039,7 @@ mod tests {
             shutdown_rx,
             Arc::new(Semaphore::new(1)),
             Ok(events),
+            current_uid(),
         ));
 
         fs::remove_file(&socket).expect("unlink live socket");
@@ -1085,6 +1123,116 @@ mod tests {
         assert_eq!(change, DirectoryChange::DirectoryGone);
     }
 
+    /// Serve `socket` with an accept loop whose owner is `owner_uid`, connect
+    /// as this process's user, and report whether the connection reached the
+    /// control channel. A refused connection is closed by the Hub.
+    async fn same_user_connection_is_admitted_when_owner_is(owner_uid: u32) -> (bool, bool) {
+        use tokio::io::AsyncReadExt;
+        let socket = temp_socket_path("o");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let std_listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(std_listener).expect("tokio listener");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(2);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let accept_task = tokio::spawn(accept_connections_with_events(
+            listener,
+            control_tx,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            Err("no directory watch in this test".to_string()),
+            owner_uid,
+        ));
+        let mut client = TokioUnixStream::connect(&socket).await.expect("connect");
+        // timer: deadline — a refused connection sends no control message, so wait out a short window.
+        let admitted = tokio::time::timeout(Duration::from_millis(500), control_rx.recv())
+            .await
+            .is_ok_and(|message| {
+                matches!(message, Some(ControlMessage::AcceptedConnection { .. }))
+            });
+        // A refused connection is dropped by the Hub, so the client reads end of stream.
+        let mut byte = [0_u8; 1];
+        let closed = admitted
+            || tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+                .await
+                .is_ok_and(|read| read.is_ok_and(|count| count == 0));
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), accept_task)
+            .await
+            .expect("accept loop should stop")
+            .expect("accept task should not panic");
+        cleanup_socket_path(&socket, owner);
+        let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+        (admitted, closed)
+    }
+
+    /// Positive control: the owner's own connection is admitted.
+    #[tokio::test]
+    async fn the_accept_loop_admits_a_connection_of_its_owner() {
+        let (admitted, _) = same_user_connection_is_admitted_when_owner_is(current_uid()).await;
+        assert!(
+            admitted,
+            "a same-user connection must reach the control channel"
+        );
+    }
+
+    /// The accept loop refuses a peer whose uid is not its owner's: no control
+    /// message, and the connection is closed. (The owner uid is shifted, so
+    /// this process's user plays the other user.)
+    #[tokio::test]
+    async fn the_accept_loop_refuses_a_connection_of_another_user() {
+        let (admitted, closed) =
+            same_user_connection_is_admitted_when_owner_is(current_uid().wrapping_add(1)).await;
+        assert!(!admitted, "another user's connection must not be admitted");
+        assert!(closed, "another user's connection must be closed");
+    }
+
+    #[test]
+    fn a_peer_uid_matches_only_the_owner() {
+        assert!(peer_uid_matches(501, 501));
+        assert!(!peer_uid_matches(502, 501));
+        assert!(!peer_uid_matches(0, 501));
+    }
+
+    /// The bind helper restricts the socket even under a permissive umask.
+    #[test]
+    fn the_bound_control_socket_is_private_under_a_permissive_umask() {
+        let socket = temp_socket_path("u");
+        // SAFETY: `umask` only swaps the process file-creation mask.
+        let previous = unsafe { libc::umask(0) };
+        let bound = bind_control_socket(&socket);
+        // SAFETY: as above; restore at once.
+        unsafe { libc::umask(previous) };
+        let _listener = bound.expect("bind the control socket");
+        let mode = fs::metadata(&socket)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o} under umask 0");
+        let _ = fs::remove_file(&socket);
+    }
+
+    /// A rebound socket that cannot be restricted is removed, not served.
+    #[test]
+    fn a_rebound_socket_that_cannot_be_restricted_is_removed() {
+        let socket = temp_socket_path("x");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+        let first = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        first.set_nonblocking(true).expect("nonblocking");
+        let mut listener = TokioUnixListener::from_std(first).expect("tokio listener");
+        fs::remove_file(&socket).expect("unlink, as a cleaner would");
+        let outcome = rebind_listener_with(&mut listener, &socket, |_| {
+            Err(std::io::Error::other("chmod refused"))
+        });
+        assert_eq!(outcome, RebindOutcome::Failed);
+        assert!(!socket.exists(), "the unrestricted socket must be removed");
+    }
+
     async fn assert_degraded_watch_still_accepts(
         socket: PathBuf,
         owner: SocketOwnerLock,
@@ -1099,6 +1247,7 @@ mod tests {
             shutdown_rx,
             Arc::new(Semaphore::new(1)),
             socket_events,
+            current_uid(),
         ));
 
         let client = TokioUnixStream::connect(&socket)
