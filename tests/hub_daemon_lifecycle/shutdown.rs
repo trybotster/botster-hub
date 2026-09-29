@@ -1467,7 +1467,6 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
             "spawn-targets list",
         ),
         ("shutdown", &["extra"][..], "shutdown"),
-        ("mcp-serve", &["extra"][..], "mcp-serve"),
     ] {
         let output = run_daily(command, args);
         assert!(
@@ -1481,41 +1480,6 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
             command_output_text(&output)
         );
     }
-    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .current_dir(&other_checkout)
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", &xdg)
-        .env_remove("BOTSTER_HUB_DATA_DIR")
-        .arg("mcp-serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn default mcp-serve");
-    mcp_child
-        .stdin
-        .as_mut()
-        .expect("mcp stdin")
-        .write_all(
-            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
-        )
-        .expect("write MCP initialize");
-    mcp_child
-        .stdin
-        .take()
-        .expect("close mcp stdin after initialize");
-    let mcp = mcp_child.wait_with_output().expect("wait for mcp-serve");
-    assert!(
-        mcp.status.success(),
-        "mcp-serve without --data-dir failed: {}",
-        command_output_text(&mcp)
-    );
-    let mcp_stdout = String::from_utf8(mcp.stdout).expect("MCP output is UTF-8");
-    assert!(
-        mcp_stdout.contains(r#""protocolVersion":"2025-06-18""#),
-        "mcp-serve did not answer initialize through the shared daemon root: {mcp_stdout}"
-    );
-
     let doctor = run_daily("doctor", &[]);
     assert!(
         doctor.status.success(),
@@ -2978,7 +2942,7 @@ fn cli_help_like_args_print_command_guidance_without_daemon() {
         assert!(text.contains("botster-hub smoke [--data-dir <path>]"));
         assert!(text.contains("botster-hub open web [--data-dir <path>]"));
         assert!(text.contains("botster-hub open tui [--data-dir <path>]"));
-        assert!(text.contains("botster-hub mcp-serve [--data-dir <path>]"));
+        assert!(!text.contains("mcp-serve"));
         assert!(text.contains("botster-hub apps open [--data-dir <path>] <app|package/app>"));
         assert!(text.contains(
             "botster-hub packages config set [--data-dir <path>] <name> '<json-object>'"
