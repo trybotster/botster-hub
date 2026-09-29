@@ -28,6 +28,14 @@ await_file() {
     perl -e 'select(undef, undef, undef, 0.05)'
   done
 }
+await_text() {
+  i=0
+  until grep -q -- "$2" "$1" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for a supervisor warning.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
 # The pid file's first line is the supervisor's pid; its second, written once
 # the command has started, is the command's process group.
 supervisor_group() { await_file "$BOTSTERQ_HOME/run/*.pid"; cat "$BOTSTERQ_HOME"/run/*.pid 2>/dev/null | head -1; }
@@ -139,6 +147,283 @@ if [ "$(cat "$work/E.start")" \> "$(cat "$work/X.end")" ] && [ "$(cat "$work/Y.s
 else
   fail "exclusive fairness" "X.end=$(cat "$work/X.end") E=$(cat "$work/E.start")..$(cat "$work/E.end") Y=$(cat "$work/Y.start")"
 fi
+
+# 8b. Arrival order. An ordinary job that waits for a queued exclusive job keeps
+#     its place: an exclusive job that arrives after it must not run before it.
+"$Q" slots 2 >/dev/null
+"$Q" run --label F1 --exclusive -- sh -c 'sleep 3' >/dev/null 2>&1 &
+F1=$!
+await_state "F1 [exclusive] @" running
+"$Q" run --label F2 --exclusive -- sh -c 'date +%s.%N > "$0/F2.start"; sleep 1' "$work" >/dev/null 2>&1 &
+F2=$!
+await_state "F2 [exclusive] @" queued
+"$Q" run --label FO -- sh -c 'date +%s.%N > "$0/FO.start"; sleep 1' "$work" >/dev/null 2>"$work/FO.err" &
+FO=$!
+await_text "$work/FO.err" "waiting for exclusive job"
+"$Q" run --label F3 --exclusive -- sh -c 'date +%s.%N > "$0/F3.start"' "$work" >/dev/null 2>&1 &
+F3=$!
+wait "$F1" "$F2" "$FO" "$F3"
+if [ "$(cat "$work/F2.start")" \< "$(cat "$work/FO.start")" ] && [ "$(cat "$work/FO.start")" \< "$(cat "$work/F3.start")" ]; then
+  pass "arrival order: a waiting ordinary job runs before an exclusive job that arrived after it"
+else
+  fail "arrival order" "F2=$(cat "$work/F2.start") FO=$(cat "$work/FO.start") F3=$(cat "$work/F3.start")"
+fi
+# 8c. Cancelling a run that waits for an exclusive job ends it at once and lets
+#     the jobs behind it proceed; `slots` does not block on the waiting run.
+"$Q" run --label G1 --exclusive -- sh -c 'sleep 6' >/dev/null 2>&1 &
+G1=$!
+await_state "G1 [exclusive] @" running
+"$Q" run --label G2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+G2=$!
+await_state "G2 [exclusive] @" queued
+"$Q" run --label GO -- sh -c 'touch "$0/GO.ran"' "$work" >/dev/null 2>"$work/GO.err" &
+GO=$!
+await_text "$work/GO.err" "waiting for exclusive job"
+"$Q" run --label G3 -- sh -c 'touch "$0/G3.ran"' "$work" >/dev/null 2>&1 &
+G3=$!
+started=$(date +%s)
+slots_out=$("$Q" slots 3 2>&1); slots_code=$?
+slots_elapsed=$(( $(date +%s) - started ))
+cancel_started=$(date +%s)
+kill -TERM "$GO"; wait "$GO"; codeGO=$?
+cancel_elapsed=$(( $(date +%s) - cancel_started ))
+wait "$G1" "$G2" "$G3"
+[ "$slots_code" = 1 ] && [ "$slots_elapsed" -le 2 ] && [ "$codeGO" = 130 ] && [ "$cancel_elapsed" -le 2 ] && [ ! -e "$work/GO.ran" ] && [ -e "$work/G3.ran" ] \
+  && pass "cancelling a waiting run exits 130 at once; slots refuses without blocking; the job behind it runs" \
+  || fail "cancel while waiting" "slots=$slots_code (${slots_elapsed}s: $slots_out) cancel=$codeGO (${cancel_elapsed}s) GO.ran=$([ -e "$work/GO.ran" ] && echo yes || echo no) G3.ran=$([ -e "$work/G3.ran" ] && echo yes || echo no) err=$(cat "$work/GO.err")"
+
+# 8d. The events log and audit: a run writes one start line (with the host load
+#     average) and one end line; audit reports no overlap for jobs that ran one
+#     after the other, and reports an overlap in a log that has one.
+"$Q" slots 2 >/dev/null
+rm -f "$BOTSTERQ_HOME/events.log"
+"$Q" run --label AE --exclusive -- true >/dev/null 2>&1
+"$Q" run --label AO -- true >/dev/null 2>&1
+starts=$(grep -c "^start" "$BOTSTERQ_HOME/events.log"); ends=$(grep -c "^end" "$BOTSTERQ_HOME/events.log")
+"$Q" audit >"$work/audit.out" 2>&1; codeAudit=$?
+[ "$starts" = 2 ] && [ "$ends" = 2 ] && [ "$codeAudit" = 0 ] && grep -q "load=" "$BOTSTERQ_HOME/events.log" && grep -q "0 overlap" "$work/audit.out" \
+  && pass "events log has a start and an end per job, with the load average; audit finds no overlap" \
+  || fail "events log" "starts=$starts ends=$ends audit=$codeAudit out=$(cat "$work/audit.out")"
+printf 'start\t100.0\tT1\t2\t1\tX\tload=1/1/1\nstart\t105.0\tT2\t1\t0\tY\tload=1/1/1\nend\t110.0\tT2\t1\t0\tY\t\nend\t120.0\tT1\t2\t1\tX\t\nstart\t130.0\tT3\t1\t0\tZ\tload=1/1/1\nend\t140.0\tT3\t1\t0\tZ\t\n' >"$BOTSTERQ_HOME/events.log"
+"$Q" audit >"$work/audit.out" 2>&1; codeAudit=$?
+[ "$codeAudit" = 1 ] && grep -q "OVERLAP exclusive job T1 (X) and job T2 (Y)" "$work/audit.out" && grep -q "1 overlap" "$work/audit.out" && ! grep -q "T3" "$work/audit.out" \
+  && pass "audit reports the job that overlapped an exclusive job, and only that one (exit 1)" \
+  || fail "audit overlap" "audit=$codeAudit out=$(cat "$work/audit.out")"
+
+# 8e. Cancel before the admission lock is held. A run that waits for an
+#     exclusive job holds the lock; a second ordinary run then waits at the
+#     lock. Cancelling that second run exits 130 at once, its command never
+#     starts, and it leaves no admission process or file behind.
+lock_waiters() { ps -axo command= | grep -F -- "$BOTSTERQ_HOME/admission.lock" | grep -vc grep; }
+"$Q" slots 2 >/dev/null
+"$Q" run --label H1 --exclusive -- sh -c 'sleep 6' >/dev/null 2>&1 &
+H1=$!
+await_state "H1 [exclusive] @" running
+"$Q" run --label H2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+H2=$!
+await_state "H2 [exclusive] @" queued
+"$Q" run --label HO1 -- sh -c 'touch "$0/HO1.ran"' "$work" >/dev/null 2>"$work/HO1.err" &
+HO1=$!
+await_text "$work/HO1.err" "waiting for exclusive job"
+mkfifo "$work/ho2.announce"
+BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/ho2.announce" "$Q" run --label HO2 -- sh -c 'touch "$0/HO2.ran"' "$work" >/dev/null 2>"$work/HO2.err" &
+HO2=$!
+# The admission announces that it is about to block on the lock (an event, not a
+# poll); the cancel then lands while it blocks or in the instant before.
+read _ <"$work/ho2.announce"
+cancel_started=$(date +%s)
+kill -TERM "$HO2"; wait "$HO2"; codeHO2=$?
+cancel_elapsed=$(( $(date +%s) - cancel_started ))
+waiters_after=$(lock_waiters)
+admit_files=$(ls "$BOTSTERQ_HOME"/run/"$HO2"-*.admit* 2>/dev/null | wc -l | tr -d ' ')
+wait "$H1" "$H2" "$HO1"
+[ "$codeHO2" = 130 ] && [ "$cancel_elapsed" -le 2 ] && [ "$waiters_after" = 1 ] && [ "$admit_files" = 0 ] \
+  && [ ! -e "$work/HO2.ran" ] && [ -e "$work/HO1.ran" ] \
+  && pass "cancelling a run that waits at the admission lock exits 130 at once, never starts, leaves nothing behind" \
+  || fail "cancel at the lock" "cancel=$codeHO2 (${cancel_elapsed}s) lock_waiters=$waiters_after admit_files=$admit_files HO2.ran=$([ -e "$work/HO2.ran" ] && echo yes || echo no) HO1.ran=$([ -e "$work/HO1.ran" ] && echo yes || echo no) err=$(cat "$work/HO2.err")"
+leftover=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+[ "$leftover" = 0 ] && pass "no admission file remains after the runs end" || fail "admission files" "$leftover left: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
+
+# 8k. The two boundaries of the admission protocol, tested directly (the test
+#     stops `run` at the exact point through a hold fifo and sends TERM there):
+#     (1) after the run marked the admission as started, before the admission
+#     process exists; (2) after the admission ended and was reaped, before the
+#     run marked it over; (3) the admission process just forked, before it wrote
+#     its pid file. Each: exit 130 at once, the command never starts or is gone,
+#     no admission file, no lock waiter, no job.
+boundary_check() {
+  name=$1 code=$2 elapsed=$3 label=${4:-}
+  # A run cancelled before its admission gave a job to the queue must not have
+  # started a command, even for a moment: the events log has no start for it.
+  started_events=0
+  [ -z "$label" ] || started_events=$(awk -F'\t' -v l="$label" '$1 == "start" && $6 == l { n++ } END { print n + 0 }' "$BOTSTERQ_HOME/events.log" 2>/dev/null)
+  files=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+  waiters=$(lock_waiters)
+  i=0
+  until [ "$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')" = 0 ]; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && break
+    # timer: deadline — bounded wait for the queue to drain.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+  jobs=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')
+  alive=no
+  [ -f "$work/$name.pid" ] && kill -0 "$(cat "$work/$name.pid")" 2>/dev/null && alive=yes
+  [ "$code" = 130 ] && [ "$elapsed" -le 2 ] && [ "$files" = 0 ] && [ "$waiters" = 0 ] && [ "$jobs" = 0 ] && [ "$alive" = no ] && [ "$started_events" = 0 ] \
+    && pass "cancel at the boundary: $name (exit 130, no admission file, no lock waiter, no job, no live command, no start event)" \
+    || fail "boundary $name" "exit=$code (${elapsed}s) files=$files waiters=$waiters jobs=$jobs live_command=$alive start_events=$started_events: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
+}
+"$Q" slots 2 >/dev/null
+# (1) before the admission process exists
+mkfifo "$work/b1.hold" "$work/b1.hold.reached"
+BOTSTERQ_TEST_RUN_BEFORE_ADMISSION="$work/b1.hold" "$Q" run --label B1 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b1.pid" >/dev/null 2>&1 &
+B1=$!
+read _ <"$work/b1.hold.reached"
+started=$(date +%s); kill -TERM "$B1"; wait "$B1"; code=$?; elapsed=$(( $(date +%s) - started ))
+boundary_check b1 "$code" "$elapsed" B1
+# (2) after the admission was reaped, before the run marked it over
+mkfifo "$work/b2.hold" "$work/b2.hold.reached"
+BOTSTERQ_TEST_RUN_AFTER_ADMISSION="$work/b2.hold" "$Q" run --label B2 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b2.pid" >/dev/null 2>&1 &
+B2=$!
+read _ <"$work/b2.hold.reached"
+started=$(date +%s); kill -TERM "$B2"; wait "$B2"; code=$?; elapsed=$(( $(date +%s) - started ))
+boundary_check b2 "$code" "$elapsed"
+# (3) the admission process just forked, before its pid file
+mkfifo "$work/b3.hold" "$work/b3.hold.reached"
+BOTSTERQ_TEST_ADMISSION_HOLD="$work/b3.hold" "$Q" run --label B3 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b3.pid" >/dev/null 2>&1 &
+B3=$!
+read _ <"$work/b3.hold.reached"
+started=$(date +%s)
+kill -TERM "$B3"
+# The run must wait for its admission process (it cannot know its state): while
+# that process is held, the run stays alive.
+# timer: deadline — a negative window: the run must not exit while the admission lives.
+perl -e 'select(undef, undef, undef, 0.4)'
+kill -0 "$B3" 2>/dev/null && b3_waited=yes || b3_waited=no
+printf x >"$work/b3.hold"   # release the held admission process; it finds the marker
+wait "$B3"; code=$?; elapsed=$(( $(date +%s) - started ))
+[ "$b3_waited" = yes ] && pass "cancel at the boundary: b3 the run waits for its admission process" || fail "boundary b3 wait" "the run exited while its admission process was held"
+boundary_check b3 "$code" "$elapsed" B3
+
+# 8l. A run killed without a chance to cancel (SIGKILL) while its admission
+#     waits at the lock: the cancel fifo reports end of file, the admission
+#     cancels itself, and no admission process is left waiting at the lock.
+"$Q" slots 2 >/dev/null
+"$Q" run --label M1 --exclusive -- sh -c 'sleep 3' >/dev/null 2>&1 &
+M1=$!
+await_state "M1 [exclusive] @" running
+"$Q" run --label M0 --exclusive -- sh -c 'sleep 0.5' >/dev/null 2>&1 &
+M0=$!
+await_state "M0 [exclusive] @" queued
+"$Q" run --label MO -- sh -c 'touch "$0/MO.ran"' "$work" >/dev/null 2>"$work/MO.err" &
+MO=$!
+await_text "$work/MO.err" "waiting for exclusive job"
+mkfifo "$work/mk.announce" "$work/mk.life"
+BOTSTERQ_TEST_ADMISSION_LIFETIME="$work/mk.life" BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/mk.announce" "$Q" run --label MK -- sh -c 'touch "$0/MK.ran"' "$work" >/dev/null 2>&1 &
+MK=$!
+exec 8<"$work/mk.life"        # opens once the admission process has opened its end
+read _ <"$work/mk.announce"
+kill -KILL "$MK"; wait "$MK" 2>/dev/null
+# End of file on the lifetime fifo is the event that the admission process ended
+# (it cancelled itself because its run died); no polling.
+read _ <&8
+exec 8<&-
+waiters_killed=$(lock_waiters)
+wait "$M1" "$M0" "$MO"
+[ "$waiters_killed" = 1 ] && [ ! -e "$work/MK.ran" ] && [ -e "$work/MO.ran" ] \
+  && pass "a run killed with SIGKILL while its admission waits at the lock: the admission cancels itself and its command never runs" \
+  || fail "SIGKILLed run" "lock_waiters=$waiters_killed MK.ran=$([ -e "$work/MK.ran" ] && echo yes || echo no) MO.ran=$([ -e "$work/MO.ran" ] && echo yes || echo no)"
+
+# 8f. Several waiters behind the holder start in the order they arrived. The
+#     order among waiters at the lock is the kernel's flock wakeup order, which
+#     is not a promise; this checks what the platform does, over three waiters.
+"$Q" slots 1 >/dev/null
+"$Q" run --label K1 --exclusive -- sh -c 'sleep 4' >/dev/null 2>&1 &
+K1=$!
+await_state "K1 [exclusive] @" running
+"$Q" run --label K2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+K2=$!
+await_state "K2 [exclusive] @" queued
+for n in 1 2 3; do
+  mkfifo "$work/kw$n.announce"
+  BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/kw$n.announce" "$Q" run --label "KW$n" -- sh -c 'date +%s.%N > "$0/KW'"$n"'.start"; sleep 0.3' "$work" >/dev/null 2>"$work/KW$n.err" &
+  eval "KW$n=\$!"
+  # KW1 takes the lock and waits for K2; KW2 and KW3 announce that they block.
+  if [ "$n" = 1 ]; then await_text "$work/KW1.err" "waiting for exclusive job"; else read _ <"$work/kw$n.announce"; fi
+done
+wait "$K1" "$K2" "$KW1" "$KW2" "$KW3"
+if [ "$(cat "$work/KW1.start")" \< "$(cat "$work/KW2.start")" ] && [ "$(cat "$work/KW2.start")" \< "$(cat "$work/KW3.start")" ]; then
+  pass "three waiters behind the lock holder start in arrival order (platform behaviour, not a guarantee)"
+else
+  fail "waiter order" "1=$(cat "$work/KW1.start") 2=$(cat "$work/KW2.start") 3=$(cat "$work/KW3.start")"
+fi
+
+# 8g. Compatibility. The supervisor accepts the argument shape of a `run` that
+#     started before the deadline existed (no run limit), and the legacy
+#     `__admit` entry point still admits a job.
+python3 "$here/botsterq-job" "$work/old.pid" "$work/old.marker" "$work/old.lock" "$$" 2 -- sh -c 'exit 3' >/dev/null 2>&1; codeOld=$?
+[ "$codeOld" = 3 ] && pass "the supervisor accepts the old argument shape (no deadline), run status kept" || fail "old supervisor shape" "exit=$codeOld"
+legacy_id=$(BOTSTERQ_OWNER=$$ "$Q" __admit legacy-token 0 legacy true 3>/dev/null 4>/dev/null </dev/null)
+TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -w "$legacy_id" >/dev/null 2>&1; codeLegacy=$?
+case "$legacy_id" in ''|*[!0-9]*) legacy_ok=no ;; *) legacy_ok=yes ;; esac
+[ "$legacy_ok" = yes ] && [ "$codeLegacy" = 0 ] && pass "the legacy __admit entry point admits a job (id $legacy_id, exit 0)" || fail "legacy admit" "id=$legacy_id exit=$codeLegacy"
+rm -f "$work/old.pid" "$work/old.marker" "$work/old.lock" "$BOTSTERQ_HOME"/run/legacy-token.*
+
+# 8h. Audit compares an open interval like a closed one (fractional seconds):
+#     two jobs that are still running and started 0.1 s apart overlap.
+printf 'start\t100.100\tO1\t2\t1\tX\tload=1/1/1\nstart\t100.200\tO2\t1\t0\tY\tload=1/1/1\n' >"$BOTSTERQ_HOME/events.log"
+BOTSTERQ_AUDIT_NOW=100 "$Q" audit >"$work/audit.out" 2>&1; codeOpen=$?
+BOTSTERQ_AUDIT_NOW=101 "$Q" audit >"$work/audit2.out" 2>&1; codeOpen2=$?
+[ "$codeOpen2" = 1 ] && grep -q "OVERLAP exclusive job O1 (X) and job O2 (Y)" "$work/audit2.out" && grep -q "not proof" "$work/audit2.out" \
+  && pass "audit: two open jobs that started 0.1 s apart overlap (exit 1); the output states its evidence limit" \
+  || fail "audit open interval" "now=101: exit=$codeOpen2 out=$(cat "$work/audit2.out")"
+
+# 8i. The same with the real clock: two jobs that are still running and started
+#     a few milliseconds ago overlap (a clock truncated to whole seconds would
+#     put both starts after "now" and report nothing).
+now_s=$(perl -MTime::HiRes=time -e 'printf "%.3f %.3f", time - 0.05, time - 0.02')
+set -- $now_s
+printf 'start\t%s\tR1\t2\t1\tX\tload=1/1/1\nstart\t%s\tR2\t1\t0\tY\tload=1/1/1\n' "$1" "$2" >"$BOTSTERQ_HOME/events.log"
+"$Q" audit >"$work/audit3.out" 2>&1; codeReal=$?
+[ "$codeReal" = 1 ] && grep -q "OVERLAP exclusive job R1 (X) and job R2 (Y)" "$work/audit3.out" \
+  && pass "audit with the real clock: two open jobs that just started overlap" \
+  || fail "audit real clock" "exit=$codeReal out=$(cat "$work/audit3.out")"
+rm -f "$BOTSTERQ_HOME/events.log"
+
+# 8j. Cancel at every stage of admission. Runs are cancelled at increasing
+#     delays after they start, so the signal lands while the run waits for the
+#     lock, while the admission runs and after the job started. Each `run` ends;
+#     a command that had started is gone (its pid is dead); no admission process
+#     waits at the lock; no admission file is left; and the queue drains (a job
+#     that was enqueued in the instant of the cancel is skipped at its start,
+#     because its `run` is gone).
+"$Q" slots 2 >/dev/null
+j=0
+while [ "$j" -lt 30 ]; do
+  "$Q" run --label "J$j" -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/J$j.pid" >/dev/null 2>&1 &
+  J=$!
+  # timer: deadline — test-side delay that walks the cancel across the stages.
+  perl -e 'select(undef, undef, undef, $ARGV[0])' "$(perl -e 'printf "%.3f", $ARGV[0] * 0.012' "$j")"
+  kill -TERM "$J" 2>/dev/null
+  wait "$J" 2>/dev/null
+  j=$((j + 1))
+done
+i=0
+until [ "$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')" = 0 ]; do
+  i=$((i + 1)); [ "$i" -gt 200 ] && break
+  # timer: deadline — bounded wait for the queue to drain.
+  perl -e 'select(undef, undef, undef, 0.05)'
+done
+left_jobs=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')
+left_waiters=$(lock_waiters)
+left_files=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+alive=0
+for f in "$work"/J*.pid; do
+  [ -f "$f" ] || continue
+  kill -0 "$(cat "$f")" 2>/dev/null && alive=$((alive + 1))
+done
+[ "$left_waiters" = 0 ] && [ "$left_jobs" = 0 ] && [ "$alive" = 0 ] && [ "$left_files" = 0 ] \
+  && pass "30 runs cancelled at increasing delays leave no lock waiter, no job, no live command and no admission file" \
+  || fail "cancel at every stage" "lock_waiters=$left_waiters jobs=$left_jobs live_commands=$alive admission_files=$left_files: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
 
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null
@@ -288,14 +573,6 @@ wait "$S"; codeS=$?
 #     the variants also fail the ps census or the exit watch. A successor
 #     queued at 1 slot must stay queued while the survivor lives, and start
 #     only after the test kills the survivor (by its pid), seeing no member.
-await_text() {
-  i=0
-  until grep -q -- "$2" "$1" 2>/dev/null; do
-    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
-    # timer: deadline — test-side wait for a supervisor warning.
-    perl -e 'select(undef, undef, undef, 0.05)'
-  done
-}
 fault_case() {
   name=$1 expect=$2 ready=$3
   shift 3
@@ -361,7 +638,41 @@ after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
   && pass "a python3 older than 3.9 is refused before admission (run exit 127)" \
   || fail "old python" "run=$codeOld queued_before=$before after=$after stderr=$(cat "$work/old.err")"
 
-# 19. A suite run leaves no supervisor behind. Jobs still finishing get a
+# 19. Deadline. A hung command is stopped at expiry like a cancel: "deadline
+#     expired", exit 124, no group member left, and the successor runs after
+#     cleanup. An exclusive job has a default deadline (BOTSTERQ_EXCLUSIVE_DEADLINE
+#     stands in for the 45 minutes); an ordinary job has none; a job that ends
+#     first keeps its own status; a bad value is refused before admission.
+"$Q" slots 1 >/dev/null
+"$Q" run --label DL --deadline 3s -- sh -c 'trap "" TERM; touch "$0/DL-ready"; while :; do sleep 1; done' "$work" >/dev/null 2>"$work/DL.err" &
+DL=$!
+await_file "$work/DL-ready"
+g=$(job_group)
+"$Q" run --label DLnext -- sh -c 'ps -axo pgid= | awk -v g="$1" "\$1 == g" | wc -l | tr -d " " > "$0/DLnext.seen"' "$work" "$g" >/dev/null 2>&1 &
+DLN=$!
+await_state "DLnext @" queued
+started=$(date +%s)
+wait "$DL"; codeDL=$?
+elapsed=$(( $(date +%s) - started ))
+wait "$DLN"
+[ "$codeDL" = 124 ] && grep -q "deadline expired" "$work/DL.err" && [ "$(group_members "$g")" = 0 ] \
+  && [ "$(cat "$work/DLnext.seen" 2>/dev/null)" = 0 ] && [ "$elapsed" -le $((3 + BOTSTERQ_KILL_GRACE + 5)) ] \
+  && pass "a hung command is stopped at its deadline (run exit 124, ${elapsed}s after the start of the wait); the successor runs after cleanup" \
+  || fail "deadline" "run=$codeDL elapsed=${elapsed}s members=$(group_members "$g") next-saw=$(cat "$work/DLnext.seen" 2>/dev/null) stderr=$(cat "$work/DL.err")"
+BOTSTERQ_EXCLUSIVE_DEADLINE=3 "$Q" run --label DLX --exclusive -- sh -c 'sleep 600' >/dev/null 2>"$work/DLX.err"; codeDLX=$?
+[ "$codeDLX" = 124 ] && grep -q "deadline expired" "$work/DLX.err" \
+  && pass "an exclusive job gets the default deadline (run exit 124)" \
+  || fail "exclusive default deadline" "run=$codeDLX stderr=$(cat "$work/DLX.err")"
+BOTSTERQ_EXCLUSIVE_DEADLINE=2 "$Q" run --label DLO -- sh -c 'sleep 5' >/dev/null 2>&1; codeDLO=$?
+[ "$codeDLO" = 0 ] && pass "an ordinary job has no default deadline" || fail "ordinary job" "run=$codeDLO"
+BOTSTERQ_EXCLUSIVE_DEADLINE=2 "$Q" run --label DLS --exclusive --deadline 60s -- sh -c 'sleep 4; exit 7' >/dev/null 2>&1; codeDLS=$?
+[ "$codeDLS" = 7 ] && pass "an explicit deadline replaces the exclusive default, and a job that ends first keeps its status (7)" || fail "explicit deadline" "run=$codeDLS"
+before=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
+"$Q" run --label DLB --deadline 0 -- true >/dev/null 2>"$work/DLB.err"; codeDLB=$?
+after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
+[ "$codeDLB" = 2 ] && [ "$before" = "$after" ] && pass "a bad deadline is refused before admission (run exit 2)" || fail "bad deadline" "run=$codeDLB before=$before after=$after"
+
+# 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.
 leaked() { ps -axo pid=,command= | grep -F -- "botsterq-job $BOTSTERQ_HOME/" | grep -v grep; }
 i=0

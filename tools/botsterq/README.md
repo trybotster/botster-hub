@@ -24,7 +24,9 @@ supervisor. State (socket, slot count, pid files) lives in
 ```sh
 botsterq run --label "hub lib" -- cargo test --locked -p botster-hub --lib
 botsterq run --label "hub lifecycle" --exclusive -- ./test.sh --locked --test hub_daemon_lifecycle_test
+botsterq run --label "hub tests" --exclusive --deadline 20m -- ./test.sh --locked   # shorter hang guard
 botsterq list            # queued and running jobs: id, state, enqueue time, label @ owner dir
+botsterq audit           # jobs that overlapped an exclusive job (from the events log)
 botsterq cancel <id>     # remove a queued job, or SIGTERM a running job's process group
 botsterq slots           # show how many jobs run at once (default 2)
 botsterq slots 3         # change it (kept across server restarts)
@@ -47,6 +49,46 @@ botsterq slots 3         # change it (kept across server restarts)
   command's own status.
 - A job whose `run` process is gone when its turn comes does not start. A caller
   killed with SIGKILL while its job runs cannot be noticed; use `botsterq cancel <id>`.
+- Deadline: `--deadline <duration>` (seconds, or a number with `s`, `m` or `h`)
+  bounds a job's run time from its start (queue wait is not counted). At expiry the
+  supervisor prints `deadline expired`, stops the group like a cancel (SIGTERM,
+  SIGKILL when the grace ends, the slot held until the group is gone), and `run`
+  exits 124; a cancel (130) wins. An `--exclusive` job has a 45 minute deadline
+  unless it passes its own (any value replaces the default; the environment variable
+  `BOTSTERQ_EXCLUSIVE_DEADLINE`, in seconds, changes the default for tests). An
+  ordinary job has none. It is a hang guard, not a budget: it exists so one hung job
+  cannot hold the queue for hours. It does not apply after an unexpected supervisor
+  error, when the supervisor only holds the slot until the group is gone.
+- An ordinary job that meets a queued exclusive job waits for it while holding the
+  admission lock, so a job that arrives later cannot be queued ahead of it. What is and
+  is not promised: (1) a job that holds the lock, or is queued, keeps its place; (2)
+  the order among jobs that are all waiting at the lock is the kernel's `flock` wakeup
+  order, first come first served on macOS in practice and checked by a test with
+  three waiters, but not promised by the platform. `botsterq slots N` refuses at once
+  while that wait holds the lock. Cancelling a `run` that waits, at the lock or for the
+  exclusive job, ends it at once with exit 130: its command never starts and it leaves
+  no admission process behind. How a cancel reaches the admission: `run` holds a cancel
+  fifo (`~/.botsterq/run/<token>.admitcancel`) open for writing and sends a cancel as one
+  byte; it stores and signals no pid. The admission process (a small perl event loop)
+  waits in `select` for the lock, which its own child takes, or for a cancel, and then for
+  its admission child or a cancel; it signals only those two children, which it has not
+  reaped, so a reused pid cannot be hit. If `run` dies without a chance to clean up (a
+  SIGKILL), the fifo reports end of file, and the admission cancels itself and removes its
+  own fifo and output file. A cancel that lands in the
+  instant an admission finishes can leave a queued job for a run that is gone; the job
+  is skipped when its turn comes, because its `run` process no longer exists, and never
+  starts its command. The admission files (`*.admit*`) of a cancelled run do not
+  remain, by the tests.
+- After an install, a `run` that started before it keeps working: the supervisor
+  accepts the old argument shape (no deadline) and the legacy `__admit` entry point
+  admits with the old protocol.
+- `botsterq audit` reads `~/.botsterq/events.log` (an append-only file: the supervisor
+  writes a `start` line, with the host load average, and an `end` line, when the
+  command's group is gone, for every job) and prints each job that ran at the same time
+  as an exclusive job; it exits 1 if there is one. Use it to answer whether an exclusive
+  job really ran alone. The log has no rotation. It is evidence only for the jobs it
+  recorded: a write failure makes the supervisor print a warning on stderr and the
+  job disappears from the audit, so an empty result is not proof that a job ran alone.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 

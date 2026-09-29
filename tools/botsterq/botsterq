@@ -1,9 +1,10 @@
 #!/bin/sh
 # botsterq: a machine-wide queue for heavy work (cargo builds, test suites).
 #
-#   botsterq run [--label <text>] [--exclusive] -- <command...>
+#   botsterq run [--label <text>] [--exclusive] [--deadline <duration>] -- <command...>
 #   botsterq list
 #   botsterq cancel <id>
+#   botsterq audit
 #   botsterq slots [N]
 #
 # Jobs run through task-spooler (`ts`, brew install task-spooler) on a
@@ -13,9 +14,18 @@
 # `nice -n 10`, in its own process group. `--exclusive` makes the job take
 # every slot, so it runs alone (use it for load-sensitive suites).
 #
+# Deadline: `--deadline <duration>` (seconds, or a number with s, m or h) bounds
+# a job's run time from its start; queue wait is not counted. At expiry the job
+# prints "deadline expired", its group is stopped like a cancel, and `run`
+# exits 124. An `--exclusive` job has a 45 minute deadline unless it passes its
+# own; an ordinary job has none. A deadline is a hang guard for a job that would
+# otherwise hold the queue.
+#
 # Admission (enqueueing, and changing the slot count) is serialized by one
 # lock, and `slots N` refuses while any job is queued or running, so an
-# exclusive job's reservation always equals the slot count.
+# exclusive job's reservation always equals the slot count. Admission is in
+# arrival order: an ordinary job that meets a queued exclusive job waits for it
+# WHILE HOLDING that lock, so nothing that arrives later can enqueue ahead of it.
 #
 # Cancelling (Ctrl-C, SIGTERM or SIGHUP to `run`, or `botsterq cancel <id>`):
 # a queued job never starts; a running job's process group gets SIGTERM, and
@@ -30,6 +40,7 @@ mkdir -p "$state/run"
 export TS_SOCKET="$state/queue.sock"
 default_slots=2
 kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
+exclusive_deadline_seconds=${BOTSTERQ_EXCLUSIVE_DEADLINE:-2700}
 # Resolve symlinks (~/.local/bin/botsterq links to the installed copy), so the
 # job supervisor next to this script is found.
 self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
@@ -59,6 +70,109 @@ with_admission_lock() {
   perl -MFcntl=:flock -e '
     open(my $lock, ">>", shift) or die "botsterq: open lock: $!\n";
     flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+    exit(system(@ARGV) >> 8);
+  ' "$state/admission.lock" "$@"
+}
+
+# The admission script of `run`, an event loop that keeps process identity:
+#   - the lock is taken by a child (L) that holds it until this process closes a
+#     pipe or dies; this process waits, in select(2), for L to report the lock or
+#     for a cancel;
+#   - the admission (A) is another child; this process waits, in select(2), for
+#     A to end (SIGCHLD, through a self-pipe) or for a cancel;
+#   - a cancel is data (or end of file) on the cancel fifo, which `run` holds
+#     open for writing. `run` sends it by writing one byte; no pid is stored or
+#     signalled by `run`. This process signals only its own children L and A,
+#     which it has not reaped, so their pids cannot be reused; if `run` dies,
+#     the fifo reports end of file and this process cancels itself.
+ADMISSION_PERL='
+  use Fcntl qw(:flock O_RDONLY O_NONBLOCK);
+  use POSIX qw(:sys_wait_h);
+  my ($lockfile, $cancelfifo, $out) = splice(@ARGV, 0, 3);
+  # Test hook: a fifo opened for writing and never written; its reader sees end of
+  # file exactly when this process ends (its own children close it), which is
+  # the event the SIGKILL test waits for instead of polling ps.
+  my $lifetime;
+  if (defined $ENV{BOTSTERQ_TEST_ADMISSION_LIFETIME}) { open($lifetime, ">", $ENV{BOTSTERQ_TEST_ADMISSION_LIFETIME}); }
+  # Test hold: a fifo read before anything (the interrupt tests stop this
+  # process just after its fork).
+  if (defined $ENV{BOTSTERQ_TEST_ADMISSION_HOLD}) {
+    if (open(my $r, ">", "$ENV{BOTSTERQ_TEST_ADMISSION_HOLD}.reached")) { print $r "reached\n"; close $r; }
+    if (open(my $h, "<", $ENV{BOTSTERQ_TEST_ADMISSION_HOLD})) { my $l = <$h>; close $h; }
+  }
+  # A cancelled admission removes its own files (the fifo and the output file),
+  # whether `run` cancelled it or died: a killed `run` cannot clean up itself.
+  sub cancel_exit { unlink $out, $cancelfifo; exit 130; }
+  sysopen(my $cf, $cancelfifo, O_RDONLY | O_NONBLOCK) or cancel_exit();
+  my $cfd = fileno($cf);
+  sub cancel_pending { my $in = ""; vec($in, $cfd, 1) = 1; my $ready = select(my $out_mask = $in, undef, undef, 0); return $ready > 0 && vec($out_mask, $cfd, 1); }
+  cancel_exit() if cancel_pending();
+  pipe(my $lock_r, my $lock_w) or die "botsterq: pipe: $!\n";
+  pipe(my $hold_r, my $hold_w) or die "botsterq: pipe: $!\n";
+  my $waiter = fork();
+  die "botsterq: fork: $!\n" unless defined $waiter;
+  if (!$waiter) {
+    $0 = "botsterq-lock-waiter";
+    close $lock_r; close $hold_w; close $cf; close $lifetime if $lifetime;
+    open(my $lock, ">>", $lockfile) or exit 1;
+    unless (flock($lock, LOCK_EX | LOCK_NB)) {
+      # The lock is held: about to block. The test hook announces this through
+      # a fifo (its reader is the test), so a test can cancel exactly here.
+      if (defined $ENV{BOTSTERQ_TEST_LOCK_ANNOUNCE}) {
+        if (open(my $announce, ">", $ENV{BOTSTERQ_TEST_LOCK_ANNOUNCE})) { print $announce "blocked\n"; close $announce; }
+      }
+      flock($lock, LOCK_EX) or exit 1;
+    }
+    syswrite($lock_w, "1"); close $lock_w;
+    my $wait; sysread($hold_r, $wait, 1);   # holds the lock until the parent lets go
+    exit 0;
+  }
+  close $lock_w; close $hold_r;
+  # Wait for the lock or a cancel.
+  my $locked = 0;
+  while (!$locked) {
+    my $in = ""; vec($in, $cfd, 1) = 1; vec($in, fileno($lock_r), 1) = 1;
+    # select returns -1 when a signal interrupts it, and then leaves the mask
+    # as it was given: only a positive count says which descriptors are ready.
+    my $ready = select(my $out_mask = $in, undef, undef, undef);
+    next if $ready <= 0;
+    if (vec($out_mask, $cfd, 1)) { kill "TERM", $waiter; waitpid($waiter, 0); cancel_exit(); }
+    if (vec($out_mask, fileno($lock_r), 1)) {
+      my $b; my $n = sysread($lock_r, $b, 1);
+      if ($n) { $locked = 1 } else { waitpid($waiter, 0); die "botsterq: lock waiter failed\n"; }
+    }
+  }
+  # The lock is held. Run the admission as a child and wait for it or a cancel.
+  pipe(my $sig_r, my $sig_w) or die "botsterq: pipe: $!\n";
+  $SIG{CHLD} = sub { syswrite($sig_w, "x"); };
+  my $admission = fork();
+  die "botsterq: fork: $!\n" unless defined $admission;
+  if (!$admission) {
+    $SIG{CHLD} = "DEFAULT";
+    close $sig_r; close $sig_w; close $cf; close $hold_w; close $lock_r;
+    exec { $ARGV[0] } @ARGV or die "botsterq: exec: $!\n";
+  }
+  my ($status, $done, $cancelled) = (0, 0, 0);
+  while (!$done) {
+    my $r = waitpid($admission, WNOHANG);
+    if ($r == $admission) { $status = $?; $done = 1; last; }
+    my $in = ""; vec($in, fileno($sig_r), 1) = 1; vec($in, $cfd, 1) = 1 unless $cancelled;
+    my $ready = select(my $out_mask = $in, undef, undef, undef);
+    next if $ready <= 0;
+    if (!$cancelled && vec($out_mask, $cfd, 1)) { $cancelled = 1; kill "TERM", $admission; }
+    if (vec($out_mask, fileno($sig_r), 1)) { my $b; sysread($sig_r, $b, 512); }
+  }
+  close $hold_w;              # the waiter lets go of the lock and exits
+  waitpid($waiter, 0);
+  unlink $out, $cancelfifo if $cancelled;
+  exit($cancelled ? 130 : ($status >> 8));
+'
+
+# Like with_admission_lock, but fails at once (exit 75) when the lock is held.
+try_admission_lock() {
+  perl -MFcntl=:flock -e '
+    open(my $lock, ">>", shift) or die "botsterq: open lock: $!\n";
+    flock($lock, LOCK_EX | LOCK_NB) or exit 75;
     exit(system(@ARGV) >> 8);
   ' "$state/admission.lock" "$@"
 }
@@ -131,6 +245,21 @@ stop_job() {
   return 0
 }
 
+# Prints <duration> (N, Ns, Nm or Nh) as whole seconds, or fails.
+duration_seconds() {
+  case "$1" in
+    ''|*[!0-9smh]*|*[smh]*[0-9]*|*[smh][smh]*) return 1 ;;
+  esac
+  number=${1%[smh]}
+  case "$number" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$number" -gt 0 ] || return 1
+  case "$1" in
+    *m) echo $((number * 60)) ;;
+    *h) echo $((number * 3600)) ;;
+    *) echo "$number" ;;
+  esac
+}
+
 cmd_slots() {
   ensure_server
   if [ "$#" -eq 0 ]; then
@@ -140,7 +269,12 @@ cmd_slots() {
   case "$1" in
     ''|*[!0-9]*|0) echo "botsterq: slots must be a positive integer" >&2; exit 2 ;;
   esac
-  with_admission_lock "$self" __set-slots "$1"
+  # A run waiting for an exclusive job holds the lock for as long as that job
+  # runs, and a queued or running job means slots cannot change anyway.
+  try_admission_lock "$self" __set-slots "$1" || {
+    [ "$?" -ne 75 ] || { echo "botsterq: jobs are queued or waiting to queue; change slots when the queue is empty" >&2; exit 1; }
+    exit 1
+  }
 }
 
 set_slots_locked() {
@@ -164,6 +298,38 @@ cmd_list() {
   done
 }
 
+# Reads the events log (one start and one end line per job) and prints every
+# pair of jobs that ran at the same time when one of them is exclusive. A job
+# without an end line is still running. Exit 1 when an overlap exists.
+cmd_audit() {
+  log="$state/events.log"
+  [ -f "$log" ] || { echo "botsterq: no events yet ($log)"; return 0; }
+  # Same precision as the log (fractional seconds), so an open interval is
+  # compared like a closed one. BOTSTERQ_AUDIT_NOW fixes the clock for tests.
+  now=${BOTSTERQ_AUDIT_NOW:-$(perl -MTime::HiRes=time -e 'printf "%.3f", time')}
+  awk -F'\t' -v now="$now" '
+    $1 == "start" { s[$3] = $2; ex[$3] = $5; lab[$3] = $6; order[++n] = $3 }
+    $1 == "end"   { e[$3] = $2 }
+    END {
+      overlaps = 0
+      for (i = 1; i <= n; i++) {
+        a = order[i]; if (ex[a] != 1) continue
+        aend = (a in e) ? e[a] : now
+        for (j = 1; j <= n; j++) {
+          b = order[j]; if (b == a) continue
+          bend = (b in e) ? e[b] : now
+          if (s[b] < aend && s[a] < bend) {
+            printf "OVERLAP exclusive job %s (%s) and job %s (%s)\n", a, lab[a], b, lab[b]
+            overlaps++
+          }
+        }
+      }
+      printf "%d job(s), %d overlap(s) with an exclusive job\n", n, overlaps
+      print "note: the log is evidence only for the jobs it recorded; a job whose start could not be written (the supervisor then warns on stderr) is invisible here, so no overlap listed is not proof that a job ran alone"
+      exit overlaps > 0
+    }' "$log"
+}
+
 cmd_cancel() {
   [ "$#" -eq 1 ] || usage
   ensure_server
@@ -179,8 +345,8 @@ cmd_cancel() {
 # Under the admission lock: enqueue the job and print its id, or print
 # "wait <id>" when an exclusive job is queued ahead of this ordinary job.
 admit_locked() {
-  token=$1 exclusive=$2 label=$3
-  shift 3
+  token=$1 exclusive=$2 label=$3 deadline=$4
+  shift 4
   if [ "$exclusive" = 1 ]; then
     slots_needed=$(ts -S)
     marker_text=" [exclusive]"
@@ -188,13 +354,22 @@ admit_locked() {
     slots_needed=1
     marker_text=
     # An exclusive job needs every slot at once; task-spooler would keep
-    # filling single free slots from behind it, so ordinary jobs wait for it.
-    queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
-    if [ -n "$queued_exclusive" ]; then
-      echo "wait $queued_exclusive"
-      return
-    fi
+    # filling single free slots from behind it, so an ordinary job waits until
+    # no exclusive job is queued. It waits here, holding the admission lock, so
+    # a job that arrives later queues behind it at the lock instead of ahead of
+    # it in the queue.
+    while :; do
+      queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
+      [ -n "$queued_exclusive" ] || break
+      echo "botsterq: waiting for exclusive job $queued_exclusive before queueing" >&2
+      ts -w "$queued_exclusive" >/dev/null 2>&1 &
+      waiting=$!
+      trap 'kill "$waiting" 2>/dev/null; exit 130' TERM
+      wait "$waiting" || true
+      trap ':' TERM
+    done
   fi
+  trap ':' TERM
   job_paths "$token"
   enqueued="$state/run/$token.enqueued"
   rm -f "$enqueued"
@@ -202,10 +377,14 @@ admit_locked() {
   # TS_ENV runs once ts has enqueued the job: its FIFO write is the event that
   # makes the job's id readable. The job publishes its pid, then starts only
   # if it was not cancelled and its `run` process still exists.
+  BOTSTERQ_SLOTS="$slots_needed" BOTSTERQ_EXCLUSIVE="$exclusive" BOTSTERQ_LABEL="$label" \
   TS_ENV="echo enqueued >'$enqueued'" ts -f -n -N "$slots_needed" -L "$label$marker_text @ $(pwd) #$token" \
-    python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" -- "$@" \
+    python3 "$supervisor" "$pidfile" "$marker" "$joblock" "$BOTSTERQ_OWNER" "$kill_grace_seconds" "$deadline" -- "$@" \
     </dev/null >&3 2>&4 &
-  read _ <"$enqueued" || true
+  # The reader must stay until ts has written: a TERM (the run was cancelled)
+  # must not end this read, or the ts client's hook blocks forever writing to a
+  # fifo nobody reads. TERM is ignored in this subshell only.
+  ( trap '' TERM; read _ <"$enqueued" ) || true
   rm -f "$enqueued"
   id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
   [ -n "$id" ] || { echo "botsterq: enqueued job not found" >&2; exit 1; }
@@ -213,18 +392,44 @@ admit_locked() {
   echo "$id"
 }
 
+# Legacy entry point. A `run` that started before this version was installed
+# calls `$self __admit` with the old arguments (no deadline) and speaks the old
+# protocol: enqueue, or print "wait <id>" when an exclusive job is queued ahead
+# of an ordinary job. Keep it so an install cannot break a run that is waiting.
+admit_legacy() {
+  token=$1 exclusive=$2 label=$3
+  shift 3
+  if [ "$exclusive" != 1 ]; then
+    queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
+    if [ -n "$queued_exclusive" ]; then
+      echo "wait $queued_exclusive"
+      return
+    fi
+  fi
+  admit_locked "$token" "$exclusive" "$label" "$([ "$exclusive" = 1 ] && echo "$exclusive_deadline_seconds" || echo 0)" "$@"
+}
+
 cmd_run() {
   label=job
   exclusive=0
+  deadline=
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --label) [ "$#" -ge 2 ] || usage; label=$2; shift 2 ;;
       --exclusive) exclusive=1; shift ;;
+      --deadline)
+        [ "$#" -ge 2 ] || usage
+        deadline=$(duration_seconds "$2") || { echo "botsterq: --deadline needs a positive number of seconds, or a number with s, m or h" >&2; exit 2; }
+        shift 2 ;;
       --) shift; break ;;
       *) usage ;;
     esac
   done
   [ "$#" -ge 1 ] || usage
+  # An exclusive job that names no deadline gets the default; an ordinary job none (0).
+  if [ -z "$deadline" ]; then
+    if [ "$exclusive" = 1 ]; then deadline=$exclusive_deadline_seconds; else deadline=0; fi
+  fi
   # Inside a botsterq job, run directly: queueing would wait for a slot this
   # job's own parent holds, which deadlocks when the slots are full.
   if [ -n "${BOTSTERQ_JOB:-}" ]; then
@@ -239,9 +444,31 @@ cmd_run() {
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
   export BOTSTERQ_OWNER=$$
   id=
+  admission_started=
+  admission_over=
   interrupted() {
     trap - INT TERM HUP
     status=130
+    # Admission protocol. `run` opens the cancel fifo for writing (fd 9) and marks
+    # the admission started BEFORE it forks the admission process, and marks it
+    # over right after it reaped it. An interrupt while it is started and not
+    # over writes one byte to the cancel fifo (the admission process cancels
+    # itself: while it waits for the lock, or by ending its own admission
+    # child), waits for every child of this run (the admission process, if
+    # there is one), and removes the fifo and the output file, because no child
+    # is left to use them. No pid is stored or signalled here, so there is no
+    # stale pid to signal: identity is the fifo, and only the admission process
+    # signals its own children, which it has not reaped.
+    if [ -n "${admission_started:-}" ] && [ -z "${admission_over:-}" ]; then
+      printf x >&9 2>/dev/null || true
+      wait 2>/dev/null || true
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel"
+    fi
+    # Admission already over: its files are this run's to remove (the interrupt
+    # can land between the end of the admission and the normal removal).
+    if [ -n "${admission_over:-}" ]; then
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel"
+    fi
     # The signal may arrive before the admitted id is stored; the token names
     # the job either way, so resolve its id and stop it.
     [ -n "$id" ] || id=$(ts -l | awk -v token="#$token]" 'index($0, token) { print $1; exit }')
@@ -253,17 +480,29 @@ cmd_run() {
   # The job's output goes to the caller's stdout and stderr (fds 3 and 4),
   # not into the command substitution that reads the admitted id.
   exec 3>&1 4>&2
-  while :; do
-    admitted=$(with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$@")
-    case "$admitted" in
-      "wait "*)
-        echo "botsterq: waiting for exclusive job ${admitted#wait } before queueing" >&2
-        ( ts -w "${admitted#wait }" >/dev/null 2>&1 ) &
-        wait $! || true
-        ;;
-      *) id=$admitted; break ;;
-    esac
-  done
+  # Admission runs in the background (its result goes to a file), so a cancel
+  # that arrives while it waits for an exclusive job is handled at once.
+  admitted_file="$state/run/$token.admitted"
+  # Started first: an interrupt from here on removes the fifo this creates.
+  admission_started=1
+  cancel_fifo="$state/run/$token.admitcancel"
+  mkfifo "$cancel_fifo"
+  exec 9<>"$cancel_fifo"
+  # Test holds (fifos): the interrupt tests stop `run` at exactly these points.
+  if [ -n "${BOTSTERQ_TEST_RUN_BEFORE_ADMISSION:-}" ]; then
+    echo reached >"$BOTSTERQ_TEST_RUN_BEFORE_ADMISSION.reached"; read _ <"$BOTSTERQ_TEST_RUN_BEFORE_ADMISSION" || true
+  fi
+  perl -e "$ADMISSION_PERL" "$state/admission.lock" "$cancel_fifo" "$admitted_file" \
+    "$self" __admit2 "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" 9>&- &
+  wait $! || true
+  if [ -n "${BOTSTERQ_TEST_RUN_AFTER_ADMISSION:-}" ]; then
+    echo reached >"$BOTSTERQ_TEST_RUN_AFTER_ADMISSION.reached"; read _ <"$BOTSTERQ_TEST_RUN_AFTER_ADMISSION" || true
+  fi
+  admission_over=1
+  exec 9>&-
+  id=$(cat "$admitted_file" 2>/dev/null || true)
+  rm -f "$admitted_file" "$state/run/$token.admitcancel"
+  [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!
   status=0
@@ -279,8 +518,10 @@ case "$subcommand" in
   run) cmd_run "$@" ;;
   list) cmd_list ;;
   cancel) cmd_cancel "$@" ;;
+  audit) cmd_audit ;;
   slots) cmd_slots "$@" ;;
-  __admit) admit_locked "$@" ;;
+  __admit) admit_legacy "$@" ;;
+  __admit2) admit_locked "$@" ;;
   __set-slots) set_slots_locked "$@" ;;
   *) usage ;;
 esac

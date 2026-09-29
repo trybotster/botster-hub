@@ -2,7 +2,7 @@
 """botsterq job supervisor: runs one queued command and holds its queue slot
 until every process of the command's process group is gone.
 
-Usage: botsterq-job <pidfile> <marker> <joblock> <owner-pid> <grace-seconds> -- <command...>
+Usage: botsterq-job <pidfile> <marker> <joblock> <owner-pid> <grace-seconds> <deadline-seconds> -- <command...>
 
 task-spooler starts this as the job and releases the slot when it exits, so it
 exits only once the command's group is proved absent: killpg(group, 0) fails
@@ -22,6 +22,11 @@ failed census, a failed watch or a process that survives SIGKILL, ends the job.
   then SIGTERM, then SIGKILL, and then as long as they take: a process that
   survives SIGKILL keeps the slot, with a warning, until it is gone. The exit
   status is the command's, or 130 when cancelled.
+- Deadline: a positive <deadline-seconds> (0 means none) bounds the command's
+  run time from its start (queue wait is not counted). At expiry it prints
+  "deadline expired" and stops the group like a cancel (SIGTERM, SIGKILL when
+  the grace ends); the exit status is then 124 (a cancel, 130, wins). The
+  deadline is a timer that ends the job, so callers set it as a hang guard.
 - Waiting uses process-exit events (kqueue NOTE_EXIT on macOS, pidfd on Linux)
   on the members a `ps` census names, plus the command itself until it is
   reaped.
@@ -36,6 +41,7 @@ failed census, a failed watch or a process that survives SIGKILL, ends the job.
 - Needs Python 3.9 or later (`botsterq run` checks before admission).
 """
 
+import atexit
 import errno
 import fcntl
 import os
@@ -153,6 +159,27 @@ def recheck_wait(deadline, recheck, wakeup):
         time.sleep(remaining)
 
 
+def log_event(events, kind, token, info):
+    """Append one line to the events log (the command's start or end), so that
+    `botsterq audit` can later prove which jobs ran at the same time. One
+    O_APPEND write per line; a failure to log never affects the job."""
+    try:
+        line = "\t".join([kind, f"{time.time():.3f}", token, *info]).replace("\n", " ") + "\n"
+        fd = os.open(events, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except Exception as error:
+        # A missing record makes `botsterq audit` blind to this job, so say so
+        # (once per line; never fail the job).
+        try:
+            print(f"botsterq: cannot write the events log ({error}); audit will not see this {kind}",
+                  file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+
 def install_test_faults():
     """Test hook: BOTSTERQ_TEST_FAIL_AT names watch boundaries that fail, by
     replacing the real select functions, so the conversion code itself runs:
@@ -200,18 +227,32 @@ def hold_for_test(name):
 
 
 def main():
-    pidfile, marker, joblock, owner, grace = sys.argv[1:6]
-    if sys.argv[6] != "--":
-        sys.exit("botsterq-job: usage error")
-    command = sys.argv[7:]
+    if len(sys.argv) > 6 and sys.argv[6] == "--":
+        # The shape of a `botsterq run` from before the deadline existed: no
+        # run limit (an install must not break a run that is already waiting).
+        pidfile, marker, joblock, owner, grace = sys.argv[1:6]
+        run_limit = "0"
+        command = sys.argv[7:]
+    else:
+        pidfile, marker, joblock, owner, grace, run_limit = sys.argv[1:7]
+        if len(sys.argv) < 8 or sys.argv[7] != "--":
+            sys.exit("botsterq-job: usage error")
+        command = sys.argv[8:]
     grace = float(grace)
+    run_limit = float(run_limit)
     pgid = os.getpgrp()
 
     hold_for_test("BOTSTERQ_TEST_BEFORE_PIDFILE")
     try:
         os.kill(int(owner), 0)
     except ProcessLookupError:
-        sys.exit(130)  # its `botsterq run` is gone: do not start
+        # Its `botsterq run` is gone: do not start. Its cancel marker (left for
+        # this supervisor by a cancel that found no pid yet) goes with it.
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        sys.exit(130)
     # Under the job lock: a cancel that came first left a marker (consume it and
     # do not start); otherwise publish this process for any later cancel.
     with open(joblock, "a") as lock:
@@ -246,6 +287,13 @@ def main():
     signal.pthread_sigmask(signal.SIG_BLOCK, cancel_signals)
     if requested["cancel"]:
         sys.exit(130)
+    # Job facts for the events log come from `botsterq run`; the command does
+    # not need them.
+    slots = os.environ.pop("BOTSTERQ_SLOTS", "?")
+    exclusive = os.environ.pop("BOTSTERQ_EXCLUSIVE", "?")
+    label = os.environ.pop("BOTSTERQ_LABEL", "")
+    token = os.path.basename(pidfile).rsplit(".", 1)[0]
+    events = os.path.join(os.path.dirname(os.path.dirname(pidfile)), "events.log")
     env = dict(os.environ, BOTSTERQ_JOB=str(pgid))
     def in_child():
         # A process group of its own (Popen's process_group needs Python 3.11).
@@ -255,6 +303,14 @@ def main():
     faults = install_test_faults()
     child = subprocess.Popen(["nice", "-n", "10", *command], env=env, preexec_fn=in_child)
     group = child.pid
+    try:
+        load = "load=" + "/".join(f"{value:.1f}" for value in os.getloadavg())
+    except OSError:
+        load = "load=?"
+    log_event(events, "start", token, [slots, exclusive, label, load])
+    # The end is logged when the group is gone (every exit path leaves through
+    # sys.exit), which is when the queue slot is released.
+    atexit.register(log_event, events, "end", token, [slots, exclusive, label, ""])
     # The reservation guard starts here: from now on the command may be alive,
     # so no failure below may end this supervisor before the group is gone.
     try:
@@ -265,7 +321,8 @@ def main():
             with open(pidfile, "a") as published:
                 published.write(f"{group}\n")
         signal.pthread_sigmask(signal.SIG_UNBLOCK, cancel_signals)
-        status, cancelled = supervise(child, group, grace, requested, wakeup_read, faults)
+        run_deadline = time.monotonic() + run_limit if run_limit > 0 else None
+        status, cancelled, expired = supervise(child, group, grace, requested, wakeup_read, faults, run_deadline)
     except Exception as error:
         # Whatever failed, a supervisor exit releases the slot, so it happens
         # only once the group is proved absent. Cancel delivery must be live
@@ -287,12 +344,14 @@ def main():
         sys.exit(status if status >= 0 else 128 - status)
     if cancelled:
         sys.exit(130)
+    if expired:
+        sys.exit(124)
     sys.exit(status if status >= 0 else 128 - status)
 
 
-def supervise(child, group, grace, requested, wakeup_read, faults):
+def supervise(child, group, grace, requested, wakeup_read, faults, run_deadline):
     """Run the escalation loop until the kernel reports the group gone.
-    Returns (status, cancelled)."""
+    Returns (status, cancelled, expired)."""
     warned = set()
 
     def warn_once(key, text):
@@ -302,6 +361,7 @@ def supervise(child, group, grace, requested, wakeup_read, faults):
 
     status = None
     cancelled = False
+    expired = False
     # Escalation after a cancel, or after the command leaves processes behind:
     # "wait" (grace for leftovers to exit), then "term", then "kill", then
     # "held" (survivors of SIGKILL keep the slot until they are gone).
@@ -315,6 +375,12 @@ def supervise(child, group, grace, requested, wakeup_read, faults):
         hold_for_test("BOTSTERQ_TEST_AFTER_POLL")
         if requested["cancel"] and not cancelled:
             cancelled = True
+            signal_group(group, signal.SIGTERM)
+            phase, deadline = "term", time.monotonic() + grace
+        if (run_deadline is not None and not expired and not cancelled and status is None
+                and time.monotonic() >= run_deadline):
+            expired = True
+            warn_once("deadline", f"deadline expired: stopping the job's group {group}")
             signal_group(group, signal.SIGTERM)
             phase, deadline = "term", time.monotonic() + grace
         # While the command is unreaped its group exists, so only after that is
@@ -344,23 +410,27 @@ def supervise(child, group, grace, requested, wakeup_read, faults):
         # The census omits zombies, so an exited but unreaped command is not a
         # member; watch it too, or its exit would not end the wait while other
         # members (processes it left behind) run.
+        # The escalation deadline, else the run deadline that has not yet passed.
+        wait_until = deadline
+        if wait_until is None and run_deadline is not None and not expired and status is None:
+            wait_until = run_deadline
         watch = None if members is None else (members if status is not None else [*members, child.pid])
         recheck = time.monotonic() + RECHECK_SECONDS
         if watch:
             try:
-                wait_events(watch, deadline, wakeup_read)
+                wait_events(watch, wait_until, wakeup_read)
             except WatchError as error:
                 warn_once("watch", f"{error}; polling group {group} for absence instead")
-                recheck_wait(deadline, recheck, wakeup_read)
+                recheck_wait(wait_until, recheck, wakeup_read)
         else:
             # No event source: the census failed, or the group holds only
             # processes it cannot name (zombies awaiting their reaper).
-            recheck_wait(deadline, recheck, wakeup_read)
+            recheck_wait(wait_until, recheck, wakeup_read)
         try:
             os.read(wakeup_read, 512)
         except OSError:
             pass
-    return status, cancelled
+    return status, cancelled, expired
 
 
 
