@@ -181,21 +181,29 @@ pub(crate) fn handle_runtime(
     })
 }
 
-/// Start Core's in-place release of the ended session.
-///
-/// The seam for Core `ReleaseEndedSession` (Core 8f69957). Until Hub is pinned
-/// to it, there is no release to start, so a restart is refused.
+/// Start Core's in-place release of the ended session. It keeps the registry
+/// row and journals no removal, so the entity never disappears.
 fn begin_release(
-    _runtime: &crate::HubRuntime,
-    _waiter_id: crate::owner_identity::WaiterId,
-    _session_id: &str,
+    runtime: &crate::HubRuntime,
+    waiter_id: crate::owner_identity::WaiterId,
+    session_id: &str,
 ) -> Option<CoreOperationTracker> {
-    None
+    Some(
+        runtime.begin_release_ended_session_for_owner(waiter_id, SessionId(session_id.to_string())),
+    )
 }
 
 /// True when Core released the row (`Ok(true)`), so the id can be reserved.
-fn released(_completion: &botster_core_daemon::CoreCompletion) -> bool {
-    false
+/// `Ok(false)` with the row ended means the previous run's process group is
+/// still alive.
+fn released(completion: &botster_core_daemon::CoreCompletion) -> bool {
+    matches!(
+        completion,
+        botster_core_daemon::CoreCompletion::ReleaseEndedSession {
+            result: Ok(true),
+            ..
+        }
+    )
 }
 
 fn refuse_now(
