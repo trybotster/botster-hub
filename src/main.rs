@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufReader, IsTerminal};
+use std::io::{self, IsTerminal};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -19,7 +19,7 @@ use botster_hub::{
     HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
     SessionDefaults, TransportBindings, daemon_transport_request,
     daemon_transport_request_for_doctor, host_profile, installation_identity, serve_daemon,
-    serve_mcp_stdio, software_identity, stream_attach,
+    software_identity, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonPackageUpdateStatus, DaemonSessionTypeDefinition,
@@ -138,7 +138,7 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
         "shutdown" => operator_shutdown(args)
             .map(|()| CommandOutcome::DaemonStopped)
             .map_err(|error| error.to_string()),
-        "mcp-serve" => mcp_serve(args)
+        "audit" => operator_audit(args)
             .map(|()| CommandOutcome::Completed)
             .map_err(|error| error.to_string()),
         "open" => operator_open_alias(args).map_err(|error| error.to_string()),
@@ -248,7 +248,7 @@ fn stateful_command(command: &str) -> bool {
             | "spawn-targets"
             | "context"
             | "shutdown"
-            | "mcp-serve"
+            | "audit"
             | "open"
             | "reload"
             | "apps"
@@ -347,7 +347,7 @@ fn command_usage(command: &str) -> &'static str {
         "spawn-targets" => "spawn-targets",
         "context" => "context",
         "shutdown" => "shutdown",
-        "mcp-serve" => "mcp-serve",
+        "audit" => "audit",
         "open" => "open",
         "reload" => "reload",
         "apps" => "apps",
@@ -1846,6 +1846,47 @@ fn parse_session_type_request(
     Ok(request)
 }
 
+/// `botster-hub audit tools [--session <id>]`: print the tool-call audit log,
+/// one JSON line per call, optionally only the calls a session made or that
+/// named it as their target.
+fn operator_audit(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataArgs::parse(args, "audit")?;
+    let mut arguments = options.arguments.iter();
+    if arguments.next().map(String::as_str) != Some("tools") {
+        return Err(OperatorError::Usage("audit"));
+    }
+    let mut session = None;
+    while let Some(argument) = arguments.next() {
+        match (argument.as_str(), session.is_none()) {
+            ("--session", true) => {
+                session = Some(arguments.next().ok_or(OperatorError::Usage("audit"))?);
+            }
+            _ => return Err(OperatorError::Usage("audit")),
+        }
+    }
+    let path = botster_hub::tool_audit_log_path(&options.data_directory);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // No call has been logged yet.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(OperatorError::App(error.to_string())),
+    };
+    for line in text.lines() {
+        let keep = match session {
+            None => true,
+            Some(session) => serde_json::from_str::<serde_json::Value>(line).is_ok_and(|call| {
+                ["caller", "target"]
+                    .iter()
+                    .any(|role| call[*role]["session_id"] == session.as_str())
+            }),
+        };
+        if keep {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
 fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     let options = DataArgs::parse(args, "shutdown")?;
     if !options.arguments.is_empty() {
@@ -1858,18 +1899,6 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
     print_daemon_response(response)?;
     complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon)
         .map_err(|error| OperatorError::App(error.to_string()))?;
-    Ok(())
-}
-
-fn mcp_serve(args: Vec<String>) -> Result<(), McpCliError> {
-    let options = DataArgs::parse(args, "mcp-serve")?;
-    if !options.arguments.is_empty() {
-        return Err(OperatorError::Usage("mcp-serve").into());
-    }
-    let config = explicit_config(options.data_directory)?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    serve_mcp_stdio(config, BufReader::new(stdin.lock()), stdout.lock())?;
     Ok(())
 }
 
@@ -3474,7 +3503,6 @@ fn print_local_runtime_ready(
     println!("web={}", outcome.web.local_url);
     let data_dir_args = command_data_dir_args(&outcome.options.data_directory);
     println!("tui=botster-hub apps open{data_dir_args} botster-tui");
-    println!("mcp=botster-hub mcp-serve{data_dir_args}");
     println!("status=botster-hub status{data_dir_args}");
     println!("apps=botster-hub apps list{data_dir_args}");
     println!("down=botster-hub down{data_dir_args}");
@@ -4328,29 +4356,12 @@ enum OperatorError {
 }
 
 #[derive(Debug)]
-enum McpCliError {
-    Usage(Box<OperatorError>),
-    Config(botster_hub::HubConfigError),
-    Serve(botster_hub::McpServeError),
-}
-
-#[derive(Debug)]
 enum RunOneError {
     Usage,
     Config(botster_hub::HubConfigError),
     Runtime(botster_hub::HubRuntimeError),
     State(botster_hub::HubStateStoreError),
     TimedOut,
-}
-
-impl fmt::Display for McpCliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage(error) => write!(formatter, "{error}"),
-            Self::Config(error) => write!(formatter, "{error}"),
-            Self::Serve(error) => write!(formatter, "{error}"),
-        }
-    }
 }
 
 impl fmt::Display for StartError {
@@ -4639,13 +4650,13 @@ Daily runtime commands:
   botster-hub update <core|all> [--source <path>] [--data-dir <path>]
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
+  botster-hub audit tools [--data-dir <path>] [--session <id>]
   botster-hub check-update [--data-dir <path>]
   botster-hub version
   botster-hub doctor [--data-dir <path>]
   botster-hub smoke [--data-dir <path>] [...]
   botster-hub open web [--data-dir <path>]
   botster-hub open tui [--data-dir <path>]
-  botster-hub mcp-serve [--data-dir <path>]
 
 Apps:
   botster-hub apps list [--data-dir <path>]
@@ -4753,7 +4764,7 @@ Packages:
             "usage: botster-hub sessions shutdown [--data-dir <path>] <session-id>"
         }
         "shutdown" => "usage: botster-hub shutdown [--data-dir <path>]",
-        "mcp-serve" => "usage: botster-hub mcp-serve [--data-dir <path>]",
+        "audit" => "usage: botster-hub audit tools [--data-dir <path>] [--session <id>]",
         "open" => "usage: botster-hub open <web|tui> [--data-dir <path>]",
         "apps" => "usage: botster-hub apps <list|show|open> ...",
         "apps list" => "usage: botster-hub apps list [--data-dir <path>]",
@@ -4811,7 +4822,7 @@ Packages:
         "providers" | "providers list" => "usage: botster-hub providers list [--data-dir <path>]",
         "inspect" => "usage: botster-hub inspect [--data-dir <path>] <session-id>",
         _ => {
-            "usage: botster-hub <help|up|update|down|doctor|smoke|open|reload|start|status|sessions|shutdown|mcp-serve|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <help|up|update|down|doctor|smoke|open|reload|start|status|sessions|shutdown|audit|apps|packages|providers|inspect|run-one>"
         }
     }
 }
@@ -4867,24 +4878,6 @@ impl From<OperatorError> for StartError {
 impl From<botster_hub::HubConfigError> for OperatorError {
     fn from(error: botster_hub::HubConfigError) -> Self {
         Self::Config(error)
-    }
-}
-
-impl From<OperatorError> for McpCliError {
-    fn from(error: OperatorError) -> Self {
-        Self::Usage(Box::new(error))
-    }
-}
-
-impl From<botster_hub::HubConfigError> for McpCliError {
-    fn from(error: botster_hub::HubConfigError) -> Self {
-        Self::Config(error)
-    }
-}
-
-impl From<botster_hub::McpServeError> for McpCliError {
-    fn from(error: botster_hub::McpServeError) -> Self {
-        Self::Serve(error)
     }
 }
 
@@ -4964,7 +4957,6 @@ mod cli_data_dir_tests {
             ("smoke", vec![], 0),
             ("status", vec![], 0),
             ("shutdown", vec![], 0),
-            ("mcp-serve", vec![], 0),
             ("inspect", vec!["session"], 0),
             ("sessions", vec!["list"], 1),
             ("session-types", vec!["list"], 1),
@@ -5179,7 +5171,6 @@ mod cli_data_dir_tests {
             "session-types list",
             "apps list",
             "packages list",
-            "mcp-serve",
         ] {
             assert!(
                 usage_for(command).contains("[--data-dir <path>]"),
