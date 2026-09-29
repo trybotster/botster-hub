@@ -45,10 +45,13 @@ import atexit
 import errno
 import fcntl
 import os
+import re
 import select
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # Progress-poll interval of the degraded mode (see above).
@@ -180,6 +183,101 @@ def log_event(events, kind, token, info):
             pass
 
 
+def running_jobs_sharing(directory, token):
+    """Other botsterq jobs that are running in `directory` or inside it (a job
+    in a subdirectory of a cargo workspace builds into the workspace's target).
+    Read from the queue's own list (`ts -l`, label `<label> @ <dir> #<token>`).
+    Returns None when the list cannot be read: the caller then treats it as
+    busy."""
+    if os.environ.get("BOTSTERQ_TEST_FAIL_JOB_LIST"):
+        return None  # test hook: the running-job list cannot be read
+    try:
+        listing = subprocess.run(["ts", "-l"], stdout=subprocess.PIPE, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    mine = os.path.realpath(directory)
+    sharing = []
+    for line in listing.splitlines()[1:]:
+        fields = line.split(None, 2)
+        if len(fields) < 2 or fields[1] != "running":
+            continue
+        match = re.search(r"\[(.*) @ ([^\]]*) #([^ \]]+)\]", line)
+        if not match or match.group(3) == token:
+            continue
+        other = os.path.realpath(match.group(2))
+        if other == mine or other.startswith(mine + os.sep):
+            sharing.append(fields[0])
+    return sharing
+
+
+def enforce_target_cap(events, token):
+    """Before the command starts: if ./target of the job's directory (its cargo
+    workspace) is above the cap, run `cargo clean --target-dir target` there, in
+    this job's slot, and say so. Only ./target of the job's own directory is
+    ever cleaned: nothing when the directory has no Cargo.toml or no target, and
+    nothing when CARGO_TARGET_DIR points somewhere else (the command builds
+    there, not in ./target). A cap of 0 turns it off."""
+    cap = os.environ.pop("BOTSTERQ_TARGET_CAP_GB", "")
+    try:
+        cap_gb = float(cap)
+    except ValueError:
+        return
+    if cap_gb <= 0 or os.environ.get("CARGO_TARGET_DIR"):
+        return
+    target = "target"
+    if not (os.path.isdir(target) and os.path.isfile("Cargo.toml")):
+        return
+    try:
+        usage = subprocess.run(["du", "-sk", target], stdout=subprocess.PIPE, text=True, check=True)
+        size_gb = int(usage.stdout.split()[0]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError, subprocess.CalledProcessError):
+        return
+    if size_gb <= cap_gb:
+        return
+    # A running job in the same directory is using this target: cleaning it now
+    # would delete that job's live artifacts. Skip, and say why.
+    sharing = running_jobs_sharing(os.getcwd(), token)
+    if sharing is None or sharing:
+        why = "the running-job list cannot be read" if sharing is None else f"job(s) {', '.join(sharing)} are running in this directory"
+        print(f"botsterq: {os.path.join(os.getcwd(), target)} is {size_gb:.1f} GB, above the {cap_gb:g} GB cap; "
+              f"cargo clean skipped: {why}", file=sys.stderr, flush=True)
+        log_event(events, "clean_skipped", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", why])
+        return
+    print(f"botsterq: {os.path.join(os.getcwd(), target)} is {size_gb:.1f} GB, above the {cap_gb:g} GB cap; "
+          "running cargo clean there before the job starts", file=sys.stderr, flush=True)
+    # target/candidate holds the candidate directory that `test.sh --phase build`
+    # hands to the later phases: it survives the clean (moved aside, then back).
+    candidate = os.path.join(target, "candidate")
+    kept = None
+    if os.path.isdir(candidate):
+        try:
+            kept = tempfile.mkdtemp(prefix="candidate-", dir=os.path.dirname(events))
+            os.rename(candidate, os.path.join(kept, "candidate"))
+        except OSError as error:
+            if kept:
+                shutil.rmtree(kept, ignore_errors=True)
+            print(f"botsterq: cargo clean skipped: cannot keep the candidate directory ({error})",
+                  file=sys.stderr, flush=True)
+            log_event(events, "clean_skipped", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", "candidate directory cannot be kept"])
+            return
+    try:
+        cleaned = subprocess.run(["cargo", "clean", "--target-dir", target]).returncode
+    except OSError:
+        cleaned = 127
+    if kept:
+        try:
+            os.makedirs(target, exist_ok=True)
+            os.rename(os.path.join(kept, "candidate"), candidate)
+        except OSError as error:
+            print(f"botsterq: the candidate directory is left at {kept}/candidate ({error})", file=sys.stderr, flush=True)
+            kept = None
+        if kept:
+            shutil.rmtree(kept, ignore_errors=True)
+    log_event(events, "clean", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", f"exit={cleaned}"])
+    if cleaned != 0:
+        print(f"botsterq: cargo clean failed (exit {cleaned}); the job starts anyway", file=sys.stderr, flush=True)
+
+
 def install_test_faults():
     """Test hook: BOTSTERQ_TEST_FAIL_AT names watch boundaries that fail, by
     replacing the real select functions, so the conversion code itself runs:
@@ -279,6 +377,8 @@ def main():
     for signum in cancel_signals:
         signal.signal(signum, on_cancel)
     hold_for_test("BOTSTERQ_TEST_BEFORE_SPAWN")
+    enforce_target_cap(os.path.join(os.path.dirname(os.path.dirname(pidfile)), "events.log"),
+                       os.path.basename(pidfile).rsplit(".", 1)[0])
 
     # Start the command with cancel signals blocked, so a cancel either comes
     # before the check below (the command never starts) or is handled after the
