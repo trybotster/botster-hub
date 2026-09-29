@@ -12,3 +12,5 @@ pub use botster_hub::plugin_test_kit::{
     TimerFired, hold_handler, session_record,
 };
 pub use botster_hub_client::{DaemonRequest, DaemonResponse};
+
+pub mod spec;
