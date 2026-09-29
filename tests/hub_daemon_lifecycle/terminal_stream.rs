@@ -87,7 +87,7 @@ impl RawSocket {
         // macOS refuses a timeout on a socket the Hub already shut down; such
         // a socket never blocks, so its buffered frames are still readable.
         if let Err(error) = self.stream.set_read_timeout(timeout)
-            && error.kind() != std::io::ErrorKind::InvalidInput
+            && error.raw_os_error() != Some(22)
         {
             return Err(DaemonTransportError::Io(error));
         }
