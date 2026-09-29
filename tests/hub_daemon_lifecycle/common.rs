@@ -50,7 +50,39 @@ use crate::support::{
 use super::*;
 pub(crate) use botster_hub::test_internals::TestHubStateStoreExt;
 
-pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// How many real-daemon tests may run at once: `BOTSTER_LIFECYCLE_PARALLEL`
+/// (a positive integer), default 1, which is the old process-wide mutex. An
+/// experiment knob: every test that fails above 1 shares state with another.
+pub(crate) static REAL_DAEMON_PERMITS: OnceLock<DaemonPermits> = OnceLock::new();
+
+pub(crate) struct DaemonPermits {
+    free: Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+pub(crate) struct DaemonPermit(&'static DaemonPermits);
+
+impl DaemonPermits {
+    fn acquire(&'static self) -> DaemonPermit {
+        let mut free = self.free.lock().unwrap_or_else(|error| error.into_inner());
+        while *free == 0 {
+            free = self
+                .released
+                .wait(free)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *free -= 1;
+        DaemonPermit(self)
+    }
+}
+
+impl Drop for DaemonPermit {
+    fn drop(&mut self) {
+        let mut free = self.0.free.lock().unwrap_or_else(|error| error.into_inner());
+        *free += 1;
+        self.0.released.notify_one();
+    }
+}
 
 pub(crate) const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 pub(crate) const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
@@ -567,8 +599,18 @@ pub(crate) fn assert_detached_daemon_stdin(pid: u32) {
     panic!("detached daemon stdin assertion is unsupported on this Unix target for pid {pid}");
 }
 
-pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
-    REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
+pub(crate) fn daemon_test_permits() -> &'static DaemonPermits {
+    REAL_DAEMON_PERMITS.get_or_init(|| {
+        let permits = std::env::var("BOTSTER_LIFECYCLE_PARALLEL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        DaemonPermits {
+            free: Mutex::new(permits),
+            released: std::sync::Condvar::new(),
+        }
+    })
 }
 
 thread_local! {
@@ -653,7 +695,7 @@ pub(crate) fn bypass_real_daemon_start_guard(bypass: bool) {
 }
 
 pub(crate) struct DaemonTestGuard {
-    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+    _inner: Option<DaemonPermit>,
 }
 
 impl Drop for DaemonTestGuard {
@@ -915,7 +957,7 @@ pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
                 check_harness_taint();
                 return DaemonTestGuard { _inner: None };
             }
-            let inner = recovering_mutex_guard(daemon_test_lock());
+            let inner = daemon_test_permits().acquire();
             check_harness_taint();
             depth.set(1);
             DaemonTestGuard {
