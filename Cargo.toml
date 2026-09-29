@@ -1,5 +1,4 @@
 [workspace]
-exclude = ["vendor/rtc-0.21.0-rc.1"]
 members = [
   ".",
   "crates/botster-hub-client",
@@ -77,15 +76,14 @@ loom = "0.7.2"
 [patch."https://github.com/trybotster/botster-hub.git"]
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 
-# Hub runtime builds use the local rtc repairs documented in vendor/README.md,
-# and rtc-sctp (with its sibling rtc-shared, so one copy resolves) from the
-# trybotster/rtc fork: upstream 51558ffb plus one commit, branch
-# botster/rtc-sctp-stream-reuse-3. That commit lets a stream id be reused only
-# after both directions of its reset complete (RFC 8831 section 6.7).
+# The rtc family (rtc, rtc-sctp, rtc-shared and the other rtc-* crates) comes from the
+# trybotster/rtc fork as ONE git copy: upstream webrtc-rs/rtc 51558ffb plus the Botster repairs,
+# branch botster/rtc-repairs-1-4 (see BOTSTER-PATCHES.md there): ordered close, the SCTP drain's
+# terminal results, the receive-side close barrier, and a stream id reusable only after both
+# directions of its reset complete. Only `rtc` depends on the rest of the family and only
+# `webrtc` depends on `rtc`, so patching `rtc` alone resolves every sibling from the same checkout.
 [patch.crates-io]
-rtc = { path = "vendor/rtc-0.21.0-rc.1" }
-rtc-sctp = { git = "https://github.com/trybotster/rtc", rev = "a96b03c93c648b9abb6214a0adf97ae5c5ca89d1" }
-rtc-shared = { git = "https://github.com/trybotster/rtc", rev = "a96b03c93c648b9abb6214a0adf97ae5c5ca89d1" }
+rtc = { git = "https://github.com/trybotster/rtc", rev = "b0534a73dd684c1ed6c786fab6f607e539bc9a1f" }
 
 # Dev and test builds keep line tables only: panics and backtraces still name
 # every frame's file and line, but variable and type debug info (most of the
