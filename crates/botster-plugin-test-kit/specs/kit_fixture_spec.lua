@@ -1,0 +1,76 @@
+-- Specs for the in-repo fixtures. Run with:
+--   botster-plugin-test --plugin fixtures specs/kit_fixture_spec.lua
+local kit = require("botster.test")
+
+kit.test("a tool call runs the real handler and writes plugin_db", function(t)
+  local p = t:load("kit-fixture")
+  local stored = p:call_tool("kit-fixture.remember", { key = "alpha", value = "one" })
+  t:eq(stored.ok, true)
+  t:eq(stored.result.stored, "alpha")
+  t:eq(p:db_get("alpha").value, "one")
+  t:match(p:logs(), { { level = "info", message = "remembered" } })
+end)
+
+kit.test("an emitted event reaches the downstream handler inside the step", function(t)
+  local p = t:load("kit-fixture")
+  t:eq(p:call_tool("kit-fixture.note", { key = "beta" }).result.emitted, true)
+  t:eq(p:db_get("noted").items[1], "beta")
+  t:match(p:emitted_events(), { { owner = "kit-fixture", name = "kit-fixture.noted", payload = { key = "beta" } } })
+end)
+
+kit.test("session input reaches the plugin as production frames", function(t)
+  local p = t:load("kit-fixture")
+  t:sessions_baseline({ kit.session({ id = "sess-a", state = "running" }) })
+  t:session_upsert(kit.session({ id = "sess-a", state = "exited", code = 0 }))
+  t:session_remove("sess-a")
+  local family = p:db_get("family").items
+  t:eq(#family, 5)
+  t:eq(family[4].lifecycle_class, "ended")
+  t:eq(family[5].type, "entity_remove")
+end)
+
+kit.test("a plugin that calls the removed events.on fails to load", function(t)
+  local plugin, err = t:try_load("removed-events-on")
+  t:eq(plugin, nil)
+  t:ok(err ~= nil, "a load error is reported")
+  t:ok(tostring(err.message):find("events", 1, true), err.message)
+end)
+
+kit.test("a timer armed after advance fires one delay later", function(t)
+  local p = t:load("kit-fixture-timer")
+  t:eq(#t:advance(5000), 0)
+  t:eq(p:call_tool("kit-fixture-timer.arm", { delay_ms = 1000 }).ok, true)
+  t:eq(#t:advance(999), 0)
+  local fired = t:advance(1)
+  t:eq(#fired, 1)
+  t:eq(fired[1].package, "kit-fixture-timer")
+end)
+
+kit.test("unsupported features refuse with the gate", function(t)
+  local p = t:load("kit-fixture")
+  local refused = p:call_tool("kit-fixture.read", { key = "x" }, { caller = { session_id = "sess-a" } })
+  t:eq(refused.ok, false)
+  t:eq(refused.error.kind, "unsupported_by_kit")
+  t:eq(refused.error.gate, "G1")
+  t:eq(pcall(function() return p:views() end), false)
+end)
+
+kit.test("a routed envelope is received again until the target acknowledges it", function(t)
+  local p = t:load("kit-fixture")
+  p:call_tool("kit-fixture.route", {
+    envelope_id = "env-1",
+    target = { type = "session", session_id = "sess-b" },
+    body = "hello",
+  })
+  t:eq(#p:routed("sess-b"), 1)
+  t:eq(p:routed("sess-b")[1].payload.body, "hello")
+  t:eq(#t:receive_routed("sess-b"), 1)
+  t:eq(#t:receive_routed("sess-b"), 1)
+  t:ok(t:ack_routed("sess-b", "env-1"))
+  t:eq(#t:receive_routed("sess-b"), 0)
+end)
+
+kit.test("a Hub request table goes through the production path", function(t)
+  local response = t:request({ type = "plugin_mcp_list_tools" })
+  t:eq(response.ok, true)
+end)
