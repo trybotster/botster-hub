@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::io::{self, BufRead, Write};
 
-use botster_hub_client::{DaemonConnection, DaemonEndpoint, DaemonRequest};
+use botster_hub_client::{DaemonConnection, DaemonEndpoint, DaemonRequest, DaemonRouteStream};
 
 fn serve(
     endpoint: &DaemonEndpoint,
@@ -37,7 +37,15 @@ fn serve(
         // The client parks unsolicited frames until the response arrives.
         drop(connection.take_skipped_entity_frames());
         drop(connection.take_skipped_events());
-        drop(connection.take_skipped_terminal());
+        if let Some(attach) = &response.terminal_attach
+            && attach.route_socket.is_some()
+        {
+            // Terminal frames arrive on the route's own socket. This harness
+            // observes control responses only, so it reads and discards them.
+            if let Ok(mut route) = DaemonRouteStream::connect(attach) {
+                std::thread::spawn(move || while route.read_frame().is_ok() {});
+            }
+        }
         serde_json::to_writer(&mut *output, &response)?;
         writeln!(output)?;
         output.flush()?;

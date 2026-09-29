@@ -16,6 +16,7 @@ use crate::subscription::closed_events::{
 };
 use crate::transport::shared::adapter_slot::AdapterSlot;
 use crate::transport::shared::wake::AdapterWake;
+use crate::transport::unix::route_socket::RouteSocketDir;
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
 };
@@ -36,7 +37,6 @@ pub(crate) struct UnixTerminalAdapterHandle {
 
 struct UnixTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
-    deferred: AtomicBool,
 }
 
 impl UnixTerminalAdapterInner {
@@ -46,7 +46,6 @@ impl UnixTerminalAdapterInner {
                 AdapterWake::new(),
                 Arc::new(AtomicBool::new(false)),
             ),
-            deferred: AtomicBool::new(false),
         }
     }
 
@@ -89,18 +88,6 @@ impl UnixTerminalAdapterInner {
         self.slot.snapshot_active()
     }
 
-    fn defer_flush(&self) {
-        self.deferred.store(true, Ordering::SeqCst);
-    }
-
-    fn clear_defer_flush(&self) {
-        self.deferred.store(false, Ordering::SeqCst);
-    }
-
-    fn is_flush_deferred(&self) -> bool {
-        self.deferred.load(Ordering::SeqCst)
-    }
-
     fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         self.slot.complete_active()
     }
@@ -133,7 +120,6 @@ impl UnixTerminalAdapter {
     ) -> (Self, UnixTerminalAdapterHandle) {
         let inner = Arc::new(UnixTerminalAdapterInner {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
-            deferred: AtomicBool::new(false),
         });
         (
             Self {
@@ -214,6 +200,7 @@ struct UnixMuxInner {
     closed_events: ClosedEventLedger,
     close_work: Mutex<Arc<AtomicBool>>,
     close_source: Mutex<Option<CloseWorkSource>>,
+    route_dir: Mutex<Option<Arc<RouteSocketDir>>>,
 }
 
 impl UnixConnectionMux {
@@ -226,6 +213,7 @@ impl UnixConnectionMux {
                 closed_events: ClosedEventLedger::default(),
                 close_work: Mutex::new(Arc::new(AtomicBool::new(false))),
                 close_source: Mutex::new(None),
+                route_dir: Mutex::new(None),
             }),
         }
     }
@@ -242,6 +230,22 @@ impl UnixConnectionMux {
         }
     }
 
+    pub(crate) fn bind_route_dir(&self, dir: Arc<RouteSocketDir>) {
+        if let Ok(mut slot) = self.inner.route_dir.lock() {
+            *slot = Some(dir);
+        }
+    }
+
+    /// Where this connection's route sockets are bound, once the owner has
+    /// admitted the connection.
+    pub(crate) fn route_dir(&self) -> Option<Arc<RouteSocketDir>> {
+        self.inner
+            .route_dir
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
     pub(crate) fn create_adapter(&self) -> (UnixTerminalAdapter, UnixTerminalAdapterHandle) {
         let close_work = self
             .inner
@@ -250,7 +254,8 @@ impl UnixConnectionMux {
             .ok()
             .map(|slot| Arc::clone(&*slot))
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        UnixTerminalAdapter::pair_with_wake_and_close_work(self.inner.wake.clone(), close_work)
+        // Each route wakes its own socket task, not the control connection.
+        UnixTerminalAdapter::pair_with_wake_and_close_work(AdapterWake::new(), close_work)
     }
 
     /// Register one bound route. Returns `false` without registering when
@@ -443,17 +448,9 @@ impl UnixConnectionMux {
         self.inner.closed_events.pop_pending_event()
     }
 
+    /// The control connection has close events to write.
     pub(crate) fn has_unsent_mux_writes(&self) -> bool {
-        self.has_pending_event() || self.has_occupied_adapter_slot()
-    }
-
-    fn has_occupied_adapter_slot(&self) -> bool {
-        let Ok(routes) = self.inner.routes.lock() else {
-            return false;
-        };
-        routes
-            .values()
-            .any(|route| route.handle.snapshot_active().is_some())
+        self.has_pending_event()
     }
 
     #[cfg(test)]
@@ -488,37 +485,8 @@ impl UnixConnectionMux {
         })
     }
 
-    /// Occupied, non-deferred write slots. Frames are `Arc` clones.
-    pub(crate) fn snapshot_writes(&self) -> Vec<(UnixTerminalAdapterHandle, RoutedTerminalFrame)> {
-        let Ok(routes) = self.inner.routes.lock() else {
-            return Vec::new();
-        };
-        routes
-            .values()
-            .filter_map(|route| {
-                if route.handle.is_flush_deferred() {
-                    return None;
-                }
-                route
-                    .handle
-                    .snapshot_active()
-                    .map(|frame| (route.handle.clone(), frame))
-            })
-            .collect()
-    }
-
     pub(crate) async fn wait_for_write(&self) {
         self.inner.wake.wait().await;
-    }
-
-    /// Allow a later flush to retry a route that yielded to a host response.
-    pub(crate) fn clear_deferred_flushes(&self) {
-        let Ok(routes) = self.inner.routes.lock() else {
-            return;
-        };
-        for route in routes.values() {
-            route.handle.clear_defer_flush();
-        }
     }
 }
 
@@ -552,16 +520,16 @@ impl UnixTerminalAdapterHandle {
         let _ = self.inner.try_write(frame);
     }
 
-    pub(crate) fn defer_flush(&self) {
-        self.inner.defer_flush();
+    /// Resolves when the adapter slot is written or closed.
+    pub(crate) async fn wait_for_write(&self) {
+        self.inner.slot.wait_for_write().await;
     }
 
-    pub(crate) fn clear_defer_flush(&self) {
-        self.inner.clear_defer_flush();
-    }
-
-    pub(crate) fn is_flush_deferred(&self) -> bool {
-        self.inner.is_flush_deferred()
+    /// Resolves once the route is closed.
+    pub(crate) async fn closed(&self) {
+        while !self.is_closed() {
+            self.wait_for_write().await;
+        }
     }
 
     pub(crate) fn attach_close_hook(
@@ -731,22 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_route_is_omitted_from_snapshot_writes() {
-        let mux = UnixConnectionMux::new();
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone()));
-        assert_eq!(adapter.try_write(&output_frame("sub", "flood")), Ok(()));
-        assert_eq!(mux.snapshot_writes().len(), 1);
-        handle.defer_flush();
-        assert!(mux.snapshot_writes().is_empty());
-        assert!(handle.snapshot_active().is_some());
-        assert!(mux.has_bound_routes());
-        mux.clear_deferred_flushes();
-        assert_eq!(mux.snapshot_writes().len(), 1);
-        assert!(handle.snapshot_active().is_some());
-    }
-
-    #[test]
     fn slot_shares_the_body_without_copying_it() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
         let frame = output_frame("sub", "shared");
@@ -776,13 +728,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_mux_retains_a_write_wake_before_the_connection_waits() {
+    async fn a_route_retains_a_write_wake_before_its_task_waits() {
         let mux = UnixConnectionMux::new();
-        let (mut adapter, _handle) = mux.create_adapter();
+        let (mut adapter, handle) = mux.create_adapter();
         assert_eq!(adapter.try_write(&output_frame("sub", "early")), Ok(()));
-        tokio::time::timeout(std::time::Duration::from_millis(50), mux.wait_for_write())
-            .await
-            .expect("a Unix adapter write before waiter registration must retain its wake");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.wait_for_write(),
+        )
+        .await
+        .expect("a Unix adapter write before waiter registration must retain its wake");
     }
 
     #[test]

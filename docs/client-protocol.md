@@ -1728,7 +1728,7 @@ success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
 
-## Host-control protocol 12
+## Host-control protocol 13
 
 `PROTOCOL_VERSION` is 12. It arrived at `CONFORMANCE_FIXTURE_REVISION` 52;
 revision 53 adds the optional plugin logs `log_id` (below). Protocol 12 is a
