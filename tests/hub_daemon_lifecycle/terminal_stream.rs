@@ -162,13 +162,13 @@ impl RawUnixClient {
     }
 
     /// Whether `route`'s socket reaches end of stream within `timeout`,
-    /// discarding any frames that arrive first.
+    /// discarding any frames that arrive first. A socket this client already
+    /// saw end (and dropped) counts as ended.
     pub(crate) fn route_socket_reaches_eof(&mut self, route: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let socket = self
-            .route_sockets
-            .get_mut(route)
-            .unwrap_or_else(|| panic!("route {route} has no open route socket"));
+        let Some(socket) = self.route_sockets.get_mut(route) else {
+            return self.routes.contains_key(route);
+        };
         while Instant::now() < deadline {
             match socket.read_within(Some(Duration::from_millis(100))) {
                 Ok(_) => {}
