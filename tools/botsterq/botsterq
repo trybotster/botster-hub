@@ -88,7 +88,14 @@ ADMISSION_PERL='
   use POSIX qw(:signal_h);
   my ($lockfile, $cancel) = splice(@ARGV, 0, 2);
   open(my $lock, ">>", $lockfile) or die "botsterq: open lock: $!\n";
-  flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+  unless (flock($lock, LOCK_EX | LOCK_NB)) {
+    # The lock is held: about to block. The test hook announces this through a
+    # fifo (its reader is the test), so a test can cancel exactly here.
+    if (defined $ENV{BOTSTERQ_TEST_LOCK_ANNOUNCE}) {
+      if (open(my $announce, ">", $ENV{BOTSTERQ_TEST_LOCK_ANNOUNCE})) { print $announce "blocked\n"; close $announce; }
+    }
+    flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+  }
   exit 130 if -e $cancel;
   my $term = POSIX::SigSet->new(SIGTERM);
   my $old = POSIX::SigSet->new;
