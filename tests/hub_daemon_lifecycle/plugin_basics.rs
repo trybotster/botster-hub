@@ -522,3 +522,56 @@ fn a_failed_reload_keeps_the_records_its_entrypoint_wrote() {
     drop(connection);
     shutdown_cli_daemon(&data_dir, child);
 }
+
+const CALLER_PROBE_PLUGIN: &str = r#"
+return botster.register({
+  tools = {{
+    name = "caller.probe",
+    description = "Return the caller the Hub set for this call.",
+    handler = "probe",
+    call = function(args, request)
+      return { caller = request.caller, argument_caller = args.caller }
+    end,
+  }},
+})
+"#;
+
+/// A tool called over the Hub socket runs for the local operator, whatever
+/// caller its arguments claim.
+#[test]
+fn live_daemon_socket_tool_call_runs_for_the_operator() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("caller-data");
+    let package_dir = unique_short_test_dir("caller-package");
+    fs::create_dir_all(&package_dir).expect("create caller package root");
+    fs::write(package_dir.join("plugin.lua"), CALLER_PROBE_PLUGIN).expect("write caller plugin");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "caller.probe",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": "." },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }))
+        .expect("serialize caller manifest"),
+    )
+    .expect("write caller manifest");
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "plugin caller daemon cleanup");
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir.clone() },
+    )
+    .expect("enable caller package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision, "{enabled:?}");
+    let probe = call_plugin_tool(
+        &data_dir,
+        "caller.probe",
+        serde_json::json!({ "caller": { "kind": "session", "hub_id": "h", "session_id": "forged" } }),
+    );
+    assert_eq!(probe["caller"], serde_json::json!({ "kind": "operator" }), "{probe}");
+    assert_eq!(probe["argument_caller"]["session_id"], "forged", "{probe}");
+    daemon.shutdown();
+}
