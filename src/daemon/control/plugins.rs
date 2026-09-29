@@ -424,11 +424,22 @@ pub(crate) fn handle_runtime(
             let Some(runtime) = daemon.runtime() else {
                 return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
             };
+            // An HTTP MCP call is the session its bearer token proved, named
+            // with its hub; an unproven token never reaches here (it is
+            // refused with 401). The Hub socket is the operator's, or the
+            // caller the plugin test kit chose.
+            let caller = match observability.caller.session_id() {
+                Some(session_id) => crate::plugin_caller::PluginCaller::Session {
+                    hub_id: runtime.config().host.id.clone(),
+                    session_id: session_id.0,
+                },
+                None => state.plugin_controls.mcp_call_caller(),
+            };
             let request = match runtime.prepare_plugin_mcp_tool(
                 crate::McpCallRequest { name, arguments },
                 request_id,
                 None,
-                state.plugin_controls.mcp_call_caller(),
+                caller,
             ) {
                 Ok(request) => request,
                 Err(error) => return ControlStep::ready(daemon_plugin_tool_error(error)),
