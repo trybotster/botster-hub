@@ -342,7 +342,7 @@ mod tests {
         _dir: RouteSocketDir,
     }
 
-    async fn connected_route(name: &str) -> Route {
+    async fn connected_route(_name: &str) -> Route {
         let dir = RouteSocketDir::create(&unique_socket_path()).expect("route dir");
         let mux = UnixConnectionMux::new();
         let (adapter, handle) = mux.create_adapter();
