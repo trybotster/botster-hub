@@ -1,4 +1,4 @@
-//! Unix framing and mux scheduling for host-control protocol 12.
+//! Unix framing and mux scheduling for host-control protocol 13.
 //!
 //! Every frame is one length-prefixed container. Control frames are UTF-8
 //! JSON [`ServerFrame`] payloads. Terminal frames are written as two slices,
@@ -6,7 +6,6 @@
 //! vectored write; the body is never copied by Hub.
 use std::collections::VecDeque;
 use std::io::IoSlice;
-use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -16,14 +15,14 @@ use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
     ClientFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest, DaemonResponse,
     DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES, MAX_UNIX_FRAME_BYTES,
-    ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader, decode_unix_frame,
-    encode_control_json, encode_server_frame,
+    ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, decode_unix_frame, encode_control_json,
+    encode_server_frame,
 };
 use botster_terminal_protocol::MAX_TERMINAL_INPUT_FRAME_BYTES;
 
 use crate::admission::budgets::{DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_INCOMPLETE_FRAME_TIMEOUT};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapterHandle};
+use crate::transport::unix::UnixConnectionMux;
 
 /// Maximum serialized response storage retained by one Unix connection.
 pub(crate) const PENDING_RESPONSE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
@@ -111,7 +110,6 @@ impl MuxWriteState {
         self.enqueue_response_frame(PendingMuxFrame {
             bytes: PendingMuxBytes::Control(bytes),
             offset: 0,
-            complete_envelope: None,
             class: PendingMuxClass::Response,
             delivery_ack,
             delivery_receipt: None,
@@ -145,7 +143,6 @@ impl MuxWriteState {
                 self.queued_events.push_back(PendingMuxFrame {
                     bytes: PendingMuxBytes::PreparedEntity(delivery),
                     offset: 0,
-                    complete_envelope: None,
                     class: PendingMuxClass::Event,
                     delivery_ack: None,
                     delivery_receipt: None,
@@ -166,7 +163,6 @@ impl MuxWriteState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingMuxClass {
-    Terminal,
     Event,
     Response,
 }
@@ -175,11 +171,6 @@ pub(crate) enum PendingMuxBytes {
     /// One complete control container, length prefix included.
     Control(Vec<u8>),
     PreparedEntity(crate::entity_delivery::PreparedEntityDelivery),
-    /// One terminal container: stack header plus the shared body.
-    Terminal {
-        header: UnixTerminalContainerHeader,
-        body: Arc<[u8]>,
-    },
 }
 
 impl PendingMuxBytes {
@@ -187,7 +178,6 @@ impl PendingMuxBytes {
         match self {
             Self::Control(bytes) => bytes.len(),
             Self::PreparedEntity(delivery) => delivery.container().len(),
-            Self::Terminal { header, body } => header.as_bytes().len() + body.len(),
         }
     }
 
@@ -202,20 +192,6 @@ impl PendingMuxBytes {
                 ],
                 1,
             ),
-            Self::Terminal { header, body } => {
-                let header = header.as_bytes();
-                if offset < header.len() {
-                    ([IoSlice::new(&header[offset..]), IoSlice::new(body)], 2)
-                } else {
-                    (
-                        [
-                            IoSlice::new(&body[offset - header.len()..]),
-                            IoSlice::new(&[]),
-                        ],
-                        1,
-                    )
-                }
-            }
         }
     }
 }
@@ -223,7 +199,6 @@ impl PendingMuxBytes {
 pub(crate) struct PendingMuxFrame {
     bytes: PendingMuxBytes,
     offset: usize,
-    complete_envelope: Option<UnixTerminalAdapterHandle>,
     class: PendingMuxClass,
     delivery_ack: Option<mpsc::Sender<()>>,
     delivery_receipt: Option<crate::runtime::SpawnDeliveryReceipt>,
@@ -267,7 +242,6 @@ pub(crate) async fn flush_unix_mux_writes(
         HostControlClass, MAX_HOST_FRAMES_PER_FLUSH_TURN, next_ready_host_control_class,
     };
 
-    abandon_zero_offset_terminal_for_response(write_state);
     if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
         return Ok(());
     }
@@ -328,45 +302,6 @@ pub(crate) async fn flush_unix_mux_writes(
             None => break,
         }
     }
-    let mut terminal_passes = 0;
-    loop {
-        let writes = mux.snapshot_writes();
-        if writes.is_empty() {
-            break;
-        }
-        terminal_passes += 1;
-        if terminal_passes > 16 {
-            break;
-        }
-        for (handle, frame) in writes {
-            let Some(header) = UnixTerminalContainerHeader::new(
-                frame.route.as_str(),
-                frame.generation,
-                frame.stream_epoch,
-                frame.frame.len(),
-            ) else {
-                // A Core-validated route and body always fit; a frame that does
-                // not is a contract violation and ends that route only.
-                handle.close();
-                continue;
-            };
-            write_state.pending = Some(PendingMuxFrame {
-                bytes: PendingMuxBytes::Terminal {
-                    header,
-                    body: Arc::clone(frame.frame.shared_bytes()),
-                },
-                offset: 0,
-                complete_envelope: Some(handle),
-                class: PendingMuxClass::Terminal,
-                delivery_ack: None,
-                delivery_receipt: None,
-                close_after: false,
-            });
-            if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
-                return Ok(());
-            }
-        }
-    }
     Ok(())
 }
 
@@ -380,31 +315,11 @@ pub(crate) fn control_mux_frame(
     Ok(PendingMuxFrame {
         bytes: PendingMuxBytes::Control(bytes),
         offset: 0,
-        complete_envelope: None,
         class,
         delivery_ack,
         delivery_receipt: None,
         close_after,
     })
-}
-
-pub(crate) fn abandon_zero_offset_terminal_for_response(write_state: &mut MuxWriteState) {
-    let should_abandon = write_state.pending.as_ref().is_some_and(|pending| {
-        pending.class == PendingMuxClass::Terminal
-            && pending.offset == 0
-            && !write_state.queued_control.is_empty()
-    });
-    if should_abandon {
-        abandon_pending_terminal(write_state);
-    }
-}
-
-pub(crate) fn abandon_pending_terminal(write_state: &mut MuxWriteState) {
-    if let Some(pending) = write_state.pending.take()
-        && let Some(handle) = pending.complete_envelope
-    {
-        handle.defer_flush();
-    }
 }
 
 pub(crate) async fn resume_pending_mux_write(
@@ -414,15 +329,6 @@ pub(crate) async fn resume_pending_mux_write(
     let Some(pending) = write_state.pending.as_mut() else {
         return Ok(MuxWrite::Written);
     };
-    if pending.offset == 0
-        && pending
-            .complete_envelope
-            .as_ref()
-            .is_some_and(|handle| handle.is_closed())
-    {
-        write_state.pending.take();
-        return Ok(MuxWrite::Written);
-    }
     match write_frame_bytes_resumable(writer, pending).await? {
         MuxWrite::Written => {
             let pending = write_state.pending.take().expect("pending mux frame");
@@ -438,20 +344,9 @@ pub(crate) async fn resume_pending_mux_write(
             if let Some(receipt) = pending.delivery_receipt {
                 receipt.delivered();
             }
-            if let Some(handle) = pending.complete_envelope
-                && !handle.is_closed()
-            {
-                let _ = handle.complete_active();
-            }
             Ok(MuxWrite::Written)
         }
-        MuxWrite::Pending => {
-            if pending.class == PendingMuxClass::Terminal && pending.offset == 0 {
-                abandon_pending_terminal(write_state);
-                return Ok(MuxWrite::Written);
-            }
-            Ok(MuxWrite::Pending)
-        }
+        MuxWrite::Pending => Ok(MuxWrite::Pending),
     }
 }
 
@@ -464,34 +359,23 @@ pub(crate) async fn write_frame_bytes_resumable(
         match tokio::time::timeout(
             Duration::from_millis(50),
             std::future::poll_fn(|context| {
-                if pending.offset == 0
-                    && pending
-                        .complete_envelope
-                        .as_ref()
-                        .is_some_and(|handle| handle.is_closed())
-                {
-                    return std::task::Poll::Ready(None);
-                }
                 let (slices, count) = pending.bytes.remaining(pending.offset);
-                std::pin::Pin::new(&mut *writer)
-                    .poll_write_vectored(context, &slices[..count])
-                    .map(Some)
+                std::pin::Pin::new(&mut *writer).poll_write_vectored(context, &slices[..count])
             }),
         )
         .await
         {
-            Ok(None) => return Ok(MuxWrite::Written),
-            Ok(Some(Ok(0))) => {
+            Ok(Ok(0)) => {
                 return Err(DaemonTransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "unix mux write returned zero bytes",
                 )));
             }
-            Ok(Some(Ok(written))) => pending.offset += written,
-            Ok(Some(Err(error))) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(Ok(written)) => pending.offset += written,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(MuxWrite::Pending);
             }
-            Ok(Some(Err(error))) => return Err(DaemonTransportError::Io(error)),
+            Ok(Err(error)) => return Err(DaemonTransportError::Io(error)),
             Err(_) => return Ok(MuxWrite::Pending),
         }
     }
@@ -827,13 +711,6 @@ pub(crate) mod mux_write_resume_tests {
         )
     }
 
-    pub(crate) fn terminal_route(frame: &DaemonUnixMuxFrame) -> Option<&str> {
-        match frame {
-            DaemonUnixMuxFrame::Terminal(frame) => Some(frame.route.as_str()),
-            DaemonUnixMuxFrame::Server(_) => None,
-        }
-    }
-
     pub(crate) fn response_kind(frame: &DaemonUnixMuxFrame) -> Option<DaemonResponseKind> {
         match frame {
             DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. }) => {
@@ -925,70 +802,10 @@ pub(crate) mod mux_write_resume_tests {
         assert_ne!(writer.written, [first_bytes.clone(), second_bytes].concat());
         match &pending.bytes {
             PendingMuxBytes::Control(bytes) => assert_eq!(bytes, &first_bytes),
-            PendingMuxBytes::Terminal { .. } | PendingMuxBytes::PreparedEntity(_) => {
+            PendingMuxBytes::PreparedEntity(_) => {
                 panic!("event frames are control containers")
             }
         }
-    }
-
-    #[tokio::test]
-    pub(crate) async fn terminal_container_is_written_as_header_then_shared_body() {
-        let frame = output_frame("sub", "vectored");
-        let header =
-            UnixTerminalContainerHeader::new("sub", 1, 0, frame.frame.len()).expect("header");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: header.as_bytes().len() + 3,
-            allow_remainder: false,
-        };
-        let mut pending = PendingMuxFrame {
-            bytes: PendingMuxBytes::Terminal {
-                header,
-                body: Arc::clone(frame.frame.shared_bytes()),
-            },
-            offset: 0,
-            complete_envelope: None,
-            class: PendingMuxClass::Terminal,
-            delivery_ack: None,
-            delivery_receipt: None,
-            close_after: false,
-        };
-        let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
-        assert!(matches!(result, Ok(MuxWrite::Pending)));
-        writer.allow_remainder = true;
-        write_frame_bytes_resumable(&mut writer, &mut pending)
-            .await
-            .expect("resume across the body slice");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 1);
-        match &frames[0] {
-            DaemonUnixMuxFrame::Terminal(decoded) => {
-                assert_eq!(decoded.route, "sub");
-                assert_eq!(decoded.generation, 1);
-                assert_eq!(decoded.body, frame.frame.as_bytes());
-            }
-            other => panic!("expected a terminal container, got {other:?}"),
-        }
-    }
-
-    pub(crate) fn occupy_route(
-        mux: &UnixConnectionMux,
-        session_id: &str,
-        subscription_id: &str,
-        marker: &str,
-    ) -> UnixTerminalAdapter {
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register(
-            session_id.to_string(),
-            subscription_id.to_string(),
-            1,
-            handle,
-        ));
-        assert_eq!(
-            adapter.try_write(&output_frame(subscription_id, marker)),
-            Ok(())
-        );
-        adapter
     }
 
     pub(crate) fn parse_written_mux_frames(written: &[u8]) -> Vec<DaemonUnixMuxFrame> {
@@ -1007,84 +824,6 @@ pub(crate) mod mux_write_resume_tests {
             "written bytes must not end inside a frame"
         );
         frames
-    }
-
-    #[tokio::test]
-    pub(crate) async fn abandoned_zero_progress_terminal_retries_the_original_frame() {
-        let mux = UnixConnectionMux::new();
-        let stall = occupy_route(&mux, "stall", "sub", "flood");
-        assert_eq!(mux.snapshot_writes().len(), 1);
-
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 0,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("zero-progress terminal start is abandoned");
-        assert_eq!(
-            stall.pressure(),
-            TerminalAdapterPressure::Full,
-            "abandon must keep the original adapter frame"
-        );
-        assert!(
-            mux.snapshot_writes().is_empty(),
-            "deferred flush omits the frame only for this pass"
-        );
-
-        mux.clear_deferred_flushes();
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("retry the original deferred frame");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert!(
-            frames
-                .iter()
-                .any(|frame| terminal_route(frame) == Some("sub")),
-            "the original flood frame must still be delivered, frames={frames:?}"
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn partial_terminal_then_response_parses_two_complete_mux_frames() {
-        let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 8,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("first flush");
-        assert!(write_state.pending.is_some());
-        assert!(write_state.pending.as_ref().is_some_and(|pending| {
-            pending.class == PendingMuxClass::Terminal && pending.offset == 8
-        }));
-
-        let response = daemon_response_base(DaemonResponseKind::Status);
-        write_state
-            .enqueue_response("1", response, None, false)
-            .expect("enqueue status");
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("resume flush");
-        assert!(!write_state.has_pending());
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 2, "expected two complete mux frames");
-        assert_eq!(terminal_route(&frames[0]), Some("sub"));
-        assert_eq!(response_kind(&frames[1]), Some(DaemonResponseKind::Status));
-        assert!(matches!(
-            &frames[1],
-            DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) if request_id == "1"
-        ));
     }
 
     #[tokio::test]
@@ -1252,386 +991,20 @@ pub(crate) mod mux_write_resume_tests {
     }
 
     #[tokio::test]
-    pub(crate) async fn zero_progress_terminal_start_is_abandoned_without_completing_slot() {
-        let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 0,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("abandon flush");
-        assert!(writer.written.is_empty());
-        assert!(write_state.pending.is_none());
-        assert!(mux.snapshot_writes().is_empty());
-        let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("sibling flush");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(terminal_route(&frames[0]), Some("sub-live"));
-    }
-
-    #[tokio::test]
-    pub(crate) async fn hard_close_abandons_terminal_while_host_events_and_sibling_progress() {
-        let mux = UnixConnectionMux::new();
-        let mailbox = crate::subscription::package_events::ClientEventMailbox::new(
-            crate::config::PackageEventPlanePolicy {
-                consumer_queue_max_events: 8,
-                ..crate::config::PackageEventPlanePolicy::default()
-            },
-        );
-        for index in 0..8 {
-            mailbox
-                .try_push(
-                    "sub",
-                    "owner",
-                    "ready",
-                    serde_json::json!({ "ok": true, "n": index }),
-                    8,
-                )
-                .expect("admit event");
-        }
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register(
-            "late".to_string(),
-            "sub-late".to_string(),
-            1,
-            handle.clone(),
-        ));
-        let exit = RoutedTerminalFrame::new(
-            RouteId::new("sub-late").expect("route"),
-            1,
-            0,
-            encode_process_exit(Some(0)).expect("exit frame"),
-        );
-        assert_eq!(adapter.try_write(&exit), Ok(()));
-        handle.close();
-        assert!(handle.snapshot_active().is_none());
-
-        let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: usize::MAX,
-            allow_remainder: true,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, Some(&mailbox))
-            .await
-            .expect("flush host events and sibling");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert!(
-            frames.iter().any(is_package_event),
-            "host events still flush first: {frames:?}"
-        );
-        assert!(
-            !frames
-                .iter()
-                .any(|frame| terminal_route(frame) == Some("sub-late")),
-            "closed route must not send its abandoned frame: {frames:?}"
-        );
-        assert!(
-            frames
-                .iter()
-                .any(|frame| terminal_route(frame) == Some("sub-live"))
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn hard_close_after_serialization_abandons_zero_offset_terminal() {
-        let mux = UnixConnectionMux::new();
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register("closed".to_string(), "sub".to_string(), 1, handle.clone()));
-        let frame = output_frame("sub", "closed");
-        assert_eq!(adapter.try_write(&frame), Ok(()));
-        let active = handle.snapshot_active().expect("active frame");
-        let pending = PendingMuxFrame {
-            bytes: PendingMuxBytes::Terminal {
-                header: UnixTerminalContainerHeader::new("sub", 1, 0, active.frame.len())
-                    .expect("header"),
-                body: Arc::clone(active.frame.shared_bytes()),
-            },
-            offset: 0,
-            complete_envelope: Some(handle.clone()),
-            class: PendingMuxClass::Terminal,
-            delivery_ack: None,
-            delivery_receipt: None,
-            close_after: false,
-        };
-        handle.close();
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: usize::MAX,
-            allow_remainder: true,
-        };
-        let mut state = MuxWriteState {
-            pending: Some(pending),
-            ..MuxWriteState::default()
-        };
-        resume_pending_mux_write(&mut writer, &mut state)
-            .await
-            .expect("abandon serialized frame");
-        assert!(writer.written.is_empty());
-        assert!(!state.has_pending());
-        let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
-        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
-            .await
-            .expect("sibling flush");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(terminal_route(&frames[0]), Some("sub-live"));
-    }
-
-    #[tokio::test]
-    pub(crate) async fn partial_envelope_finishes_once_after_close_before_host_and_sibling_frames()
-    {
-        let mux = UnixConnectionMux::new();
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register("closing".to_string(), "sub".to_string(), 1, handle.clone()));
-        assert_eq!(adapter.try_write(&output_frame("sub", "closing")), Ok(()));
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 8,
-            allow_remainder: false,
-        };
-        let mut state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
-            .await
-            .expect("partial write");
-        assert_eq!(writer.written.len(), 8);
-        assert!(state.has_pending());
-        handle.close();
-        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
-        let _sibling = occupy_route(&mux, "sibling", "sub-live", "live");
-        state
-            .enqueue_response(
-                "1",
-                daemon_response_base(DaemonResponseKind::Status),
-                None,
-                false,
-            )
-            .expect("status response");
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
-            .await
-            .expect("complete framing and sibling traffic");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 4);
-        assert_eq!(terminal_route(&frames[0]), Some("sub"));
-        assert_eq!(
-            frames
-                .iter()
-                .filter(|frame| terminal_route(frame) == Some("sub"))
-                .count(),
-            1
-        );
-        assert!(
-            frames[1..]
-                .iter()
-                .any(|frame| response_kind(frame) == Some(DaemonResponseKind::Status))
-        );
-        assert!(
-            frames[1..]
-                .iter()
-                .any(|frame| closed_event_session(frame) == Some("closing"))
-        );
-        assert_eq!(frames.last().and_then(terminal_route), Some("sub-live"));
-        assert!(!state.has_pending());
-        let length = writer.written.len();
-        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
-            .await
-            .expect("no replay");
-        assert_eq!(writer.written.len(), length);
-    }
-
-    #[tokio::test]
-    pub(crate) async fn finishing_a_partial_live_write_does_not_defer_the_next_frame() {
-        let mux = UnixConnectionMux::new();
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register("s".to_string(), "sub".to_string(), 1, handle.clone()));
-        let output = output_frame("sub", "out");
-        assert_eq!(adapter.try_write(&output), Ok(()));
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 8,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("partial live write");
-        assert!(write_state.has_pending());
-        assert_eq!(
-            adapter.pressure(),
-            TerminalAdapterPressure::Full,
-            "a partial envelope must keep the active slot occupied"
-        );
-        assert_eq!(
-            adapter.try_write(&output),
-            Err(botster_core::contract::terminal_adapter::TerminalAdapterWriteError::Full)
-        );
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("finish live write");
-        let exit = RoutedTerminalFrame::new(
-            RouteId::new("sub").expect("route"),
-            1,
-            0,
-            encode_process_exit(Some(0)).expect("exit frame"),
-        );
-        assert_eq!(adapter.try_write(&exit), Ok(()));
-        assert_eq!(
-            mux.snapshot_writes().len(),
-            1,
-            "a completed live send must not defer the next occupant"
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn host_event_flushes_before_new_terminal_slots() {
-        let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
-        let (mut closer, close_handle) = mux.create_adapter();
-        assert!(mux.register(
-            "closing".to_string(),
-            "sub-close".to_string(),
-            1,
-            close_handle.clone(),
-        ));
-        assert_eq!(
-            closer.try_write(&output_frame("sub-close", "close")),
-            Ok(())
-        );
-        close_handle.close();
-        assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
-
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: usize::MAX,
-            allow_remainder: true,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("host-first flush");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(
-            frames.first().and_then(closed_event_session),
-            Some("closing"),
-            "host Event must precede new terminal slots: {frames:?}"
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn partial_terminal_then_shutdown_response_acks_after_written() {
-        let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 6,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("partial terminal");
-        let (ack_tx, ack_rx) = mpsc::channel();
-        write_state
-            .enqueue_response(
-                "9",
-                daemon_response_base(DaemonResponseKind::Shutdown),
-                Some(ack_tx),
-                true,
-            )
-            .expect("enqueue shutdown");
-        assert!(ack_rx.try_recv().is_err());
-        assert!(write_state.has_close_after_pending());
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("cannot finish while stalled");
-        assert!(ack_rx.try_recv().is_err());
-        assert!(write_state.has_close_after_pending());
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("finish close-after");
-        ack_rx
-            .try_recv()
-            .expect("ack after complete shutdown frame");
-        assert!(!write_state.has_close_after_pending());
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 2);
-        assert!(terminal_route(&frames[0]).is_some());
-        assert_eq!(
-            response_kind(&frames[1]),
-            Some(DaemonResponseKind::Shutdown)
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn partial_terminal_then_update_response_acks_after_written() {
-        let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
-        let mut writer = PrefixStallWriter {
-            written: Vec::new(),
-            stall_after: 6,
-            allow_remainder: false,
-        };
-        let mut write_state = MuxWriteState::default();
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("partial terminal");
-        let (ack_tx, ack_rx) = mpsc::channel();
-        write_state
-            .enqueue_response(
-                "2",
-                daemon_response_base(DaemonResponseKind::HubUpdate),
-                Some(ack_tx),
-                false,
-            )
-            .expect("enqueue update");
-        assert!(ack_rx.try_recv().is_err());
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("still pending");
-        assert!(ack_rx.try_recv().is_err());
-        writer.allow_remainder = true;
-        writer.stall_after = usize::MAX;
-        flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
-            .await
-            .expect("finish update");
-        ack_rx.try_recv().expect("ack after complete update frame");
-        let frames = parse_written_mux_frames(&writer.written);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(
-            response_kind(&frames[1]),
-            Some(DaemonResponseKind::HubUpdate)
-        );
-    }
-
-    #[tokio::test]
     pub(crate) async fn stalled_response_stays_bounded() {
         let mux = UnixConnectionMux::new();
-        let _stall = occupy_route(&mux, "stall", "sub", "flood");
         let mut writer = PrefixStallWriter {
             written: Vec::new(),
             stall_after: 6,
             allow_remainder: false,
         };
         let mut write_state = MuxWriteState::default();
+        write_state
+            .queued_events
+            .push_back(event_mux_frame(closed_event()).expect("event frame"));
         flush_unix_mux_writes(&mut writer, &mux, &mut write_state, None)
             .await
-            .expect("partial terminal");
+            .expect("partial event");
         write_state
             .enqueue_response(
                 "3",
@@ -1666,7 +1039,7 @@ pub(crate) mod mux_write_resume_tests {
         assert!(!write_state.has_pending_response());
         let frames = parse_written_mux_frames(&writer.written);
         assert_eq!(frames.len(), 2);
-        assert!(terminal_route(&frames[0]).is_some());
+        assert!(closed_event_session(&frames[0]).is_some());
         assert_eq!(response_kind(&frames[1]), Some(DaemonResponseKind::Status));
         assert!(!write_state.has_pending());
     }

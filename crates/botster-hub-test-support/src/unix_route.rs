@@ -1,12 +1,13 @@
 //! Muxed Unix client for scheme 2 terminal route tests.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use botster_core_test_support::{diagnostics::StepFailure, route_observer::RouteObserver};
+use botster_core_test_support::route_observer::RouteObserver;
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportResult, DaemonUnixTerminalFrame,
+    DaemonResponse, DaemonResponseKind, DaemonRouteStream, DaemonTransportError,
+    DaemonTransportResult, DaemonUnixTerminalFrame,
 };
 use botster_terminal_protocol::{AttachStateCode, InputOutcome, TerminalFrame};
 use botster_terminal_protocol_client::{
@@ -112,7 +113,8 @@ pub fn decode_route_event(frame: &DaemonUnixTerminalFrame) -> Option<RouteEvent>
 }
 
 const MAX_ABANDONED_INPUTS: usize = 32;
-const MAX_PENDING_EVENTS: usize = 128;
+/// How long one poll waits on each route socket before trying the next.
+const ROUTE_POLL_SLICE: Duration = Duration::from_millis(5);
 
 /// One unresolved operation that a successful detach made unobservable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,15 +259,16 @@ pub fn encode_input_with_operation_id(input: &TerminalInputCommand, operation_id
         .into_bytes()
 }
 
-/// A Unix connection that tracks each attached route and its observer.
+/// A Unix connection that tracks each attached route, its own socket, and its
+/// observer.
 pub struct UnixRouteClient {
     inner: DaemonConnection,
     routes: BTreeMap<String, u64>,
+    streams: BTreeMap<String, DaemonRouteStream>,
     operation_ids: RouteOperationIds,
     observers: BTreeMap<String, RouteObserver>,
     abandoned_inputs: VecDeque<AbandonedInput>,
     abandoned_input_count: u64,
-    pending_events: VecDeque<RouteEvent>,
 }
 
 impl UnixRouteClient {
@@ -284,18 +287,17 @@ impl UnixRouteClient {
         Self {
             inner,
             routes: BTreeMap::new(),
+            streams: BTreeMap::new(),
             operation_ids: RouteOperationIds::default(),
             observers: BTreeMap::new(),
             abandoned_inputs: VecDeque::with_capacity(MAX_ABANDONED_INPUTS),
             abandoned_input_count: 0,
-            pending_events: VecDeque::new(),
         }
     }
 
     pub fn request(&mut self, request: &DaemonRequest) -> DaemonTransportResult<DaemonResponse> {
         let response = self.inner.request(request)?;
         self.note_attach(&response);
-        self.capture_skipped_route_events();
         self.note_detach(request, &response);
         Ok(response)
     }
@@ -304,6 +306,11 @@ impl UnixRouteClient {
         if let Some(attach) = &response.terminal_attach {
             self.routes
                 .insert(attach.subscription_id.clone(), attach.generation);
+            if attach.route_socket.is_some() {
+                let stream = DaemonRouteStream::connect(attach)
+                    .unwrap_or_else(|error| panic!("connect route socket: {error}"));
+                self.streams.insert(attach.subscription_id.clone(), stream);
+            }
             self.observers.insert(
                 attach.subscription_id.clone(),
                 RouteObserver::new(
@@ -323,6 +330,7 @@ impl UnixRouteClient {
             && response.kind == DaemonResponseKind::Events
         {
             let generation = self.routes.remove(subscription_id);
+            self.streams.remove(subscription_id);
             if let Some(observer) = self.observers.remove(subscription_id) {
                 let generation = generation.unwrap_or_else(|| observer.generation());
                 for operation_id in observer.state().outstanding() {
@@ -339,34 +347,6 @@ impl UnixRouteClient {
                 }
             }
             self.operation_ids.remove_route(subscription_id);
-        }
-    }
-
-    fn capture_skipped_route_events(&mut self) {
-        for frame in self.inner.take_skipped_terminal() {
-            let event = self.decode_and_observe(frame);
-            if self.pending_events.len() == MAX_PENDING_EVENTS {
-                let failure = self.observers.get(&event.route).map_or_else(
-                    || {
-                        StepFailure::new(
-                            "hub",
-                            "buffer_route_event",
-                            format!("pending route event limit {MAX_PENDING_EVENTS} was exceeded"),
-                        )
-                    },
-                    |observer| {
-                        observer.failure(
-                            "buffer_route_event",
-                            format!("pending route event limit {MAX_PENDING_EVENTS} was exceeded"),
-                        )
-                    },
-                );
-                panic!(
-                    "{failure} abandoned_input_count={} abandoned_inputs={:?}",
-                    self.abandoned_input_count, self.abandoned_inputs
-                );
-            }
-            self.pending_events.push_back(event);
         }
     }
 
@@ -427,7 +407,7 @@ impl UnixRouteClient {
                     )
                 });
         }
-        self.inner.send_terminal_frame(
+        self.route_stream(route).write_frame(
             route,
             generation,
             0,
@@ -442,23 +422,52 @@ impl UnixRouteClient {
         generation: u64,
         body: &[u8],
     ) -> DaemonTransportResult<()> {
-        self.inner.send_terminal_frame(route, generation, 0, body)
+        self.route_stream(route)
+            .write_frame(route, generation, 0, body)
     }
 
+    fn route_stream(&mut self, route: &str) -> &mut DaemonRouteStream {
+        self.streams
+            .get_mut(route)
+            .unwrap_or_else(|| panic!("route {route} has no open route socket"))
+    }
+
+    /// Read the terminal frames that arrive within `timeout`, across every
+    /// open route socket. A route whose socket ended is dropped.
     pub fn poll_route_events(&mut self, timeout: Duration) -> Vec<RouteEvent> {
-        let mut events = self.pending_events.drain(..).collect::<Vec<_>>();
-        if let Some(frame) = self.inner.poll_terminal(timeout).unwrap_or_else(|error| {
-                panic!(
-                    "failed to poll Unix route events: {error}; abandoned_input_count={} abandoned_inputs={:?}",
-                    self.abandoned_input_count,
-                    self.abandoned_inputs
-                )
-        }) {
-            events.push(self.decode_and_observe(frame));
+        let deadline = Instant::now() + timeout;
+        let mut frames = Vec::new();
+        loop {
+            let mut ended = Vec::new();
+            for (route, stream) in &mut self.streams {
+                stream
+                    .set_read_timeout(Some(ROUTE_POLL_SLICE))
+                    .unwrap_or_else(|error| panic!("set route read timeout: {error}"));
+                match stream.read_frame() {
+                    Ok(frame) => frames.push(frame),
+                    Err(DaemonTransportError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(DaemonTransportError::ClientDisconnected) => ended.push(route.clone()),
+                    Err(error) => panic!(
+                        "failed to poll Unix route events: {error}; abandoned_input_count={} abandoned_inputs={:?}",
+                        self.abandoned_input_count, self.abandoned_inputs
+                    ),
+                }
+            }
+            for route in ended {
+                self.streams.remove(&route);
+            }
+            if !frames.is_empty() || Instant::now() >= deadline {
+                break;
+            }
         }
-        self.capture_skipped_route_events();
-        events.extend(self.pending_events.drain(..));
-        events
+        frames
+            .into_iter()
+            .map(|frame| self.decode_and_observe(frame))
+            .collect()
     }
 
     fn decode_and_observe(&mut self, frame: DaemonUnixTerminalFrame) -> RouteEvent {
