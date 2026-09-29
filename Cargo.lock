@@ -528,6 +528,7 @@ version = "0.1.0"
 dependencies = [
  "botster-hub",
  "botster-hub-client",
+ "botster-hub-test-support",
  "mlua",
  "serde",
  "serde_json",

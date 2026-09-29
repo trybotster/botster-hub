@@ -28,9 +28,25 @@ pub struct TestOutcome {
 
 type Registered = Arc<Mutex<Vec<(String, Function)>>>;
 
-/// Run every test of one spec file. `plugin_directory` is where `t:load`
-/// resolves relative paths and where `require` looks for helper modules.
+/// Where a spec runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A real Hub daemon inside this process, driven one settled step at a
+    /// time on a logical clock.
+    InProcess,
+    /// A real `botster-hub` daemon process behind its socket (`--e2e`).
+    E2e,
+}
+
+/// Run every test of one spec file in-process. `plugin_directory` is where
+/// `t:load` resolves relative paths and where `require` looks for helper
+/// modules.
 pub fn run_spec_file(plugin_directory: &Path, spec_path: &Path) -> Vec<TestOutcome> {
+    run_spec_file_in(Mode::InProcess, plugin_directory, spec_path)
+}
+
+/// Run every test of one spec file in the given mode.
+pub fn run_spec_file_in(mode: Mode, plugin_directory: &Path, spec_path: &Path) -> Vec<TestOutcome> {
     let name = spec_path.display().to_string();
     let source = match std::fs::read_to_string(spec_path) {
         Ok(source) => source,
@@ -55,7 +71,7 @@ pub fn run_spec_file(plugin_directory: &Path, spec_path: &Path) -> Vec<TestOutco
     tests
         .into_iter()
         .map(
-            |(test_name, body)| match run_test(&lua, plugin_directory, &test_name, &body) {
+            |(test_name, body)| match run_test(mode, &lua, plugin_directory, &test_name, &body) {
                 Ok(()) => TestOutcome {
                     name: test_name,
                     failure: None,
@@ -123,9 +139,8 @@ fn install(
     Ok(())
 }
 
-fn run_test(lua: &Lua, plugin_directory: &Path, name: &str, body: &Function) -> mlua::Result<()> {
-    let label: String = name
-        .chars()
+pub(crate) fn test_label(name: &str) -> String {
+    name.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
                 character
@@ -133,7 +148,20 @@ fn run_test(lua: &Lua, plugin_directory: &Path, name: &str, body: &Function) -> 
                 '-'
             }
         })
-        .collect();
+        .collect()
+}
+
+fn run_test(
+    mode: Mode,
+    lua: &Lua,
+    plugin_directory: &Path,
+    name: &str,
+    body: &Function,
+) -> mlua::Result<()> {
+    let label = test_label(name);
+    if mode == Mode::E2e {
+        return crate::e2e::run_test(lua, plugin_directory, &label, body);
+    }
     let options = KitOptions::temporary(&label)
         .map_err(|error| mlua::Error::runtime(format!("kit root: {error}")))?;
     let kit = KitHub::start(options).map_err(kit_error)?;
@@ -145,11 +173,11 @@ fn run_test(lua: &Lua, plugin_directory: &Path, name: &str, body: &Function) -> 
     })
 }
 
-fn kit_error(error: KitError) -> mlua::Error {
+pub(crate) fn kit_error(error: KitError) -> mlua::Error {
     mlua::Error::runtime(error.to_string())
 }
 
-fn to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+pub(crate) fn to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
     lua.to_value_with(
         value,
         SerializeOptions::new()
@@ -158,13 +186,13 @@ fn to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
     )
 }
 
-fn serialize<T: serde::Serialize>(lua: &Lua, value: &T) -> mlua::Result<Value> {
+pub(crate) fn serialize<T: serde::Serialize>(lua: &Lua, value: &T) -> mlua::Result<Value> {
     let json = serde_json::to_value(value).map_err(mlua::Error::external)?;
     to_lua(lua, &json)
 }
 
 /// `{ ok, error = { kind, message }, result, response }` for one Hub reply.
-fn response_table(lua: &Lua, response: &DaemonResponse) -> mlua::Result<Table> {
+pub(crate) fn response_table(lua: &Lua, response: &DaemonResponse) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("ok", response.error.is_none())?;
     if let Some(error) = &response.error {
@@ -179,7 +207,7 @@ fn response_table(lua: &Lua, response: &DaemonResponse) -> mlua::Result<Table> {
 }
 
 /// A typed refusal for a feature that the Hub cannot serve yet.
-fn unsupported(lua: &Lua, feature: &str, gate: &str) -> mlua::Result<Table> {
+pub(crate) fn unsupported(lua: &Lua, feature: &str, gate: &str) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("ok", false)?;
     let detail = lua.create_table()?;
@@ -194,7 +222,7 @@ fn unsupported(lua: &Lua, feature: &str, gate: &str) -> mlua::Result<Table> {
     Ok(table)
 }
 
-fn unsupported_error(feature: &str, gate: &str) -> mlua::Error {
+pub(crate) fn unsupported_error(feature: &str, gate: &str) -> mlua::Error {
     mlua::Error::runtime(format!(
         "unsupported_by_kit: {feature} is not supported by the kit yet (gate {gate})"
     ))
@@ -267,17 +295,44 @@ fn envelope_json(envelope: &impl serde::Serialize) -> serde_json::Value {
     value
 }
 
-fn json_of(lua: &Lua, value: Value) -> mlua::Result<serde_json::Value> {
+pub(crate) fn json_of(lua: &Lua, value: Value) -> mlua::Result<serde_json::Value> {
     if matches!(value, Value::Nil) {
         return Ok(serde_json::Value::Null);
     }
     lua.from_value(value)
 }
 
-fn json_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+/// JSON numbers compare exactly: two integers by value, two floats by
+/// value, and an integer with a float only when the float is that integer.
+/// No integer is rounded through `f64`, so 2^53 and 2^53 + 1 stay unequal.
+fn numbers_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    enum Exact {
+        Integer(i128),
+        Float(f64),
+    }
+    fn exact(number: &serde_json::Number) -> Exact {
+        if let Some(value) = number.as_i64() {
+            Exact::Integer(i128::from(value))
+        } else if let Some(value) = number.as_u64() {
+            Exact::Integer(i128::from(value))
+        } else {
+            Exact::Float(number.as_f64().unwrap_or(f64::NAN))
+        }
+    }
+    match (exact(left), exact(right)) {
+        (Exact::Integer(a), Exact::Integer(b)) => a == b,
+        (Exact::Float(a), Exact::Float(b)) => a == b,
+        (Exact::Integer(integer), Exact::Float(float))
+        | (Exact::Float(float), Exact::Integer(integer)) => {
+            float.fract() == 0.0 && float.abs() < 1e30 && float as i128 == integer
+        }
+    }
+}
+
+pub(crate) fn json_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     use serde_json::Value::{Array, Number, Object};
     match (left, right) {
-        (Number(a), Number(b)) => a.as_f64() == b.as_f64(),
+        (Number(a), Number(b)) => numbers_equal(a, b),
         (Array(a), Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_equal(x, y))
         }
@@ -292,7 +347,7 @@ fn json_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
 
 /// `expected` is a subset of `actual`: every expected key is present and
 /// matches; arrays match element by element.
-fn json_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+pub(crate) fn json_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
     use serde_json::Value::{Array, Object};
     match (actual, expected) {
         (Object(a), Object(e)) => e
@@ -305,7 +360,7 @@ fn json_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> boo
     }
 }
 
-fn pretty(value: &serde_json::Value) -> String {
+pub(crate) fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
@@ -460,57 +515,11 @@ fn build_driver<'scope, 'env>(
         })?,
     )?;
 
-    t.set(
-        "eq",
-        scope.create_function(
-            |lua, (_, actual, expected, message): (Value, Value, Value, Option<String>)| {
-                let actual = json_of(lua, actual)?;
-                let expected = json_of(lua, expected)?;
-                if json_equal(&actual, &expected) {
-                    return Ok(());
-                }
-                Err(mlua::Error::runtime(format!(
-                    "{}expected equal values\n  actual:   {}\n  expected: {}",
-                    message.map(|text| format!("{text}: ")).unwrap_or_default(),
-                    pretty(&actual),
-                    pretty(&expected)
-                )))
-            },
-        )?,
-    )?;
-    t.set(
-        "match",
-        scope.create_function(
-            |lua, (_, actual, expected, message): (Value, Value, Value, Option<String>)| {
-                let actual = json_of(lua, actual)?;
-                let expected = json_of(lua, expected)?;
-                if json_matches(&actual, &expected) {
-                    return Ok(());
-                }
-                Err(mlua::Error::runtime(format!(
-                    "{}the value does not contain the expected fields\n  actual:   {}\n  expected: {}",
-                    message.map(|text| format!("{text}: ")).unwrap_or_default(),
-                    pretty(&actual),
-                    pretty(&expected)
-                )))
-            },
-        )?,
-    )?;
-    t.set(
-        "ok",
-        scope.create_function(|_, (_, value, message): (Value, Value, Option<String>)| {
-            if matches!(value, Value::Nil | Value::Boolean(false)) {
-                return Err(mlua::Error::runtime(
-                    message.unwrap_or_else(|| "expected a truthy value".to_string()),
-                ));
-            }
-            Ok(())
-        })?,
-    )?;
+    install_assertions(scope, &t)?;
     Ok(t)
 }
 
-fn package_name(directory: &Path) -> mlua::Result<String> {
+pub(crate) fn package_name(directory: &Path) -> mlua::Result<String> {
     let manifest = directory.join("botster-package.json");
     let bytes = std::fs::read(&manifest)
         .map_err(|error| mlua::Error::runtime(format!("{}: {error}", manifest.display())))?;
@@ -585,10 +594,17 @@ fn plugin_table<'scope, 'env>(
         scope.create_function(move |lua, (_, entity_type): (Value, String)| {
             // The first read subscribes as a client does; the Hub replies
             // with the current snapshot, then every later frame arrives.
-            if watched.borrow_mut().insert(entity_type.clone()) {
+            if !watched.borrow().contains(&entity_type) {
                 let mut kit = kit.borrow_mut();
-                kit.subscribe_entities(&entity_type).map_err(kit_error)?;
+                let response = kit.subscribe_entities(&entity_type).map_err(kit_error)?;
+                if let Some(error) = response.error {
+                    return Err(mlua::Error::runtime(format!(
+                        "the entity subscription to {entity_type:?} was refused: {}: {}",
+                        error.code, error.message
+                    )));
+                }
                 kit.settle().map_err(kit_error)?;
+                watched.borrow_mut().insert(entity_type.clone());
             }
             // A client receives each frame inside `{ frame = "entity", entity }`.
             // A spec reads the frame itself: `{ type, id, entity, ... }`.
@@ -671,4 +687,90 @@ fn plugin_table<'scope, 'env>(
         })?,
     )?;
     Ok(p)
+}
+
+/// `t:eq`, `t:match`, and `t:ok`: the assertions both modes share.
+pub(crate) fn install_assertions<'scope, 'env>(
+    scope: &'scope Scope<'scope, 'env>,
+    t: &Table,
+) -> mlua::Result<()> {
+    t.set(
+        "eq",
+        scope.create_function(
+            |lua, (_, actual, expected, message): (Value, Value, Value, Option<String>)| {
+                let actual = json_of(lua, actual)?;
+                let expected = json_of(lua, expected)?;
+                if json_equal(&actual, &expected) {
+                    return Ok(());
+                }
+                Err(mlua::Error::runtime(format!(
+                    "{}expected equal values\n  actual:   {}\n  expected: {}",
+                    message.map(|text| format!("{text}: ")).unwrap_or_default(),
+                    pretty(&actual),
+                    pretty(&expected)
+                )))
+            },
+        )?,
+    )?;
+    t.set(
+        "match",
+        scope.create_function(
+            |lua, (_, actual, expected, message): (Value, Value, Value, Option<String>)| {
+                let actual = json_of(lua, actual)?;
+                let expected = json_of(lua, expected)?;
+                if json_matches(&actual, &expected) {
+                    return Ok(());
+                }
+                Err(mlua::Error::runtime(format!(
+                    "{}the value does not contain the expected fields\n  actual:   {}\n  expected: {}",
+                    message.map(|text| format!("{text}: ")).unwrap_or_default(),
+                    pretty(&actual),
+                    pretty(&expected)
+                )))
+            },
+        )?,
+    )?;
+    t.set(
+        "ok",
+        scope.create_function(|_, (_, value, message): (Value, Value, Option<String>)| {
+            if matches!(value, Value::Nil | Value::Boolean(false)) {
+                return Err(mlua::Error::runtime(
+                    message.unwrap_or_else(|| "expected a truthy value".to_string()),
+                ));
+            }
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 2^53 and 2^53 + 1 convert to the same `f64`; they are different values.
+    #[test]
+    fn distinct_large_integers_are_unequal_for_eq_and_match() {
+        let low = json!(9_007_199_254_740_992_i64);
+        let high = json!(9_007_199_254_740_993_i64);
+        assert!(!json_equal(&low, &high));
+        assert!(!json_matches(&low, &high));
+        let nested_low = json!({ "items": [{ "n": 9_007_199_254_740_992_i64 }] });
+        let nested_high = json!({ "items": [{ "n": 9_007_199_254_740_993_i64 }] });
+        assert!(!json_equal(&nested_low, &nested_high));
+        assert!(!json_matches(&nested_low, &nested_high));
+    }
+
+    #[test]
+    fn integers_and_floats_compare_by_value_without_rounding() {
+        assert!(json_equal(&json!(1), &json!(1.0)));
+        assert!(!json_equal(&json!(1), &json!(1.5)));
+        assert!(!json_equal(
+            &json!(9_007_199_254_740_993_i64),
+            &json!(9_007_199_254_740_992.0)
+        ));
+        assert!(json_equal(&json!(u64::MAX), &json!(u64::MAX)));
+        assert!(!json_equal(&json!(u64::MAX), &json!(-1)));
+    }
 }

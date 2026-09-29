@@ -6,13 +6,16 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use botster_plugin_test_kit::spec;
+use botster_plugin_test_kit::e2e;
+use botster_plugin_test_kit::spec::{self, Mode};
 
-const USAGE: &str = "usage: botster-plugin-test [--plugin <dir>] <spec.lua>...";
+const USAGE: &str = "usage: botster-plugin-test [--e2e] [--plugin <dir>] <spec.lua>...\n       botster-plugin-test --conformance\n\n--e2e          run against a real botster-hub daemon process (needs BOTSTER_HUB_BIN,\n               BOTSTER_SESSION_WORKER_BIN, and BOTSTER_CANDIDATE_MANIFEST)\n--conformance  run the Hub's plugin contract matrix conformance on a real daemon";
 
 fn main() -> ExitCode {
     let mut plugin_directory = PathBuf::from(".");
     let mut specs = Vec::new();
+    let mut mode = Mode::InProcess;
+    let mut conformance = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -23,6 +26,8 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--e2e" => mode = Mode::E2e,
+            "--conformance" => conformance = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -34,6 +39,18 @@ fn main() -> ExitCode {
             _ => specs.push(PathBuf::from(argument)),
         }
     }
+    if conformance {
+        return match e2e::run_conformance() {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if specs.is_empty() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -41,7 +58,7 @@ fn main() -> ExitCode {
     let mut failed = 0usize;
     let mut total = 0usize;
     for spec_path in &specs {
-        for outcome in spec::run_spec_file(&plugin_directory, spec_path) {
+        for outcome in spec::run_spec_file_in(mode, &plugin_directory, spec_path) {
             total += 1;
             match outcome.failure {
                 None => println!("ok {total} - {}", outcome.name),
