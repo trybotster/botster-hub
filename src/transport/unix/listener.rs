@@ -1186,7 +1186,7 @@ mod tests {
     /// Positive control: the owner's own connection is admitted.
     #[tokio::test]
     async fn the_accept_loop_admits_a_connection_of_its_owner() {
-        let (admitted, _) = same_user_connection_is_admitted_when_owner_is(current_uid()).await;
+        let admitted = same_user_connection_is_admitted_when_owner_is(current_uid()).await;
         assert!(
             admitted,
             "a same-user connection must reach the control channel"
