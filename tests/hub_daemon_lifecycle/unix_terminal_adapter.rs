@@ -1521,6 +1521,98 @@ fn route_whose_socket_is_never_connected_is_released() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
+/// Route sockets: the Hub guarantees end of stream after a route ends, on
+/// every path. `Detach`:
+#[test]
+fn detach_ends_the_route_socket_with_eof() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("dse");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "dse-session", "dse-sub", "exec cat", &mut envelopes, &mut events);
+    let detached = client.request_collecting(
+        &botster_hub_client::DaemonRequest::Detach {
+            session_id: "dse-session".to_string(),
+            subscription_id: "dse-sub".to_string(),
+        },
+        &mut envelopes,
+        &mut events,
+    );
+    assert_eq!(detached.kind, botster_hub_client::DaemonResponseKind::Events, "{detached:?}");
+    assert!(
+        client.route_socket_reaches_eof("dse-sub", Duration::from_secs(10)),
+        "a detached route's socket must reach end of stream"
+    );
+    drop(client);
+    shutdown_short_lived_session(hub.endpoint(), "dse-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// A Core close (a reader stalled past the deadline): the closed event
+/// arrives on the control socket, and the route socket still reaches end of
+/// stream after the client keeps reading it.
+#[test]
+fn stalled_route_socket_reaches_eof_after_the_closed_event() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("sse");
+    let mut reader = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut reader, "sse-dead", "sse-sub", "yes stalled-eof", &mut envelopes, &mut events);
+    // timer: deadline — Core's reader deadline D plus slack; the client reads nothing until then.
+    thread::sleep(READER_PROGRESS_DEADLINE + Duration::from_secs(5));
+    assert!(
+        wait_for_subscription_closed(&mut reader, "sse-dead", "sse-sub", &mut envelopes, &mut events),
+        "the stalled reader must receive TerminalSubscriptionClosed: {events:?}"
+    );
+    assert!(
+        reader.route_socket_reaches_eof("sse-sub", Duration::from_secs(20)),
+        "after the closed event the route socket must reach end of stream"
+    );
+    drop(reader);
+    shutdown_short_lived_session(hub.endpoint(), "sse-dead");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// A session that exits: PROCESS_EXIT, then end of stream.
+#[test]
+fn natural_exit_ends_the_route_socket_after_process_exit() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("nee");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "nee-session", "nee-sub", "printf nee-done; sleep 1", &mut envelopes, &mut events);
+    client.read_terminal_until(&mut envelopes, Instant::now() + Duration::from_secs(15), |frames| {
+        frames_process_exit(frames, "nee-sub")
+    });
+    assert!(frames_process_exit(&envelopes, "nee-sub"), "the route must deliver PROCESS_EXIT");
+    assert!(
+        client.route_socket_reaches_eof("nee-sub", Duration::from_secs(10)),
+        "the route socket must end after PROCESS_EXIT"
+    );
+    drop(client);
+    shutdown_short_lived_session(hub.endpoint(), "nee-session");
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+/// Daemon shutdown ends every route socket.
+#[test]
+fn daemon_shutdown_ends_route_sockets() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("dss");
+    let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut client, "dss-session", "dss-sub", "exec cat", &mut envelopes, &mut events);
+    hub.shutdown().expect("shutdown isolated hub");
+    assert!(
+        client.route_socket_reaches_eof("dss-sub", Duration::from_secs(10)),
+        "daemon shutdown must end the route socket"
+    );
+}
+
 #[test]
 fn connection_death_and_detach_do_not_emit_terminal_subscription_closed() {
     let _guard = daemon_test_guard();
