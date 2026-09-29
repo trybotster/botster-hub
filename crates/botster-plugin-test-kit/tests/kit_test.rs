@@ -390,3 +390,26 @@ fn timers_crossed_by_one_advance_fire_in_deadline_order() {
         "{fired:?}"
     );
 }
+
+/// The Hub's log mirror thread copies each record under the log book's lock.
+/// A read right after a plugin logged used to see that lock held and fail with
+/// `plugin_logs_busy` (a real race: 3 failures in 40 loaded runs). The read
+/// now waits for the lock, so every read succeeds however busy the mirror is.
+#[test]
+fn logs_are_readable_while_the_hub_mirrors_them() {
+    let mut kit = start("logs-under-mirror");
+    let response = kit
+        .enable_package(&fixture("kit-fixture"))
+        .expect("enable settles");
+    assert!(response.error.is_none(), "{response:?}");
+    let logged = kit
+        .call_tool("kit-fixture.log_many", serde_json::json!({ "count": 150 }))
+        .expect("call settles");
+    assert!(logged.error.is_none(), "{logged:?}");
+    for read in 0..300 {
+        let logs = kit
+            .logs("kit-fixture")
+            .unwrap_or_else(|error| panic!("read {read} failed: {error}"));
+        assert_eq!(logs.records.len(), 150, "read {read}");
+    }
+}
