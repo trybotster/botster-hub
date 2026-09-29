@@ -215,14 +215,6 @@ printf 'start\t100.0\tT1\t2\t1\tX\tload=1/1/1\nstart\t105.0\tT2\t1\t0\tY\tload=1
 #     lock. Cancelling that second run exits 130 at once, its command never
 #     starts, and it leaves no admission process or file behind.
 lock_waiters() { ps -axo command= | grep -F -- "$BOTSTERQ_HOME/admission.lock" | grep -vc grep; }
-await_lock_waiters() {
-  i=0
-  until [ "$(lock_waiters)" -ge "$1" ]; do
-    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
-    # timer: deadline — test-side wait for a run to reach the admission lock.
-    perl -e 'select(undef, undef, undef, 0.05)'
-  done
-}
 "$Q" slots 2 >/dev/null
 "$Q" run --label H1 --exclusive -- sh -c 'sleep 6' >/dev/null 2>&1 &
 H1=$!
@@ -233,9 +225,12 @@ await_state "H2 [exclusive] @" queued
 "$Q" run --label HO1 -- sh -c 'touch "$0/HO1.ran"' "$work" >/dev/null 2>"$work/HO1.err" &
 HO1=$!
 await_text "$work/HO1.err" "waiting for exclusive job"
-"$Q" run --label HO2 -- sh -c 'touch "$0/HO2.ran"' "$work" >/dev/null 2>"$work/HO2.err" &
+mkfifo "$work/ho2.announce"
+BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/ho2.announce" "$Q" run --label HO2 -- sh -c 'touch "$0/HO2.ran"' "$work" >/dev/null 2>"$work/HO2.err" &
 HO2=$!
-await_lock_waiters 2
+# The admission announces that it is about to block on the lock (an event, not a
+# poll); the cancel then lands while it blocks or in the instant before.
+read _ <"$work/ho2.announce"
 cancel_started=$(date +%s)
 kill -TERM "$HO2"; wait "$HO2"; codeHO2=$?
 cancel_elapsed=$(( $(date +%s) - cancel_started ))
@@ -260,9 +255,11 @@ await_state "K1 [exclusive] @" running
 K2=$!
 await_state "K2 [exclusive] @" queued
 for n in 1 2 3; do
-  "$Q" run --label "KW$n" -- sh -c 'date +%s.%N > "$0/KW'"$n"'.start"; sleep 0.3' "$work" >/dev/null 2>&1 &
+  mkfifo "$work/kw$n.announce"
+  BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/kw$n.announce" "$Q" run --label "KW$n" -- sh -c 'date +%s.%N > "$0/KW'"$n"'.start"; sleep 0.3' "$work" >/dev/null 2>"$work/KW$n.err" &
   eval "KW$n=\$!"
-  await_lock_waiters "$n"
+  # KW1 takes the lock and waits for K2; KW2 and KW3 announce that they block.
+  if [ "$n" = 1 ]; then await_text "$work/KW1.err" "waiting for exclusive job"; else read _ <"$work/kw$n.announce"; fi
 done
 wait "$K1" "$K2" "$KW1" "$KW2" "$KW3"
 if [ "$(cat "$work/KW1.start")" \< "$(cat "$work/KW2.start")" ] && [ "$(cat "$work/KW2.start")" \< "$(cat "$work/KW3.start")" ]; then
