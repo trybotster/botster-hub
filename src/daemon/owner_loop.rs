@@ -1372,7 +1372,8 @@ fn serve_daemon_inner(
     let socket_path = socket_path(&config)?;
     let socket_owner = acquire_socket_owner_lock(&socket_path)?;
     prepare_socket_path(&socket_path, &socket_owner)?;
-    let route_dir = Arc::new(crate::transport::unix::route_socket::RouteSocketDir::create()?);
+    let route_dir =
+        Arc::new(crate::transport::unix::route_socket::RouteSocketDir::create(&socket_path)?);
     let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
     listener
         .set_nonblocking(true)
