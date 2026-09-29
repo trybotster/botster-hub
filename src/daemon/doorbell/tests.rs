@@ -267,6 +267,32 @@ impl Rig {
             .collect()
     }
 
+    fn read_issued(&self) -> bool {
+        self.log
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadCursor))
+    }
+
+    /// A ring starts a read; the facts change before the read answers.
+    fn ring_then_change_before_the_read(&mut self, change: impl FnOnce(&mut Terminal)) {
+        let facts = self.terminal.facts();
+        self.reported = Some(facts.clone());
+        self.feed(Event::Ring {
+            text: "hello".to_string(),
+            facts,
+            last_input_at: self.input_at,
+        });
+        assert!(self.read_out, "the ring must start with a read");
+        change(&mut self.terminal);
+        let facts = self.terminal.facts();
+        self.reported = Some(facts.clone());
+        self.feed(Event::Facts(facts));
+        self.read_out = false;
+        let read = self.terminal.read();
+        self.feed(Event::Cursor(read));
+        self.settle();
+    }
+
     fn pending(&self) -> bool {
         self.doorbell.is_pending(&self.session)
     }
@@ -325,6 +351,7 @@ fn nothing_is_typed_while_the_client_is_composing() {
     let mut rig = Rig::new(terminal);
     rig.ring("hello");
     assert!(rig.terminal.writes.is_empty(), "the probe ran over a draft");
+    assert!(!rig.read_issued(), "the start gate must not even read");
     assert!(rig.pending());
     // The human submits: composing ends; after the quiet period the ring goes.
     rig.terminal.human_types("\r");
@@ -374,6 +401,7 @@ fn a_hidden_cursor_holds_the_ring_until_it_reappears() {
         rig.terminal.writes.is_empty(),
         "the probe ran under a dialog"
     );
+    assert!(!rig.read_issued(), "the start gate must not even read");
     // The dialog closes: the mode edge is the retry.
     rig.terminal.cursor_visible = true;
     rig.terminal.modes_epoch += 1;
@@ -571,4 +599,40 @@ fn the_probe_echo_test_is_decided_from_the_model_never_from_bytes() {
         text_before_cursor: "> zx".to_string(),
     };
     assert!(echoed(&baseline, &echo));
+}
+
+#[test]
+fn a_draft_begun_while_the_baseline_read_is_out_stops_the_attempt() {
+    let mut rig = Rig::new(Terminal::composer());
+    rig.ring_then_change_before_the_read(|terminal| terminal.composing = true);
+    assert!(rig.terminal.writes.is_empty(), "the probe ran over a draft");
+    assert!(rig.pending());
+}
+
+#[test]
+fn a_dialog_opened_while_the_baseline_read_is_out_stops_the_attempt() {
+    let mut rig = Rig::new(Terminal::composer());
+    rig.ring_then_change_before_the_read(|terminal| terminal.cursor_visible = false);
+    assert!(
+        rig.terminal.writes.is_empty(),
+        "the probe ran under a dialog"
+    );
+    assert!(rig.pending());
+}
+
+#[test]
+fn the_echo_is_exactly_two_cells_further() {
+    let baseline = Read {
+        row: 3,
+        col: 2,
+        text_before_cursor: "> ".to_string(),
+    };
+    for col in [2, 3, 5, 9] {
+        let read = Read {
+            row: 3,
+            col,
+            text_before_cursor: "> zx".to_string(),
+        };
+        assert!(!echoed(&baseline, &read), "column {col} is not an echo");
+    }
 }
