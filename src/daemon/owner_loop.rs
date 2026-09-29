@@ -6892,8 +6892,9 @@ mod tests {
 
     fn unique_package_control_dir(name: &str) -> PathBuf {
         // Parallel tests can read the same clock value (macOS reports it at
-        // microsecond resolution), so a per-process sequence keeps each
-        // directory, and the daemon state lock inside it, distinct.
+        // microsecond resolution), so a per-process sequence and the process
+        // id keep each directory, and the daemon state lock inside it, distinct
+        // across test threads and across test processes.
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6904,7 +6905,7 @@ mod tests {
             .join("botster-hub-test-data")
             .join("package-control")
             .join(name)
-            .join(format!("{nanos}-{sequence}"))
+            .join(format!("{nanos}-{}-{sequence}", std::process::id()))
     }
 
     fn package_control_config(data_directory: PathBuf) -> crate::HubConfig {
@@ -7889,6 +7890,10 @@ return botster.register({ handlers = {{
                     if refused && daemon.runtime().unwrap().host_executor().outstanding() == 0 {
                         break;
                     }
+                    // The owner loop marks waiters whose signal moved after every step;
+                    // a hand-driven loop does the same, or a request parked on Core
+                    // lock contention never runs again.
+                    mark_signaled_requests(&mut state);
                     // Collect admission phases before retaining each completed provider.
                     collect_entity_test_host_completions(&daemon, &mut state);
                     if let Some(item) = state.owner_ready.pop_next() {
