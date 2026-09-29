@@ -354,6 +354,11 @@ impl LuaCallbackStorageLease {
             charge: Some(Arc::new(charge)),
         }
     }
+
+    /// The bytes the shared charge holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.charge.as_ref().map_or(0, |charge| charge.bytes())
+    }
 }
 
 impl Clone for LuaCallbackStorageLease {
