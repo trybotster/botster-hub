@@ -93,6 +93,7 @@ pub mod runtime;
 pub mod session_credential;
 mod session_projection;
 pub mod session_types;
+mod session_view;
 pub(crate) mod shared_view;
 #[doc(hidden)]
 pub mod source_update;

@@ -5,6 +5,7 @@
 //! package-owned product policy.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use botster_core::SessionLifecycleState;
 use botster_core_daemon::{
@@ -13,6 +14,8 @@ use botster_core_daemon::{
 };
 use botster_hub_client::DaemonSessionEntity;
 use serde_json::Value;
+
+use crate::session_view::SessionView;
 
 /// One projected session row and the evidence that may prove it ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +32,18 @@ pub struct SessionProjectionRow {
     pub restartable: bool,
 }
 
+/// The optional handle to the plugin-readable copy of the rows. It takes no
+/// part in the projection's equality.
+#[derive(Debug, Clone, Default)]
+pub struct SessionViewHandle(Option<Arc<SessionView>>);
+
+impl PartialEq for SessionViewHandle {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SessionViewHandle {}
+
 /// One Hub lifecycle cursor and one canonical session projection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionProjection {
@@ -43,6 +58,8 @@ pub struct SessionProjection {
     /// Session ids that hold a durable restart record. Refreshed from the
     /// published Hub state at each baseline, then kept by keyed changes.
     pub restart_ids: BTreeSet<String>,
+    /// The plugin-readable copy of the rows, written by the mutators below.
+    view: SessionViewHandle,
 }
 
 impl SessionProjection {
@@ -97,6 +114,25 @@ impl SessionProjection {
         }
     }
 
+    /// Attach the plugin-readable view. The first call wins. The view is
+    /// filled from the rows already projected, and sealed when the baseline is.
+    pub(crate) fn attach_view(&mut self, view: &Arc<SessionView>) {
+        if self.view.0.is_some() {
+            return;
+        }
+        for row in self.rows.values() {
+            view.upsert(Self::project_row(row));
+        }
+        view.set_sealed(self.baseline_complete);
+        self.view = SessionViewHandle(Some(Arc::clone(view)));
+    }
+
+    fn view_upsert(&self, id: &str) {
+        if let (Some(view), Some(row)) = (&self.view.0, self.rows.get(id)) {
+            view.upsert(Self::project_row(row));
+        }
+    }
+
     /// Project one row, including its derived `restartable` flag.
     #[must_use]
     pub fn project_row(row: &SessionProjectionRow) -> DaemonSessionEntity {
@@ -123,6 +159,9 @@ impl SessionProjection {
                 flipped.push(id.clone());
             }
         }
+        for id in &flipped {
+            self.view_upsert(id);
+        }
         flipped
     }
 
@@ -139,13 +178,17 @@ impl SessionProjection {
             .rows
             .get(session_id)
             .is_some_and(|row| self.derive_restartable(row.lifecycle_class, session_id));
-        match self.rows.get_mut(session_id) {
+        let flipped = match self.rows.get_mut(session_id) {
             Some(row) if row.restartable != restartable => {
                 row.restartable = restartable;
                 true
             }
             _ => false,
+        };
+        if flipped {
+            self.view_upsert(session_id);
         }
+        flipped
     }
 
     /// Apply one journal change. Remove is not ended evidence.
@@ -169,9 +212,13 @@ impl SessionProjection {
                         restartable,
                     },
                 );
+                self.view_upsert(&record.session.session_id.0);
             }
             SessionLifecycleChangeKind::Removed { session_id } => {
                 self.rows.remove(&session_id.0);
+                if let Some(view) = &self.view.0 {
+                    view.remove(&session_id.0);
+                }
             }
             _ => {}
         }
@@ -202,10 +249,10 @@ impl SessionProjection {
         for record in records {
             let lifecycle_class =
                 session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
-            let restartable =
-                self.derive_restartable(lifecycle_class, &record.session.session_id.0);
+            let id = record.session.session_id.0.clone();
+            let restartable = self.derive_restartable(lifecycle_class, &id);
             self.rows.insert(
-                record.session.session_id.0.clone(),
+                id.clone(),
                 SessionProjectionRow {
                     record,
                     lifecycle_class,
@@ -214,6 +261,7 @@ impl SessionProjection {
                     restartable,
                 },
             );
+            self.view_upsert(&id);
         }
     }
 
@@ -222,6 +270,9 @@ impl SessionProjection {
         self.cursor = Some(snapshot);
         self.baseline_complete = true;
         self.gap = false;
+        if let Some(view) = &self.view.0 {
+            view.set_sealed(true);
+        }
     }
 
     /// Replace the projection with a complete baseline and clear the gap.
@@ -233,6 +284,9 @@ impl SessionProjection {
     ) {
         self.rows.clear();
         self.baseline_complete = false;
+        if let Some(view) = &self.view.0 {
+            view.reset();
+        }
         self.apply_baseline_page(snapshot, records, true);
     }
 
@@ -241,6 +295,9 @@ impl SessionProjection {
     pub fn mark_gap(&mut self) {
         self.gap = true;
         self.baseline_complete = false;
+        if let Some(view) = &self.view.0 {
+            view.set_sealed(false);
+        }
     }
 
     /// Start a fresh baseline recovery without treating current rows as complete.
@@ -249,6 +306,9 @@ impl SessionProjection {
         self.baseline_complete = false;
         self.rows.clear();
         self.cursor = None;
+        if let Some(view) = &self.view.0 {
+            view.reset();
+        }
     }
 
     /// Positive ended evidence only.
