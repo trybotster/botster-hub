@@ -9,9 +9,10 @@ return botster.register({{
     name = "{tool}",
     description = "Read sessions through botster.capabilities.sessions.",
     handler = "probe",
-    call = function(args)
+    call = function(args, request)
       local sessions = botster.capabilities.sessions
       return {{
+        caller = request.caller,
         list = sessions.list({{ owner = "any" }}),
         get = sessions.get({{ session = {{ session_id = args.session_id }} }}),
         get_string = sessions.get({{ session = args.session_id }}),
@@ -96,6 +97,8 @@ fn live_daemon_plugin_reads_sessions_by_hub_and_session_id() {
         "sessions.reader.probe",
         serde_json::json!({ "session_id": session_id }),
     );
+    // A tool called over the Hub socket runs for the local operator.
+    assert_eq!(read["caller"], serde_json::json!({ "kind": "operator" }), "{read}");
     assert_eq!(read["list"]["ok"], true, "{read}");
     let rows = read["list"]["value"]["sessions"].as_array().expect("session rows");
     let row = rows
