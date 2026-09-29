@@ -31,6 +31,9 @@ use crate::transport::unix::mux_write::{UnixInbound, read_async_inbound};
 const ROUTE_DIR_PARENT: &str = "/tmp";
 const ROUTE_NAME_ENTROPY_BYTES: usize = 8;
 const ROUTE_DIR_ENTROPY_BYTES: usize = 4;
+/// Names the socket path that owns a route directory. It is not a socket, so
+/// it never collides with a random 16-hex route name.
+const OWNER_FILE: &str = "owner";
 
 /// The private directory holding route sockets. Created at daemon start with
 /// mode 0700, and removed at drop.
@@ -41,29 +44,31 @@ pub(crate) struct RouteSocketDir {
 impl RouteSocketDir {
     /// Create the route directory for the Hub that owns `socket_path`.
     ///
-    /// The name is `/tmp/br-<uid>-<hash of the socket path>`, so the next
-    /// start of the same Hub finds and sweeps what a crash left behind. The
-    /// caller holds the socket owner lock, so no other Hub of this user uses
-    /// that name. A path at that name that is not a directory of this user
-    /// (another user created it, or it is a symlink) is left alone and a
-    /// random name is used instead, so nobody can block the start.
+    /// The name is `/tmp/br-<uid>-<64-bit hash of the socket path>`, so the
+    /// next start of the same Hub finds and sweeps what a crash left behind.
+    /// A hash is not an identity: the directory holds an `owner` file with
+    /// the exact socket path, and an existing directory is swept only when
+    /// that file matches. Any other path at the name (another Hub's directory,
+    /// another user's, a symlink) is left alone and a random name is used
+    /// instead, so nobody can block the start and two Hubs never remove each
+    /// other's routes.
     pub(crate) fn create(socket_path: &Path) -> DaemonTransportResult<Self> {
         // SAFETY: `geteuid` has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        let preferred = Path::new(ROUTE_DIR_PARENT).join(format!(
-            "br-{uid}-{:08x}",
-            path_hash(socket_path.as_os_str().as_encoded_bytes())
-        ));
-        match fs::symlink_metadata(&preferred) {
-            Ok(metadata) if metadata.file_type().is_dir() && metadata.uid() == uid => {
-                fs::remove_dir_all(&preferred).map_err(DaemonTransportError::Io)?;
-            }
-            _ => {}
+        let identity = socket_path.as_os_str().as_encoded_bytes();
+        let preferred =
+            Path::new(ROUTE_DIR_PARENT).join(format!("br-{uid}-{:016x}", path_hash(identity)));
+        if let Ok(metadata) = fs::symlink_metadata(&preferred)
+            && metadata.file_type().is_dir()
+            && metadata.uid() == uid
+            && fs::read(preferred.join(OWNER_FILE)).is_ok_and(|owner| owner == identity)
+        {
+            fs::remove_dir_all(&preferred).map_err(DaemonTransportError::Io)?;
         }
         // The mode is applied at creation, so no other user can ever enter
         // the directory. The umask can only narrow it.
         match fs::DirBuilder::new().mode(0o700).create(&preferred) {
-            Ok(()) => Self::verified(preferred, uid),
+            Ok(()) => Self::claimed(preferred, uid, identity),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let mut entropy = [0_u8; ROUTE_DIR_ENTROPY_BYTES];
                 getrandom::fill(&mut entropy).map_err(|_| {
@@ -77,10 +82,17 @@ impl RouteSocketDir {
                     .mode(0o700)
                     .create(&random)
                     .map_err(DaemonTransportError::Io)?;
-                Self::verified(random, uid)
+                Self::claimed(random, uid, identity)
             }
             Err(error) => Err(DaemonTransportError::Io(error)),
         }
+    }
+
+    /// Check the new directory and write its owner file.
+    fn claimed(path: PathBuf, uid: u32, identity: &[u8]) -> DaemonTransportResult<Self> {
+        let dir = Self::verified(path, uid)?;
+        fs::write(dir.path.join(OWNER_FILE), identity).map_err(DaemonTransportError::Io)?;
+        Ok(dir)
     }
 
     fn verified(path: PathBuf, uid: u32) -> DaemonTransportResult<Self> {
@@ -122,12 +134,13 @@ impl RouteSocketDir {
     }
 }
 
-/// FNV-1a: stable across runs and Rust versions, unlike `DefaultHasher`.
-fn path_hash(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
+/// FNV-1a, 64-bit: stable across runs and Rust versions, unlike
+/// `DefaultHasher`. It only picks a name; the `owner` file decides identity.
+fn path_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
 }
@@ -384,6 +397,24 @@ mod tests {
             second.path(),
             "another socket path, another directory"
         );
+    }
+
+    /// A different socket path whose directory sits at the preferred name
+    /// (a hash collision, simulated by writing another owner) is never swept:
+    /// its owner file differs, so a random name takes over.
+    #[test]
+    fn another_hubs_directory_at_the_preferred_name_is_never_removed() {
+        let socket = unique_socket_path();
+        let mine = RouteSocketDir::create(&socket).expect("create");
+        let path = mine.path().to_owned();
+        std::mem::forget(mine);
+        fs::write(path.join(OWNER_FILE), b"/some/other/hub.sock").expect("another owner");
+        fs::write(path.join("live-route-socket"), b"x").expect("another hub's file");
+        let second = RouteSocketDir::create(&socket).expect("start beside it");
+        assert_ne!(second.path(), path, "a different owner is never reused");
+        assert!(path.join("live-route-socket").exists(), "and never swept");
+        drop(second);
+        fs::remove_dir_all(&path).expect("clean up the simulated neighbour");
     }
 
     /// A path at the preferred name that this user does not own as a
