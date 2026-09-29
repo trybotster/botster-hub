@@ -10,6 +10,7 @@ use botster_hub_client::{
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_hub_update;
+use crate::daemon::control::Caller;
 use crate::daemon::control::attach_bind_operator_error;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
@@ -43,6 +44,26 @@ pub(crate) fn handle(
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
     message: ControlMessage,
+) -> bool {
+    handle_as(
+        daemon,
+        state,
+        transport_handle,
+        control_tx,
+        message,
+        Caller::Operator,
+    )
+}
+
+/// Admit one request that runs as `caller`: the operator for every socket and
+/// WebRTC client, a session for an HTTP MCP request.
+pub(crate) fn handle_as(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_handle: &tokio::runtime::Handle,
+    control_tx: ControlSender,
+    message: ControlMessage,
+    caller: Caller,
 ) -> bool {
     let ControlMessage::Request {
         request,
@@ -136,12 +157,14 @@ pub(crate) fn handle(
             client_id: None,
             grant_id: None,
             transport_request_id,
+            caller,
         }
     } else {
         DaemonObservability {
             client_id: client_id.clone(),
             grant_id: grant_id.clone(),
             transport_request_id,
+            caller,
         }
     };
     let must_finish = request_must_finish(&request);
