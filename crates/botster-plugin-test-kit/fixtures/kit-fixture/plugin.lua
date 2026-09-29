@@ -87,6 +87,22 @@ return botster.register({
       end,
     },
     {
+      name = "kit-fixture.log_many",
+      description = "Write many log records.",
+      input_schema = {
+        type = "object",
+        properties = { count = { type = "integer" } },
+        required = { "count" },
+      },
+      handler = "log_many",
+      call = function(request)
+        for index = 1, request.count do
+          botster.log.info({ message = "record", fields = { index = index } })
+        end
+        return { logged = request.count }
+      end,
+    },
+    {
       name = "kit-fixture.note",
       description = "Emit kit-fixture.noted for one key.",
       input_schema = {
