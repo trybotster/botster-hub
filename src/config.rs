@@ -151,6 +151,7 @@ impl HubStartupOptions {
             package_event_plane: self.package_event_plane.into_policy()?,
             retention: self.retention,
             update_source_root: None,
+            mcp_url: None,
         })
     }
 
@@ -187,6 +188,11 @@ pub struct HubConfig {
     /// it. `None` leaves the updater on its development default.
     #[serde(default)]
     pub update_source_root: Option<PathBuf>,
+    /// The URL of the daemon's MCP endpoint, set by the daemon after it binds
+    /// the listener and never read from a file. Sessions receive it as
+    /// `BOTSTER_MCP_URL`. `None` outside a serving daemon.
+    #[serde(skip)]
+    pub mcp_url: Option<String>,
 }
 
 impl HubConfig {
