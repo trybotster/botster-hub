@@ -2548,7 +2548,7 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.0-rc.1"
-source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
+source = "git+https://github.com/trybotster/rtc?rev=25e99030437bd0bc5b056925738e7f64d57fa4c9#25e99030437bd0bc5b056925738e7f64d57fa4c9"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2574,7 +2574,7 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.21.0-rc.1"
-source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
+source = "git+https://github.com/trybotster/rtc?rev=25e99030437bd0bc5b056925738e7f64d57fa4c9#25e99030437bd0bc5b056925738e7f64d57fa4c9"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",

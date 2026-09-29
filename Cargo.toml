@@ -78,12 +78,12 @@ botster-ui-contract = { path = "crates/botster-ui-contract" }
 # Hub runtime builds use the local rtc repairs documented in vendor/README.md,
 # and rtc-sctp (with its sibling rtc-shared, so one copy resolves) from the
 # trybotster/rtc fork: upstream 51558ffb plus one commit, branch
-# botster/rtc-sctp-stream-reuse. That commit lets a stream id be reused only
+# botster/rtc-sctp-stream-reuse-2. That commit lets a stream id be reused only
 # after both directions of its reset complete (RFC 8831 section 6.7).
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
-rtc-sctp = { git = "https://github.com/trybotster/rtc", rev = "3a1d78830588e766d243655483e58d2455961239" }
-rtc-shared = { git = "https://github.com/trybotster/rtc", rev = "3a1d78830588e766d243655483e58d2455961239" }
+rtc-sctp = { git = "https://github.com/trybotster/rtc", rev = "25e99030437bd0bc5b056925738e7f64d57fa4c9" }
+rtc-shared = { git = "https://github.com/trybotster/rtc", rev = "25e99030437bd0bc5b056925738e7f64d57fa4c9" }
 
 # Dev and test builds keep line tables only: panics and backtraces still name
 # every frame's file and line, but variable and type debug info (most of the
