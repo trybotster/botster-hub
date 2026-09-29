@@ -476,10 +476,11 @@ mod tests {
         .await
         .expect("join");
         assert_eq!(received.1.route, "sub");
-        let entries = fs::read_dir(received.0._dir.path())
-            .expect("read dir")
-            .count();
-        assert_eq!(entries, 0, "the path is unlinked at accept");
+        assert_eq!(
+            route_sockets_in(received.0._dir.path()),
+            0,
+            "the path is unlinked at accept"
+        );
     }
 
     #[tokio::test]

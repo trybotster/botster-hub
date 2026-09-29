@@ -93,13 +93,3 @@ pub(crate) fn read_response(
         other => panic!("expected correlated response, got {other:?}"),
     }
 }
-
-pub(crate) fn read_terminal(
-    client: &mut UnixStream,
-    reader: &mut DaemonUnixFrameReader,
-) -> DaemonUnixTerminalFrame {
-    match reader.read_frame(client).expect("read terminal frame") {
-        DaemonUnixMuxFrame::Terminal(frame) => frame,
-        other => panic!("expected terminal container, got {other:?}"),
-    }
-}
