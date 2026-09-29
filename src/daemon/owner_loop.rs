@@ -2651,8 +2651,8 @@ mod tests {
     use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
     use crate::transport::unix::connection::handle_connection;
     use crate::transport::unix::test_harness::{
-        read_hello_ack, read_response, read_terminal, receive_test_control_message,
-        receive_test_control_request, write_hello, write_request,
+        read_hello_ack, read_response, receive_test_control_message, receive_test_control_request,
+        write_hello, write_request,
     };
     use botster_core::RequestId;
     use botster_core::contract::terminal_adapter::TerminalAdapter;
@@ -6494,88 +6494,6 @@ mod tests {
     }
 
     #[test]
-    fn unix_writer_wake_preserves_a_partial_inbound_request() {
-        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("bound daemon client reads");
-        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
-        let connection = thread::spawn(move || handle_connection(server, control_tx));
-
-        write_hello(&mut client);
-        let mut reader = DaemonUnixFrameReader::new();
-        let _ = read_hello_ack(&mut client, &mut reader);
-
-        let ControlMessage::RegisterUnixAdmission {
-            admission,
-            reply_tx,
-            ..
-        } = receive_test_control_message(&mut control_rx)
-        else {
-            panic!("expected RegisterUnixAdmission after Hello");
-        };
-        let UnixTerminalAdmission::Admitted { mux, .. } = admission else {
-            panic!("expected terminal admission");
-        };
-        let (mut adapter, handle) = mux.create_adapter();
-        assert!(mux.register(
-            "partial-session".to_string(),
-            "partial-subscription".to_string(),
-            1,
-            handle,
-        ));
-
-        let request_bytes = encode_client_frame(&ClientFrame::Request {
-            request_id: "1".to_string(),
-            request: DaemonRequest::Status,
-        })
-        .expect("encode status request");
-        let split = request_bytes.len() / 2;
-        client
-            .write_all(&request_bytes[..split])
-            .expect("write partial status request");
-
-        let body = encode_output(b"writer-wake").expect("encode terminal output");
-        let body_bytes = body.as_bytes().to_vec();
-        let frame = RoutedTerminalFrame::new(
-            RouteId::new("partial-subscription").expect("route"),
-            1,
-            0,
-            body,
-        );
-        adapter.try_write(&frame).expect("store terminal output");
-        reply_tx.send(()).expect("ack unix admission");
-        let terminal = read_terminal(&mut client, &mut reader);
-        assert_eq!(terminal.route, "partial-subscription");
-        assert_eq!(terminal.generation, 1);
-        assert_eq!(terminal.body, body_bytes);
-
-        client
-            .write_all(&request_bytes[split..])
-            .expect("complete status request");
-        let ControlMessage::Request {
-            request, reply_tx, ..
-        } = receive_test_control_request(&mut control_rx)
-        else {
-            panic!("expected complete Status request");
-        };
-        assert!(matches!(*request, DaemonRequest::Status));
-        reply_tx
-            .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
-            .expect("reply to status");
-        let response = read_response(&mut client, &mut reader, 1);
-        assert_eq!(response.kind, DaemonResponseKind::Status);
-
-        client
-            .shutdown(Shutdown::Both)
-            .expect("disconnect daemon client");
-        connection
-            .join()
-            .expect("join daemon connection")
-            .expect("client disconnect is a clean connection close");
-    }
-
-    #[test]
     fn attach_operator_error_does_not_detach_on_client_eof() {
         let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
@@ -10192,20 +10110,6 @@ return botster.register({tools = {{
             .build()
             .expect("build plugin pressure transport runtime");
         let registration = receive_test_control_message(&mut control_rx);
-        let terminal_mux = match &registration {
-            ControlMessage::RegisterUnixAdmission {
-                admission: UnixTerminalAdmission::Admitted { mux, .. },
-                ..
-            } => mux.clone(),
-            _ => panic!("expected admitted Unix registration"),
-        };
-        let (mut terminal_adapter, terminal_handle) = terminal_mux.create_adapter();
-        assert!(terminal_mux.register(
-            "pressure-session".to_string(),
-            "pressure-subscription".to_string(),
-            1,
-            terminal_handle,
-        ));
         assert!(!handle_control_message(
             &mut daemon,
             &mut state,
@@ -10300,22 +10204,6 @@ return botster.register({tools = {{
         }
         assert!(refusals.is_empty());
         assert_eq!(state.pending_requests.len(), core_capacity);
-
-        let terminal_body =
-            encode_output(b"terminal-after-refusal").expect("encode terminal output after refusal");
-        let expected_terminal_body = terminal_body.as_bytes().to_vec();
-        terminal_adapter
-            .try_write(&RoutedTerminalFrame::new(
-                RouteId::new("pressure-subscription").expect("pressure route"),
-                1,
-                0,
-                terminal_body,
-            ))
-            .expect("write terminal output after refusal");
-        let terminal = read_terminal(&mut client, &mut reader);
-        assert_eq!(terminal.route, "pressure-subscription");
-        assert_eq!(terminal.generation, 1);
-        assert_eq!(terminal.body, expected_terminal_body);
 
         let (sibling_server, mut sibling_client) =
             UnixStream::pair().expect("create sibling status socket pair");

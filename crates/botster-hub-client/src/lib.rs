@@ -750,7 +750,18 @@ impl DaemonRouteStream {
     /// Read the next terminal frame. A timeout keeps any partial frame for
     /// the next read; end of stream is the route's end.
     pub fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
-        match self.frames.read_frame(&mut self.stream)? {
+        let frame = match self.frames.read_frame(&mut self.stream) {
+            // End of stream inside a frame: the Hub closed the socket while a
+            // frame this client had not read was half written. It is the
+            // route's end; the partial frame is discarded.
+            Err(DaemonTransportError::Protocol(message))
+                if message.starts_with("truncated unix frame") =>
+            {
+                return Err(DaemonTransportError::ClientDisconnected);
+            }
+            frame => frame?,
+        };
+        match frame {
             DaemonUnixMuxFrame::Terminal(frame) => Ok(frame),
             DaemonUnixMuxFrame::Server(_) => Err(DaemonTransportError::Protocol(
                 "control frame on a route socket",
