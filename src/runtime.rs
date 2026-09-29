@@ -2094,6 +2094,7 @@ impl HubRuntime {
         let handler = descriptor.handler.ok_or_else(|| {
             crate::McpToolError::new("plugin_tool_unavailable", "plugin MCP tool has no handler")
         })?;
+        let caller_hub_id = caller.as_ref().map(|_| self.config().host.id.clone());
         Ok(PluginInvocationRequest {
             request_id,
             handler,
@@ -2105,7 +2106,11 @@ impl HubRuntime {
                 subscription_id: None,
                 surface_id: None,
                 origin: Some("mcp-http".to_string()),
-                metadata: None,
+                // The caller's hub travels with the caller: a session id alone is
+                // never meaningful across hubs.
+                metadata: caller_hub_id.map(|hub_id| {
+                    botster_core::BoundaryJson(serde_json::json!({ "caller_hub_id": hub_id }))
+                }),
             },
             payload: botster_core::BoundaryJson(call.arguments),
         })

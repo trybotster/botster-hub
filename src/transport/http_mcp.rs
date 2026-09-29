@@ -4,6 +4,7 @@
 //! token the Hub issued at spawn. There is no operator over HTTP; the Unix
 //! socket stays the operator's path.
 
+pub(crate) mod audit;
 pub(crate) mod connection;
 pub(crate) mod listener;
 pub(crate) mod tools;

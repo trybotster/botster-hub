@@ -1365,6 +1365,8 @@ fn serve_daemon_inner(
     // MCP over HTTP binds before any session can spawn, so every spawn issues
     // the endpoint URL. A Hub that cannot bind loopback still serves the rest.
     let mut config = config;
+    let audit_data_directory = config.data_directory.clone();
+    let audit_hub_id = config.host.id.clone();
     let mcp_http = match crate::transport::http_mcp::listener::bind(&config.data_directory, None)
     {
         Ok(bound) => {
@@ -1423,9 +1425,15 @@ fn serve_daemon_inner(
         Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
     ))];
     if let Some(bound) = mcp_http {
-        connection_tasks.push(
-            transport_runtime.spawn(bound.serve(control_tx.clone(), shutdown_tx.subscribe())),
+        let audit = crate::transport::http_mcp::audit::ToolAudit::new(
+            &audit_data_directory,
+            audit_hub_id,
         );
+        connection_tasks.push(transport_runtime.spawn(bound.serve(
+            control_tx.clone(),
+            audit,
+            shutdown_tx.subscribe(),
+        )));
     }
     #[cfg(test)]
     let (selected, stopped) = match terminal_test {

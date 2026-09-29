@@ -26,6 +26,7 @@ use crate::mcp::{
 };
 use crate::HubClientError;
 use crate::session_credential::CallerToken;
+use crate::transport::http_mcp::audit::ToolCallRecord;
 use crate::transport::http_mcp::wire::Refusal;
 
 /// What one HTTP body turns into.
@@ -158,31 +159,36 @@ fn refused_token(response: &DaemonTransportResult<DaemonResponse>) -> bool {
     }
 }
 
-/// Serve one HTTP body for the session that `token` claims to be.
+/// Serve one HTTP body for the session that `token` claims to be. A tool
+/// call also returns its audit record.
 pub(crate) async fn dispatch(
     control_tx: &ControlSender,
     token: &CallerToken,
     body: &[u8],
-) -> Dispatched {
+) -> (Dispatched, Option<ToolCallRecord>) {
     let channel = CallerChannel { control_tx, token };
     match serve(&channel, body).await {
-        Ok(dispatched) => dispatched,
-        Err(failure) => Dispatched::Refused(failure.refusal()),
+        Ok(served) => served,
+        Err(failure) => (Dispatched::Refused(failure.refusal()), None),
     }
 }
 
-async fn serve(channel: &CallerChannel<'_>, body: &[u8]) -> Result<Dispatched, CallFailure> {
+async fn serve(
+    channel: &CallerChannel<'_>,
+    body: &[u8],
+) -> Result<(Dispatched, Option<ToolCallRecord>), CallFailure> {
     let (id, method, params) = match parse_inbound(body) {
         Inbound::Request { id, method, params } => (id, method, params),
         Inbound::NoReply => {
             verify(channel).await?;
-            return Ok(Dispatched::Accepted);
+            return Ok((Dispatched::Accepted, None));
         }
         Inbound::Invalid(response) => {
             verify(channel).await?;
-            return Ok(Dispatched::Body(encode_response(&response)));
+            return Ok((Dispatched::Body(encode_response(&response)), None));
         }
     };
+    let mut audit = None;
     let result = match method.as_str() {
         "initialize" => {
             verify(channel).await?;
@@ -202,25 +208,55 @@ async fn serve(channel: &CallerChannel<'_>, body: &[u8]) -> Result<Dispatched, C
                 Ok(call) => call,
                 Err(error) => {
                     verify(channel).await?;
-                    return Ok(Dispatched::Body(encode_response(&JsonRpcResponse::error(
-                        id,
-                        JsonRpcError::invalid_params(error),
-                    ))));
+                    return Ok((
+                        Dispatched::Body(encode_response(&JsonRpcResponse::error(
+                            id,
+                            JsonRpcError::invalid_params(error),
+                        ))),
+                        None,
+                    ));
                 }
             };
-            tool_call_response(call_tool(channel, call).await?)
+            let mut record = ToolCallRecord {
+                tool: call.name.clone(),
+                target_session_id: call
+                    .arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                outcome: "ok".to_string(),
+                caller_verified: true,
+            };
+            let outcome = match call_tool(channel, call).await {
+                Ok(outcome) => outcome,
+                Err(CallFailure::Unauthenticated) => {
+                    record.outcome = CALLER_UNAUTHENTICATED.to_string();
+                    record.caller_verified = false;
+                    return Ok((Dispatched::Refused(Refusal::Unauthenticated), Some(record)));
+                }
+                Err(failure) => return Err(failure),
+            };
+            if let Err(error) = &outcome {
+                record.outcome = error.code.clone();
+            }
+            audit = Some(record);
+            tool_call_response(outcome)
         }
         _ => {
             verify(channel).await?;
-            return Ok(Dispatched::Body(encode_response(&JsonRpcResponse::error(
-                id,
-                JsonRpcError::method_not_found(&method),
-            ))));
+            return Ok((
+                Dispatched::Body(encode_response(&JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::method_not_found(&method),
+                ))),
+                None,
+            ));
         }
     };
-    Ok(Dispatched::Body(encode_response(&JsonRpcResponse::result(
-        id, result,
-    ))))
+    Ok((
+        Dispatched::Body(encode_response(&JsonRpcResponse::result(id, result))),
+        audit,
+    ))
 }
 
 /// Prove the token without doing anything else, for methods that would
@@ -266,4 +302,179 @@ async fn call_tool(
         })
         .await?;
     Ok(plugin_tool_result(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use botster_hub_client::{DaemonIdentity, DaemonResponseKind};
+    use tokio::sync::mpsc;
+
+    use crate::client_api_dto::plugin::daemon_coordination_identity;
+    use crate::client_api_dto::response::daemon_coordination;
+    use crate::daemon::control::operator_refusal;
+
+    fn token() -> CallerToken {
+        CallerToken::parse(&format!("sess-1.{}", "5a".repeat(32))).expect("a well-formed token")
+    }
+
+    fn body(method: &str, params: Value) -> Vec<u8> {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn identity_response(session_id: &str) -> DaemonResponse {
+        daemon_coordination(
+            DaemonResponseKind::Identity,
+            daemon_coordination_identity(DaemonIdentity {
+                client_id: "test".to_string(),
+                role: "session".to_string(),
+                identity_source: "caller_token".to_string(),
+                caller_session_id: Some(session_id.to_string()),
+                host_id: "hub-1".to_string(),
+                host_display_name: "Hub".to_string(),
+            }),
+        )
+    }
+
+    fn unauthenticated_response() -> DaemonResponse {
+        operator_refusal(CALLER_UNAUTHENTICATED, "caller_auth", "refused")
+    }
+
+    /// A stand-in for the owner: it answers each message in turn with the
+    /// given responses and reports what it received (request name, proven).
+    fn fake_owner(
+        mut control_rx: mpsc::Receiver<ControlMessage>,
+        answers: Vec<DaemonResponse>,
+    ) -> tokio::task::JoinHandle<Vec<(String, Option<String>)>> {
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for answer in answers {
+                let Some(ControlMessage::CallerRequest {
+                    proven,
+                    request,
+                    reply_tx,
+                    ..
+                }) = control_rx.recv().await
+                else {
+                    break;
+                };
+                seen.push((
+                    format!("{:?}", request.into_daemon_request())
+                        .split([' ', '{', '('])
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                    proven.map(|session| session.0),
+                ));
+                let _ = reply_tx.send(Ok(answer));
+            }
+            seen
+        })
+    }
+
+    #[tokio::test]
+    async fn initialize_proves_the_token_before_answering() {
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let owner = fake_owner(control_rx, vec![unauthenticated_response()]);
+        let (dispatched, _) = dispatch(&control_tx, &token(), &body("initialize", json!({}))).await;
+        assert!(matches!(
+            dispatched,
+            Dispatched::Refused(Refusal::Unauthenticated)
+        ));
+        // The only message was the proof: initialize alone never reaches Core.
+        assert_eq!(owner.await.unwrap(), [("Whoami".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn a_proven_token_gets_the_initialize_answer() {
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let owner = fake_owner(control_rx, vec![identity_response("sess-1")]);
+        let (dispatched, _) = dispatch(&control_tx, &token(), &body("initialize", json!({}))).await;
+        let Dispatched::Body(bytes) = dispatched else {
+            panic!("initialize is answered");
+        };
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply["result"]["serverInfo"]["name"], "botster-hub");
+        owner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_messaging_tool_sends_one_message_that_proves_itself_in_core() {
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let owner = fake_owner(control_rx, vec![unauthenticated_response()]);
+        let call = body(
+            "tools/call",
+            json!({ "name": "post_message", "arguments": { "session_id": "b", "body": "x" } }),
+        );
+        let (dispatched, _) = dispatch(&control_tx, &token(), &call).await;
+        // The owner refused the token inside the operation: 401, not a tool error.
+        assert!(matches!(
+            dispatched,
+            Dispatched::Refused(Refusal::Unauthenticated)
+        ));
+        assert_eq!(owner.await.unwrap(), [("PostMessage".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_tool_is_preceded_by_a_proof_and_carries_the_proven_session() {
+        let (control_tx, control_rx) = mpsc::channel(8);
+        // The proof succeeds; the plugin call is then refused, which ends the test.
+        let owner = fake_owner(
+            control_rx,
+            vec![identity_response("sess-1"), unauthenticated_response()],
+        );
+        let call = body(
+            "tools/call",
+            json!({ "name": "plugin.tool", "arguments": {} }),
+        );
+        let (_, record) = dispatch(&control_tx, &token(), &call).await;
+        let record = record.expect("a refused tool call is audited");
+        assert!(!record.caller_verified);
+        assert_eq!(record.outcome, CALLER_UNAUTHENTICATED);
+        assert_eq!(record.tool, "plugin.tool");
+        assert_eq!(
+            owner.await.unwrap(),
+            [
+                ("Whoami".to_string(), None),
+                ("PluginMcpCallTool".to_string(), Some("sess-1".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_control_queue_is_busy_and_never_waited_on() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        // Fill the queue with an unrelated message.
+        let (filler_reply, _) = crate::daemon::control::message::control_reply_channel();
+        control_tx
+            .try_send(ControlMessage::CallerRequest {
+                token: token(),
+                proven: None,
+                request: Box::new(CallerRequest::Whoami),
+                reply_tx: filler_reply,
+                enqueued_at: Instant::now(),
+            })
+            .expect("the first message fits");
+        let (dispatched, _) = dispatch(&control_tx, &token(), &body("ping", json!({}))).await;
+        assert!(matches!(dispatched, Dispatched::Refused(Refusal::Busy)));
+    }
+
+    #[tokio::test]
+    async fn a_batch_or_garbage_body_is_answered_only_after_the_token_is_proven() {
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let owner = fake_owner(
+            control_rx,
+            vec![identity_response("sess-1"), unauthenticated_response()],
+        );
+        let (proven, _) = dispatch(&control_tx, &token(), b"not json").await;
+        assert!(matches!(proven, Dispatched::Body(_)));
+        let (refused, _) = dispatch(&control_tx, &token(), b"[]").await;
+        assert!(matches!(
+            refused,
+            Dispatched::Refused(Refusal::Unauthenticated)
+        ));
+        owner.await.unwrap();
+    }
 }

@@ -285,7 +285,7 @@ mod tests {
             "the raw secret must not reach persisted metadata"
         );
         assert_eq!(
-            credential_string_bytes("session-a"),
+            credential_string_bytes("session-a", None),
             Some(
                 tokens[0].len()
                     + MCP_TOKEN_ENVIRONMENT.len()

@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn head_end_finds_the_blank_line() {
-        assert_eq!(head_end(b"GET / HTTP/1.1\r\nA: b\r\n\r\nbody"), Some(25));
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\nA: b\r\n\r\nbody"), Some(24));
         assert_eq!(head_end(b"GET / HTTP/1.1\r\nA: b\r\n"), None);
     }
 

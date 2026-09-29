@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufReader, IsTerminal};
+use std::io::{self, IsTerminal};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -138,6 +138,9 @@ fn dispatch_command(command: &str, args: Vec<String>) -> Result<CommandOutcome, 
         "shutdown" => operator_shutdown(args)
             .map(|()| CommandOutcome::DaemonStopped)
             .map_err(|error| error.to_string()),
+        "audit" => operator_audit(args)
+            .map(|()| CommandOutcome::Completed)
+            .map_err(|error| error.to_string()),
         "open" => operator_open_alias(args).map_err(|error| error.to_string()),
         "reload" => operator_reload_alias(args)
             .map(|()| CommandOutcome::Completed)
@@ -245,6 +248,7 @@ fn stateful_command(command: &str) -> bool {
             | "spawn-targets"
             | "context"
             | "shutdown"
+            | "audit"
             | "open"
             | "reload"
             | "apps"
@@ -343,6 +347,7 @@ fn command_usage(command: &str) -> &'static str {
         "spawn-targets" => "spawn-targets",
         "context" => "context",
         "shutdown" => "shutdown",
+        "audit" => "audit",
         "open" => "open",
         "reload" => "reload",
         "apps" => "apps",
@@ -1839,6 +1844,48 @@ fn parse_session_type_request(
         }
     }
     Ok(request)
+}
+
+/// `botster-hub audit tools [--session <id>]`: print the tool-call audit log,
+/// one JSON line per call, optionally only the calls a session made or that
+/// named it as their target.
+fn operator_audit(args: Vec<String>) -> Result<(), OperatorError> {
+    let options = DataArgs::parse(args, "audit")?;
+    let mut arguments = options.arguments.iter();
+    if arguments.next().map(String::as_str) != Some("tools") {
+        return Err(OperatorError::Usage("audit"));
+    }
+    let mut session = None;
+    while let Some(argument) = arguments.next() {
+        match (argument.as_str(), session.is_none()) {
+            ("--session", true) => {
+                session = Some(arguments.next().ok_or(OperatorError::Usage("audit"))?);
+            }
+            _ => return Err(OperatorError::Usage("audit")),
+        }
+    }
+    let path = botster_hub::tool_audit_log_path(&options.data_directory);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // No call has been logged yet.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(OperatorError::App(error.to_string())),
+    };
+    for line in text.lines() {
+        let keep = match session {
+            None => true,
+            Some(session) => serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|call| {
+                    ["caller", "target"]
+                        .iter()
+                        .any(|role| call[*role]["session_id"] == session.as_str())
+                }),
+        };
+        if keep {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
@@ -4604,6 +4651,7 @@ Daily runtime commands:
   botster-hub update <core|all> [--source <path>] [--data-dir <path>]
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
+  botster-hub audit tools [--data-dir <path>] [--session <id>]
   botster-hub check-update [--data-dir <path>]
   botster-hub version
   botster-hub doctor [--data-dir <path>]
@@ -4717,6 +4765,7 @@ Packages:
             "usage: botster-hub sessions shutdown [--data-dir <path>] <session-id>"
         }
         "shutdown" => "usage: botster-hub shutdown [--data-dir <path>]",
+        "audit" => "usage: botster-hub audit tools [--data-dir <path>] [--session <id>]",
         "open" => "usage: botster-hub open <web|tui> [--data-dir <path>]",
         "apps" => "usage: botster-hub apps <list|show|open> ...",
         "apps list" => "usage: botster-hub apps list [--data-dir <path>]",
@@ -4774,7 +4823,7 @@ Packages:
         "providers" | "providers list" => "usage: botster-hub providers list [--data-dir <path>]",
         "inspect" => "usage: botster-hub inspect [--data-dir <path>] <session-id>",
         _ => {
-            "usage: botster-hub <help|up|update|down|doctor|smoke|open|reload|start|status|sessions|shutdown|apps|packages|providers|inspect|run-one>"
+            "usage: botster-hub <help|up|update|down|doctor|smoke|open|reload|start|status|sessions|shutdown|audit|apps|packages|providers|inspect|run-one>"
         }
     }
 }

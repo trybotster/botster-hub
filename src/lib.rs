@@ -195,6 +195,7 @@ pub use maintenance::{
     SourceUpdateRefusal, installation_identity, software_identity, source_update_refusal,
 };
 pub use mcp::{McpCallRequest, McpToolDescriptor, McpToolError, McpToolResult};
+pub use transport::http_mcp::audit::log_path as tool_audit_log_path;
 pub use package_event_router::{EventPlaneStatus, PackageEventRouter};
 pub use packages::{
     AvailablePackage, AvailablePackageState, HubEmittedEvent, HubPackageEvents, HubPackageManifest,

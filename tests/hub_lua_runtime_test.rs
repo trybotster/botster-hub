@@ -1376,6 +1376,103 @@ fn real_lua_plugin_loads_invokes_tool_and_uses_hub_capability_runtime() {
     );
 }
 
+fn install_caller_probe_registry(name: &str) -> PackageRegistry {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join(name);
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create caller probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {
+    {
+      name = "caller_probe.who",
+      description = "Report the caller an MCP tool call carries.",
+      handler = "who",
+      call = function(arguments, request)
+        local caller = request and request.caller
+        return {
+          arguments = arguments,
+          has_request = request ~= nil,
+          session_id = caller and caller.session_id,
+          hub_id = caller and caller.hub_id,
+        }
+      end,
+    },
+  },
+})
+"#,
+    )
+    .expect("write caller probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "caller-probe",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write caller probe manifest");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install caller probe package")
+        .expect("install caller probe package");
+    policy
+        .enable("caller-probe", "enable caller probe package")
+        .expect("enable caller probe package");
+    policy.registry().clone()
+}
+
+#[test]
+fn a_plugin_mcp_tool_handler_sees_the_caller_only_when_a_session_called() {
+    let registry = install_caller_probe_registry("caller-probe");
+    let mut hub = explicit_runtime("caller-probe");
+    let plugin_key = hub
+        .load_lua_plugin_package(&registry, "caller-probe")
+        .expect("load caller probe package");
+    let handler = PluginHandlerRef {
+        plugin_key,
+        kind: PluginHandlerKind::McpTool,
+        handler_id: "who".to_string(),
+    };
+
+    // A session called: the handler gets `request.caller` with both parts.
+    let mut called = invocation(handler.clone(), serde_json::json!({ "a": 1 }));
+    called.context.session_id = Some(SessionId("caller-session".to_string()));
+    called.context.metadata = Some(BoundaryJson(
+        serde_json::json!({ "caller_hub_id": "caller-hub" }),
+    ));
+    let PluginInvocationResult::Completed(PluginInvocationSuccess { payload, .. }) =
+        hub.invoke_plugin(called).result
+    else {
+        panic!("a caller-carrying invocation should complete");
+    };
+    let payload = payload.expect("lua response payload").0;
+    assert_eq!(payload["session_id"], "caller-session");
+    assert_eq!(payload["hub_id"], "caller-hub");
+    assert_eq!(payload["arguments"]["a"], 1);
+
+    // No session: the handler gets its arguments only, as before.
+    let PluginInvocationResult::Completed(PluginInvocationSuccess { payload, .. }) = hub
+        .invoke_plugin(invocation(handler, serde_json::json!({ "a": 2 })))
+        .result
+    else {
+        panic!("an invocation without a caller should complete");
+    };
+    let payload = payload.expect("lua response payload").0;
+    assert_eq!(payload["has_request"], false);
+    assert_eq!(payload["arguments"]["a"], 2);
+}
+
 #[test]
 fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() {
     let registry = install_spawn_target_reader_registry("spawn-target-reader");

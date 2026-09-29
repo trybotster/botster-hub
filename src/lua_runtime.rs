@@ -1949,8 +1949,8 @@ impl PluginRuntime for LuaPluginRuntime {
     }
 }
 
-/// `{ caller = { session_id = "<session>" } }` for an MCP tool call made by
-/// a session, `None` for every other invocation.
+/// `{ caller = { hub_id = "<hub>", session_id = "<session>" } }` for an MCP
+/// tool call made by a session, `None` for every other invocation.
 fn mcp_tool_caller_table(
     lua: &Lua,
     request: &PluginInvocationRequest,
@@ -1963,6 +1963,15 @@ fn mcp_tool_caller_table(
     };
     let caller = lua.create_table()?;
     caller.set("session_id", session_id.0.as_str())?;
+    if let Some(hub_id) = request
+        .context
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.0.get("caller_hub_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        caller.set("hub_id", hub_id)?;
+    }
     let table = lua.create_table()?;
     table.set("caller", caller)?;
     Ok(Some(table))

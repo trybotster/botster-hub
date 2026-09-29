@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -15,6 +17,7 @@ use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_HANDSHAKE_TIMEOUT, DAEMON_INCOMPLETE_FRAME_TIMEOUT,
 };
 use crate::daemon::control::message::ControlSender;
+use crate::transport::http_mcp::audit::ToolAudit;
 use crate::transport::http_mcp::tools::{Dispatched, dispatch};
 use crate::transport::http_mcp::wire::{
     AdmittedHead, MAX_HEADER_BLOCK_BYTES, Method, Refusal, admit_head, head_end, refusal_response,
@@ -43,6 +46,7 @@ pub(crate) async fn serve_connection(
     mut stream: TcpStream,
     port: u16,
     control_tx: ControlSender,
+    audit: Arc<ToolAudit>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     // Bytes read past one request belong to the next.
@@ -65,10 +69,13 @@ pub(crate) async fn serve_connection(
             return;
         }
         let keep_alive = request.head.keep_alive;
-        let dispatched = tokio::select! {
-            dispatched = dispatch(&control_tx, &request.head.token, &request.body) => dispatched,
+        let (dispatched, record) = tokio::select! {
+            served = dispatch(&control_tx, &request.head.token, &request.body) => served,
             _ = shutdown_rx.changed() => return,
         };
+        if let Some(record) = record {
+            audit.append(&request.head.token, &record).await;
+        }
         let bytes = match dispatched {
             Dispatched::Body(body) => response_bytes(200, "OK", &[], &body, keep_alive),
             Dispatched::Accepted => {

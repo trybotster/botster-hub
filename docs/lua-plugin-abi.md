@@ -2,7 +2,7 @@
 
 `botster-hub` loads local package entrypoints declared as Lua through
 `HubRuntime::load_lua_plugin_package`. The entrypoint executes behind
-`botster_core::PluginRuntime`; plugin code does not run in `mcp-serve` or in a
+`botster_core::PluginRuntime`; plugin code does not run in the MCP HTTP transport or in a
 second MCP dispatcher.
 
 ## Initial ABI
@@ -488,12 +488,12 @@ module access.
 
 Lua-provided tools are listed and called through the existing
 `McpToolRegistry`. The plugin MCP provider delegates to daemon requests against
-the running `HubRuntime`; `mcp-serve` does not load plugin files or hold Lua VM
+the running `HubRuntime`; the MCP HTTP transport does not load plugin files or hold Lua VM
 state.
 
 The production invocation path is:
 
-`mcp-serve -> McpToolRegistry -> PluginHubToolProvider -> daemon request -> HubRuntime -> HubPluginLifecycle -> botster_core::PluginWorkerEngine -> LuaPluginRuntime`.
+`HTTP MCP -> daemon control (PluginMcpCallTool) -> HubRuntime -> HubPluginLifecycle -> botster_core::PluginWorkerEngine -> LuaPluginRuntime`.
 
 ## Unsupported Monolith Primitives
 
@@ -516,3 +516,13 @@ Lua execution currently has an instruction-count guard. If a handler exceeds
 the budget, invocation returns a structured plugin handler failure. Memory
 accounting, per-plugin restart/quarantine policy, and full resource ledgers are
 not implemented in this slice.
+
+## MCP tool handlers and the caller
+
+A handler registered for an MCP tool is called with the tool arguments as its
+first argument. When a session called the tool over HTTP MCP, the handler also
+receives a second argument, `request`, and `request.caller.session_id` and
+`request.caller.hub_id` name the session that the bearer token proved and its
+hub (a session id alone is never meaningful across hubs). A handler that takes only its
+arguments is unaffected. A tool called without a session (an operator or an
+internal call) gets no second argument.

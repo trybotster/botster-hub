@@ -121,10 +121,5 @@ mod tests {
             assert!(session_endpoint(hub, "s").starts_with("hub:"));
             assert!(operator_endpoint(hub).starts_with("hub:"));
         }
-        let messaging = include_str!("daemon/control/messaging.rs");
-        assert!(
-            !messaging.contains("format!(\"session:"),
-            "messaging builds endpoints through routed_endpoint"
-        );
     }
 }

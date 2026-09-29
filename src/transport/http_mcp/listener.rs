@@ -20,6 +20,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::admission::budgets::DAEMON_MAX_CONNECTIONS;
 use crate::daemon::control::message::ControlSender;
+use crate::transport::http_mcp::audit::ToolAudit;
 use crate::transport::http_mcp::connection::serve_connection;
 
 /// File in the data directory that records the listener's port.
@@ -105,8 +106,10 @@ impl BoundMcpHttp {
     pub(crate) async fn serve(
         self,
         control_tx: ControlSender,
+        audit: ToolAudit,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
+        let audit = Arc::new(audit);
         let port = self.endpoint.port;
         let Ok(listener) = TcpListener::from_std(self.listener) else {
             eprintln!("botster-hub mcp http listener could not register with the runtime");
@@ -124,9 +127,10 @@ impl BoundMcpHttp {
                             continue;
                         };
                         let control_tx = control_tx.clone();
+                        let audit = Arc::clone(&audit);
                         let shutdown_rx = shutdown_rx.clone();
                         tokio::spawn(async move {
-                            serve_connection(stream, port, control_tx, shutdown_rx).await;
+                            serve_connection(stream, port, control_tx, audit, shutdown_rx).await;
                             drop(permit);
                         });
                     }
