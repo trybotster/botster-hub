@@ -167,3 +167,94 @@ fn a_restart_of_an_unknown_running_or_unrecorded_session_is_refused_with_its_cod
     drop(sessions);
     shutdown_cli_daemon(&data_dir, child);
 }
+
+fn session_frame_is_current(frame: &botster_hub_client::DaemonEntityFrame, session_id: &str) -> bool {
+    let fields = match frame {
+        botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. } if id == session_id => entity,
+        botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. } if id == session_id => patch,
+        _ => return false,
+    };
+    fields.get("lifecycle_class").and_then(serde_json::Value::as_str) == Some("current")
+}
+
+/// An ended session-type session restarts under the same id: its entity goes
+/// from ended to current with no removal in between, its context equals the
+/// original, and the restartable flag turns false again.
+#[test]
+fn a_restart_runs_the_same_session_id_again_with_its_context_and_no_removal() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("restart-same-id");
+    let package_root = unique_test_dir("restart-same-id-package");
+    write_session_type_context_package(&package_root);
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable session type package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    let mut sessions =
+        botster_hub_client::subscribe_entities(&socket_endpoint(&data_dir), "session", "restart-same-id")
+            .expect("subscribe to sessions");
+
+    let session_id = "restart-same-id-session";
+    let spawned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "init".to_string(),
+            session_id: session_id.to_string(),
+            request: botster_hub::DaemonSessionTypeRequest {
+                context: botster_hub::DaemonSessionTypeContextInput {
+                    prompt: Some("restart me".to_string()),
+                    ..botster_hub::DaemonSessionTypeContextInput::default()
+                },
+                ..botster_hub::DaemonSessionTypeRequest::default()
+            },
+        },
+    )
+    .expect("spawn session type");
+    assert_eq!(spawned.kind, botster_hub::DaemonResponseKind::Spawned, "{spawned:?}");
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_restartable(frame, session_id)
+    });
+
+    let mut removed_seen = false;
+    let restarted = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::RestartSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("restart the ended session");
+    assert_eq!(restarted.kind, botster_hub::DaemonResponseKind::Spawned, "{restarted:?}");
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        if matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Remove { id, .. } if id == session_id
+        ) {
+            removed_seen = true;
+        }
+        session_frame_is_current(frame, session_id)
+    });
+    assert!(!removed_seen, "a restart never removes the session entity");
+
+    let context = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReadSessionContext {
+            session_id: session_id.to_string(),
+            context_id: None,
+            key: Some("prompt".to_string()),
+        },
+    )
+    .expect("read the restarted session context");
+    assert_eq!(context.kind, botster_hub::DaemonResponseKind::SessionContext, "{context:?}");
+    assert!(format!("{context:?}").contains("restart me"), "{context:?}");
+    // The record is kept, so the session can be restarted again once it ends.
+    let state = hub_state_json(&data_dir);
+    assert!(state["restart_records"].get(session_id).is_some(), "{state}");
+    drop(sessions);
+    shutdown_cli_daemon(&data_dir, child);
+}
