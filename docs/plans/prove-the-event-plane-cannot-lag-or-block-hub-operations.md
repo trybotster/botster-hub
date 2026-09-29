@@ -398,7 +398,7 @@ Router policy is configurable, not constant. `PackageEventPlaneOptions::default(
 | `crates/botster-hub-test-support/src/isolated_hub.rs` | `IsolatedHubBuilder` with per-child env |
 | `examples/event-plane-producer`, `event-plane-consumer`, `event-plane-cycle`, `synthetic-plugin` | checked-in package-event fixtures |
 | `docs/hub-resource-proof.md`, `docs/lifecycle-suite-harness.md`, `docs/loaded-daemon-lifecycle-runner.md` | the top-level proof-contract doc tier this campaign joins |
-| `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json` | the machine-readable campaign-evidence schema to mirror |
+| `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json@2a61d032` | the machine-readable campaign-evidence schema to mirror |
 
 Baseline commands already executed in this worktree at `b3b54f1`:
 
@@ -454,7 +454,7 @@ This ticket is therefore not test-only. It needs a bounded production observabil
 
 **Finding 2 — the North Star publishes no numeric terminal input or output budget.**
 
-The ticket's acceptance says terminal input and output must "stay within their existing North Star budgets." No such number exists. `docs/plans/prove-the-terminal-transport-north-star-across-core-hub-web-and-tui.md` publishes behavioural oracles (identity, ordering, bytes, late-attach history, resize, input, cancellation, reconnect, exit, connection loss, session types) and the rule that Hub cannot inspect terminal bodies. The only numeric terminal-adjacent limits are the Core-owned write budget, whose threshold lives in Core, and the WebRTC 64 KiB plaintext chunk with a 16 MiB declared delivery cap (`docs/client-protocol.md:662`). `docs/client-protocol.md:1189` states explicitly that the many-PTY session counts "are bounded correctness cases, not performance targets or benchmark claims." `README.md` contains no performance, latency, throughput, or scale claim.
+The ticket's acceptance says terminal input and output must "stay within their existing North Star budgets." No such number exists. `docs/plans/prove-the-terminal-transport-north-star-across-core-hub-web-and-tui.md@2a61d032` publishes behavioural oracles (identity, ordering, bytes, late-attach history, resize, input, cancellation, reconnect, exit, connection loss, session types) and the rule that Hub cannot inspect terminal bodies. The only numeric terminal-adjacent limits are the Core-owned write budget, whose threshold lives in Core, and the WebRTC 64 KiB plaintext chunk with a 16 MiB declared delivery cap (`docs/client-protocol.md:662`). `docs/client-protocol.md:1189` states explicitly that the many-PTY session counts "are bounded correctness cases, not performance targets or benchmark claims." `README.md` contains no performance, latency, throughput, or scale claim.
 
 Assumption A1 in section 8 records how this plan resolves that.
 
@@ -762,7 +762,7 @@ Plan Review `finding_1787278903_320205` found that sections 5F, 5G.3, 5G.6, 7, a
 
 The report must state plainly that the Hub workflow executes no client or package code, and that the cited revisions are the merged state that makes the boundary claim true rather than artifacts this campaign ran. That satisfies the ticket's requirement to use all five main revisions without pretending the campaign executed them.
 
-The JSON keeps the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json` for both blocks, under `executed_revisions` and `cited_prerequisite_revisions`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`.
+The JSON keeps the flat-SHA `revisions` shape of `docs/reports/bounded-hub-resources-fresh-campaign-evidence.json@2a61d032` for both blocks, under `executed_revisions` and `cited_prerequisite_revisions`, plus the runner `provenance` block from `docs/reports/focused-ubuntu-idle-cpu-resource-bound-evidence.json`.
 
 ## 6. Repository ownership boundaries and cross-repo dependencies
 
@@ -822,7 +822,7 @@ Consumer note for that ticket: this ticket `ticket_1786663585_879846` depends on
 - No new transport, request vocabulary change, `PROTOCOL_VERSION` bump, or conformance-fixture revision bump.
 - **This run edits and executes only botster-hub against its locked Core.** It changes no file in botster-core, botster-web, botster-tui, botster-tui-kit, or botster-project-pipelines, checks none of them out, installs none of them, and drives none of their harnesses. Client and package repositories **are** prerequisites as merged state (section 5G.3), and their merged revisions are cited but not executed (section 5G.6). Those two statements are scoped differently and do not conflict.
 - No real `botster-project-pipelines` package is installed, and no bound product run, shared `north-star-shared` session, or cross-client identity join is created. Note the precise claim: a prerequisite in that repository **does** change it (`ticket_1787278658_151737`); this campaign neither changes nor executes it.
-- No `--test-threads=1`, no `serial_test`, and no nextest. Repository policy forbids serialization as acceptance evidence (`docs/plans/isolate-lifecycle-suite-workers-and-host-resources.md:154`).
+- No `--test-threads=1`, no `serial_test`, and no nextest. Repository policy forbids serialization as acceptance evidence (`docs/plans/isolate-lifecycle-suite-workers-and-host-resources.md@2a61d032:154`).
 - No retry loop that discards a red repetition.
 - No change to `run_many_pty_client_attach_conformance` or its published session counts.
 
@@ -873,8 +873,8 @@ The vault rule that wall-clock durations are observations rather than gates ([[c
 | `docs/event-plane-load-proof.md` | published budget contract, machine profile, formulas, verdict rules |
 | `tests/hub_daemon_lifecycle/event_plane_saturation.rs` | the campaign lanes |
 | `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-calibration.json` | committed calibration dataset and derived immutable thresholds (section 5A phase 1) |
-| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md` | narrative report; must keep coexistence budgets and the North Star behavioural contract distinct |
-| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json` | machine-readable acceptance evidence, seven-key `revisions` object plus runner `provenance` |
+| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-implement.md@2a61d032` | narrative report; must keep coexistence budgets and the North Star behavioural contract distinct |
+| `docs/reports/prove-the-event-plane-cannot-lag-or-block-hub-operations-evidence.json@2a61d032` | machine-readable acceptance evidence, seven-key `revisions` object plus runner `provenance` |
 
 ### Modified
 
