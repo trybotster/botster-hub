@@ -81,6 +81,7 @@ pub mod package_event_router;
 pub(crate) mod package_event_schema;
 pub mod packages;
 pub mod persistence;
+mod plugin_caller;
 pub(crate) mod plugin_entity;
 pub(crate) mod plugin_logs;
 pub(crate) mod plugin_response;
