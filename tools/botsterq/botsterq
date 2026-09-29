@@ -41,6 +41,10 @@ export TS_SOCKET="$state/queue.sock"
 default_slots=2
 kill_grace_seconds=${BOTSTERQ_KILL_GRACE:-10}
 exclusive_deadline_seconds=${BOTSTERQ_EXCLUSIVE_DEADLINE:-2700}
+# The one setting for the per-worktree target cap, in GB (PROVISIONAL, awaiting
+# the user's confirmation; 0 turns it off). A job whose directory has a cargo
+# ./target above the cap gets `cargo clean` there before its command starts.
+export BOTSTERQ_TARGET_CAP_GB=${BOTSTERQ_TARGET_CAP_GB:-15}
 # Resolve symlinks (~/.local/bin/botsterq links to the installed copy), so the
 # job supervisor next to this script is found.
 self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
