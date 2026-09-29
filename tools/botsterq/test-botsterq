@@ -672,6 +672,45 @@ before=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
 after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
 [ "$codeDLB" = 2 ] && [ "$before" = "$after" ] && pass "a bad deadline is refused before admission (run exit 2)" || fail "bad deadline" "run=$codeDLB before=$before after=$after"
 
+# 19b. Target cap. A job whose directory is a cargo workspace with a target/
+#     above the cap gets `cargo clean --target-dir target` there before its
+#     command starts, and one line says so; under the cap, or with the cap off,
+#     nothing happens; only that directory's ./target is ever cleaned (never
+#     another worktree's, never a CARGO_TARGET_DIR, never a directory without
+#     a Cargo.toml).
+make_project() {
+  mkdir -p "$1/src" "$1/target/debug"
+  printf '[package]\nname = "capfixture"\nversion = "0.1.0"\nedition = "2021"\n' >"$1/Cargo.toml"
+  : >"$1/src/lib.rs"
+  dd if=/dev/zero of="$1/target/debug/big" bs=1048576 count=3 2>/dev/null
+}
+make_project "$work/capA"
+make_project "$work/capB"
+mkdir -p "$work/capC/target"; dd if=/dev/zero of="$work/capC/target/big" bs=1048576 count=3 2>/dev/null   # no Cargo.toml
+"$Q" slots 2 >/dev/null
+# under the cap: nothing happens
+( cd "$work/capA" && BOTSTERQ_TARGET_CAP_GB=1 "$Q" run --label CapUnder -- sh -c 'test -e target/debug/big && echo kept' >"$work/capunder.out" 2>"$work/capunder.err" )
+[ "$(cat "$work/capunder.out")" = kept ] && ! grep -q "cargo clean" "$work/capunder.err" \
+  && pass "under the target cap: nothing is cleaned, no message" || fail "cap under" "out=$(cat "$work/capunder.out") err=$(cat "$work/capunder.err")"
+# cap off (0): nothing happens
+( cd "$work/capA" && BOTSTERQ_TARGET_CAP_GB=0 "$Q" run --label CapOff -- sh -c 'test -e target/debug/big && echo kept' >"$work/capoff.out" 2>&1 )
+[ "$(cat "$work/capoff.out")" = kept ] && pass "a cap of 0 turns the clean off" || fail "cap off" "$(cat "$work/capoff.out")"
+# CARGO_TARGET_DIR set: the command builds elsewhere; ./target is left alone
+( cd "$work/capA" && CARGO_TARGET_DIR="$work/elsewhere" BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapEnv -- sh -c 'test -e target/debug/big && echo kept' >"$work/capenv.out" 2>&1 )
+[ "$(cat "$work/capenv.out")" = kept ] && pass "with CARGO_TARGET_DIR set, ./target is not cleaned" || fail "cap env" "$(cat "$work/capenv.out")"
+# no Cargo.toml: not a cargo workspace, nothing is cleaned
+( cd "$work/capC" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapNoCargo -- sh -c 'test -e target/big && echo kept' >"$work/capnc.out" 2>&1 )
+[ "$(cat "$work/capnc.out")" = kept ] && pass "a directory without Cargo.toml is not cleaned" || fail "cap no cargo" "$(cat "$work/capnc.out")"
+# over the cap: cleaned before the command starts, one line, an event, and the
+# other worktree is untouched
+rm -f "$BOTSTERQ_HOME/events.log"
+( cd "$work/capA" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapOver -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capover.out" 2>"$work/capover.err" )
+lines=$(grep -c "above the 0.001 GB cap" "$work/capover.err")
+[ "$(cat "$work/capover.out")" = cleaned ] && [ "$lines" = 1 ] && [ -e "$work/capB/target/debug/big" ] && [ -e "$work/capC/target/big" ] \
+  && grep -q "^clean	" "$BOTSTERQ_HOME/events.log" \
+  && pass "over the target cap: cargo clean runs before the command, one message, an events line; other worktrees untouched" \
+  || fail "cap over" "out=$(cat "$work/capover.out") lines=$lines B=$([ -e "$work/capB/target/debug/big" ] && echo kept || echo GONE) events=$(cat "$BOTSTERQ_HOME/events.log" 2>/dev/null | tr '\t' ' ')"
+
 # 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.
 leaked() { ps -axo pid=,command= | grep -F -- "botsterq-job $BOTSTERQ_HOME/" | grep -v grep; }
