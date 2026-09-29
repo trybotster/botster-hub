@@ -4106,7 +4106,7 @@ if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
   process.exit(45);
 }
 
-// Host-control protocol 12 Unix framing: [u32 LE frame_len][u8 container][payload].
+// Host-control protocol 14 Unix framing: [u32 LE frame_len][u8 container][payload].
 const UNIX_CONTAINER_CONTROL = 1;
 
 function encodeControlFrame(frame) {
@@ -4183,7 +4183,7 @@ stream.write(encodeControlFrame({
     protocol: 'botster-hub-daemon-v1',
     compatibility: {
       protocol: 'botster-hub-daemon-v1',
-      protocol_version: 12,
+      protocol_version: 14,
       required_features: [],
       minimum_conformance_fixture_revision: 53,
       client_name: 'foreground-terminal-app-open-fixture',

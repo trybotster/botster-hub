@@ -4,7 +4,7 @@
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
 //!
-//! # Host-control protocol 12
+//! # Host-control protocol 14
 //!
 //! Every frame on the Unix socket is one length-prefixed container:
 //!
@@ -55,7 +55,7 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const CONFORMANCE_FIXTURE_REVISION: u16 = 53;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
@@ -2296,7 +2296,7 @@ impl DaemonRequest {
             Self::SubscribeEvents { .. } => "subscribe_events",
             Self::UnsubscribeEvents { .. } => "unsubscribe_events",
             Self::RemoveSession { .. } => "remove_session",
-            Self::Whoami { .. } => "whoami",
+            Self::Whoami => "whoami",
             Self::PostMessage { .. } => "post_message",
             Self::ReceiveMessages { .. } => "receive_messages",
             Self::AckMessage { .. } => "ack_message",
@@ -5621,18 +5621,18 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twelve_rejects_protocol_eleven_and_pins_the_conformance_floor() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn protocol_fourteen_rejects_protocol_thirteen_and_pins_the_conformance_floor() {
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
-        let protocol_eleven = DaemonCompatibilityRequirement {
-            protocol_version: 11,
+        let protocol_thirteen = DaemonCompatibilityRequirement {
+            protocol_version: 13,
             minimum_conformance_fixture_revision: 51,
             ..DaemonCompatibilityRequirement::current()
         };
-        let error = ensure_compatible(&protocol_eleven, &DaemonCompatibility::current())
-            .expect_err("protocol-11 client must fail closed against protocol 12");
-        assert!(error.diagnostic.contains("unsupported protocol version 12"));
+        let error = ensure_compatible(&protocol_thirteen, &DaemonCompatibility::current())
+            .expect_err("protocol-13 client must fail closed against protocol 14");
+        assert!(error.diagnostic.contains("unsupported protocol version 14"));
 
         let hub_at_fifty_two = DaemonCompatibility {
             conformance_fixture_revision: 52,
@@ -5642,7 +5642,7 @@ mod tests {
             &DaemonCompatibilityRequirement::current(),
             &hub_at_fifty_two,
         )
-        .expect_err("a protocol-12 client at the current floor rejects a revision-52 Hub");
+        .expect_err("a protocol-14 client at the current floor rejects a revision-52 Hub");
     }
 
     #[test]
@@ -5702,7 +5702,7 @@ mod tests {
                 "| { frame: \"response\"; request_id: string; response: DaemonResponse }"
             )
         );
-        assert!(generated.contains("export const PROTOCOL_VERSION = 12;"));
+        assert!(generated.contains("export const PROTOCOL_VERSION = 14;"));
         assert!(generated.contains("export const MAX_OUTSTANDING_REQUESTS = 32;"));
     }
 
@@ -6307,7 +6307,7 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
     }
@@ -7529,7 +7529,7 @@ mod tests {
             DaemonRequest::SubscribeEvents { .. } => "subscribe_events",
             DaemonRequest::UnsubscribeEvents { .. } => "unsubscribe_events",
             DaemonRequest::RemoveSession { .. } => "remove_session",
-            DaemonRequest::Whoami { .. } => "whoami",
+            DaemonRequest::Whoami => "whoami",
             DaemonRequest::PostMessage { .. } => "post_message",
             DaemonRequest::ReceiveMessages { .. } => "receive_messages",
             DaemonRequest::AckMessage { .. } => "ack_message",
@@ -8682,8 +8682,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twelve_and_conformance_fifty_two_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn protocol_fourteen_and_conformance_fifty_three_define_the_cold_cut_boundary() {
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
 
         let requirement = DaemonCompatibilityRequirement::current();
@@ -8737,7 +8737,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 12);
+        assert_eq!(stale.compatibility.protocol_version, 14);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -8745,9 +8745,9 @@ mod tests {
     #[test]
     fn additive_session_type_definition_read_rides_the_conformance_floor() {
         // `ensure_compatible` compares protocol version with exact equality and
-        // conformance revision with a floor. Protocol 11 is a cold cut, so the
+        // conformance revision with a floor. Protocol 14 is a cold cut, so the
         // default floor equals the current revision.
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(
@@ -8796,7 +8796,7 @@ mod tests {
             ..DaemonCompatibilityRequirement::current()
         };
         ensure_compatible(&pinned_at_fifty_two, &DaemonCompatibility::current()).expect(
-            "a protocol-12 client pinned at conformance 52 accepts a revision-53 Hub: log_id is additive",
+            "a protocol-14 client pinned at conformance 52 accepts a revision-53 Hub: log_id is additive",
         );
 
         assert_eq!(
