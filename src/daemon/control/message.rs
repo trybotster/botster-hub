@@ -157,6 +157,8 @@ pub(crate) enum ControlMessage {
     EntityPublishProgress,
     /// A Lua worker queued one managed worktree and session spawn operation.
     ManagedSessionSpawnQueued,
+    /// One plugin read the owner answers (a request, not a doorbell).
+    PluginHostCall(Box<crate::plugin_host_call::PluginHostRequest>),
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
