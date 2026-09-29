@@ -9,7 +9,7 @@ This directory contains the published `rtc 0.21.0-rc.1` crate with two local rep
 - The directory preserves `LICENSE-APACHE` and `LICENSE-MIT` without changes.
 - The package version and public function signatures remain unchanged.
 
-The rest of the `rtc` family is consumed unmodified from crates.io at the same version.
+`rtc-sctp` is not vendored. The Hub takes it, with `rtc-shared`, from the `trybotster/rtc` fork: upstream revision `51558ffb` plus one commit (Repair 4: a stream id is reusable only after both directions of its reset complete). Its regression test, `tests/data_channel_stream_id_reuse_rtc2rtc.rs`, lives here. The rest of the `rtc` family is consumed unmodified from crates.io at the same version.
 `Cargo.lock` records these checksums for the family members this crate depends on:
 
 | crate | sha256 |
@@ -86,6 +86,7 @@ The repair changes no signature and no queue.
 Changed upstream files:
 
 - `src/peer_connection/handler/sctp.rs`: `forward_association_event` shared by `handle_read` and `resume_pending_reads`; the two terminal arms in `drain_stream`; the event forward after a resumed drain; the readiness wake in `poll_timeout`; and tests for the immediate drain with a reset that overtook its data, the parked drain with a reset deferred against parked data (payload sequence, cleared entry, the close forwarded without another datagram, the wake while that close waits, and the wake cleared once it is consumed), a stale parked entry for a missing stream, and an unrelated `ErrShortBuffer` that must still fail the read. The two drain tests run with a read budget above one.
+- Repair 4 (`rtc-sctp`) keeps a remotely reset stream registered until the peer answers our answering reset. The two drain tests therefore assert that the stream is still registered and that no close is reported after the drain, then deliver the peer's answer (`deliver_reset_answer`: the client flushes its reset, the server answers, the client reads the answer) and assert that the stream is gone and that the close is reported once. The wake assertions in the parked test are unchanged and still pass.
 - The immediate-path test asserts a data count and a close count on two separate queues. It does not prove public data-before-close ordering; that proof belongs to the peer-connection boundary and the real-peer tests.
 
 ## Repair 3: receive-side close barrier at the public queue boundary
@@ -123,7 +124,7 @@ Hub client and test-support do not depend on the Hub runtime crate.
 A consumer that embeds the Hub runtime from another workspace must select this patch explicitly.
 
 This crate is excluded from the Hub workspace and is also patched by path, so Cargo cannot test it in place.
-Tests run from a disposable copy of this directory with an empty `[workspace]` table appended to its `Cargo.toml`.
+Tests run from a disposable copy of this directory with an empty `[workspace]` table appended to its `Cargo.toml`, and a `[patch.crates-io]` entry that points `rtc-sctp` and `rtc-shared` at the `trybotster/rtc` fork, as the Hub root `Cargo.toml` does (without it, the copy tests against the unrepaired published `rtc-sctp`).
 The Hub strict gate lints Hub workspace members, not this crate.
 
 Validation results belong in the Hub implementation report. Source preparation alone is not delivery proof.
