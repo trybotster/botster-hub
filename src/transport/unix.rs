@@ -3,6 +3,7 @@ pub(crate) mod connection;
 pub(crate) mod host_write_order;
 pub(crate) mod listener;
 pub(crate) mod mux_write;
+pub(crate) mod route_socket;
 #[cfg(test)]
 pub(crate) mod test_harness;
 
