@@ -2084,7 +2084,12 @@ impl HubRuntime {
         call: crate::McpCallRequest,
     ) -> Result<serde_json::Value, crate::McpToolError> {
         let request_id = RequestId(format!("mcp-tool-{}", call.name));
-        let request = self.prepare_plugin_mcp_tool(call, request_id, None)?;
+        let request = self.prepare_plugin_mcp_tool(
+            call,
+            request_id,
+            None,
+            crate::plugin_caller::PluginCaller::Operator,
+        )?;
         Self::complete_plugin_mcp_tool(self.invoke_plugin(request).result)
     }
 
@@ -2094,6 +2099,7 @@ impl HubRuntime {
         call: crate::McpCallRequest,
         request_id: RequestId,
         client_id: Option<ClientId>,
+        caller: crate::plugin_caller::PluginCaller,
     ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let descriptor = self
             .plugin_lifecycle()
@@ -2126,7 +2132,7 @@ impl HubRuntime {
                 subscription_id: None,
                 surface_id: None,
                 origin: Some("mcp-serve".to_string()),
-                metadata: None,
+                metadata: caller.to_metadata(),
             },
             payload: botster_core::BoundaryJson(call.arguments),
         })
