@@ -1385,12 +1385,7 @@ fn serve_daemon_inner(
     prepare_socket_path(&socket_path, &socket_owner)?;
     let route_dir =
         Arc::new(crate::transport::unix::route_socket::RouteSocketDir::create(&socket_path)?);
-    let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
-    crate::transport::unix::listener::restrict_socket_to_owner(&socket_path)
-        .map_err(DaemonTransportError::Io)?;
-    listener
-        .set_nonblocking(true)
-        .map_err(DaemonTransportError::Io)?;
+    let listener = crate::transport::unix::listener::bind_control_socket(&socket_path)?;
 
     let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
     let (shutdown_tx, _) = watch::channel(false);
