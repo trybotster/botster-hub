@@ -109,6 +109,14 @@ impl OwnerSignal {
         self.doorbell.notify_one();
     }
 
+    /// A wait on `seen`, to re-check without knowing who raised its key.
+    pub(crate) fn parked(self: &Arc<Self>, seen: Seen) -> Parked {
+        Parked {
+            signal: Arc::clone(self),
+            seen,
+        }
+    }
+
     /// Read `key`'s epoch. Call it before the final attempt on the state.
     pub(crate) fn seen(&self, key: SignalKey) -> Seen {
         Seen {

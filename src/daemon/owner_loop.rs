@@ -416,6 +416,14 @@ pub(crate) fn mark_event_owner_ready(state: &mut DaemonControlState) {
 
 /// Mark every parked request whose lock was released since it parked.
 pub(crate) fn mark_signaled_requests(state: &mut DaemonControlState) {
+    for waiter in state.plugin_entities.take_moved_signal_waiters() {
+        crate::daemon::control::entities::mark_plugin_entity_ready(
+            state,
+            waiter,
+            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            crate::daemon::control::pending::READY_HOST_COMPLETION,
+        );
+    }
     if state.signal_request_waits.is_empty() {
         return;
     }
@@ -8249,6 +8257,204 @@ return botster.register({
             transport_request_id,
         );
         finish_async_plugin_control(daemon, state, reply_rx)
+    }
+
+    /// Core reports lock contention on the provider admission. The client gets
+    /// no refusal: the waiter parks on the plugin engine, retries nothing until
+    /// the epoch moves, and is admitted again once.
+    #[test]
+    fn a_contended_entity_admission_parks_and_retries_once_per_engine_release() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
+        let root = unique_package_control_dir("entity-admission-contended");
+        let package_dir = root.join("owner-entity-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-entity-gate",
+            serde_json::json!({
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        write_controlled_entity_gate_lua_plugin(&package_dir);
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-entity-gate".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        daemon
+            .runtime()
+            .unwrap()
+            .set_test_forced_admission(Some(crate::runtime::ForcedAdmission::LockBusy));
+        let (frame_tx, _frame_rx) = tokio_mpsc::channel(8);
+        let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
+        crate::daemon::control::entities::handle(
+            &mut daemon,
+            &mut state,
+            ControlMessage::SubscribeEntities {
+                entity_type: "owner-entity-gate.entity".into(),
+                subscription_id: "contended".into(),
+                transport_request_id: None,
+                client_id: Some("contended-client".into()),
+                frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                frame_rx: None,
+                reply_tx,
+                grant_id: None,
+            },
+        );
+        // timer: deadline — the test hang guard; progress arrives as owner work.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut drive = |daemon: &mut HubDaemon, state: &mut DaemonControlState| {
+            collect_entity_test_host_completions(daemon, state);
+            if let Some(item) = state.owner_ready.pop_next() {
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                assert!(!dispatch_owner_ready_item(daemon, state, item, &mut budget));
+            }
+            thread::yield_now();
+        };
+        while state.plugin_entities.signal_waiter_count() == 0 {
+            drive(&mut daemon, &mut state);
+            assert!(Instant::now() < deadline, "contention must park the waiter");
+        }
+        assert!(reply_rx.try_recv().is_err(), "contention is not a refusal");
+        // A different refusal exposes any retry that happens without a release.
+        let runtime = daemon.runtime().unwrap();
+        runtime.set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+        for _ in 0..200 {
+            drive(&mut daemon, &mut state);
+        }
+        assert!(reply_rx.try_recv().is_err(), "no retry without a release");
+        assert_eq!(state.plugin_entities.signal_waiter_count(), 1);
+        // One release admits the waiter once; the new outcome reaches the client.
+        let runtime = daemon.runtime().unwrap();
+        runtime
+            .owner_signal()
+            .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        mark_signaled_requests(&mut state);
+        let reply = loop {
+            drive(&mut daemon, &mut state);
+            if let Ok(reply) = reply_rx.try_recv() {
+                break reply;
+            }
+            assert!(Instant::now() < deadline, "the released waiter must run");
+        };
+        let response = reply.into_parts().0.unwrap();
+        assert_eq!(
+            response.error.unwrap().code,
+            "plugin_invocation_backpressured"
+        );
+        assert_eq!(state.plugin_entities.signal_waiter_count(), 0);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The same rule for a plugin control request (an MCP tool call).
+    #[test]
+    fn a_contended_plugin_control_admission_parks_and_retries_once_per_engine_release() {
+        let root = unique_package_control_dir("control-admission-contended");
+        let package_dir = root.join("owner-publisher");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-publisher",
+            serde_json::json!({
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+return botster.register({
+  tools = {{
+    name = "owner-publisher.ping", description = "Ping.",
+    input_schema = { type = "object" }, handler = "ping",
+    call = function() return { ok = true } end,
+  }},
+})
+"#,
+        )
+        .unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-publisher".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .set_test_forced_admission(Some(crate::runtime::ForcedAdmission::LockBusy));
+        let mut reply_rx = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginMcpCallTool {
+                name: "owner-publisher.ping".into(),
+                arguments: serde_json::json!({}),
+            },
+            "contended-connection",
+            "contended-ping",
+        );
+        // timer: deadline — the test hang guard; progress arrives as owner work.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.signal_request_waits.is_empty() {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "contention must park the request"
+            );
+        }
+        assert_eq!(state.signal_request_waits.len(), 1, "the request parked");
+        assert!(reply_rx.try_recv().is_err(), "contention is not a refusal");
+        // A different refusal exposes any retry that happens without a release.
+        daemon
+            .runtime()
+            .unwrap()
+            .set_test_forced_admission(Some(crate::runtime::ForcedAdmission::Backpressured));
+        for _ in 0..200 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+        }
+        assert!(reply_rx.try_recv().is_err(), "no retry without a release");
+        assert_eq!(state.signal_request_waits.len(), 1);
+        daemon
+            .runtime()
+            .unwrap()
+            .owner_signal()
+            .raise(crate::daemon::owner_signal::SignalKey::PluginEngine);
+        mark_signaled_requests(&mut state);
+        // The refusal is a plain reply, not a worker-encoded one.
+        let reply = loop {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            if let Ok(reply) = reply_rx.try_recv() {
+                break reply;
+            }
+            assert!(Instant::now() < deadline, "the released request must run");
+        };
+        assert_eq!(
+            reply.into_parts().0.unwrap().error.unwrap().code,
+            "plugin_invocation_backpressured"
+        );
+        assert!(state.signal_request_waits.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

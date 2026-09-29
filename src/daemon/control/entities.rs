@@ -89,6 +89,9 @@ pub(crate) struct PluginEntityState {
     ready: VecDeque<crate::owner_identity::WaiterId>,
     completion_inconsistencies: u64,
     capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    /// Waiters parked on a plugin-engine release after Core reported lock
+    /// contention. The owner marks each ready when its epoch moves.
+    signal_waiters: BTreeMap<crate::owner_identity::WaiterId, crate::daemon::owner_signal::Parked>,
     pub(crate) causal_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) model_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     causal_faults: BTreeSet<crate::owner_identity::WaiterId>,
@@ -442,6 +445,26 @@ impl PluginEntityState {
             .and_then(|request| self.pending.get(request))
             .and_then(|entry| entry.invocation.as_ref())
             .and_then(|invocation| invocation.causal_lease)
+    }
+
+    /// Waiters whose plugin-engine wait moved; they leave the wait set.
+    pub(crate) fn take_moved_signal_waiters(&mut self) -> Vec<crate::owner_identity::WaiterId> {
+        let moved: Vec<_> = self
+            .signal_waiters
+            .iter()
+            .filter(|(_, parked)| parked.moved())
+            .map(|(waiter, _)| *waiter)
+            .collect();
+        for waiter in &moved {
+            self.signal_waiters.remove(waiter);
+        }
+        moved
+    }
+
+    /// Test only: waiters parked on a plugin-engine release.
+    #[cfg(test)]
+    pub(crate) fn signal_waiter_count(&self) -> usize {
+        self.signal_waiters.len()
     }
 
     pub(crate) fn has_capacity_waiters(&self) -> bool {
@@ -916,6 +939,7 @@ pub(crate) fn drive_plugin_entity_ready_item(
             }
             state.deadlines.retire(waiter_id);
             state.plugin_entities.capacity_waiters.remove(&waiter_id);
+            state.plugin_entities.signal_waiters.remove(&waiter_id);
             state.plugin_entities.causal_waiters.remove(&waiter_id);
             state.plugin_entities.model_waiters.remove(&waiter_id);
             state.plugin_entities.causal_faults.remove(&waiter_id);

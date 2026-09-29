@@ -118,6 +118,12 @@ pub(crate) struct Target {
 pub(crate) enum Completion {
     ProviderPrepared(ProviderRequestPlan),
     ProviderAdmitted(Option<McpToolError>),
+    /// Core reported lock contention. The plan comes back so the owner can
+    /// admit it again once the plugin-engine epoch moves past `seen`.
+    ProviderContended {
+        plan: ProviderRequestPlan,
+        seen: crate::daemon::owner_signal::Seen,
+    },
     Prepared {
         payload: Payload,
         family: Arc<String>,
@@ -335,11 +341,17 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             scope_id,
         } => {
             plan.set_scope(scope_id);
+            let seen = admission.engine_seen();
             let admission = admission.try_admit(
                 botster_core::PluginInvocationClass::RequestResponse,
-                plan.request,
+                plan.request.clone(),
             );
             use botster_core::PluginAdmissionResult;
+            // Contention is never a refusal to the client: the owner waits on
+            // the engine and admits the same plan again.
+            if matches!(admission, PluginAdmissionResult::LockBusy { .. }) {
+                return Completion::ProviderContended { plan, seen };
+            }
             let refusal = match admission {
                 PluginAdmissionResult::Queued { .. } => None,
                 PluginAdmissionResult::Backpressured { reason, .. } => {

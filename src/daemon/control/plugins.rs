@@ -569,32 +569,120 @@ fn start_plugin_control(
     let Some(runtime) = daemon.runtime() else {
         return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     };
-    match runtime.try_admit_plugin(PluginInvocationClass::RequestResponse, request) {
-        PluginAdmissionResult::Queued { .. } => {
-            state.plugin_controls.insert(
-                &request_id,
-                state.current_waiter_id.expect("owner waiter is assigned"),
-                identity.clone(),
-                kind,
-            );
-            state.maintenance.try_wake();
+    match admit_plugin_control(runtime, &request) {
+        ControlAdmission::Queued => {
+            let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+            queue_plugin_control(state, &request_id, waiter_id, &identity, kind);
             pending_plugin_control(request_id, identity)
         }
-        PluginAdmissionResult::Backpressured { reason, .. } => {
-            plugin_control_refused(&kind, "plugin_invocation_backpressured", reason)
+        ControlAdmission::Refused { code, reason } => plugin_control_refused(&kind, code, reason),
+        // Contention is never a refusal to the client: wait for the engine and
+        // admit the same request again.
+        ControlAdmission::Contended(parked) => {
+            contended_plugin_control(request, identity, kind, parked)
         }
-        PluginAdmissionResult::RejectedBudget { reason, .. } => {
-            plugin_control_refused(&kind, "plugin_invocation_rejected", reason)
-        }
-        PluginAdmissionResult::WorkerStopped { reason, .. } => {
-            plugin_control_refused(&kind, "plugin_worker_stopped", reason)
-        }
-        _ => plugin_control_refused(
-            &kind,
-            "plugin_invocation_rejected",
-            "the plugin worker refused the invocation".to_string(),
-        ),
     }
+}
+
+enum ControlAdmission {
+    Queued,
+    Refused { code: &'static str, reason: String },
+    Contended(crate::daemon::owner_signal::Parked),
+}
+
+/// One admission attempt. The engine epoch is read before it: Core arms its
+/// retry wake on lock contention, so a release after the read moves the epoch.
+fn admit_plugin_control(
+    runtime: &crate::HubRuntime,
+    request: &botster_core::PluginInvocationRequest,
+) -> ControlAdmission {
+    let seen = runtime
+        .owner_signal()
+        .seen(crate::daemon::owner_signal::SignalKey::PluginEngine);
+    match runtime.try_admit_plugin(PluginInvocationClass::RequestResponse, request.clone()) {
+        PluginAdmissionResult::Queued { .. } => ControlAdmission::Queued,
+        PluginAdmissionResult::LockBusy { .. } => {
+            ControlAdmission::Contended(runtime.owner_signal().parked(seen))
+        }
+        PluginAdmissionResult::Backpressured { reason, .. } => ControlAdmission::Refused {
+            code: "plugin_invocation_backpressured",
+            reason,
+        },
+        PluginAdmissionResult::RejectedBudget { reason, .. } => ControlAdmission::Refused {
+            code: "plugin_invocation_rejected",
+            reason,
+        },
+        PluginAdmissionResult::WorkerStopped { reason, .. } => ControlAdmission::Refused {
+            code: "plugin_worker_stopped",
+            reason,
+        },
+        _ => ControlAdmission::Refused {
+            code: "plugin_invocation_rejected",
+            reason: "the plugin worker refused the invocation".to_string(),
+        },
+    }
+}
+
+fn queue_plugin_control(
+    state: &mut DaemonControlState,
+    request_id: &RequestId,
+    waiter_id: crate::owner_identity::WaiterId,
+    identity: &PluginInvocationIdentity,
+    kind: PendingPluginControlKind,
+) {
+    state
+        .plugin_controls
+        .insert(request_id, waiter_id, identity.clone(), kind);
+    state.maintenance.try_wake();
+}
+
+/// A request that Core could not admit for lock contention. It parks on the
+/// engine epoch it read; the owner marks it ready when the epoch moves, and
+/// each poll admits it again, or parks it on the newer epoch. Once admitted it
+/// waits for its completion like any queued request.
+fn contended_plugin_control(
+    request: botster_core::PluginInvocationRequest,
+    identity: PluginInvocationIdentity,
+    kind: PendingPluginControlKind,
+    parked: crate::daemon::owner_signal::Parked,
+) -> ControlStep {
+    let request_id = request.request_id.clone();
+    let mut waiting = Some((request, kind));
+    let mut parked = Some(parked);
+    ControlStep::pending_in(ReadyClass::PluginCompletion, move |daemon, state| {
+        let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+        let Some((request, _)) = waiting.as_ref() else {
+            return poll_plugin_control(daemon, state, &request_id, &identity);
+        };
+        if let Some(wait) = parked.take()
+            && !wait.moved()
+        {
+            // Not the engine's release: keep waiting on the same epoch.
+            state.signal_request_waits.insert(waiter_id, wait);
+            return ControlPoll::Pending;
+        }
+        let Some(runtime) = daemon.runtime() else {
+            return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+        };
+        match admit_plugin_control(runtime, request) {
+            ControlAdmission::Queued => {
+                let (_, kind) = waiting.take().expect("the request is still waiting");
+                queue_plugin_control(state, &request_id, waiter_id, &identity, kind);
+                poll_plugin_control(daemon, state, &request_id, &identity)
+            }
+            ControlAdmission::Refused { code, reason } => {
+                let (_, kind) = waiting.take().expect("the request is still waiting");
+                match plugin_control_refused(&kind, code, reason) {
+                    ControlStep::Ready(result) => ControlPoll::Ready(result),
+                    ControlStep::Pending(_) => unreachable!("a refusal is a ready step"),
+                }
+            }
+            ControlAdmission::Contended(wait) => {
+                state.signal_request_waits.insert(waiter_id, wait);
+                ControlPoll::Pending
+            }
+        }
+    })
 }
 
 fn pending_plugin_control(
@@ -602,56 +690,66 @@ fn pending_plugin_control(
     identity: PluginInvocationIdentity,
 ) -> ControlStep {
     ControlStep::pending_in(ReadyClass::PluginCompletion, move |daemon, state| {
-        let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
-        if let Some(completion) = state.host_completions.remove(&waiter_id) {
-            let (_, result, permit) = completion.into_parts();
-            state.plugin_controls.retire(&request_id, &identity);
-            drop(permit);
-            return match result {
-                HostResult::PluginResponseAbandoned => {
-                    ControlPoll::Ready(Err(DaemonTransportError::ControlThreadStopped))
-                }
-                HostResult::PluginResponseDelivered { kind } => {
-                    ControlPoll::Ready(Ok(daemon_response_base(kind)))
-                }
-                HostResult::Failed { error, .. } => ControlPoll::Ready(Ok(
-                    daemon_plugin_tool_error(McpToolError::new(error.code, error.message)),
-                )),
-                _ => ControlPoll::Ready(Ok(daemon_plugin_tool_error(McpToolError::new(
-                    "host_completion_kind_mismatch",
-                    "the host returned an invalid plugin response outcome",
-                )))),
-            };
-        }
-        let Some(entry) = state.plugin_controls.pending.get_mut(&request_id.0) else {
-            return ControlPoll::Pending;
-        };
-        if let Some(failure) = entry.submission_failure.take() {
-            return ControlPoll::SubmitPluginHost(failure);
-        }
-        if entry.identity != identity || entry.result.is_none() || entry.kind.is_none() {
-            return ControlPoll::Pending;
-        }
-        let Some(runtime) = daemon.runtime() else {
-            return ControlPoll::Pending;
-        };
-        let Some(permit) = runtime.host_executor().try_reserve() else {
-            state.plugin_controls.capacity_waiters.insert(waiter_id);
-            return ControlPoll::Pending;
-        };
-        let (result, inconsistent) = match entry.result.take().expect("ready result exists") {
-            RoutedPluginControlCompletion::Invocation(result) => (result.map(Ok), false),
-            RoutedPluginControlCompletion::Inconsistent(result) => (result.map(Ok), true),
-        };
-        let input = PluginResponseInput {
-            kind: entry.kind.take().expect("ready kind exists"),
-            lifecycle: runtime.plugin_lifecycle_handle(),
-            result,
-            inconsistent,
-            transport_request_id: identity.transport_request_id.clone(),
-        };
-        ControlPoll::PreparePluginResponse(input, permit)
+        poll_plugin_control(daemon, state, &request_id, &identity)
     })
+}
+
+/// Advance a queued plugin request toward its response.
+fn poll_plugin_control(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    request_id: &RequestId,
+    identity: &PluginInvocationIdentity,
+) -> ControlPoll {
+    let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+    if let Some(completion) = state.host_completions.remove(&waiter_id) {
+        let (_, result, permit) = completion.into_parts();
+        state.plugin_controls.retire(request_id, identity);
+        drop(permit);
+        return match result {
+            HostResult::PluginResponseAbandoned => {
+                ControlPoll::Ready(Err(DaemonTransportError::ControlThreadStopped))
+            }
+            HostResult::PluginResponseDelivered { kind } => {
+                ControlPoll::Ready(Ok(daemon_response_base(kind)))
+            }
+            HostResult::Failed { error, .. } => ControlPoll::Ready(Ok(daemon_plugin_tool_error(
+                McpToolError::new(error.code, error.message),
+            ))),
+            _ => ControlPoll::Ready(Ok(daemon_plugin_tool_error(McpToolError::new(
+                "host_completion_kind_mismatch",
+                "the host returned an invalid plugin response outcome",
+            )))),
+        };
+    }
+    let Some(entry) = state.plugin_controls.pending.get_mut(&request_id.0) else {
+        return ControlPoll::Pending;
+    };
+    if let Some(failure) = entry.submission_failure.take() {
+        return ControlPoll::SubmitPluginHost(failure);
+    }
+    if entry.identity != *identity || entry.result.is_none() || entry.kind.is_none() {
+        return ControlPoll::Pending;
+    }
+    let Some(runtime) = daemon.runtime() else {
+        return ControlPoll::Pending;
+    };
+    let Some(permit) = runtime.host_executor().try_reserve() else {
+        state.plugin_controls.capacity_waiters.insert(waiter_id);
+        return ControlPoll::Pending;
+    };
+    let (result, inconsistent) = match entry.result.take().expect("ready result exists") {
+        RoutedPluginControlCompletion::Invocation(result) => (result.map(Ok), false),
+        RoutedPluginControlCompletion::Inconsistent(result) => (result.map(Ok), true),
+    };
+    let input = PluginResponseInput {
+        kind: entry.kind.take().expect("ready kind exists"),
+        lifecycle: runtime.plugin_lifecycle_handle(),
+        result,
+        inconsistent,
+        transport_request_id: identity.transport_request_id.clone(),
+    };
+    ControlPoll::PreparePluginResponse(input, permit)
 }
 
 pub(crate) fn submit_response(

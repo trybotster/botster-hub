@@ -285,7 +285,9 @@ impl EntityWork {
                 HostResult::PluginEntity(Completion::ProviderPrepared(_)),
                 Stage::PrepareProvider
             ) | (
-                HostResult::PluginEntity(Completion::ProviderAdmitted(_)),
+                HostResult::PluginEntity(
+                    Completion::ProviderAdmitted(_) | Completion::ProviderContended { .. }
+                ),
                 Stage::AdmitProvider
             ) | (
                 HostResult::PluginEntity(Completion::Prepared { .. }),
@@ -1301,6 +1303,12 @@ pub(super) fn step(
                 entry.work.provider_plan = Some(plan);
                 entry.work.stage = Stage::AcquireProvider;
             }
+            Completion::ProviderContended { plan, seen } => {
+                entry.work.provider_plan = Some(plan);
+                entry.work.stage = Stage::AdmitProvider;
+                let parked = runtime.owner_signal().parked(seen);
+                state.plugin_entities.signal_waiters.insert(waiter, parked);
+            }
             Completion::ProviderAdmitted(refusal) => {
                 entry.work.stage = if let Some(error) = refusal {
                     entry.work.provider_refusal = Some(error);
@@ -1468,6 +1476,18 @@ pub(super) fn step(
             Step::Again
         }
         Stage::AdmitProvider => {
+            // Parked on the plugin engine: nothing retries until its epoch
+            // moves. A cancelled request goes on, so its permit is reclaimed.
+            if !entry.work.cancelled
+                && state
+                    .plugin_entities
+                    .signal_waiters
+                    .get(&waiter)
+                    .is_some_and(|parked| !parked.moved())
+            {
+                return Step::Waiting;
+            }
+            state.plugin_entities.signal_waiters.remove(&waiter);
             let command = Command::AdmitProvider {
                 admission: runtime.plugin_provider_admission(),
                 plan: entry
