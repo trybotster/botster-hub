@@ -8,7 +8,7 @@
 //! this user inside a directory this user owns, and nothing accepts
 //! connections on it. Any other existing path fails closed.
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -148,6 +148,14 @@ async fn accept_connections_with_events(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
+                        // The socket file is 0600, but the file mode is only
+                        // as strong as the directory and the umask around
+                        // it. A peer of another user is refused before any
+                        // frame is read.
+                        if !peer_is_owner(&stream) {
+                            eprintln!("botster-hub daemon refused a connection from another user");
+                            continue;
+                        }
                         match admission.clone().try_acquire_owned() {
                             Ok(admission_permit) => {
                                 let cleanup_permit = match control_tx.clone().reserve_owned().await {
@@ -603,6 +611,12 @@ fn rebind_listener(listener: &mut TokioUnixListener, path: &Path) -> RebindOutco
     }
     match TokioUnixListener::bind(path) {
         Ok(rebound) => {
+            if let Err(error) = restrict_socket_to_owner(path) {
+                // A socket that other users could open is worse than none.
+                eprintln!("botster-hub daemon socket rebind error: {error}");
+                let _ = fs::remove_file(path);
+                return RebindOutcome::Failed;
+            }
             *listener = rebound;
             RebindOutcome::Rebound
         }
@@ -695,6 +709,18 @@ pub(crate) fn cleanup_socket_path(path: &Path, owner: SocketOwnerLock) {
     drop(owner);
 }
 
+/// The control socket is for its owner only: mode 0600, set right after bind.
+pub(crate) fn restrict_socket_to_owner(path: &Path) -> std::io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// Whether the peer of an accepted connection is this Hub's own user.
+fn peer_is_owner(stream: &TokioUnixStream) -> bool {
+    stream
+        .peer_cred()
+        .is_ok_and(|credentials| credentials.uid() == current_uid())
+}
+
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions.
     unsafe { libc::geteuid() }
@@ -718,6 +744,59 @@ impl From<ClientDaemonTransportError> for UnixInboundError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control socket file is for its owner only, whatever the umask.
+    #[test]
+    fn the_control_socket_is_restricted_to_its_owner() {
+        let socket = temp_socket_path("m");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        restrict_socket_to_owner(&socket).expect("restrict");
+        let mode = fs::metadata(&socket)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o}");
+        drop(listener);
+        let _ = fs::remove_file(&socket);
+    }
+
+    /// A same-user connection passes the peer check; the check compares the
+    /// peer's uid with this Hub's own.
+    #[tokio::test]
+    async fn a_peer_of_the_same_user_is_the_owner() {
+        let socket = temp_socket_path("p");
+        let std_listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(std_listener).expect("tokio listener");
+        let _client = UnixStream::connect(&socket).expect("connect");
+        let (accepted, _) = listener.accept().await.expect("accept");
+        assert!(peer_is_owner(&accepted));
+        let _ = fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn a_rebound_control_socket_is_restricted_too() {
+        let socket = temp_socket_path("rb");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+        let first = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        first.set_nonblocking(true).expect("nonblocking");
+        let mut listener = TokioUnixListener::from_std(first).expect("tokio listener");
+        fs::remove_file(&socket).expect("unlink, as a cleaner would");
+        assert_eq!(
+            rebind_listener(&mut listener, &socket),
+            RebindOutcome::Rebound
+        );
+        let mode = fs::metadata(&socket)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "rebound mode was {mode:o}");
+        let _ = fs::remove_file(&socket);
+    }
 
     #[test]
     fn a_released_socket_owner_does_not_block_while_a_descriptor_copy_survives() {
