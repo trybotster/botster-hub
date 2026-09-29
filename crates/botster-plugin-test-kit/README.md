@@ -89,6 +89,7 @@ the plugin read that clock.
 | `p:entities(type)` | Published entity frames of a type. The first call subscribes as a client does. Call it before the action to see every frame. A refused subscription raises. |
 | `p:emitted_events()` | Plugin-audience events that this plugin emitted, through the real event router. |
 | `p:routed(session_id)` | Routed envelopes that Core holds for a session. Reading does not acknowledge them. |
+| `p:undefined_globals()` | Strict globals: every global name that the plugin's Lua files use but the sandbox does not define, as `{ file, line, column, name, write }`. It parses the plugin's `.lua` files (not `test/`) and checks each name against the sandbox's real global set, which the kit reads from the running runtime. A call such as `log.warn(...)` in an error path that no spec reaches passes every runtime spec and fails in production; this finds it. Assert `#p:undefined_globals() == 0`. It does not see `_G[name]` or `load`. |
 | `p:logs()` / `p:tools()` | Structured logs of the plugin, and the tool descriptors that the Hub lists. |
 
 A package may subscribe to an event of a package that is not loaded yet. The

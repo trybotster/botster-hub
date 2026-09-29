@@ -206,6 +206,9 @@ pub struct KitHub {
     /// The observer package of each enabled package that declares
     /// plugin-audience events, in enable order.
     observers: Vec<String>,
+    /// The global names of the plugin sandbox, read back from a probe plugin
+    /// in this Hub the first time a spec asks.
+    sandbox_globals: Option<std::collections::BTreeSet<String>>,
     /// The packages that loaded, in enable order. `advance` drains their timers.
     loaded: Vec<String>,
 }
@@ -309,6 +312,7 @@ impl KitHub {
             recent_wakes: std::collections::VecDeque::new(),
             wake_count: 0,
             observers: Vec::new(),
+            sandbox_globals: None,
             loaded: Vec::new(),
         })
     }
@@ -558,6 +562,37 @@ impl KitHub {
             .wait(self.step_deadline)
             .map_err(|error| KitError::Daemon(format!("{error:?}")))?
             .map_err(|error| KitError::Daemon(error.to_string()))
+    }
+
+    /// The global names that a plugin can read in this Hub's real sandbox. The
+    /// kit enables a probe plugin once, and the probe lists its own `_G`: the
+    /// answer comes from the runtime, not from a list kept by hand.
+    pub fn sandbox_globals(&mut self) -> Result<std::collections::BTreeSet<String>, KitError> {
+        if let Some(names) = &self.sandbox_globals {
+            return Ok(names.clone());
+        }
+        let package = write_globals_probe_package(&self.root)?;
+        let enabled = self.request(DaemonRequest::EnablePackageLocalPath { path: package })?;
+        if let Some(error) = enabled.error {
+            return Err(KitError::Observer(format!("{error:?}")));
+        }
+        let listed = self.call_tool(
+            &format!("{GLOBALS_PROBE_PACKAGE}.list"),
+            serde_json::json!({}),
+        )?;
+        let names: std::collections::BTreeSet<String> = listed
+            .plugin_tool_result
+            .get("names")
+            .and_then(serde_json::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| KitError::Package("the globals probe returned no names".to_string()))?;
+        self.sandbox_globals = Some(names.clone());
+        Ok(names)
     }
 
     /// The Hub id of this kit Hub, as `botster.hub.identity()` reports it.
@@ -1026,6 +1061,53 @@ fn write_observer_package(
         lua.push_str(&format!("observe({owner}, {name})\n"));
     }
     lua.push_str("return botster.register({})\n");
+    std::fs::write(
+        directory.join(crate::packages::LOCAL_PACKAGE_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| KitError::Package(error.to_string()))?,
+    )
+    .map_err(|error| KitError::Package(error.to_string()))?;
+    std::fs::write(directory.join("plugin.lua"), lua)
+        .map_err(|error| KitError::Package(error.to_string()))?;
+    Ok(directory)
+}
+
+/// The package the kit enables to read the sandbox's global names.
+const GLOBALS_PROBE_PACKAGE: &str = "botster-plugin-test-kit-globals";
+
+/// Write the probe package under the kit root. Its one tool lists the names in
+/// its own global table, which is the table every plugin reads.
+fn write_globals_probe_package(root: &Path) -> Result<PathBuf, KitError> {
+    let directory = root.join(GLOBALS_PROBE_PACKAGE);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| KitError::Package(format!("{}: {error}", directory.display())))?;
+    let manifest = serde_json::json!({
+        "name": GLOBALS_PROBE_PACKAGE,
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "description": "Plugin test kit probe: lists the sandbox's global names.",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "mcp" }],
+        "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+    });
+    let lua = format!(
+        r#"return botster.register({{ tools = {{ {{
+  name = "{GLOBALS_PROBE_PACKAGE}.list",
+  description = "List the global names of the sandbox.",
+  input_schema = {{ type = "object" }},
+  handler = "list",
+  call = function()
+    local names = {{}}
+    for name in pairs(_G) do
+      names[#names + 1] = tostring(name)
+    end
+    table.sort(names)
+    return {{ names = names }}
+  end,
+}} }} }})
+"#
+    );
     std::fs::write(
         directory.join(crate::packages::LOCAL_PACKAGE_MANIFEST_FILE),
         serde_json::to_vec_pretty(&manifest)
