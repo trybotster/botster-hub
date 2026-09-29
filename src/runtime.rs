@@ -4528,6 +4528,18 @@ impl HubRuntime {
         )
     }
 
+    /// Have Core release an ended session in place, keeping its registry row.
+    pub(crate) fn begin_release_ended_session_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin_for_owner(waiter_id, CoreOperation::ReleaseEndedSession(session_id)),
+        )
+    }
+
     pub(crate) fn begin_spawn_reserved_for_owner(
         &self,
         waiter_id: crate::owner_identity::WaiterId,
