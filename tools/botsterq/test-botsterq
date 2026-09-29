@@ -792,12 +792,12 @@ make_project "$work/capE"
 #      an mbx nothing changes; an explicit MBX_CACHE_DIR is respected; and the target
 #      cap's `cargo clean` never goes through the shim.
 mkdir -p "$work/fakebin"
-printf '#!/bin/sh\necho "called: $0 $*" >> "$MBX_FAKE_LOG"\nexit 0\n' >"$work/fakebin/mbx"
+printf '#!/bin/sh\necho "called: $0 $* toolchain=${RUSTUP_TOOLCHAIN-unset}" >> "$MBX_FAKE_LOG"\nexit 0\n' >"$work/fakebin/mbx"
 chmod +x "$work/fakebin/mbx"
 probe='echo "cargo=$(command -v cargo)"; echo "cache=${MBX_CACHE_DIR-unset}"; echo "views=${MBX_TARGET_VIEWS-unset}"'
 BOTSTERQ_MBX=1 PATH="$work/fakebin:$PATH" "$Q" run --label MbxOn -- sh -c "$probe" >"$work/mbxon.out" 2>&1
 [ "$(sed -n 1p "$work/mbxon.out")" = "cargo=$BOTSTERQ_HOME/mbx-shim/cargo" ] \
-  && [ "$(readlink "$BOTSTERQ_HOME/mbx-shim/cargo")" = "$work/fakebin/mbx" ] \
+  && [ "$(readlink "$BOTSTERQ_HOME/mbx-shim/.mbx/cargo")" = "$work/fakebin/mbx" ] \
   && [ "$(sed -n 2p "$work/mbxon.out")" = "cache=$BOTSTERQ_HOME/mbx-cache" ] && [ "$(sed -n 3p "$work/mbxon.out")" = "views=0" ] \
   && pass "mbx on: the job gets a cargo shim to mbx first on PATH, the cache under the queue's state directory, managed target views off" \
   || fail "mbx on" "$(cat "$work/mbxon.out")"
@@ -816,6 +816,16 @@ make_project "$work/capM"
 ( cd "$work/capM" && MBX_FAKE_LOG="$work/mbx-fake.log" BOTSTERQ_MBX=1 BOTSTERQ_TARGET_CAP_GB=0.001 PATH="$work/fakebin:$PATH" "$Q" run --label MbxCap -- sh -c 'test -e target/debug/big && echo big-kept || echo big-cleaned' >"$work/mbxcap.out" 2>/dev/null )
 [ "$(tail -1 "$work/mbxcap.out")" = big-cleaned ] && [ ! -s "$work/mbx-fake.log" ] \
   && pass "the target cap's cargo clean does not go through the mbx shim" || fail "mbx and the cap" "out=$(cat "$work/mbxcap.out") fake_calls=$(cat "$work/mbx-fake.log")"
+
+# 19f. `cargo +<toolchain>` through the shim: mbx does not understand the rustup
+#      directive, so the shim wrapper turns it into RUSTUP_TOOLCHAIN and runs mbx
+#      without it; without a directive the arguments pass through unchanged.
+: >"$work/mbx-fake.log"
+env -u RUSTUP_TOOLCHAIN MBX_FAKE_LOG="$work/mbx-fake.log" BOTSTERQ_MBX=1 PATH="$work/fakebin:$PATH" "$Q" run --label MbxPlus -- sh -c 'cargo +1.97.0 clippy --workspace; cargo build -p x' >/dev/null 2>&1
+[ "$(sed -n 1p "$work/mbx-fake.log")" = "called: $BOTSTERQ_HOME/mbx-shim/.mbx/cargo clippy --workspace toolchain=1.97.0" ] \
+  && [ "$(sed -n 2p "$work/mbx-fake.log")" = "called: $BOTSTERQ_HOME/mbx-shim/.mbx/cargo build -p x toolchain=unset" ] \
+  && pass "cargo +toolchain through the shim: mbx gets RUSTUP_TOOLCHAIN and no +argument; plain arguments pass through" \
+  || fail "cargo +toolchain" "$(cat "$work/mbx-fake.log")"
 
 # 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.

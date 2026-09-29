@@ -134,7 +134,7 @@ botsterq slots 3         # change it (kept across server restarts)
 - Mr Boxington (`mbx`, https://mr-boxington.jdx.dev), a shared build cache. Enabled for every
   job by one setting at the top of the `botsterq` script (`mbx_default=1`; `0` turns it off for
   everyone; `BOTSTERQ_MBX=0` turns it off for one job). When `mbx` is installed, `botsterq run`
-  puts a shim directory (`~/.botsterq/mbx-shim`, one symlink named `cargo` to the `mbx` binary)
+  puts a shim directory (`~/.botsterq/mbx-shim`, whose `cargo` is a small wrapper that turns rustup's `cargo +<toolchain>` into `RUSTUP_TOOLCHAIN` and runs the `mbx` binary as cargo through `.mbx/cargo`)
   first on the job's PATH, so every plain `cargo` in the job goes through mbx, and sets
   `MBX_CACHE_DIR` to `~/.botsterq/mbx-cache` (unless you set it) and `MBX_TARGET_VIEWS=0`.
   Managed target views stay off because mbx would otherwise replace `./target` with a symlink into
