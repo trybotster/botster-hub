@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonHelloAck, DaemonRequest,
-    DaemonResponse, DaemonUnixFrameReader, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, PROTOCOL,
-    ServerFrame, write_client_frame,
+    DaemonResponse, DaemonUnixFrameReader, DaemonUnixMuxFrame, PROTOCOL, ServerFrame,
+    write_client_frame,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
