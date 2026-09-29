@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -163,6 +164,38 @@ fn signal_daemon_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Resul
 }
 
 fn shutdown_cli_daemon(data_dir: &Path, child: Child) -> Output {
+    // End the caller sessions this test spawned first: a session outlives
+    // its daemon, so a daemon shutdown alone would leave their workers.
+    let spawned: Vec<String> = {
+        let mut tokens = CALLER_TOKENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("caller token map");
+        let keys: Vec<_> = tokens
+            .keys()
+            .filter(|(directory, _)| directory == data_dir)
+            .cloned()
+            .collect();
+        for key in &keys {
+            tokens.remove(key);
+        }
+        keys.into_iter().map(|(_, session_id)| session_id).collect()
+    };
+    for session_id in spawned {
+        let ended = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+            .arg("sessions")
+            .arg("shutdown")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg(&session_id)
+            .output()
+            .expect("run botster-hub sessions shutdown");
+        assert!(
+            ended.status.success(),
+            "shutdown {session_id} failed: {}",
+            String::from_utf8_lossy(&ended.stderr)
+        );
+    }
     let shutdown = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
         .arg("--data-dir")
@@ -207,46 +240,143 @@ fn disable_project_pipelines_package(data_dir: &Path) {
     );
 }
 
+/// Bearer tokens of the sessions these tests spawn as callers, by data
+/// directory and session id. A token prints nothing.
+static CALLER_TOKENS: OnceLock<Mutex<BTreeMap<(PathBuf, String), String>>> = OnceLock::new();
+
+fn make_fifo(path: &Path) {
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: `name` is a valid NUL-terminated path for the duration of the call.
+    let created = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(created, 0, "mkfifo {}", path.display());
+}
+
+/// The bearer token of `session_id`, spawning that session on first use. The
+/// session prints its own token into a FIFO; the writer's close is the event.
+fn caller_token(data_dir: &Path, session_id: &str) -> String {
+    let key = (data_dir.to_path_buf(), session_id.to_string());
+    let tokens = CALLER_TOKENS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(token) = tokens.lock().expect("caller token map").get(&key) {
+        return token.clone();
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let fifo = std::env::temp_dir().join(format!("mcp-token-{}-{nanos}.fifo", std::process::id()));
+    make_fifo(&fifo);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = fifo.clone();
+    thread::spawn(move || {
+        let _ = sender.send(fs::read_to_string(&reader));
+    });
+    let command = format!(
+        "printf '%s' \"$BOTSTER_MCP_TOKEN\" > '{}'; exec cat",
+        fifo.display()
+    );
+    let spawn = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("sessions")
+        .arg("spawn")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--")
+        .arg(&command)
+        .output()
+        .expect("run botster-hub sessions spawn");
+    assert!(
+        spawn.status.success(),
+        "spawn {session_id} failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+    // timer: deadline — the session writes its token and closes the fifo; expiry means it never did.
+    let token = match receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(token)) => token,
+        _ => {
+            // Unblock the reader thread before failing.
+            drop(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo),
+            );
+            panic!("session {session_id} never wrote its token");
+        }
+    };
+    let _ = fs::remove_file(&fifo);
+    tokens
+        .lock()
+        .expect("caller token map")
+        .insert(key, token.clone());
+    token
+}
+
+/// One JSON-RPC request over HTTP as `token`'s session; the reply body.
+fn mcp_http_request(data_dir: &Path, token: &str, request: &Value) -> Vec<u8> {
+    use std::io::Read;
+    let port: u16 = fs::read_to_string(data_dir.join("mcp-http.endpoint"))
+        .expect("the daemon records its MCP port")
+        .trim()
+        .parse()
+        .expect("the recorded MCP port is a number");
+    let body = serde_json::to_string(request).expect("serialize MCP request");
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to MCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("set MCP read deadline");
+    write!(
+        stream,
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write MCP request");
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    let (head, reply_body) = text.split_once("\r\n\r\n").expect("HTTP reply head");
+    let status = head.split_whitespace().nth(1).unwrap_or("");
+    assert!(
+        status == "200" || status == "202",
+        "MCP request was answered with status {status}"
+    );
+    reply_body.as_bytes().to_vec()
+}
+
 fn run_mcp_serve(data_dir: &Path, requests: &[Value]) -> Output {
     run_mcp_serve_with_session(data_dir, None, requests)
 }
 
+/// Send the requests over HTTP, in order, as the token's session (a default
+/// caller session when none is named), and return them shaped like the stdio
+/// server's output: one JSON response per line for each request that gets one.
 fn run_mcp_serve_with_session(
     data_dir: &Path,
     caller_session_id: Option<&str>,
     requests: &[Value],
 ) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("mcp-serve")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove(botster_hub::session_types::SESSION_ID_ENVIRONMENT)
-        .envs(
-            caller_session_id
-                .map(|value| (botster_hub::session_types::SESSION_ID_ENVIRONMENT, value)),
-        )
-        .spawn()
-        .expect("spawn botster-hub mcp-serve");
-
-    {
-        let stdin = child.stdin.as_mut().expect("mcp stdin");
-        for request in requests {
-            let line = serde_json::to_string(request).expect("serialize MCP request");
-            stdin.write_all(line.as_bytes()).expect("write MCP request");
-            stdin.write_all(b"\n").expect("write MCP newline");
+    use std::os::unix::process::ExitStatusExt;
+    let token = caller_token(data_dir, caller_session_id.unwrap_or("mcp-test-caller"));
+    let mut stdout = Vec::new();
+    for request in requests {
+        let reply = mcp_http_request(data_dir, &token, request);
+        if !reply.is_empty() {
+            stdout.extend_from_slice(&reply);
+            stdout.push(b'\n');
         }
     }
-
-    child.wait_with_output().expect("wait for mcp-serve")
+    Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout,
+        stderr: Vec::new(),
+    }
 }
 
 fn parse_mcp_output(output: Output, label: &str) -> Vec<Value> {
     assert!(
         output.status.success(),
-        "{label} mcp-serve failed: {}",
+        "{label} MCP request failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -318,7 +448,7 @@ fn enable_synthetic_package_by_name(data_dir: &Path) {
 }
 
 #[test]
-fn mcp_serve_supports_initialize_list_and_native_status_over_stdio() {
+fn mcp_supports_initialize_list_and_native_status_over_http() {
     let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("status-round-trip");
     let _ = fs::remove_dir_all(&data_dir);
@@ -493,7 +623,7 @@ fn mcp_status_reports_managed_receipt_without_receipt_path_or_source() {
 }
 
 #[test]
-fn mcp_serve_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
+fn mcp_lists_and_calls_loaded_lua_plugin_tool_through_daemon_runtime() {
     let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("lua-plugin-tool");
     let _ = fs::remove_dir_all(&data_dir);
@@ -641,41 +771,7 @@ fn mcp_native_coordination_tools_refuse_an_unknown_session() {
 }
 
 #[test]
-fn mcp_serve_returns_structured_tool_error_when_daemon_is_unavailable() {
-    let _guard = mcp_daemon_test_guard();
-    let data_dir = unique_test_dir("daemon-unavailable");
-    let _ = fs::remove_dir_all(&data_dir);
-
-    let output = run_mcp_serve(
-        &data_dir,
-        &[
-            initialize_request(1),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "hub.status",
-                    "arguments": {}
-                }
-            }),
-        ],
-    );
-
-    let messages = parse_mcp_output(output, "daemon unavailable");
-    assert_eq!(messages.len(), 2);
-    let call = &messages[1];
-
-    assert_eq!(call["id"], 2);
-    assert_eq!(call["result"]["isError"], true);
-    assert_eq!(
-        call["result"]["structuredContent"]["error"]["code"],
-        "daemon_unavailable"
-    );
-}
-
-#[test]
-fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
+fn mcp_lists_calls_and_reloads_project_pipelines_plugin_tools() {
     let _guard = mcp_daemon_test_guard();
     let data_dir = unique_test_dir("project-pipelines-plugin");
     let _ = fs::remove_dir_all(&data_dir);
