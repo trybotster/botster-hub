@@ -190,6 +190,7 @@ mod modules;
 mod registration_tests;
 pub(crate) mod result;
 mod session_type_spawn;
+mod sessions;
 use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
@@ -2189,6 +2190,9 @@ fn install_botster_api(
     )?;
 
     let identity_state = host_api.spawn_targets.clone();
+    let sessions_state = host_api.spawn_targets.clone();
+    let sessions_packages = Arc::clone(&host_api.package_registry);
+    let sessions_spawner = Arc::clone(&host_api.session_types);
     let capabilities_table = lua.create_table()?;
     let timer_capabilities = host_api.capabilities.clone();
     let timer_plugin_key = plugin_key.clone();
@@ -2241,6 +2245,16 @@ fn install_botster_api(
     capabilities_table.set(
         "worktrees",
         worktrees_table(lua, host_api.worktrees, host_api.spawn_targets)?,
+    )?;
+    capabilities_table.set(
+        "sessions",
+        sessions::table(
+            lua,
+            plugin_key.0.clone(),
+            sessions_spawner,
+            sessions_packages,
+            sessions_state,
+        )?,
     )?;
     capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;

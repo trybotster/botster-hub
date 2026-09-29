@@ -140,6 +140,10 @@ pub(crate) fn dispatch_control_message(
             crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
             false
         }
+        ControlMessage::PluginHostCall(request) => {
+            crate::plugin_host_call::serve(state, *request);
+            false
+        }
         ControlMessage::EntitySubscriptionCapacityReleased => {
             state
                 .maintenance

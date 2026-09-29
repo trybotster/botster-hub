@@ -83,6 +83,7 @@ pub mod packages;
 pub mod persistence;
 mod plugin_caller;
 pub(crate) mod plugin_entity;
+mod plugin_host_call;
 pub(crate) mod plugin_logs;
 pub(crate) mod plugin_response;
 pub mod process_exit;
