@@ -686,6 +686,9 @@ pub fn write_unix_terminal_frame(
     stream.write_all(body).map_err(normalize_socket_io_error)
 }
 
+/// The OS error macOS returns for a timeout on a shut-down socket.
+const EINVAL: i32 = 22;
+
 /// One attached route's own socket: terminal frames in both directions.
 ///
 /// The control connection carries no terminal frames. A client that stops
@@ -723,13 +726,21 @@ impl DaemonRouteStream {
         self.stream.try_clone().map_err(normalize_socket_io_error)
     }
 
-    /// Bound reads. macOS refuses a timeout (`EINVAL`) on a socket the Hub
-    /// has already shut down. Such a socket never blocks: reads return what
-    /// is buffered, then end of stream. So the refusal is ignored, and the
-    /// buffered frames stay readable.
+    /// Bound reads. A zero duration is refused, as `UnixStream` refuses it.
+    ///
+    /// macOS also refuses a timeout on a socket the Hub has already shut
+    /// down, with an OS-level `EINVAL`. Such a socket never blocks: reads
+    /// return what is buffered, then end of stream. Only that refusal is
+    /// ignored, so the buffered frames stay readable.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> DaemonTransportResult<()> {
+        if timeout == Some(Duration::ZERO) {
+            return Err(DaemonTransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot set a zero read timeout",
+            )));
+        }
         match self.stream.set_read_timeout(timeout) {
-            Err(error) if error.kind() != std::io::ErrorKind::InvalidInput => {
+            Err(error) if error.raw_os_error() != Some(EINVAL) => {
                 Err(normalize_socket_io_error(error))
             }
             Ok(()) | Err(_) => Ok(()),
@@ -5201,6 +5212,20 @@ mod tests {
             other => panic!("expected PackageEvent, got {other:?}"),
         }
         server_handle.join().expect("server writes");
+    }
+
+    #[test]
+    fn route_stream_refuses_a_zero_timeout_on_an_open_socket() {
+        let (_server, client) = UnixStream::pair().expect("pair");
+        let route = DaemonRouteStream::from_stream(client);
+        assert!(matches!(
+            route.set_read_timeout(Some(Duration::ZERO)),
+            Err(DaemonTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        route
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .expect("a real timeout applies");
     }
 
     #[test]
