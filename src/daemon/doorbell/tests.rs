@@ -17,6 +17,8 @@ enum Behaviour {
     Ignores,
     /// A slow composer: the echo shows only when `release_echo` is called.
     SlowEcho,
+    /// A composer that echoes letters but ignores backspaces.
+    KeepsLetters,
 }
 
 struct Terminal {
@@ -108,7 +110,9 @@ impl Terminal {
                 self.type_letters(PROBE_TEXT);
             }
         } else if bytes == [0x7f, 0x7f] || bytes == b"\x1b[127u\x1b[127u" {
-            self.backspace(2);
+            if self.behaviour != Behaviour::KeepsLetters {
+                self.backspace(2);
+            }
         } else {
             // The ring: bracketed paste or plain text, ended by a CR.
             let text = String::from_utf8_lossy(bytes);
@@ -635,4 +639,43 @@ fn the_echo_is_exactly_two_cells_further() {
         };
         assert!(!echoed(&baseline, &read), "column {col} is not an echo");
     }
+}
+
+#[test]
+fn the_ring_is_not_typed_until_the_cursor_is_back_at_the_baseline() {
+    let mut terminal = Terminal::composer();
+    terminal.behaviour = Behaviour::KeepsLetters;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    let erase = vec![0x7f, 0x7f];
+    assert_eq!(rig.terminal.writes, [PROBE.to_vec(), erase]);
+    assert!(rig.terminal.submitted.is_empty(), "typed over a probe");
+    assert!(rig.pending());
+}
+
+#[test]
+fn a_ring_text_cannot_act_as_terminal_input() {
+    let mut rig = Rig::new(Terminal::composer());
+    rig.ring("a\rb\x1b[201~\x1b[31mc\x07\u{85}d\ne\tf");
+    // ESC, BEL, C1 and the CR are gone; line breaks became spaces; the
+    // paste-end text is plain letters with no ESC in front of it.
+    assert_eq!(rig.terminal.submitted, ["a b[201~[31mcd e f"]);
+    let last = rig.terminal.writes.last().unwrap();
+    let inner = &last[b"\x1b[200~".len()..last.len() - b"\x1b[201~\r".len()];
+    assert!(!inner.contains(&0x1b) && !inner.contains(&b'\r'));
+}
+
+#[test]
+fn a_probe_that_wraps_to_the_next_row_is_not_an_echo() {
+    let baseline = Read {
+        row: 3,
+        col: 79,
+        text_before_cursor: "> ".to_string(),
+    };
+    let wrapped = Read {
+        row: 4,
+        col: 1,
+        text_before_cursor: "zx".to_string(),
+    };
+    assert!(!echoed(&baseline, &wrapped));
 }
