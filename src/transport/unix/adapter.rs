@@ -680,7 +680,10 @@ impl UnixConnectionMux {
     }
 
     /// Queued credit frames of every route whose attach is on the socket.
-    pub(crate) fn take_credit_frames(&self) -> Vec<DaemonUnixCreditFrame> {
+    /// An `INPUT_CREDIT` carries the route and items to report through
+    /// [`UnixTerminalAdapterHandle::input_credit_written`] once it is fully
+    /// written.
+    pub(crate) fn take_credit_frames_acked(&self) -> Vec<CreditFrameOut> {
         let mut frames = Vec::new();
         if let Ok(routes) = self.inner.routes.lock() {
             for route in routes.values() {
@@ -688,6 +691,14 @@ impl UnixConnectionMux {
             }
         }
         frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_credit_frames(&self) -> Vec<DaemonUnixCreditFrame> {
+        self.take_credit_frames_acked()
+            .into_iter()
+            .map(|(frame, _)| frame)
+            .collect()
     }
 
     fn has_credit_frames(&self) -> bool {
@@ -777,6 +788,13 @@ impl UnixConnectionMux {
     }
 }
 
+/// A credit frame taken for the socket. An `INPUT_CREDIT` also names the
+/// route and item count to report once it is fully written.
+pub(crate) type CreditFrameOut = (
+    DaemonUnixCreditFrame,
+    Option<(UnixTerminalAdapterHandle, u32)>,
+);
+
 /// One frame on the Unix close lane.
 #[derive(Debug)]
 pub(crate) enum UnixCloseLaneItem {
@@ -811,6 +829,22 @@ impl UnixTerminalAdapterHandle {
         true
     }
 
+    /// Stand in for Core reading one input frame: its credit becomes due.
+    #[cfg(test)]
+    pub(crate) fn note_input_consumed_for_test(&self) {
+        if let Some(mut credit) = self.inner.lock_credit() {
+            credit.input_credit += 1;
+        }
+    }
+
+    /// An `INPUT_CREDIT` of `items` is fully on the socket: the client has
+    /// them, so the route's input window reopens by that many frames.
+    pub(crate) fn input_credit_written(&self, items: u32) {
+        if let Some(mut credit) = self.inner.lock_credit() {
+            credit.input_outstanding = credit.input_outstanding.saturating_sub(items);
+        }
+    }
+
     /// The route's `TerminalAttached` response is fully on the socket; its
     /// held credit frames may follow.
     pub(crate) fn mark_attach_written(&self) {
@@ -841,24 +875,26 @@ impl UnixTerminalAdapterHandle {
 
     /// Move this route's queued credit frames to `frames`, the returned
     /// input credit coalesced into one `INPUT_CREDIT`.
-    fn take_credit_frames(&self, frames: &mut Vec<DaemonUnixCreditFrame>) {
+    fn take_credit_frames(&self, frames: &mut Vec<CreditFrameOut>) {
         let Some(mut credit) = self.inner.lock_credit() else {
             return;
         };
         if !credit.has_output() {
             return;
         }
-        frames.extend(credit.outbox.drain(..));
+        frames.extend(credit.outbox.drain(..).map(|frame| (frame, None)));
         if credit.input_credit > 0
             && let Some((route, generation)) = credit.route.clone()
         {
             let items = std::mem::take(&mut credit.input_credit);
-            credit.input_outstanding = credit.input_outstanding.saturating_sub(items);
-            frames.push(DaemonUnixCreditFrame::InputCredit {
-                route,
-                generation,
-                items,
-            });
+            frames.push((
+                DaemonUnixCreditFrame::InputCredit {
+                    route,
+                    generation,
+                    items,
+                },
+                Some((self.clone(), items)),
+            ));
         }
     }
 
@@ -1130,7 +1166,16 @@ mod tests {
             assert_eq!(core_wakes(&route.wakes), 0, "and wakes it once");
             assert_eq!(route.adapter.pressure(), TerminalAdapterPressure::Ready);
             assert_eq!(route.adapter.try_write(&frame), Ok(()));
-            assert!(route.mux.take_credit_frames().is_empty());
+            // Two item grants funded one frame: the spare item goes back.
+            assert_eq!(
+                route.mux.take_credit_frames(),
+                vec![DaemonUnixCreditFrame::Return {
+                    route: "sub".to_string(),
+                    generation: 1,
+                    items: 1,
+                    bytes: 0,
+                }]
+            );
         }
 
         /// Plan test 8: credit granted before the adapter's check is used
@@ -1193,12 +1238,7 @@ mod tests {
             }
             assert!(!route.handle.reserve_input_credit(window));
             // Core consumed one; its INPUT_CREDIT is not yet taken.
-            route
-                .handle
-                .inner
-                .lock_credit()
-                .expect("credit")
-                .input_credit += 1;
+            route.handle.note_input_consumed_for_test();
             assert!(
                 !route.handle.reserve_input_credit(window),
                 "free ingress room is not issued credit"
@@ -1212,6 +1252,11 @@ mod tests {
                     items: 1,
                 }]
             );
+            assert!(
+                !route.handle.reserve_input_credit(window),
+                "a taken but unwritten INPUT_CREDIT has not reached the client"
+            );
+            route.handle.input_credit_written(1);
             assert!(route.handle.reserve_input_credit(window));
             assert!(!route.handle.reserve_input_credit(window));
         }

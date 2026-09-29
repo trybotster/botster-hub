@@ -106,12 +106,6 @@ impl RouteCredit {
         if self.keep_surplus {
             return None;
         }
-        // The client budgets bytes, not items, so a leftover item with no
-        // bytes goes unreported.
-        if self.pool_bytes == 0 {
-            self.pool_items = 0;
-            return None;
-        }
         self.take_pool()
     }
 

@@ -110,6 +110,7 @@ impl MuxWriteState {
         let bytes = encode_control_json(encoded_frame).map_err(DaemonTransportError::from)?;
         self.enqueue_response_frame(PendingMuxFrame {
             attach_ack: None,
+            input_credit_ack: None,
             bytes: PendingMuxBytes::Control(bytes),
             offset: 0,
             complete_envelope: None,
@@ -152,6 +153,7 @@ impl MuxWriteState {
             crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
                 self.queued_events.push_back(PendingMuxFrame {
                     attach_ack: None,
+                    input_credit_ack: None,
                     bytes: PendingMuxBytes::PreparedEntity(delivery),
                     offset: 0,
                     complete_envelope: None,
@@ -240,6 +242,9 @@ pub(crate) struct PendingMuxFrame {
     /// S13: a `TerminalAttached` response for this route. Once it is fully
     /// written, the route's held credit frames may follow.
     attach_ack: Option<UnixTerminalAdapterHandle>,
+    /// An `INPUT_CREDIT` frame: the route and the items it returns. The
+    /// route's input window reopens only when the frame is fully written.
+    input_credit_ack: Option<(UnixTerminalAdapterHandle, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -285,10 +290,10 @@ pub(crate) async fn flush_unix_mux_writes(
     }
     // S13 credit frames ride the event lane, in order with close events, so
     // a route's `CLOSED` always follows its earlier credit frames.
-    for frame in mux.take_credit_frames() {
-        write_state
-            .queued_events
-            .push_back(credit_mux_frame(&frame)?);
+    for (frame, input_ack) in mux.take_credit_frames_acked() {
+        let mut pending = credit_mux_frame(&frame)?;
+        pending.input_credit_ack = input_ack;
+        write_state.queued_events.push_back(pending);
     }
     let mut host_frames = 0;
     loop {
@@ -371,6 +376,7 @@ pub(crate) async fn flush_unix_mux_writes(
             };
             write_state.pending = Some(PendingMuxFrame {
                 attach_ack: None,
+                input_credit_ack: None,
                 bytes: PendingMuxBytes::Terminal {
                     header,
                     body: Arc::clone(frame.frame.shared_bytes()),
@@ -399,6 +405,7 @@ pub(crate) fn control_mux_frame(
     let bytes = encode_server_frame(frame).map_err(DaemonTransportError::from)?;
     Ok(PendingMuxFrame {
         attach_ack: None,
+        input_credit_ack: None,
         bytes: PendingMuxBytes::Control(bytes),
         offset: 0,
         complete_envelope: None,
@@ -461,6 +468,9 @@ pub(crate) async fn resume_pending_mux_write(
             }
             if let Some(route) = pending.attach_ack {
                 route.mark_attach_written();
+            }
+            if let Some((route, items)) = pending.input_credit_ack {
+                route.input_credit_written(items);
             }
             if let Some(handle) = pending.complete_envelope {
                 // The whole frame is on the socket, so its credit is spent,
@@ -710,6 +720,7 @@ pub(crate) fn credit_mux_frame(
         delivery_receipt: None,
         close_after: false,
         attach_ack: None,
+        input_credit_ack: None,
     })
 }
 
@@ -871,6 +882,43 @@ pub(crate) mod mux_write_resume_tests {
         }
     }
 
+    /// The input window reopens when `INPUT_CREDIT` is fully written, not
+    /// when it is queued or partly written behind a stalled socket.
+    #[tokio::test]
+    async fn input_credit_reopens_the_window_only_after_a_complete_write() {
+        let mux = UnixConnectionMux::new();
+        let (_adapter, handle) = mux.create_adapter();
+        assert!(mux.register("s".to_string(), "sub".to_string(), 1, handle.clone()));
+        handle.mark_attach_written();
+        let window = 2;
+        assert!(handle.reserve_input_credit(window));
+        assert!(handle.reserve_input_credit(window));
+        assert!(!handle.reserve_input_credit(window));
+        // Core consumed one input frame; its INPUT_CREDIT goes to the socket.
+        handle.note_input_consumed_for_test();
+        let mut state = MuxWriteState::default();
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 3,
+            allow_remainder: false,
+        };
+        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
+            .await
+            .expect("partial INPUT_CREDIT write");
+        assert!(state.pending.is_some(), "the credit frame is half written");
+        assert!(
+            !handle.reserve_input_credit(window),
+            "a partly written INPUT_CREDIT has not reached the client"
+        );
+        writer.allow_remainder = true;
+        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
+            .await
+            .expect("complete INPUT_CREDIT write");
+        assert!(!state.has_pending());
+        assert!(handle.reserve_input_credit(window));
+        assert!(!handle.reserve_input_credit(window));
+    }
+
     pub(crate) fn closed_event() -> DaemonEvent {
         DaemonEvent::TerminalSubscriptionClosed {
             session_id: "session".to_string(),
@@ -1012,6 +1060,7 @@ pub(crate) mod mux_write_resume_tests {
         };
         let mut pending = PendingMuxFrame {
             attach_ack: None,
+            input_credit_ack: None,
             bytes: PendingMuxBytes::Terminal {
                 header,
                 body: Arc::clone(frame.frame.shared_bytes()),
@@ -1426,6 +1475,7 @@ pub(crate) mod mux_write_resume_tests {
         let active = handle.snapshot_active().expect("active frame");
         let pending = PendingMuxFrame {
             attach_ack: None,
+            input_credit_ack: None,
             bytes: PendingMuxBytes::Terminal {
                 header: UnixTerminalContainerHeader::new("sub", 1, 0, active.frame.len())
                     .expect("header"),
