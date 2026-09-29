@@ -244,6 +244,56 @@ wait "$H1" "$H2" "$HO1"
 leftover=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
 [ "$leftover" = 0 ] && pass "no admission file remains after the runs end" || fail "admission files" "$leftover left: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
 
+# 8k. The two boundaries of the admission protocol, tested directly (the test
+#     stops `run` at the exact point through a hold fifo and sends TERM there):
+#     (1) after the run marked the admission as started, before the admission
+#     process exists; (2) after the admission ended and was reaped, before the
+#     run marked it over; (3) the admission process just forked, before it wrote
+#     its pid file. Each: exit 130 at once, the command never starts or is gone,
+#     no admission file, no lock waiter, no job.
+boundary_check() {
+  name=$1 code=$2 elapsed=$3
+  files=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+  waiters=$(lock_waiters)
+  i=0
+  until [ "$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')" = 0 ]; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && break
+    # timer: deadline — bounded wait for the queue to drain.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+  jobs=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')
+  alive=no
+  [ -f "$work/$name.pid" ] && kill -0 "$(cat "$work/$name.pid")" 2>/dev/null && alive=yes
+  [ "$code" = 130 ] && [ "$elapsed" -le 2 ] && [ "$files" = 0 ] && [ "$waiters" = 0 ] && [ "$jobs" = 0 ] && [ "$alive" = no ] \
+    && pass "cancel at the boundary: $name (exit 130, no admission file, no lock waiter, no job, no live command)" \
+    || fail "boundary $name" "exit=$code (${elapsed}s) files=$files waiters=$waiters jobs=$jobs live_command=$alive: $(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | tr '\n' ' ')"
+}
+"$Q" slots 2 >/dev/null
+# (1) before the admission process exists
+mkfifo "$work/b1.hold" "$work/b1.hold.reached"
+BOTSTERQ_TEST_RUN_BEFORE_ADMISSION="$work/b1.hold" "$Q" run --label B1 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b1.pid" >/dev/null 2>&1 &
+B1=$!
+read _ <"$work/b1.hold.reached"
+started=$(date +%s); kill -TERM "$B1"; wait "$B1"; code=$?; elapsed=$(( $(date +%s) - started ))
+boundary_check b1 "$code" "$elapsed"
+# (2) after the admission was reaped, before the run marked it over
+mkfifo "$work/b2.hold" "$work/b2.hold.reached"
+BOTSTERQ_TEST_RUN_AFTER_ADMISSION="$work/b2.hold" "$Q" run --label B2 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b2.pid" >/dev/null 2>&1 &
+B2=$!
+read _ <"$work/b2.hold.reached"
+started=$(date +%s); kill -TERM "$B2"; wait "$B2"; code=$?; elapsed=$(( $(date +%s) - started ))
+boundary_check b2 "$code" "$elapsed"
+# (3) the admission process just forked, before its pid file
+mkfifo "$work/b3.hold" "$work/b3.hold.reached"
+BOTSTERQ_TEST_ADMISSION_HOLD="$work/b3.hold" "$Q" run --label B3 -- sh -c 'echo $$ > "$0"; exec sleep 30' "$work/b3.pid" >/dev/null 2>&1 &
+B3=$!
+read _ <"$work/b3.hold.reached"
+started=$(date +%s)
+kill -TERM "$B3"
+printf x >"$work/b3.hold"   # release the held admission process; it finds the marker
+wait "$B3"; code=$?; elapsed=$(( $(date +%s) - started ))
+boundary_check b3 "$code" "$elapsed"
+
 # 8f. Several waiters behind the holder start in the order they arrived. The
 #     order among waiters at the lock is the kernel's flock wakeup order, which
 #     is not a promise; this checks what the platform does, over three waiters.

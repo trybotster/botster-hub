@@ -87,8 +87,13 @@ ADMISSION_PERL='
   use Fcntl qw(:flock);
   use POSIX qw(:signal_h);
   my ($lockfile, $cancel, $out, $pidfile) = splice(@ARGV, 0, 4);
-  # `run` finds this process by the pid file (it may be signalled before `run`
-  # knows the pid of its background job); the file goes away with the process.
+  # Test hold: a fifo read before the pid file exists (the interrupt tests stop
+  # this process just after its fork).
+  if (defined $ENV{BOTSTERQ_TEST_ADMISSION_HOLD}) {
+    if (open(my $r, ">", "$ENV{BOTSTERQ_TEST_ADMISSION_HOLD}.reached")) { print $r "reached\n"; close $r; }
+    if (open(my $h, "<", $ENV{BOTSTERQ_TEST_ADMISSION_HOLD})) { my $l = <$h>; close $h; }
+  }
+  # `run` finds this process by the pid file; the file goes away with the process.
   if (open(my $pf, ">", $pidfile)) { print $pf "$$\n"; close $pf; }
   END { unlink $pidfile if defined $pidfile; }
   # A cancelled run leaves the marker; this process then cleans up after itself
@@ -403,29 +408,28 @@ cmd_run() {
   id=
   admission_started=
   admission_over=
-  admitting=
   interrupted() {
     trap - INT TERM HUP
     status=130
-    # A run still inside admission: TERM its admission process (only one that
-    # waits for an exclusive job acts on it), and let it end before the job is
-    # resolved by its token.
+    # Admission protocol. `run` marks the admission as started BEFORE it forks
+    # the admission process and as over right after it reaped it. An interrupt
+    # while it is started and not over: (1) create the cancel marker, so an
+    # admission that has not gone far ends itself; (2) if the admission wrote its
+    # pid file, TERM it (it ends at once while it waits for the lock, or forwards
+    # TERM to the admission it started); (3) wait for every child of this run,
+    # which is the admission if there is one, so nothing is left running; (4)
+    # remove the marker, the pid file and the output file, because no child is
+    # left to use them. No pid is kept in a variable, so there is no stale pid to
+    # signal, and no state where a marker has no one to remove it.
     if [ -n "${admission_started:-}" ] && [ -z "${admission_over:-}" ]; then
-      # The marker first: an admission that gets going after this ends itself
-      # and removes its own files. $admitting is the pid of the admission this
-      # run has not reaped yet (so it cannot have been reused): TERM ends it at
-      # once while it waits for the lock, or it forwards TERM to the admission
-      # it started and waits for it; then its files go. Without a pid the
-      # admission was just forked and finds the marker on its own.
       : >"$state/run/$token.admitcancel"
-      if [ -n "$admitting" ]; then
-        kill -TERM "$admitting" 2>/dev/null || true
-        wait "$admitting" 2>/dev/null || true
-        rm -f "$state/run/$token.admitted" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
-      fi
+      admit_pid=$(cat "$state/run/$token.admitpid" 2>/dev/null || true)
+      [ -z "$admit_pid" ] || kill -TERM "$admit_pid" 2>/dev/null || true
+      wait 2>/dev/null || true
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
     fi
-    # Admission already over: its output files are this run's to remove (the
-    # interrupt can land between the end of the admission and the normal removal).
+    # Admission already over: its files are this run's to remove (the interrupt
+    # can land between the end of the admission and the normal removal).
     if [ -n "${admission_over:-}" ]; then
       rm -f "$state/run/$token.admitted" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
     fi
@@ -444,11 +448,17 @@ cmd_run() {
   # that arrives while it waits for an exclusive job is handled at once.
   admitted_file="$state/run/$token.admitted"
   admission_started=1
+  # Test holds (fifos): the interrupt tests stop `run` at exactly these points.
+  if [ -n "${BOTSTERQ_TEST_RUN_BEFORE_ADMISSION:-}" ]; then
+    echo reached >"$BOTSTERQ_TEST_RUN_BEFORE_ADMISSION.reached"; read _ <"$BOTSTERQ_TEST_RUN_BEFORE_ADMISSION" || true
+  fi
   perl -e "$ADMISSION_PERL" "$state/admission.lock" "$state/run/$token.admitcancel" "$admitted_file" "$state/run/$token.admitpid" \
     "$self" __admit2 "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" &
-  admitting=$!
-  wait "$admitting" || true
-  admission_over=1; admitting=
+  wait $! || true
+  if [ -n "${BOTSTERQ_TEST_RUN_AFTER_ADMISSION:-}" ]; then
+    echo reached >"$BOTSTERQ_TEST_RUN_AFTER_ADMISSION.reached"; read _ <"$BOTSTERQ_TEST_RUN_AFTER_ADMISSION" || true
+  fi
+  admission_over=1
   id=$(cat "$admitted_file" 2>/dev/null || true)
   rm -f "$admitted_file" "$state/run/$token.admitpid" "$state/run/$token.admitcancel"
   [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
