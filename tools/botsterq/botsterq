@@ -200,6 +200,21 @@ group_alive() {
   kill -0 "-$1" 2>/dev/null
 }
 
+# A queued job was removed: the admissions that were waiting for it (`ts -w <id>`)
+# would wait forever, because task-spooler never ends a waiter for a removed job.
+# Each admission recorded its waiter's pid in run/<token>.waitfor.<id>; stop each
+# one that is still exactly `ts -w <id>` (its own internal waiter, so the admission
+# re-checks the queue and goes on).
+release_waiters() {
+  for record in "$state"/run/*.waitfor."$1"; do
+    [ -f "$record" ] || continue
+    waiter=$(cat "$record" 2>/dev/null || true)
+    if [ -n "$waiter" ] && [ "$(ps -o command= -p "$waiter" 2>/dev/null | sed 's/^ *//; s/ *$//')" = "ts -w $1" ]; then
+      kill -TERM "$waiter" 2>/dev/null || true
+    fi
+  done
+}
+
 # Stop job <id> with token <token>. The marker comes first: a job that has not
 # yet published its pid will see it and not start. A queued job is removed; a
 # running job's group gets TERM, then KILL if any member outlives the grace.
@@ -226,6 +241,10 @@ stop_job() {
   case "$published" in *" "*) command_group=${published#* } ;; esac
   if [ -n "$id" ] && ts -r "$id" >/dev/null 2>&1; then
     rm -f "$marker"
+    # The owning `run` waits for this job with `ts -w`, which would never end now:
+    # mark the job removed (that `run` then exits 130) and release the waiters.
+    : >"$state/run/$2.removed"
+    release_waiters "$id"
     return 0
   fi
   [ -n "$supervisor_pid" ] || return 0
@@ -368,9 +387,14 @@ admit_locked() {
       echo "botsterq: waiting for exclusive job $queued_exclusive before queueing" >&2
       ts -w "$queued_exclusive" >/dev/null 2>&1 &
       waiting=$!
-      trap 'kill "$waiting" 2>/dev/null; exit 130' TERM
+      # task-spooler never ends a waiter for a job that is REMOVED from the queue
+      # (a cancelled queued job): record this waiter so stop_job can release it.
+      waitfor="$state/run/$token.waitfor.$queued_exclusive"
+      echo "$waiting" >"$waitfor"
+      trap 'kill "$waiting" 2>/dev/null; rm -f "$waitfor"; exit 130' TERM
       wait "$waiting" || true
       trap ':' TERM
+      rm -f "$waitfor"
     done
   fi
   trap ':' TERM
@@ -509,9 +533,15 @@ cmd_run() {
   [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!
+  # A queued job removed by `botsterq cancel <id>` never ends this waiter: record it
+  # so stop_job can release it (see release_waiters).
+  waitfor="$state/run/$token.waitfor.$id"
+  echo "$waiter" >"$waitfor"
   status=0
   wait "$waiter" || status=$?
-  rm -f "$state/run/$token.pid" "$state/run/$token.lock" "$state/run/$token.enqueued"
+  rm -f "$waitfor"
+  [ ! -e "$state/run/$token.removed" ] || status=130
+  rm -f "$state/run/$token.pid" "$state/run/$token.lock" "$state/run/$token.enqueued" "$state/run/$token.removed"
   exit "$status"
 }
 

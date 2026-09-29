@@ -672,6 +672,30 @@ before=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
 after=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | wc -l | tr -d ' ')
 [ "$codeDLB" = 2 ] && [ "$before" = "$after" ] && pass "a bad deadline is refused before admission (run exit 2)" || fail "bad deadline" "run=$codeDLB before=$before after=$after"
 
+# 8m. Cancelling a QUEUED exclusive job while an ordinary run waits for it: the run
+#     goes on (task-spooler would leave its `ts -w` waiter hanging for the removed
+#     job, and the admission lock with it).
+"$Q" slots 2 >/dev/null
+"$Q" run --label Z1 --exclusive -- sh -c 'sleep 5' >/dev/null 2>&1 &
+Z1=$!
+await_state "Z1 [exclusive] @" running
+"$Q" run --label Z2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+Z2=$!
+await_state "Z2 [exclusive] @" queued
+"$Q" run --label ZO -- sh -c 'touch "$0/ZO.ran"' "$work" >/dev/null 2>"$work/ZO.err" &
+ZO=$!
+await_text "$work/ZO.err" "waiting for exclusive job"
+z2id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[Z2 [exclusive] @ ") { print $1 }')
+"$Q" cancel "$z2id" >/dev/null 2>&1
+wait "$Z2" 2>/dev/null; codeZ2=$?
+# ZO must now be admitted (queued behind Z1 or running), well before Z1 ends.
+await_state "ZO @" queued || kill -TERM "$ZO" 2>/dev/null   # not admitted in time: end the run, the assertion fails
+zo_state=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[ZO @ ") { print $2 }')
+wait "$Z1" "$ZO"
+[ -e "$work/ZO.ran" ] && [ -n "$zo_state" ] && [ "$codeZ2" = 130 ] \
+  && pass "a queued exclusive job cancelled by id while an ordinary run waits for it: that run is admitted and runs, and the cancelled job's own run exits 130" \
+  || fail "waiter release" "z2=$codeZ2 ZO.ran=$([ -e "$work/ZO.ran" ] && echo yes || echo no) state=$zo_state err=$(cat "$work/ZO.err")"
+
 # 19b. Target cap. A job whose directory is a cargo workspace with a target/
 #     above the cap gets `cargo clean --target-dir target` there before its
 #     command starts, and one line says so; under the cap, or with the cap off,
