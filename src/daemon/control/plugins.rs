@@ -152,6 +152,40 @@ impl PluginControlState {
             < MAX_OUTSTANDING_REQUESTS
     }
 
+    /// Test only: fill `count` rows of one connection generation.
+    #[cfg(test)]
+    pub(crate) fn test_occupy_connection(&mut self, connection_generation: &str, count: usize) {
+        for serial in 0..count {
+            let request_id = self.next_request_id().expect("request id");
+            let handler = PluginHandlerRef {
+                plugin_key: botster_core::PluginKey("filler.plugin".to_string()),
+                kind: botster_core::PluginHandlerKind::Command,
+                handler_id: "filler".to_string(),
+            };
+            self.insert(
+                &request_id,
+                WaiterId(u64::MAX - serial as u64),
+                PluginInvocationIdentity {
+                    connection_id: format!("connection-{connection_generation}"),
+                    connection_generation: connection_generation.to_string(),
+                    transport_request_id: format!("filler-{serial}"),
+                    plugin_key: handler.plugin_key.0.clone(),
+                    handler,
+                },
+                PendingPluginControlKind::McpTool,
+            );
+        }
+    }
+
+    /// Test only: rows held for one connection generation.
+    #[cfg(test)]
+    pub(crate) fn test_connection_rows(&self, connection_generation: &str) -> usize {
+        self.pending
+            .values()
+            .filter(|entry| entry.identity.connection_generation == connection_generation)
+            .count()
+    }
+
     fn next_request_id(&mut self) -> Option<RequestId> {
         self.next_serial = self.next_serial.checked_add(1)?;
         // The decimal suffix also supplies internal transport correlation.
@@ -542,11 +576,7 @@ fn start_plugin_control(
         .plugin_controls
         .connection_has_capacity(&connection_generation)
     {
-        return plugin_control_refused(
-            &kind,
-            "plugin_control_limit",
-            format!("the connection already holds {MAX_OUTSTANDING_REQUESTS} plugin requests"),
-        );
+        return control_limit_refused(&kind);
     }
     let identity = PluginInvocationIdentity {
         connection_id,
@@ -664,6 +694,19 @@ fn contended_plugin_control(
         let Some(runtime) = daemon.runtime() else {
             return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
         };
+        // A parked request holds no row, so the connection limit is checked
+        // again before every Core admission. Another request may have taken
+        // the last slot while this one waited; it is then refused, typed.
+        if !state
+            .plugin_controls
+            .connection_has_capacity(&identity.connection_generation)
+        {
+            let (_, kind) = waiting.take().expect("the request is still waiting");
+            return match control_limit_refused(&kind) {
+                ControlStep::Ready(result) => ControlPoll::Ready(result),
+                ControlStep::Pending(_) => unreachable!("a refusal is a ready step"),
+            };
+        }
         match admit_plugin_control(runtime, request) {
             ControlAdmission::Queued => {
                 let (_, kind) = waiting.take().expect("the request is still waiting");
@@ -850,6 +893,14 @@ fn daemon_plugin_logs_capacity() -> botster_hub_client::DaemonResponse {
         diagnostics: Vec::new(),
     });
     response
+}
+
+fn control_limit_refused(kind: &PendingPluginControlKind) -> ControlStep {
+    plugin_control_refused(
+        kind,
+        "plugin_control_limit",
+        format!("the connection already holds {MAX_OUTSTANDING_REQUESTS} plugin requests"),
+    )
 }
 
 fn plugin_control_refused(
