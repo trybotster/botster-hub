@@ -834,7 +834,7 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the webrtc adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 13);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 14);
 }
 
 #[test]
@@ -1356,7 +1356,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_13() {
             .iter()
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 13);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 14);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         53

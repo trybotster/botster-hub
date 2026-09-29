@@ -1,4 +1,4 @@
-//! Unix framing and mux scheduling for host-control protocol 13.
+//! Unix framing and mux scheduling for host-control protocol 14.
 //!
 //! Every frame is one length-prefixed container. Control frames are UTF-8
 //! JSON [`ServerFrame`] payloads. Terminal frames are written as two slices,

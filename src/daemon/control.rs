@@ -352,7 +352,7 @@ pub(crate) fn handle_runtime_control_request(
         DaemonRequest::ResolveQuarantine {
             target: DaemonQuarantineTarget::Package { .. },
         } => unreachable!("a package quarantine resolve uses the host executor"),
-        DaemonRequest::Whoami { .. }
+        DaemonRequest::Whoami
         | DaemonRequest::PostMessage { .. }
         | DaemonRequest::ReceiveMessages { .. }
         | DaemonRequest::AckMessage { .. }
