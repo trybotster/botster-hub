@@ -210,6 +210,99 @@ printf 'start\t100.0\tT1\t2\t1\tX\tload=1/1/1\nstart\t105.0\tT2\t1\t0\tY\tload=1
   && pass "audit reports the job that overlapped an exclusive job, and only that one (exit 1)" \
   || fail "audit overlap" "audit=$codeAudit out=$(cat "$work/audit.out")"
 
+# 8e. Cancel before the admission lock is held. A run that waits for an
+#     exclusive job holds the lock; a second ordinary run then waits at the
+#     lock. Cancelling that second run exits 130 at once, its command never
+#     starts, and it leaves no admission process or file behind.
+lock_waiters() { ps -axo command= | grep -F -- "$BOTSTERQ_HOME/admission.lock" | grep -vc grep; }
+await_lock_waiters() {
+  i=0
+  until [ "$(lock_waiters)" -ge "$1" ]; do
+    i=$((i + 1)); [ "$i" -gt 200 ] && return 1
+    # timer: deadline — test-side wait for a run to reach the admission lock.
+    perl -e 'select(undef, undef, undef, 0.05)'
+  done
+}
+"$Q" slots 2 >/dev/null
+"$Q" run --label H1 --exclusive -- sh -c 'sleep 6' >/dev/null 2>&1 &
+H1=$!
+await_state "H1 [exclusive] @" running
+"$Q" run --label H2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+H2=$!
+await_state "H2 [exclusive] @" queued
+"$Q" run --label HO1 -- sh -c 'touch "$0/HO1.ran"' "$work" >/dev/null 2>"$work/HO1.err" &
+HO1=$!
+await_text "$work/HO1.err" "waiting for exclusive job"
+"$Q" run --label HO2 -- sh -c 'touch "$0/HO2.ran"' "$work" >/dev/null 2>"$work/HO2.err" &
+HO2=$!
+await_lock_waiters 2
+cancel_started=$(date +%s)
+kill -TERM "$HO2"; wait "$HO2"; codeHO2=$?
+cancel_elapsed=$(( $(date +%s) - cancel_started ))
+waiters_after=$(lock_waiters)
+admit_files=$(ls "$BOTSTERQ_HOME"/run/"$HO2"-*.admit* 2>/dev/null | wc -l | tr -d ' ')
+wait "$H1" "$H2" "$HO1"
+[ "$codeHO2" = 130 ] && [ "$cancel_elapsed" -le 2 ] && [ "$waiters_after" = 1 ] && [ "$admit_files" = 0 ] \
+  && [ ! -e "$work/HO2.ran" ] && [ -e "$work/HO1.ran" ] \
+  && pass "cancelling a run that waits at the admission lock exits 130 at once, never starts, leaves nothing behind" \
+  || fail "cancel at the lock" "cancel=$codeHO2 (${cancel_elapsed}s) lock_waiters=$waiters_after admit_files=$admit_files HO2.ran=$([ -e "$work/HO2.ran" ] && echo yes || echo no) HO1.ran=$([ -e "$work/HO1.ran" ] && echo yes || echo no) err=$(cat "$work/HO2.err")"
+leftover=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+[ "$leftover" = 0 ] && pass "no admission file remains after the runs end" || fail "admission files" "$leftover left"
+
+# 8f. Several waiters behind the holder start in the order they arrived. The
+#     order among waiters at the lock is the kernel's flock wakeup order, which
+#     is not a promise; this checks what the platform does, over three waiters.
+"$Q" slots 1 >/dev/null
+"$Q" run --label K1 --exclusive -- sh -c 'sleep 4' >/dev/null 2>&1 &
+K1=$!
+await_state "K1 [exclusive] @" running
+"$Q" run --label K2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+K2=$!
+await_state "K2 [exclusive] @" queued
+for n in 1 2 3; do
+  "$Q" run --label "KW$n" -- sh -c 'date +%s.%N > "$0/KW'"$n"'.start"; sleep 0.3' "$work" >/dev/null 2>&1 &
+  eval "KW$n=\$!"
+  await_lock_waiters "$n"
+done
+wait "$K1" "$K2" "$KW1" "$KW2" "$KW3"
+if [ "$(cat "$work/KW1.start")" \< "$(cat "$work/KW2.start")" ] && [ "$(cat "$work/KW2.start")" \< "$(cat "$work/KW3.start")" ]; then
+  pass "three waiters behind the lock holder start in arrival order (platform behaviour, not a guarantee)"
+else
+  fail "waiter order" "1=$(cat "$work/KW1.start") 2=$(cat "$work/KW2.start") 3=$(cat "$work/KW3.start")"
+fi
+
+# 8g. Compatibility. The supervisor accepts the argument shape of a `run` that
+#     started before the deadline existed (no run limit), and the legacy
+#     `__admit` entry point still admits a job.
+python3 "$here/botsterq-job" "$work/old.pid" "$work/old.marker" "$work/old.lock" "$$" 2 -- sh -c 'exit 3' >/dev/null 2>&1; codeOld=$?
+[ "$codeOld" = 3 ] && pass "the supervisor accepts the old argument shape (no deadline), run status kept" || fail "old supervisor shape" "exit=$codeOld"
+legacy_id=$(BOTSTERQ_OWNER=$$ "$Q" __admit legacy-token 0 legacy true 3>/dev/null 4>/dev/null </dev/null)
+TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -w "$legacy_id" >/dev/null 2>&1; codeLegacy=$?
+case "$legacy_id" in ''|*[!0-9]*) legacy_ok=no ;; *) legacy_ok=yes ;; esac
+[ "$legacy_ok" = yes ] && [ "$codeLegacy" = 0 ] && pass "the legacy __admit entry point admits a job (id $legacy_id, exit 0)" || fail "legacy admit" "id=$legacy_id exit=$codeLegacy"
+rm -f "$work/old.pid" "$work/old.marker" "$work/old.lock" "$BOTSTERQ_HOME"/run/legacy-token.*
+
+# 8h. Audit compares an open interval like a closed one (fractional seconds):
+#     two jobs that are still running and started 0.1 s apart overlap.
+printf 'start\t100.100\tO1\t2\t1\tX\tload=1/1/1\nstart\t100.200\tO2\t1\t0\tY\tload=1/1/1\n' >"$BOTSTERQ_HOME/events.log"
+BOTSTERQ_AUDIT_NOW=100 "$Q" audit >"$work/audit.out" 2>&1; codeOpen=$?
+BOTSTERQ_AUDIT_NOW=101 "$Q" audit >"$work/audit2.out" 2>&1; codeOpen2=$?
+[ "$codeOpen2" = 1 ] && grep -q "OVERLAP exclusive job O1 (X) and job O2 (Y)" "$work/audit2.out" && grep -q "not proof" "$work/audit2.out" \
+  && pass "audit: two open jobs that started 0.1 s apart overlap (exit 1); the output states its evidence limit" \
+  || fail "audit open interval" "now=101: exit=$codeOpen2 out=$(cat "$work/audit2.out")"
+
+# 8i. The same with the real clock: two jobs that are still running and started
+#     a few milliseconds ago overlap (a clock truncated to whole seconds would
+#     put both starts after "now" and report nothing).
+now_s=$(perl -MTime::HiRes=time -e 'printf "%.3f %.3f", time - 0.05, time - 0.02')
+set -- $now_s
+printf 'start\t%s\tR1\t2\t1\tX\tload=1/1/1\nstart\t%s\tR2\t1\t0\tY\tload=1/1/1\n' "$1" "$2" >"$BOTSTERQ_HOME/events.log"
+"$Q" audit >"$work/audit3.out" 2>&1; codeReal=$?
+[ "$codeReal" = 1 ] && grep -q "OVERLAP exclusive job R1 (X) and job R2 (Y)" "$work/audit3.out" \
+  && pass "audit with the real clock: two open jobs that just started overlap" \
+  || fail "audit real clock" "exit=$codeReal out=$(cat "$work/audit3.out")"
+rm -f "$BOTSTERQ_HOME/events.log"
+
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null
 out=$("$Q" run --label outer -- sh -c "$Q run --label inner -- echo inner-ran" 2>&1)

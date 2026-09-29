@@ -59,15 +59,25 @@ botsterq slots 3         # change it (kept across server restarts)
   ordinary job has none. It is a hang guard, not a budget: it exists so one hung job
   cannot hold the queue for hours. It does not apply after an unexpected supervisor
   error, when the supervisor only holds the slot until the group is gone.
-- Admission is in arrival order. An ordinary job that meets a queued exclusive job
-  waits for it while holding the admission lock, so no job that arrives later can be
-  queued ahead of it. `botsterq slots N` refuses at once while that wait holds the lock,
-  and cancelling a waiting `run` ends it at once.
+- An ordinary job that meets a queued exclusive job waits for it while holding the
+  admission lock, so a job that arrives later cannot be queued ahead of it. What is and
+  is not promised: (1) a job that holds the lock, or is queued, keeps its place; (2)
+  the order among jobs that are all waiting at the lock is the kernel's `flock` wakeup
+  order, first come first served on macOS in practice and checked by a test with
+  three waiters, but not promised by the platform. `botsterq slots N` refuses at once
+  while that wait holds the lock. Cancelling a `run` that waits, at the lock or for the
+  exclusive job, ends it at once with exit 130: its command never starts and it leaves
+  no admission process or file behind.
+- After an install, a `run` that started before it keeps working: the supervisor
+  accepts the old argument shape (no deadline) and the legacy `__admit` entry point
+  admits with the old protocol.
 - `botsterq audit` reads `~/.botsterq/events.log` (an append-only file: the supervisor
   writes a `start` line, with the host load average, and an `end` line, when the
   command's group is gone, for every job) and prints each job that ran at the same time
   as an exclusive job; it exits 1 if there is one. Use it to answer whether an exclusive
-  job really ran alone. The log has no rotation.
+  job really ran alone. The log has no rotation. It is evidence only for the jobs it
+  recorded: a write failure makes the supervisor print a warning on stderr and the
+  job disappears from the audit, so an empty result is not proof that a job ran alone.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 

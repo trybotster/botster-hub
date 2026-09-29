@@ -74,6 +74,20 @@ with_admission_lock() {
   ' "$state/admission.lock" "$@"
 }
 
+# The admission script of `run`: like with_admission_lock, but a cancel marker
+# (created by `run` when it is interrupted) that exists once the lock is held
+# ends it with 130 before the admission starts. `run` starts it directly in the
+# background, so the pid it holds is this perl process, which dies at once from
+# TERM while it still waits for the lock.
+ADMISSION_PERL='
+  use Fcntl qw(:flock);
+  my ($lockfile, $cancel) = splice(@ARGV, 0, 2);
+  open(my $lock, ">>", $lockfile) or die "botsterq: open lock: $!\n";
+  flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
+  exit 130 if -e $cancel;
+  exit(system(@ARGV) >> 8);
+'
+
 # Like with_admission_lock, but fails at once (exit 75) when the lock is held.
 try_admission_lock() {
   perl -MFcntl=:flock -e '
@@ -210,7 +224,9 @@ cmd_list() {
 cmd_audit() {
   log="$state/events.log"
   [ -f "$log" ] || { echo "botsterq: no events yet ($log)"; return 0; }
-  now=$(date +%s)
+  # Same precision as the log (fractional seconds), so an open interval is
+  # compared like a closed one. BOTSTERQ_AUDIT_NOW fixes the clock for tests.
+  now=${BOTSTERQ_AUDIT_NOW:-$(perl -MTime::HiRes=time -e 'printf "%.3f", time')}
   awk -F'\t' -v now="$now" '
     $1 == "start" { s[$3] = $2; ex[$3] = $5; lab[$3] = $6; order[++n] = $3 }
     $1 == "end"   { e[$3] = $2 }
@@ -229,6 +245,7 @@ cmd_audit() {
         }
       }
       printf "%d job(s), %d overlap(s) with an exclusive job\n", n, overlaps
+      print "note: the log is evidence only for the jobs it recorded; a job whose start could not be written (the supervisor then warns on stderr) is invisible here, so no overlap listed is not proof that a job ran alone"
       exit overlaps > 0
     }' "$log"
 }
@@ -250,8 +267,12 @@ cmd_cancel() {
 admit_locked() {
   token=$1 exclusive=$2 label=$3 deadline=$4
   shift 4
-  # `run` interrupts a waiting admission by TERM to the pid in this file.
+  cancel="$state/run/$token.admitcancel"
+  # `run` interrupts a running admission by TERM to the pid in this file, after
+  # it created the cancel marker; an admission that starts after the marker
+  # ends here.
   echo "$$" >"$state/run/$token.admit"
+  [ ! -e "$cancel" ] || exit 130
   if [ "$exclusive" = 1 ]; then
     slots_needed=$(ts -S)
     marker_text=" [exclusive]"
@@ -272,9 +293,11 @@ admit_locked() {
       trap 'kill "$waiting" 2>/dev/null; exit 130' TERM
       wait "$waiting" || true
       trap ':' TERM
+      [ ! -e "$cancel" ] || exit 130
     done
   fi
   trap ':' TERM
+  [ ! -e "$cancel" ] || exit 130
   job_paths "$token"
   enqueued="$state/run/$token.enqueued"
   rm -f "$enqueued"
@@ -292,6 +315,23 @@ admit_locked() {
   [ -n "$id" ] || { echo "botsterq: enqueued job not found" >&2; exit 1; }
   [ -z "${BOTSTERQ_TEST_ADMIT_HOLD:-}" ] || read _ <"$BOTSTERQ_TEST_ADMIT_HOLD" || true
   echo "$id"
+}
+
+# Legacy entry point. A `run` that started before this version was installed
+# calls `$self __admit` with the old arguments (no deadline) and speaks the old
+# protocol: enqueue, or print "wait <id>" when an exclusive job is queued ahead
+# of an ordinary job. Keep it so an install cannot break a run that is waiting.
+admit_legacy() {
+  token=$1 exclusive=$2 label=$3
+  shift 3
+  if [ "$exclusive" != 1 ]; then
+    queued_exclusive=$(ts -l | awk '$2 == "queued" && index($0, " [exclusive] @ ") { print $1; exit }')
+    if [ -n "$queued_exclusive" ]; then
+      echo "wait $queued_exclusive"
+      return
+    fi
+  fi
+  admit_locked "$token" "$exclusive" "$label" "$([ "$exclusive" = 1 ] && echo "$exclusive_deadline_seconds" || echo 0)" "$@"
 }
 
 cmd_run() {
@@ -337,9 +377,17 @@ cmd_run() {
     # waits for an exclusive job acts on it), and let it end before the job is
     # resolved by its token.
     if [ -n "${admitting:-}" ]; then
-      [ ! -f "$state/run/$token.admit" ] || kill -TERM "$(cat "$state/run/$token.admit")" 2>/dev/null || true
+      # The marker first: an admission that gets the lock or starts after this
+      # point ends itself. Then stop the one that is running (TERM to its pid),
+      # or, while it still waits for the lock, its perl process.
+      : >"$state/run/$token.admitcancel"
+      if [ -f "$state/run/$token.admit" ]; then
+        kill -TERM "$(cat "$state/run/$token.admit")" 2>/dev/null || true
+      else
+        kill -TERM "$admitting" 2>/dev/null || true
+      fi
       wait "$admitting" 2>/dev/null || true
-      rm -f "$state/run/$token.admitted" "$state/run/$token.admit"
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admit" "$state/run/$token.admitcancel"
     fi
     # The signal may arrive before the admitted id is stored; the token names
     # the job either way, so resolve its id and stop it.
@@ -355,11 +403,15 @@ cmd_run() {
   # Admission runs in the background (its result goes to a file), so a cancel
   # that arrives while it waits for an exclusive job is handled at once.
   admitted_file="$state/run/$token.admitted"
-  with_admission_lock "$self" __admit "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" &
+  perl -e "$ADMISSION_PERL" "$state/admission.lock" "$state/run/$token.admitcancel" \
+    "$self" __admit2 "$token" "$exclusive" "$label" "$deadline" "$@" >"$admitted_file" &
   admitting=$!
   wait "$admitting" || true
+  # Admission is over: the pid is gone (and may be reused), so a later interrupt
+  # must not signal it.
+  admitting=
   id=$(cat "$admitted_file" 2>/dev/null || true)
-  rm -f "$admitted_file" "$state/run/$token.admit"
+  rm -f "$admitted_file" "$state/run/$token.admit" "$state/run/$token.admitcancel"
   [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!
@@ -378,7 +430,8 @@ case "$subcommand" in
   cancel) cmd_cancel "$@" ;;
   audit) cmd_audit ;;
   slots) cmd_slots "$@" ;;
-  __admit) admit_locked "$@" ;;
+  __admit) admit_legacy "$@" ;;
+  __admit2) admit_locked "$@" ;;
   __set-slots) set_slots_locked "$@" ;;
   *) usage ;;
 esac
