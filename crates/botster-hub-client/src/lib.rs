@@ -1986,22 +1986,20 @@ pub enum DaemonRequest {
     RemoveSession {
         session_id: String,
     },
-    Whoami {
-        caller_session_id: Option<String>,
-    },
+    /// The requester's identity. A socket client is the operator; a session
+    /// reaches the same request over HTTP MCP with its bearer token, and the
+    /// daemon derives the caller from that token. No request names a caller.
+    Whoami,
     PostMessage {
-        caller_session_id: Option<String>,
         target_session_id: String,
         envelope_id: Option<String>,
         body: String,
     },
     ReceiveMessages {
-        caller_session_id: String,
         after: Option<u64>,
         limit: usize,
     },
     AckMessage {
-        caller_session_id: String,
         envelope_id: String,
     },
     NotifySession {
@@ -2809,10 +2807,24 @@ pub struct DaemonEnvelopeDelivery {
     pub status: String,
 }
 
+/// Who sent an envelope, as the Hub structures it. `kind` is `session`,
+/// `operator`, `plugin`, or `other`. A session is always named with its hub:
+/// a session ID alone is never meaningful across hubs. Clients read these
+/// fields and never parse endpoint text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonEndpointRef {
+    pub kind: String,
+    pub hub_id: Option<String>,
+    pub session_id: Option<String>,
+    pub plugin_key: Option<String>,
+    /// The endpoint text, only for kind `other`.
+    pub raw: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonEnvelope {
     pub envelope_id: String,
-    pub source: String,
+    pub source: DaemonEndpointRef,
     pub content_type: String,
     pub body: String,
     pub created_at: u64,
@@ -7251,22 +7263,17 @@ mod tests {
             DaemonRequest::RemoveSession {
                 session_id: "session".to_string(),
             },
-            DaemonRequest::Whoami {
-                caller_session_id: Some("caller".to_string()),
-            },
+            DaemonRequest::Whoami,
             DaemonRequest::PostMessage {
-                caller_session_id: Some("caller".to_string()),
                 target_session_id: "target".to_string(),
                 envelope_id: Some("envelope".to_string()),
                 body: "hello".to_string(),
             },
             DaemonRequest::ReceiveMessages {
-                caller_session_id: "caller".to_string(),
                 after: Some(1),
                 limit: 10,
             },
             DaemonRequest::AckMessage {
-                caller_session_id: "caller".to_string(),
                 envelope_id: "envelope".to_string(),
             },
             DaemonRequest::NotifySession {
@@ -8118,7 +8125,13 @@ mod tests {
                 }),
                 messages: vec![DaemonEnvelope {
                     envelope_id: "envelope".to_string(),
-                    source: "source".to_string(),
+                    source: DaemonEndpointRef {
+                        kind: "session".to_string(),
+                        hub_id: Some("hub".to_string()),
+                        session_id: Some("source".to_string()),
+                        plugin_key: None,
+                        raw: None,
+                    },
                     content_type: "text/plain".to_string(),
                     body: "hello".to_string(),
                     created_at: 1,
