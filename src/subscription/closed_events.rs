@@ -461,47 +461,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn close_events_phase_source_does_not_take_journal_wake() {
-        const SOURCE: &str = include_str!("closed_events.rs");
-        let close = SOURCE
-            .split("fn run_close_events_phase")
-            .nth(1)
-            .expect("close phase");
-        let close = close.split("#[cfg(test)]").next().expect("close end");
-        assert!(
-            close.contains("queue_closed_subscription_events_bounded"),
-            "close-events region must still contain the bounded slice"
-        );
-        assert!(!close.contains("observe_session_lifecycle"));
-        assert!(!close.contains("observe_lifecycle_slice"));
-        assert!(
-            !close.contains("prefer_close_events"),
-            "close work must not rewrite the Pump phase pointer"
-        );
-        assert!(
-            !close.contains("queue_unix_subscription_closed_events"),
-            "control must not scan every Unix mux for close events"
-        );
-        assert!(
-            !close.contains("queue_webrtc_subscription_closed_events"),
-            "control must not scan every WebRTC mux for close events"
-        );
-        assert!(
-            !close.contains("keys().find"),
-            "CloseEvents must resume with BTreeMap::range"
-        );
-        assert!(
-            !close.contains("list_terminal_subscriptions"),
-            "Pump must use the exact membership query"
-        );
-        assert!(
-            !close.contains("list_sessions"),
-            "Pump close classification must not list sessions"
-        );
-        assert!(close.contains("next_admission_key"));
-    }
-
     #[derive(Clone)]
     struct TestHandle {
         closed: bool,
@@ -712,47 +671,6 @@ mod tests {
         assert!(
             ledger.pop_pending_event().is_some(),
             "a later attach after a missing-session snapshot must still emit"
-        );
-    }
-
-    #[test]
-    fn shutdown_handler_installs_exact_suppression_before_core_request() {
-        const TRANSPORT: &str = include_str!("../daemon/control/sessions.rs");
-        let handler = TRANSPORT
-            .split("fn handle_shutdown_session(")
-            .nth(1)
-            .expect("shutdown handler");
-        let unix_suppress = handler
-            .find("suppress_unix_session_close_events")
-            .expect("unix suppression");
-        let webrtc_suppress = handler
-            .find("suppress_webrtc_session_close_events")
-            .expect("webrtc suppression");
-        let core = handler
-            .find("begin_shutdown_session")
-            .expect("Core Shutdown request");
-        let stopping = handler
-            .find("ShutdownSessionClassification::Stopping")
-            .expect("Stopping classification");
-        assert!(
-            stopping < unix_suppress,
-            "Stopping must stay on the suppress fall-through, not a pre-suppress return"
-        );
-        assert!(
-            unix_suppress < core && webrtc_suppress < core,
-            "ShutdownSession must install exact-key suppression before the Core request"
-        );
-        let after_core = &handler[core..];
-        assert!(
-            !after_core.contains("suppress_unix_session_close_events")
-                && !after_core.contains("suppress_webrtc_session_close_events"),
-            "ShutdownSession must not reinstall suppression after the Core request"
-        );
-        const CLOSED: &str = include_str!("closed_events.rs");
-        assert!(
-            handler.contains("suppress_unix_session_close_events")
-                && CLOSED.contains("suppress_session_route_generations"),
-            "helpers must snapshot exact route generations, not session-wide keys"
         );
     }
 

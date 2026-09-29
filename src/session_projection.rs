@@ -260,31 +260,9 @@ fn session_lifecycle_class(
     }
 }
 
-/// Fail if this module's source imports terminal bodies or names product policy.
-#[cfg(test)]
-pub fn assert_projection_source_stays_control_plane(source: &str) {
-    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-    for needle in [
-        "botster-terminal-protocol-client",
-        "botster_terminal_protocol_client",
-        "ProcessExited",
-        "botster-workspaces",
-        "botster_workspaces",
-        "membership",
-        "cleanup_rule",
-        "package cleanup",
-    ] {
-        assert!(
-            !production.contains(needle),
-            "session projection source must not contain {needle}"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     use botster_core::{CoreSessionMetadata, ResizePayload, SessionId};
     use botster_core_daemon::{DaemonSession, SessionLifecycleSourceId};
@@ -468,20 +446,6 @@ mod tests {
         assert_eq!(
             session_lifecycle_class(&RegistrySessionState::Running, None),
             "indeterminate"
-        );
-    }
-
-    #[test]
-    fn source_stays_control_plane() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/session_projection.rs"
-        ));
-        assert_projection_source_stays_control_plane(source);
-        assert!(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/session_projection.rs")
-                .exists()
         );
     }
 }

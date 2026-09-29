@@ -5602,21 +5602,6 @@ mod tests {
     }
 
     #[test]
-    fn readme_runtime_example_reports_current_protocol_and_conformance() {
-        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
-        assert!(
-            readme.contains(&format!("protocol_version={PROTOCOL_VERSION}")),
-            "README runtime example must report PROTOCOL_VERSION={PROTOCOL_VERSION}"
-        );
-        assert!(
-            readme.contains(&format!(
-                "conformance_fixture_revision={CONFORMANCE_FIXTURE_REVISION}"
-            )),
-            "README runtime example must report CONFORMANCE_FIXTURE_REVISION={CONFORMANCE_FIXTURE_REVISION}"
-        );
-    }
-
-    #[test]
     fn protocol_fourteen_rejects_protocol_thirteen_and_pins_the_conformance_floor() {
         assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);

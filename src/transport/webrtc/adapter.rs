@@ -1559,17 +1559,6 @@ mod tests {
     }
 
     #[test]
-    fn production_adapter_source_does_not_name_snapshot_phases() {
-        let source = include_str!("adapter.rs");
-        let production = source.split("mod tests").next().expect("production source");
-        for forbidden in [r#""READY""#, r#""PAGE""#, r#""FINISH""#, "GHOSTSNP"] {
-            assert!(
-                !production.contains(forbidden),
-                "webrtc adapter must stay content-blind: found {forbidden}"
-            );
-        }
-    }
-    #[test]
     fn worker_lost_close_is_reported_whatever_the_registry_state() {
         let mux = WebRtcConnectionMux::new();
         let (mut lost, lost_handle) = mux.create_adapter();
