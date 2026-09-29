@@ -303,7 +303,7 @@ src/packages.rs            hub package policy over core package contracts
 src/lifecycle.rs           hub package lifecycle adapter over core plugin workers
 src/capabilities.rs        hub-owned local capability runtime policy
 src/runtime.rs             HubRuntime facade over botster-core-daemon (CoreDaemon)
-src/mcp.rs                 daemon-backed MCP stdio surface
+src/mcp.rs                 MCP JSON-RPC and tool mapping; src/transport/http_mcp is the HTTP transport
 src/lua_runtime.rs         Lua plugin runtime and CoreDaemon coordination bridge
 examples/project-pipelines/plugin.lua
                           first Project Pipelines Lua workflow plugin source
@@ -328,8 +328,8 @@ credential store for production secrets, local installed-package WebRTC
 signaling/DataChannel adapter for production runtime clients, local package path install
 and entrypoint supervision, and the constrained
 `examples/project-pipelines` local plugin package. That package loads through
-the real Lua plugin runtime; MCP tools register through `mcp-serve`, dispatch
-over daemon transport to the owner thread, invoke through `PluginWorkerEngine`,
+the real Lua plugin runtime; MCP tools register with the daemon's HTTP MCP
+endpoint, dispatch over daemon control to the owner thread, invoke through `PluginWorkerEngine`,
 and persist through PluginDb under `plugin-data/project-pipelines/`.
 
 ## Durable hub state
@@ -674,7 +674,6 @@ app_count=2
 app package=botster-web app_id=web-client kind=web_app lifecycle_state=running local_url=http://127.0.0.1:49152/
 web=http://127.0.0.1:49152/
 tui=botster-hub apps open botster-tui
-mcp=botster-hub mcp-serve
 status=botster-hub status
 apps=botster-hub apps list
 down=botster-hub down
@@ -686,7 +685,7 @@ isolated runtime includes its explicit `--data-dir` override.
 The console accepts request/response commands without a repeated
 `botster-hub` prefix. Foreground terminal apps temporarily own the terminal and
 return to the prompt afterward. Commands that own stdin or host another runtime
-(`start`, `mcp-serve`, `sessions attach`, `inspect`, and `run-one`) remain
+(`start`, `sessions attach`, `inspect`, and `run-one`) remain
 external-only and the console prints the exact explicit invocation to use.
 
 `botster-hub doctor [--data-dir <path>]` is the non-mutating diagnostic path for
@@ -721,7 +720,7 @@ registration is durably committed.
 
 Command layers:
 
-- Runtime commands: `up`, `down`, `status`, `mcp-serve`, plus the daily
+- Runtime commands: `up`, `down`, `status`, plus the daily
   `open web`, `open tui`, and `reload <package>` aliases.
 - App entrypoints: `apps list`, `apps show`, and `apps open` operate on
   installed package runnable entrypoints projected by the daemon.
@@ -929,97 +928,136 @@ the daemon is not running they fail with `daemon not running` instead of
 mutating `hub-state.json` out of band. That keeps package/provider state,
 daemon-backed status, and plugin lifecycle reads on one control plane.
 
-## Agent-facing MCP stdio
+## Agent-facing MCP over HTTP
 
-Local agents can launch the daemon-backed MCP surface against the canonical
-default data directory:
+The daemon serves MCP itself, over HTTP on loopback, so no process runs per
+agent. A session reaches it with the two variables the Hub sets in its
+environment:
 
-```sh
-botster-hub mcp-serve
+- `BOTSTER_MCP_URL` is the endpoint, `http://127.0.0.1:<port>/mcp`.
+- `BOTSTER_MCP_TOKEN` is the session's bearer token, `<session_id>.<64 hex>`.
+
+The token is the identity. Agents configure it the way the monorepo did: an
+`http` MCP server whose `url` is `${BOTSTER_MCP_URL}` and whose header is
+`Authorization: Bearer ${BOTSTER_MCP_TOKEN}`. For Claude Code that is a
+`.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "botster": {
+      "type": "http",
+      "url": "${BOTSTER_MCP_URL}",
+      "headers": { "Authorization": "Bearer ${BOTSTER_MCP_TOKEN}" }
+    }
+  }
+}
 ```
 
-`mcp-serve` speaks MCP over stdio as newline-delimited JSON-RPC: every stdout
-line is one protocol message, and the command does not use `Content-Length`
-framing. Process diagnostics belong on stderr so agent clients can treat stdout
-as the protocol stream.
+Codex has no `${VAR}` expansion in `config.toml`. Its plugin form is a
+`.mcp.json` like the one above with `"bearer_token_env_var":
+"BOTSTER_MCP_TOKEN"`. Without a plugin, write the server entry with the URL
+from the session's own environment, and name the token variable:
 
-Native tools route through the running daemon, not directly into hub state:
+```toml
+[mcp_servers.botster]
+url = "<the value of BOTSTER_MCP_URL>"
+bearer_token_env_var = "BOTSTER_MCP_TOKEN"
+```
 
-- `hub.status` returns sanitized daemon status through
-  `daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime`.
-- `hub.sessions.list` returns sanitized session ids and lifecycle labels through
-  the same daemon/client path.
-- `whoami` reports the local MCP identity available to native tools. When
-  `BOTSTER_SESSION_ID` is present it is reported as the caller session. The Hub
-  sets `BOTSTER_SESSION_ID` in every session it spawns, raw or session-type.
+Run Codex with `--no-daemon` and its own `CODEX_HOME` when several sessions
+share a machine: the shared Codex app-server daemon keeps the environment of
+the session that started it, so its MCP calls carry that session's token.
+
+The agent-side file belongs to the user's agent setup; the Hub only sets the
+two variables. A restarted session gets a new token, and its old token is
+refused, because the Hub stores only the digest of the current secret in the
+session's Core metadata.
+
+The transport is the MCP Streamable HTTP subset that needs no stream: `POST
+/mcp` with a JSON-RPC message answers with one JSON body, or `202` for a
+notification. `GET` and `DELETE` answer `405`. Requests need `Content-Length`;
+a chunked body is refused with `411`. Every request is checked in this order,
+and each refusal comes before the body is read:
+
+1. `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (DNS rebinding).
+2. Any `Origin` header is refused with `403`; agent CLIs send none and a
+   browser page always does.
+3. `Authorization: Bearer <token>` must be present and well formed, and the
+   token must prove a session. A missing, malformed, unknown, or wrong token
+   is `401 caller_unauthenticated`, with one body for every cause. There is no
+   operator over HTTP: the operator uses the Unix socket CLI.
+4. The path, the method, and the body framing. A body is at most 1 MiB
+   (`MAX_CONTROL_REQUEST_BYTES`); the request head is at most 16 KiB and 64
+   headers.
+
+The port is stable per data directory, because sessions outlive the daemon and
+keep the URL in their environment. The daemon records it in
+`<data-dir>/mcp-http.endpoint`. If that port is taken at the next start, the
+daemon binds a new one, rewrites the file, and reports it; running sessions
+keep the old URL until they restart.
+
+Tools route through the running daemon: the HTTP task sends each call to the
+owner as a control message that carries the bearer token, and the owner proves
+the token against the session's stored digest in the same Core submission that
+carries out the operation. Native tools:
+
+- `hub.status` and `hub.sessions.list` return sanitized daemon status and
+  session labels.
+- `whoami` reports the caller: `caller_session_id`, and the `host_id` of its
+  hub. A session is always named together with its hub.
 - `post_message` and `post_envelope` publish a text payload as a core routed
-  envelope to one target session. A target that Core does not hold as running
-  is refused with `unknown_session`.
+  envelope to one target session. The sender is derived from the token; no
+  argument names it. A target that Core does not hold as running is refused
+  with `unknown_session`. A received message names its sender as `source`:
+  `{ "kind": "session", "hub_id": "...", "session_id": "..." }`.
 - `receive_messages` and `receive_envelopes` return only the caller session's
-  messages, from `BOTSTER_SESSION_ID`; they do not accept another session id or
-  agent id. Delivery is at least once: a message is returned by every receive
-  until it is acknowledged, so a caller that stops after a receive loses
-  nothing. `after` pages past messages already seen.
+  messages; they do not accept another session id or agent id. Delivery is at
+  least once: a message is returned by every receive until it is acknowledged,
+  so a caller that stops after a receive loses nothing. `after` pages past
+  messages already seen.
 - `ack_message` and `ack_envelope` acknowledge one delivered caller-scoped
   envelope, which removes it. Posting an envelope id that the target still
   holds changes nothing, so a retried post cannot duplicate a message.
+- `notify_session` is a guarded-write doorbell attempt, separate from
+  routed-envelope inbox, cursor, and ack semantics.
 - Every session the Hub spawns starts without the `BOTSTER_*` names it would
   inherit from the process that started the Hub; the Hub then sets its own
   values. A name that is not valid UTF-8 cannot be listed for removal and is
   still inherited.
-- `notify_session` is a guarded-write doorbell attempt. The current native MCP
-  surface does not yet gather terminal readiness evidence from attached clients,
-  so it reports core's guarded-write decision and can defer instead of injecting
-  bytes. That result is separate from routed-envelope inbox, cursor, and ack
-  semantics.
 
-The message/envelope tools use
-`daemon_transport_request -> serve_daemon -> HubClientApi -> HubRuntime ->
-CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. That is the only
-product coordination path: CoreDaemon owns the router, cursors, and delivery
-state. Cursors are process memory; the hub surface reports the cursor returned
-by CoreDaemon and does not claim restart-durable inbox state.
+The socket (operator) path has no inbox: a post from it is labelled
+`operator`, and receive and ack are refused with `caller_required`.
 
-Tool listing and calling both route through `McpToolRegistry`. Native hub tools
-are provided by `NativeHubToolProvider`; Lua plugin tools use
-`PluginHubToolProvider` descriptors and owned daemon call messages on the same
-registry path. Plugin execution is dispatched through the plugin
-worker/supervisor boundary instead of creating a second MCP server or direct
-in-process closure path.
+A message endpoint is a Hub-internal string, `hub:<hub_id>/session:<id>` for a
+session, built and parsed in `routed_endpoint`; clients and plugins see the
+structured form. Plugin MCP tool handlers receive the tool arguments as their
+first argument and, when a session called, `request` as a second argument:
+`request.caller` names the caller.
 
-The native local coordination path uses no Lua or plugin tool execution:
-`whoami`, `post_message`, `receive_messages`, `ack_message`, and
-`notify_session` are native hub tools even when the binary also has the Lua
-plugin runtime available. Project Pipelines uses the same CoreDaemon-owned
+Tool listing and calling go through the daemon: native tools above, and Lua
+plugin tools through daemon-owned call messages to the plugin
+worker/supervisor boundary. Project Pipelines uses the same CoreDaemon-owned
 routed-envelope bus from `examples/project-pipelines/plugin.lua` through
-`botster.coordination.*` (Lua bridge into the same CoreDaemon instance—not a
-second inbox).
+`botster.coordination.*` (Lua bridge into the same CoreDaemon instance, not a
+second inbox). Cursors are process memory; the hub surface reports the cursor
+returned by CoreDaemon and does not claim restart-durable inbox state.
 
 ## Project Pipelines Local Readiness
 
 The checked-in `examples/project-pipelines` package is ready for constrained
 local coordination through the ordinary persisted package registry. Install
-and enable it against the running daemon, then run MCP from that same directory:
+and enable it against the running daemon; its tools then appear in the daemon's
+MCP `tools/list` for every session:
 
 ```sh
 botster-hub packages install \
   --path examples/project-pipelines
 botster-hub packages enable project-pipelines
-botster-hub mcp-serve
 ```
 
-For lower-level diagnostics, enable the plugin package through a running daemon
-and serve MCP from the same data directory:
-
-```sh
-cargo run -- packages install \
-  --path examples/project-pipelines
-cargo run -- packages enable project-pipelines
-cargo run -- mcp-serve
-```
-
-`mcp-serve` lists and calls the plugin's Project Pipelines tools through
-`PluginHubToolProvider -> daemon request -> HubRuntime -> HubPluginLifecycle ->
+The plugin's Project Pipelines tools are listed and called through
+the daemon's `PluginMcpCallTool` request -> `HubRuntime -> HubPluginLifecycle ->
 PluginWorkerEngine -> LuaPluginRuntime`. `project_pipelines.start` requires an
 explicit `target_id` and assigned worktree and records primitive-backed
 coordination evidence on the run: request id, agent name, owner plugin, routed
@@ -1051,7 +1089,7 @@ explicit one-shot export/import before switching active work to the local
 plugin.
 
 Project Pipelines uses the same persistent daemon, ordinary installed packages,
-and `mcp-serve` over one data directory as every other production package.
+and the daemon's MCP endpoint over one data directory as every other production package.
 
 Production runtime-ready today: explicit local daemon lifecycle, file-backed hub/package
 state, local package admission from a manifest path, typed status/package reads,
@@ -1118,7 +1156,7 @@ integration asks for them, and treat unavailable provider/GitHub automation as
 deferred unless the relevant package and config are installed.
 
 Session-template spawn failure: confirm the Project Pipelines package is
-enabled, the same data directory is used for `mcp-serve`, and the package still
+enabled, the same data directory serves MCP, and the package still
 declares the `project-pipelines/agent-step` template. `project_pipelines.start`
 also requires explicit `target_id` and `worktree` arguments; missing either one
 is a tool-call error, not a template fallback.

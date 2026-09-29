@@ -149,9 +149,7 @@ pub(crate) fn command_action(words: &[String]) -> ConsoleAction {
         "help" | "--help" | "-h" => ConsoleAction::Help,
         "exit" => ConsoleAction::Exit,
         "down" | "shutdown" => ConsoleAction::Command(CommandMode::Stop),
-        "start" | "mcp-serve" | "inspect" | "run-one" => {
-            ConsoleAction::Command(CommandMode::ExternalOnly)
-        }
+        "start" | "inspect" | "run-one" => ConsoleAction::Command(CommandMode::ExternalOnly),
         "sessions" if words.get(1).map(String::as_str) == Some("attach") => {
             ConsoleAction::Command(CommandMode::ExternalOnly)
         }
@@ -223,7 +221,7 @@ pub(crate) fn print_intro(
 pub(crate) fn print_help() {
     println!(
         "commands: status doctor packages ... apps ... sessions ... up down help exit\n\
-         external-only: start, mcp-serve, sessions attach, inspect, run-one"
+         external-only: start, sessions attach, inspect, run-one"
     );
 }
 
@@ -509,7 +507,6 @@ mod tests {
             ("spawn-targets list", CommandMode::Inline),
             ("context", CommandMode::Inline),
             ("shutdown", CommandMode::Stop),
-            ("mcp-serve", CommandMode::ExternalOnly),
             (
                 "open web",
                 CommandMode::ResolveApp("botster-web/web-client".to_string()),
@@ -560,7 +557,6 @@ mod tests {
     fn external_only_commands_render_exact_explicit_invocations() {
         for (line, expected) in [
             ("start", "botster-hub start"),
-            ("mcp-serve", "botster-hub mcp-serve"),
             (
                 "sessions attach sentinel",
                 "botster-hub sessions attach sentinel",

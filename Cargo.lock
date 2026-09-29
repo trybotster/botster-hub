@@ -450,6 +450,7 @@ dependencies = [
  "botster-ui-contract",
  "bytes",
  "getrandom 0.3.4",
+ "httparse",
  "keyring",
  "libc",
  "loom",
