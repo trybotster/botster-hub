@@ -1351,7 +1351,7 @@ fn local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads
 fn ultimate_close_failure_sacrifices_every_peer_and_sweeps_all_owners() {
     run_close_hang_fail_closed_body();
     local_webrtc_close_failure_fail_closed_parks_runtime_and_stops_driver_threads();
-    let inventory_source = include_str!("peer.rs");
+    let inventory_source = include_str!("peer_tests.rs");
     assert!(
         inventory_source.contains("timeout fail-closed must sacrifice sibling peers"),
         "ultimate close failure must keep the bound-exceeded sibling-sacrifice oracle"

@@ -177,7 +177,6 @@ fn test_items(path: &str) -> &'static [&'static str] {
     const MODULE: &str = "#[cfg(test)]\nmod tests {";
     match path {
         "src/daemon/owner_loop.rs"
-        | "src/daemon/control/sessions.rs"
         | "src/daemon_maintenance.rs"
         | "src/plugin_entity.rs"
         | "src/package_entity_fanout.rs" => &[MODULE],
@@ -212,6 +211,42 @@ fn feature_only(path: &str, root: &std::path::Path) -> Result<bool, String> {
         .map_err(|error| format!("read {owner}: {error}"))?;
     if !feature_gate_in_code(&declaration, gate)? {
         return Err(format!("{path} lacks its feature gate in {owner}"));
+    }
+    Ok(true)
+}
+
+/// A test module moved out of its owner into a sibling file. The file is exempt only while
+/// the owner still declares it behind `#[cfg(test)]`.
+fn moved_test_module(path: &str, root: &std::path::Path) -> Result<bool, String> {
+    let (owner, gate) = match path {
+        "src/transport/webrtc/peer_tests.rs" => (
+            "src/transport/webrtc/peer.rs",
+            "#[cfg(test)]\n#[allow(unused_imports)]\n#[path = \"peer_tests.rs\"]\nmod tests;",
+        ),
+        "src/daemon/control/sessions_tests.rs" => (
+            "src/daemon/control/sessions.rs",
+            "#[cfg(test)]\n#[path = \"sessions_tests.rs\"]\nmod tests;",
+        ),
+        "src/subscription/entity_tests.rs" => (
+            "src/subscription/entity.rs",
+            "#[cfg(test)]\n#[path = \"entity_tests.rs\"]\nmod tests;",
+        ),
+        "src/runtime_tests.rs" => (
+            "src/runtime.rs",
+            "#[cfg(test)]\n#[path = \"runtime_tests.rs\"]\npub(crate) mod tests;",
+        ),
+        "src/runtime_ordinary_spawn_queue_tests.rs" => (
+            "src/runtime.rs",
+            "#[cfg(test)]\n#[path = \"runtime_ordinary_spawn_queue_tests.rs\"]\nmod ordinary_spawn_queue_tests;",
+        ),
+        _ => return Ok(false),
+    };
+    let declaration = std::fs::read_to_string(root.join(owner))
+        .map_err(|error| format!("read {owner}: {error}"))?;
+    if !feature_gate_in_code(&declaration, gate)? {
+        return Err(format!(
+            "{path} is not declared behind cfg(test) in {owner}"
+        ));
     }
     Ok(true)
 }
@@ -288,6 +323,9 @@ pub(crate) fn check_lua_boundary(
     path: &str,
     source: &str,
 ) -> Result<(), String> {
+    if moved_test_module(path, root)? {
+        return Ok(());
+    }
     let mut production = without_test_items(source, test_items(path))?;
     if runtime_owner(path) || feature_only(path, root)? {
         return Ok(());
