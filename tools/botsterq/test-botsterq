@@ -8,6 +8,8 @@ Q="$here/botsterq"
 work=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/botsterq-test.XXXXXX")" && pwd)
 export BOTSTERQ_HOME="$work/home"
 export BOTSTERQ_KILL_GRACE=2
+# The suite runs on a private queue: never through the user's real mbx unless a test asks.
+export BOTSTERQ_MBX=0
 failures=0
 pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1: $2"; failures=$((failures + 1)); }
@@ -783,6 +785,37 @@ make_project "$work/capE"
 ( cd "$work/capE" && BOTSTERQ_TEST_FAIL_JOB_LIST=1 BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapNoList -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capnolist.out" 2>"$work/capnolist.err" )
 [ "$(cat "$work/capnolist.out")" = kept ] && grep -q "cargo clean skipped: the running-job list cannot be read" "$work/capnolist.err" \
   && pass "an unreadable running-job list skips the clean and says so" || fail "cap without the job list" "out=$(cat "$work/capnolist.out") err=$(cat "$work/capnolist.err")"
+
+# 19e. mbx. With BOTSTERQ_MBX=1 and an `mbx` on PATH, every job gets a cargo shim (a
+#      symlink to that mbx) first on PATH, the cache in the queue's state directory
+#      and managed target views off; BOTSTERQ_MBX=0 turns it off for one job; without
+#      an mbx nothing changes; an explicit MBX_CACHE_DIR is respected; and the target
+#      cap's `cargo clean` never goes through the shim.
+mkdir -p "$work/fakebin"
+printf '#!/bin/sh\necho "called: $0 $*" >> "$MBX_FAKE_LOG"\nexit 0\n' >"$work/fakebin/mbx"
+chmod +x "$work/fakebin/mbx"
+probe='echo "cargo=$(command -v cargo)"; echo "cache=${MBX_CACHE_DIR-unset}"; echo "views=${MBX_TARGET_VIEWS-unset}"'
+BOTSTERQ_MBX=1 PATH="$work/fakebin:$PATH" "$Q" run --label MbxOn -- sh -c "$probe" >"$work/mbxon.out" 2>&1
+[ "$(sed -n 1p "$work/mbxon.out")" = "cargo=$BOTSTERQ_HOME/mbx-shim/cargo" ] \
+  && [ "$(readlink "$BOTSTERQ_HOME/mbx-shim/cargo")" = "$work/fakebin/mbx" ] \
+  && [ "$(sed -n 2p "$work/mbxon.out")" = "cache=$BOTSTERQ_HOME/mbx-cache" ] && [ "$(sed -n 3p "$work/mbxon.out")" = "views=0" ] \
+  && pass "mbx on: the job gets a cargo shim to mbx first on PATH, the cache under the queue's state directory, managed target views off" \
+  || fail "mbx on" "$(cat "$work/mbxon.out")"
+BOTSTERQ_MBX=0 PATH="$work/fakebin:$PATH" "$Q" run --label MbxOff -- sh -c "$probe" >"$work/mbxoff.out" 2>&1
+[ "$(sed -n 1p "$work/mbxoff.out")" != "cargo=$BOTSTERQ_HOME/mbx-shim/cargo" ] && [ "$(sed -n 2p "$work/mbxoff.out")" = "cache=unset" ] \
+  && pass "BOTSTERQ_MBX=0 turns mbx off for one job" || fail "mbx off" "$(cat "$work/mbxoff.out")"
+BOTSTERQ_MBX=1 PATH="$work/fakebin:$PATH" MBX_CACHE_DIR="$work/mycache" "$Q" run --label MbxCache -- sh -c "$probe" >"$work/mbxcache.out" 2>&1
+[ "$(sed -n 2p "$work/mbxcache.out")" = "cache=$work/mycache" ] && pass "an explicit MBX_CACHE_DIR is respected" || fail "mbx cache dir" "$(cat "$work/mbxcache.out")"
+# no mbx on PATH: nothing changes (build a PATH without the fake and without any real mbx)
+nombx_path=$(printf '%s' "$PATH" | tr ':' '\n' | while read -r d; do [ -x "$d/mbx" ] || printf '%s:' "$d"; done)
+BOTSTERQ_MBX=1 PATH="$nombx_path" "$Q" run --label MbxNone -- sh -c "$probe" >"$work/mbxnone.out" 2>&1
+[ "$(sed -n 2p "$work/mbxnone.out")" = "cache=unset" ] && pass "without an mbx installed the job is unchanged" || fail "mbx absent" "$(cat "$work/mbxnone.out")"
+# the cap's clean uses the real cargo, never the shim (the fake mbx records any call)
+make_project "$work/capM"
+: >"$work/mbx-fake.log"
+( cd "$work/capM" && MBX_FAKE_LOG="$work/mbx-fake.log" BOTSTERQ_MBX=1 BOTSTERQ_TARGET_CAP_GB=0.001 PATH="$work/fakebin:$PATH" "$Q" run --label MbxCap -- sh -c 'test -e target/debug/big && echo big-kept || echo big-cleaned' >"$work/mbxcap.out" 2>/dev/null )
+[ "$(tail -1 "$work/mbxcap.out")" = big-cleaned ] && [ ! -s "$work/mbx-fake.log" ] \
+  && pass "the target cap's cargo clean does not go through the mbx shim" || fail "mbx and the cap" "out=$(cat "$work/mbxcap.out") fake_calls=$(cat "$work/mbx-fake.log")"
 
 # 20. A suite run leaves no supervisor behind. Jobs still finishing get a
 #     bounded wait; any botsterq-job under this suite's home after that leaked.

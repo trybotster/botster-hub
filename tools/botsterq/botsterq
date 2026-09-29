@@ -45,6 +45,12 @@ exclusive_deadline_seconds=${BOTSTERQ_EXCLUSIVE_DEADLINE:-2700}
 # the user's confirmation; 0 turns it off). A job whose directory has a cargo
 # ./target above the cap gets `cargo clean` there before its command starts.
 export BOTSTERQ_TARGET_CAP_GB=${BOTSTERQ_TARGET_CAP_GB:-15}
+# Mr Boxington (mbx, https://mr-boxington.jdx.dev), a shared build cache. ONE setting:
+# `mbx_default=1` puts an mbx cargo shim first on PATH for every job (when `mbx` is
+# installed), with the cache in ~/.botsterq/mbx-cache and managed target views OFF, so
+# ./target stays a real directory (the target cap and target/candidate keep working).
+# Set it to 0 to turn mbx off for everyone; BOTSTERQ_MBX=0 turns it off for one job.
+mbx_default=1
 # Resolve symlinks (~/.local/bin/botsterq links to the installed copy), so the
 # job supervisor next to this script is found.
 self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
@@ -437,6 +443,24 @@ admit_legacy() {
   admit_locked "$token" "$exclusive" "$label" "$([ "$exclusive" = 1 ] && echo "$exclusive_deadline_seconds" || echo 0)" "$@"
 }
 
+# Puts the mbx cargo shim first on PATH for the job about to be queued (its
+# environment is the job's environment). Nothing happens when it is off or mbx is
+# not installed. The shim is a symlink named cargo to the mbx binary.
+setup_mbx() {
+  [ "${BOTSTERQ_MBX:-$mbx_default}" = 1 ] || return 0
+  mbx_bin=$(command -v mbx 2>/dev/null) || return 0
+  shim_dir="$state/mbx-shim"
+  mkdir -p "$shim_dir"
+  [ "$(readlink "$shim_dir/cargo" 2>/dev/null)" = "$mbx_bin" ] || ln -sfn "$mbx_bin" "$shim_dir/cargo"
+  export MBX_CACHE_DIR=${MBX_CACHE_DIR:-$state/mbx-cache}
+  export MBX_TARGET_VIEWS=0
+  export BOTSTERQ_MBX_SHIM_DIR="$shim_dir"
+  case ":$PATH:" in
+    *":$shim_dir:"*) ;;
+    *) PATH="$shim_dir:$PATH"; export PATH ;;
+  esac
+}
+
 cmd_run() {
   label=job
   exclusive=0
@@ -469,6 +493,7 @@ cmd_run() {
     exit 127
   }
   ensure_server
+  setup_mbx
   token="$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
   export BOTSTERQ_OWNER=$$
   id=
