@@ -67,7 +67,11 @@ botsterq slots 3         # change it (kept across server restarts)
   three waiters, but not promised by the platform. `botsterq slots N` refuses at once
   while that wait holds the lock. Cancelling a `run` that waits, at the lock or for the
   exclusive job, ends it at once with exit 130: its command never starts and it leaves
-  no admission process or file behind.
+  no admission process behind. One window remains: a cancel in the few milliseconds
+  between starting the admission and recording its pid can leave a queued job (and a
+  stale `.admitted`, `.admitcancel` or `.cancelled` file in `~/.botsterq/run`) for a run
+  that is gone; the job is skipped when its turn comes, because its `run` process no
+  longer exists, and never starts its command.
 - After an install, a `run` that started before it keeps working: the supervisor
   accepts the old argument shape (no deadline) and the legacy `__admit` entry point
   admits with the old protocol.
