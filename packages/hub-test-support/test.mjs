@@ -132,9 +132,9 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.50");
+assert.equal(metadata.package_version, "0.1.51");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 12);
+assert.equal(metadata.protocol_version, 13);
 assert.equal(metadata.conformance_fixture_revision, 53);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
@@ -174,7 +174,7 @@ assert.equal(metadata.conformance_fixture_revision, 53);
     ...readme.matchAll(/"@trybotster\/hub-test-support":\s*"([^"]+)"/g),
   ].map((match) => match[1]);
   assert.deepEqual(packageSpecPins, [version]);
-  assert.match(readme, /protocol version 12/);
+  assert.match(readme, /protocol version 13/);
   assert.match(readme, /conformance revision 53/);
   assert.doesNotMatch(readme, /mode_gated_input|ModeGatedInput|SendInput/);
 }
