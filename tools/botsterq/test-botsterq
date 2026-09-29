@@ -290,8 +290,14 @@ B3=$!
 read _ <"$work/b3.hold.reached"
 started=$(date +%s)
 kill -TERM "$B3"
+# The run must wait for its admission process (it cannot know its state): while
+# that process is held, the run stays alive.
+# timer: deadline — a negative window: the run must not exit while the admission lives.
+perl -e 'select(undef, undef, undef, 0.4)'
+kill -0 "$B3" 2>/dev/null && b3_waited=yes || b3_waited=no
 printf x >"$work/b3.hold"   # release the held admission process; it finds the marker
 wait "$B3"; code=$?; elapsed=$(( $(date +%s) - started ))
+[ "$b3_waited" = yes ] && pass "cancel at the boundary: b3 the run waits for its admission process" || fail "boundary b3 wait" "the run exited while its admission process was held"
 boundary_check b3 "$code" "$elapsed"
 
 # 8f. Several waiters behind the holder start in the order they arrived. The
