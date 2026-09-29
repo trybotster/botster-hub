@@ -732,6 +732,19 @@ wait "$CAPLONG"
 ( cd "$work/capD" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapThird -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capthird.out" 2>&1 )
 [ "$(tail -1 "$work/capthird.out")" = cleaned ] && pass "after that job ended, the next job over the cap cleans" || fail "cap after the long job" "$(cat "$work/capthird.out")"
 
+# 19c2. A running job in ANOTHER directory does not block the clean: the guard is
+#       about the shared target, not about the queue being busy.
+make_project "$work/capF"
+make_project "$work/capG"
+( cd "$work/capG" && "$Q" run --label CapElsewhere -- sh -c 'touch "$0/capg.up"; sleep 3' "$work" >/dev/null 2>&1 ) &
+CAPG=$!
+await_file "$work/capg.up"
+( cd "$work/capF" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapNeighbour -- sh -c 'test -e target/debug/big && echo kept || echo cleaned' >"$work/capneighbour.out" 2>&1 )
+wait "$CAPG"
+[ "$(tail -1 "$work/capneighbour.out")" = cleaned ] && [ -e "$work/capG/target/debug/big" ] \
+  && pass "a running job in another directory does not block the clean, and its target is untouched" \
+  || fail "cap with a job elsewhere" "$(cat "$work/capneighbour.out")"
+
 # 19d. When the running-job list cannot be read the clean is skipped too, with
 #      the reason, rather than guessing that nobody else is running.
 make_project "$work/capE"
