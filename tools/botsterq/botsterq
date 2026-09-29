@@ -74,18 +74,35 @@ with_admission_lock() {
   ' "$state/admission.lock" "$@"
 }
 
-# The admission script of `run`: like with_admission_lock, but a cancel marker
-# (created by `run` when it is interrupted) that exists once the lock is held
-# ends it with 130 before the admission starts. `run` starts it directly in the
-# background, so the pid it holds is this perl process, which dies at once from
-# TERM while it still waits for the lock.
+# The admission script of `run`: like with_admission_lock, but it is the ONE
+# process `run` signals when it is interrupted. `run` starts it directly in the
+# background, so the pid it holds is this perl process. TERM while it still
+# waits for the lock ends it at once (default action); TERM after the lock is
+# held goes to the admission it started and it waits for that to end, so no
+# admission survives it. TERM is blocked from the lock until the child exists
+# and the forwarding handler is installed (a pending TERM is then delivered to
+# the handler). A cancel marker (created by `run` before it signals) that exists
+# once the lock is held ends it with 130 before the admission starts.
 ADMISSION_PERL='
   use Fcntl qw(:flock);
+  use POSIX qw(:signal_h);
   my ($lockfile, $cancel) = splice(@ARGV, 0, 2);
   open(my $lock, ">>", $lockfile) or die "botsterq: open lock: $!\n";
   flock($lock, LOCK_EX) or die "botsterq: lock: $!\n";
   exit 130 if -e $cancel;
-  exit(system(@ARGV) >> 8);
+  my $term = POSIX::SigSet->new(SIGTERM);
+  my $old = POSIX::SigSet->new;
+  sigprocmask(SIG_BLOCK, $term, $old);
+  my $child = fork();
+  die "botsterq: fork: $!\n" unless defined $child;
+  if (!$child) {
+    sigprocmask(SIG_SETMASK, $old);
+    exec { $ARGV[0] } @ARGV or die "botsterq: exec: $!\n";
+  }
+  $SIG{TERM} = sub { kill "TERM", $child };
+  sigprocmask(SIG_SETMASK, $old);
+  while (waitpid($child, 0) < 0) { last unless $!{EINTR}; }
+  exit($? >> 8);
 '
 
 # Like with_admission_lock, but fails at once (exit 75) when the lock is held.
@@ -268,10 +285,7 @@ admit_locked() {
   token=$1 exclusive=$2 label=$3 deadline=$4
   shift 4
   cancel="$state/run/$token.admitcancel"
-  # `run` interrupts a running admission by TERM to the pid in this file, after
-  # it created the cancel marker; an admission that starts after the marker
-  # ends here.
-  echo "$$" >"$state/run/$token.admit"
+  # An admission that starts after `run` created the cancel marker ends here.
   [ ! -e "$cancel" ] || exit 130
   if [ "$exclusive" = 1 ]; then
     slots_needed=$(ts -S)
@@ -377,15 +391,12 @@ cmd_run() {
     # waits for an exclusive job acts on it), and let it end before the job is
     # resolved by its token.
     if [ -n "${admitting:-}" ]; then
-      # The marker first: an admission that gets the lock or starts after this
-      # point ends itself. Then stop the one that is running (TERM to its pid),
-      # or, while it still waits for the lock, its perl process.
+      # The marker first (an admission that gets the lock after this ends
+      # itself), then TERM to the admission process: it ends at once while it
+      # waits for the lock, or forwards TERM to the admission it started and
+      # waits for it. Nothing survives it.
       : >"$state/run/$token.admitcancel"
-      if [ -f "$state/run/$token.admit" ]; then
-        kill -TERM "$(cat "$state/run/$token.admit")" 2>/dev/null || true
-      else
-        kill -TERM "$admitting" 2>/dev/null || true
-      fi
+      kill -TERM "$admitting" 2>/dev/null || true
       wait "$admitting" 2>/dev/null || true
       rm -f "$state/run/$token.admitted" "$state/run/$token.admit" "$state/run/$token.admitcancel"
     fi

@@ -303,6 +303,29 @@ printf 'start\t%s\tR1\t2\t1\tX\tload=1/1/1\nstart\t%s\tR2\t1\t0\tY\tload=1/1/1\n
   || fail "audit real clock" "exit=$codeReal out=$(cat "$work/audit3.out")"
 rm -f "$BOTSTERQ_HOME/events.log"
 
+# 8j. Cancel at every stage of admission. Runs are cancelled at increasing
+#     delays after they start, so the signal lands while the run waits for the
+#     lock, while the admission runs and after it: each ends, and nothing is
+#     left (no admission file, no lock waiter, no queued or running job).
+"$Q" slots 2 >/dev/null
+j=0
+while [ "$j" -lt 30 ]; do
+  "$Q" run --label "J$j" -- sh -c 'sleep 30' >/dev/null 2>&1 &
+  J=$!
+  # timer: deadline — test-side delay that walks the cancel across the stages.
+  perl -e 'select(undef, undef, undef, $ARGV[0])' "$(perl -e 'printf "%.3f", $ARGV[0] * 0.012' "$j")"
+  kill -TERM "$J" 2>/dev/null
+  wait "$J" 2>/dev/null
+  j=$((j + 1))
+done
+left_files=$(ls "$BOTSTERQ_HOME"/run/*.admit* 2>/dev/null | wc -l | tr -d ' ')
+left_waiters=$(lock_waiters)
+left_jobs=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk '$2 == "queued" || $2 == "running"' | wc -l | tr -d ' ')
+left_groups=$(ps -axo command= | grep -F -- "sleep 30" | grep -vc grep)
+[ "$left_files" = 0 ] && [ "$left_waiters" = 0 ] && [ "$left_jobs" = 0 ] \
+  && pass "30 runs cancelled at increasing delays leave no admission file, lock waiter or job" \
+  || fail "cancel at every stage" "admission_files=$left_files lock_waiters=$left_waiters jobs=$left_jobs sleepers=$left_groups"
+
 # 9. Nested run inside a job runs directly (no deadlock at one slot).
 "$Q" slots 1 >/dev/null
 out=$("$Q" run --label outer -- sh -c "$Q run --label inner -- echo inner-ran" 2>&1)
