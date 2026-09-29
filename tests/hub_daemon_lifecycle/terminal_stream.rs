@@ -213,6 +213,33 @@ impl RawUnixClient {
         }
     }
 
+    /// Move every terminal frame already waiting on a route socket into
+    /// `frames`. A response on the control socket no longer travels behind
+    /// the terminal frames that preceded it, so a proof that collects frames
+    /// while it requests must sweep the route sockets itself.
+    fn drain_route_sockets(&mut self, frames: &mut Vec<DaemonUnixTerminalFrame>) {
+        let mut ended = Vec::new();
+        for (route, socket) in &mut self.route_sockets {
+            loop {
+                match socket.read_within(Some(Duration::from_millis(1))) {
+                    Ok(Some(DaemonUnixMuxFrame::Terminal(frame))) => frames.push(frame),
+                    Ok(Some(DaemonUnixMuxFrame::Server(_))) => {
+                        panic!("control frame on route socket {route}")
+                    }
+                    Ok(None) => break,
+                    Err(DaemonTransportError::ClientDisconnected) => {
+                        ended.push(route.clone());
+                        break;
+                    }
+                    Err(error) => panic!("route socket {route} failed: {error}"),
+                }
+            }
+        }
+        for route in ended {
+            self.route_sockets.remove(&route);
+        }
+    }
+
     fn note_attach(&mut self, response: &DaemonResponse) {
         if let Some(attach) = &response.terminal_attach {
             self.routes
@@ -261,6 +288,7 @@ impl RawUnixClient {
                         "response must correlate with the outstanding request"
                     );
                     self.note_attach(&response);
+                    self.drain_route_sockets(frames);
                     return response;
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => frames.push(frame),
