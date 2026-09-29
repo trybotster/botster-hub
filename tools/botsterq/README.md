@@ -122,6 +122,15 @@ botsterq slots 3         # change it (kept across server restarts)
   millisecond between starting a waiter and writing its record misses that waiter, and a run
   killed with SIGKILL leaves its records behind (small files). A job removed by a plain `ts -r`
   is not released.
+- Recovery step, the ONLY case where killing a process is allowed (and only by pid): if the queue
+  looks stuck (no job runs, `run`s wait) or a `botsterq run` hangs after its job was removed, list
+  `ps -axo pid,command | grep 'ts -w'`; a `ts -w <id>` whose job `<id>` no longer appears in
+  `botsterq list` is one of botsterq's own internal waiters that will never end (this happens only
+  for waiters recorded by an older botsterq, since this version releases them itself). Check with
+  `lsof ~/.botsterq/admission.lock` that its process does not hold the admission lock, then stop
+  exactly that pid. Never stop a `ts -w <id>` of a job that still exists, and never kill by name
+  or pattern. Documented and approved by the orchestrator (2026-09-29) after such waiters (pids 55589
+  and 56728 for removed jobs 609 and 610, about 8 hours old) and a jam at 10:36 were cleared this way.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
