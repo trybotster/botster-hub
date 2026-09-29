@@ -94,6 +94,9 @@ fn register_unix_admission(
     if let UnixTerminalAdmission::Admitted { mux, .. } = &admission {
         mux.bind_close_work(Arc::clone(&state.pending_runtime.close_work));
         mux.bind_close_source(state.pending_runtime.close_source.clone());
+        if let Some(route_dir) = state.pending_runtime.route_dir.clone() {
+            mux.bind_route_dir(route_dir);
+        }
     }
     state.pending_runtime.admission.host_compatibility.insert(
         client_id.clone(),

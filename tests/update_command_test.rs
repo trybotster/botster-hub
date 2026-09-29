@@ -701,7 +701,14 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         attach.kind,
         botster_hub_client::DaemonResponseKind::TerminalAttached
     );
-    let frames = collect_attach_frames(&mut connection, new_session, "postupdate-attach");
+    let mut route_stream = botster_hub_client::DaemonRouteStream::connect(
+        attach
+            .terminal_attach
+            .as_ref()
+            .expect("attach names the route"),
+    )
+    .expect("connect route socket");
+    let frames = collect_attach_frames(&mut route_stream, new_session, "postupdate-attach");
     let kinds: Vec<TerminalKind> = frames.iter().map(|frame| frame.kind()).collect();
     let attached = kinds
         .iter()
@@ -1204,7 +1211,7 @@ fn read_worker_identity(data_dir: &Path, session_id: &str) -> (u32, PathBuf) {
 /// Read the attach stream on one route until SNAPSHOT_FINISH. Each read
 /// blocks until a frame arrives or the one deadline passes.
 fn collect_attach_frames(
-    connection: &mut botster_hub_client::DaemonConnection,
+    route_stream: &mut botster_hub_client::DaemonRouteStream,
     session_id: &str,
     subscription_id: &str,
 ) -> Vec<botster_terminal_protocol::TerminalFrame> {
@@ -1212,7 +1219,10 @@ fn collect_attach_frames(
     // timer: deadline — each frame arrival ends a read.
     let deadline = Instant::now() + Duration::from_secs(5);
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let Ok(Some(frame)) = connection.poll_terminal(remaining) else {
+        route_stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .expect("bound the route read");
+        let Ok(frame) = route_stream.read_frame() else {
             break;
         };
         if frame.route != subscription_id {
