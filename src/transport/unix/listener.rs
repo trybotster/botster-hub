@@ -1123,10 +1123,12 @@ mod tests {
         assert_eq!(change, DirectoryChange::DirectoryGone);
     }
 
-    /// Serve `socket` with an accept loop whose owner is `owner_uid`, connect
-    /// as this process's user, and report whether the connection reached the
-    /// control channel. A refused connection is closed by the Hub.
-    async fn same_user_connection_is_admitted_when_owner_is(owner_uid: u32) -> (bool, bool) {
+    /// Serve a socket with an accept loop whose owner is `owner_uid`, connect
+    /// as this process's user, and report whether the Hub admitted the
+    /// connection. The outcome is the first event: a control message means
+    /// admitted; end of stream on the client means the Hub refused it and
+    /// dropped the connection.
+    async fn same_user_connection_is_admitted_when_owner_is(owner_uid: u32) -> bool {
         use tokio::io::AsyncReadExt;
         let socket = temp_socket_path("o");
         let owner = acquire_socket_owner_lock(&socket).expect("lock");
@@ -1145,26 +1147,40 @@ mod tests {
             owner_uid,
         ));
         let mut client = TokioUnixStream::connect(&socket).await.expect("connect");
-        // timer: deadline — a refused connection sends no control message, so wait out a short window.
-        let admitted = tokio::time::timeout(Duration::from_millis(500), control_rx.recv())
-            .await
-            .is_ok_and(|message| {
-                matches!(message, Some(ControlMessage::AcceptedConnection { .. }))
-            });
-        // A refused connection is dropped by the Hub, so the client reads end of stream.
         let mut byte = [0_u8; 1];
-        let closed = admitted
-            || tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
-                .await
-                .is_ok_and(|read| read.is_ok_and(|count| count == 0));
+        // timer: deadline — bounds a lost event; the outcome is the first event, not the timeout.
+        let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                message = control_rx.recv() => {
+                    matches!(message, Some(ControlMessage::AcceptedConnection { .. }))
+                }
+                read = client.read(&mut byte) => {
+                    assert!(
+                        matches!(read, Ok(0)),
+                        "a refused client sees end of stream, got {read:?}"
+                    );
+                    false
+                }
+            }
+        })
+        .await
+        .expect("the accept loop admits or refuses the connection");
+        if !admitted {
+            // The refusal comes before any admission could be queued.
+            assert!(
+                control_rx.try_recv().is_err(),
+                "a refused connection must queue no control message"
+            );
+        }
         shutdown_tx.send(true).expect("signal shutdown");
+        // timer: deadline — bounds a lost shutdown; the accept loop stops on the signal.
         tokio::time::timeout(Duration::from_secs(1), accept_task)
             .await
             .expect("accept loop should stop")
             .expect("accept task should not panic");
         cleanup_socket_path(&socket, owner);
         let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
-        (admitted, closed)
+        admitted
     }
 
     /// Positive control: the owner's own connection is admitted.
@@ -1182,10 +1198,10 @@ mod tests {
     /// this process's user plays the other user.)
     #[tokio::test]
     async fn the_accept_loop_refuses_a_connection_of_another_user() {
-        let (admitted, closed) =
-            same_user_connection_is_admitted_when_owner_is(current_uid().wrapping_add(1)).await;
-        assert!(!admitted, "another user's connection must not be admitted");
-        assert!(closed, "another user's connection must be closed");
+        assert!(
+            !same_user_connection_is_admitted_when_owner_is(current_uid().wrapping_add(1)).await,
+            "another user's connection must not be admitted"
+        );
     }
 
     #[test]
@@ -1195,21 +1211,18 @@ mod tests {
         assert!(!peer_uid_matches(0, 501));
     }
 
-    /// The bind helper restricts the socket even under a permissive umask.
+    /// `bind` alone leaves a mode derived from the ambient umask (0755, 0775,
+    /// 0700, ...); only the helper's chmod makes it 0600. The umask is not
+    /// touched: it is process-wide and other tests run in parallel.
     #[test]
-    fn the_bound_control_socket_is_private_under_a_permissive_umask() {
+    fn the_bound_control_socket_is_private() {
         let socket = temp_socket_path("u");
-        // SAFETY: `umask` only swaps the process file-creation mask.
-        let previous = unsafe { libc::umask(0) };
-        let bound = bind_control_socket(&socket);
-        // SAFETY: as above; restore at once.
-        unsafe { libc::umask(previous) };
-        let _listener = bound.expect("bind the control socket");
+        let _listener = bind_control_socket(&socket).expect("bind the control socket");
         let mode = fs::metadata(&socket)
             .expect("metadata")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o} under umask 0");
+        assert_eq!(mode & 0o777, 0o600, "mode was {mode:o}");
         let _ = fs::remove_file(&socket);
     }
 
