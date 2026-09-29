@@ -100,6 +100,13 @@ botsterq slots 3         # change it (kept across server restarts)
   nothing when `CARGO_TARGET_DIR` is set (the command builds elsewhere). The price is one cold
   rebuild each time the cap is hit. It exists because unpruned worktree targets (15 to 40 GB each)
   filled the disk three times in 24 hours (free space 4.9 GB and 9.6 GB).
+  The clean is skipped, with one line and a `clean_skipped` events entry, when another running
+  botsterq job has the same directory or one inside it, because that job is using this target;
+  the same happens if the running-job list cannot be read. What it does not see: a job that
+  builds into this target from outside the directory tree (through a different `CARGO_TARGET_DIR`
+  setup or a symlink), and a job of another queue. A phased gate whose later phase starts over the
+  cap loses the compiled artifacts of the earlier phase (its candidate directory is outside
+  `target/` and survives); that phase recompiles.
   Why not prune by age: `cargo sweep` (0.8.0) was measured on a Hub worktree with a build, a
   clippy run, `cargo sweep --file`, and the same build again. It cleaned 1.1 GiB of 8.7 GB
   (13 percent), and the next build recompiled 293 crates instead of none, because a build that
