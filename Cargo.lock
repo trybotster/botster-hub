@@ -2536,7 +2536,7 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.0-rc.1"
-source = "git+file:///private/tmp/claude-501/-Users-jasonconigliari-botster-sessions-git-github-com-trybotster-botster-web-delivery-web-sonnet-20260928/b023fd46-c031-4570-9416-fc1cfc5fa6fc/scratchpad/rtc-fork-local.git?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
+source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2562,7 +2562,7 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.21.0-rc.1"
-source = "git+file:///private/tmp/claude-501/-Users-jasonconigliari-botster-sessions-git-github-com-trybotster-botster-web-delivery-web-sonnet-20260928/b023fd46-c031-4570-9416-fc1cfc5fa6fc/scratchpad/rtc-fork-local.git?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
+source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
