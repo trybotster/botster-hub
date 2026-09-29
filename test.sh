@@ -3,19 +3,22 @@
 #   ./test.sh [--phase all]                  the whole gate (the default)
 #   ./test.sh --phase build [--candidate-dir <dir>]
 #       checks, candidate artifacts, adapter and worker builds, and
-#       `cargo test --workspace --no-run`. The
-#       candidate directory (created if none is given) is kept, holds an `env`
-#       file, and is printed as `candidate_dir=<dir>` on the last line.
-#   ./test.sh --phase shared --candidate-dir <dir>
+#       `cargo test --workspace --no-run`. The candidate directory is kept, holds
+#       an `env` file, and is printed as `candidate_dir=<dir>` on the last line.
+#       Without --candidate-dir it is `target/candidate` of this worktree (or of
+#       CARGO_TARGET_DIR), replaced by each build phase: one per worktree, inside
+#       the target that botsterq's cap covers, nothing left in /tmp.
+#   ./test.sh --phase shared [--candidate-dir <dir>]
 #       every test target except the lifecycle target, and the doc tests.
-#   ./test.sh --phase lifecycle --candidate-dir <dir>
+#   ./test.sh --phase lifecycle [--candidate-dir <dir>]
 #       the lifecycle target (tests/hub_daemon_lifecycle_test.rs) alone.
+#       Without --candidate-dir both use the default directory of the build phase.
 # build, shared and lifecycle together run what `all` runs.
 #
 # Repeating one test (a flake hunt) needs one build, not one per run:
-#   ./test.sh --phase build --candidate-dir /tmp/cand --locked        # once
+#   ./test.sh --phase build --locked                                  # once
 #   for i in 1 2 3; do
-#     ./test.sh --phase lifecycle --candidate-dir /tmp/cand --locked -- <test name> --exact
+#     ./test.sh --phase lifecycle --locked -- <test name> --exact
 #   done                                                              # the runs
 # Which phase needs an exclusive queue slot is the queue's rule, not this
 # script's: today the lifecycle phase is the exclusive one. Whether two shared
@@ -48,6 +51,28 @@ for arg in "$@"; do
   esac
 done
 
+# The candidate directory the phases hand over. Default: target/candidate of this
+# worktree, replaced by each build phase; the shared and lifecycle phases need
+# the env file a build phase left there (or in the directory given).
+default_candidate_dir=
+if [ -z "$candidate_dir" ] && { [ "$phase" = build ] || [ "$phase" = shared ] || [ "$phase" = lifecycle ]; }; then
+  target_root=${CARGO_TARGET_DIR:-target}
+  case "$target_root" in
+    /*) ;;
+    *) target_root=$(pwd)/$target_root ;;
+  esac
+  candidate_dir=$target_root/candidate
+  default_candidate_dir=$candidate_dir
+fi
+case "$phase" in
+  shared|lifecycle)
+    [ -f "$candidate_dir/env" ] || {
+      echo "test.sh: --phase $phase needs the candidate directory of a --phase build run; $candidate_dir/env is missing (run ./test.sh --phase build first, or pass --candidate-dir <dir>)" >&2
+      exit 2
+    }
+    ;;
+esac
+
 node packages/hub-test-support/scripts/sync-assets.mjs --check
 
 export CARGO_BUILD_JOBS=2
@@ -55,10 +80,6 @@ export CARGO_INCREMENTAL=0
 
 case "$phase" in
   shared|lifecycle)
-    [ -n "$candidate_dir" ] && [ -f "$candidate_dir/env" ] || {
-      echo "--phase $phase needs --candidate-dir <dir> from a --phase build run" >&2
-      exit 2
-    }
     . "$candidate_dir/env"
     ;;
 esac
@@ -71,12 +92,12 @@ if [ "$phase" = all ]; then
   candidate_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-candidate.XXXXXX")
   trap 'rm -rf "$candidate_dir"' EXIT HUP INT TERM
 elif [ "$phase" = build ]; then
-  # Kept for the shared and lifecycle phases.
-  if [ -z "$candidate_dir" ]; then
-    candidate_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-candidate.XXXXXX")
-  else
-    mkdir -p "$candidate_dir"
+  # Kept for the shared and lifecycle phases. The default directory is replaced
+  # by each build phase; a directory given with --candidate-dir is never emptied.
+  if [ -n "$default_candidate_dir" ]; then
+    rm -rf "$candidate_dir"
   fi
+  mkdir -p "$candidate_dir"
 fi
 if [ "$phase" = shared ] || [ "$phase" = lifecycle ]; then
   :  # candidate artifacts come from the build phase (sourced above)
