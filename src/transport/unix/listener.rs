@@ -806,7 +806,7 @@ mod tests {
         let listener = TokioUnixListener::from_std(std_listener).expect("tokio listener");
         let _client = UnixStream::connect(&socket).expect("connect");
         let (accepted, _) = listener.accept().await.expect("accept");
-        assert!(peer_is_owner(&accepted));
+        assert!(peer_is_owner(&accepted, current_uid()));
         let _ = fs::remove_file(&socket);
     }
 
