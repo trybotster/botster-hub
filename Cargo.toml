@@ -92,9 +92,15 @@ loom = "0.7.2"
 [patch."https://github.com/trybotster/botster-hub.git"]
 botster-ui-contract = { path = "crates/botster-ui-contract" }
 
-# Hub runtime builds use the ordered channel close fix documented in this directory.
+# Hub runtime builds use the local rtc repairs documented in vendor/README.md,
+# and rtc-sctp (with its sibling rtc-shared, so one copy resolves) from the
+# trybotster/rtc fork: upstream 51558ffb plus one commit, branch
+# botster/rtc-sctp-stream-reuse. That commit lets a stream id be reused only
+# after both directions of its reset complete (RFC 8831 section 6.7).
 [patch.crates-io]
 rtc = { path = "vendor/rtc-0.21.0-rc.1" }
+rtc-sctp = { git = "https://github.com/trybotster/rtc", rev = "3a1d78830588e766d243655483e58d2455961239" }
+rtc-shared = { git = "https://github.com/trybotster/rtc", rev = "3a1d78830588e766d243655483e58d2455961239" }
 
 # The lifecycle harness verifies the candidate manifest (SHA-256 of the
 # ~110 MB Hub binary) on every IsolatedHub start. Unoptimized sha2 takes

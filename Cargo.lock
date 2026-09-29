@@ -2536,8 +2536,7 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8823005e23738c18e7ddf86ed15e4e539565ec07de1609017fab3422988a7587"
+source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2563,8 +2562,7 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.21.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9cb3827cf45aaeacf955b1577ff3d13f55f24319cffe94efe7d6345035b564e"
+source = "git+https://github.com/trybotster/rtc?rev=3a1d78830588e766d243655483e58d2455961239#3a1d78830588e766d243655483e58d2455961239"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
