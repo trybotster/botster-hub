@@ -131,6 +131,23 @@ botsterq slots 3         # change it (kept across server restarts)
   exactly that pid. Never stop a `ts -w <id>` of a job that still exists, and never kill by name
   or pattern. Documented and approved by the orchestrator (2026-09-29) after such waiters (pids 55589
   and 56728 for removed jobs 609 and 610, about 8 hours old) and a jam at 10:36 were cleared this way.
+- Mr Boxington (`mbx`, https://mr-boxington.jdx.dev), a shared build cache. Enabled for every
+  job by one setting at the top of the `botsterq` script (`mbx_default=1`; `0` turns it off for
+  everyone; `BOTSTERQ_MBX=0` turns it off for one job). When `mbx` is installed, `botsterq run`
+  puts a shim directory (`~/.botsterq/mbx-shim`, one symlink named `cargo` to the `mbx` binary)
+  first on the job's PATH, so every plain `cargo` in the job goes through mbx, and sets
+  `MBX_CACHE_DIR` to `~/.botsterq/mbx-cache` (unless you set it) and `MBX_TARGET_VIEWS=0`.
+  Managed target views stay off because mbx would otherwise replace `./target` with a symlink into
+  its cache, which the target cap and `target/candidate` do not expect. Nothing global changes:
+  no `mbx setup`, no mise or cargo config. The target cap's `cargo clean` uses the real cargo,
+  never the shim (mbx has its own `clean`). Measured (Hub, `./test.sh --phase build`, fresh
+  worktrees, load 9 to 14): 234 s without mbx, 267 s with an empty cache (the fill), 196 s with
+  the warm cache (16 percent faster than without), 3 GB of new disk per fresh worktree against
+  8 to 9 GB (reflinks); 484 cache hits. `mbx exec` alone caches only C and C++ compiles, which is
+  why the shim is used. If a build looks wrong (a stale or odd artifact, a Zig or build-script
+  problem, a candidate provenance mismatch), run the job with `BOTSTERQ_MBX=0`, and turn it off
+  for everyone with `mbx_default=0` before investigating. The cache's files are read-only: use
+  `chmod -R u+w ~/.botsterq/mbx-cache` before deleting it.
 - `slots N` refuses while any job is queued or running.
 - Inside a job, `botsterq run` runs its command directly, so nesting cannot deadlock.
 
