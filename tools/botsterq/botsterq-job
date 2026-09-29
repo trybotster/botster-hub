@@ -48,8 +48,10 @@ import os
 import re
 import select
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # Progress-poll interval of the degraded mode (see above).
@@ -243,10 +245,34 @@ def enforce_target_cap(events, token):
         return
     print(f"botsterq: {os.path.join(os.getcwd(), target)} is {size_gb:.1f} GB, above the {cap_gb:g} GB cap; "
           "running cargo clean there before the job starts", file=sys.stderr, flush=True)
+    # target/candidate holds the candidate directory that `test.sh --phase build`
+    # hands to the later phases: it survives the clean (moved aside, then back).
+    candidate = os.path.join(target, "candidate")
+    kept = None
+    if os.path.isdir(candidate):
+        try:
+            kept = tempfile.mkdtemp(prefix="candidate-", dir=os.path.dirname(events))
+            os.rename(candidate, os.path.join(kept, "candidate"))
+        except OSError as error:
+            if kept:
+                shutil.rmtree(kept, ignore_errors=True)
+            print(f"botsterq: cargo clean skipped: cannot keep the candidate directory ({error})",
+                  file=sys.stderr, flush=True)
+            log_event(events, "clean_skipped", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", "candidate directory cannot be kept"])
+            return
     try:
         cleaned = subprocess.run(["cargo", "clean", "--target-dir", target]).returncode
     except OSError:
         cleaned = 127
+    if kept:
+        try:
+            os.makedirs(target, exist_ok=True)
+            os.rename(os.path.join(kept, "candidate"), candidate)
+        except OSError as error:
+            print(f"botsterq: the candidate directory is left at {kept}/candidate ({error})", file=sys.stderr, flush=True)
+            kept = None
+        if kept:
+            shutil.rmtree(kept, ignore_errors=True)
     log_event(events, "clean", token, [f"{size_gb:.2f}GB", f"cap={cap_gb:g}GB", f"exit={cleaned}"])
     if cleaned != 0:
         print(f"botsterq: cargo clean failed (exit {cleaned}); the job starts anyway", file=sys.stderr, flush=True)
