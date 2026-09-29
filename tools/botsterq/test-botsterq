@@ -317,17 +317,16 @@ await_state "M0 [exclusive] @" queued
 "$Q" run --label MO -- sh -c 'touch "$0/MO.ran"' "$work" >/dev/null 2>"$work/MO.err" &
 MO=$!
 await_text "$work/MO.err" "waiting for exclusive job"
-mkfifo "$work/mk.announce"
-BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/mk.announce" "$Q" run --label MK -- sh -c 'touch "$0/MK.ran"' "$work" >/dev/null 2>&1 &
+mkfifo "$work/mk.announce" "$work/mk.life"
+BOTSTERQ_TEST_ADMISSION_LIFETIME="$work/mk.life" BOTSTERQ_TEST_LOCK_ANNOUNCE="$work/mk.announce" "$Q" run --label MK -- sh -c 'touch "$0/MK.ran"' "$work" >/dev/null 2>&1 &
 MK=$!
+exec 8<"$work/mk.life"        # opens once the admission process has opened its end
 read _ <"$work/mk.announce"
 kill -KILL "$MK"; wait "$MK" 2>/dev/null
-i=0
-until [ "$(lock_waiters)" = 1 ]; do
-  i=$((i + 1)); [ "$i" -gt 100 ] && break
-  # timer: deadline — bounded wait for the orphaned admission to end itself.
-  perl -e 'select(undef, undef, undef, 0.05)'
-done
+# End of file on the lifetime fifo is the event that the admission process ended
+# (it cancelled itself because its run died); no polling.
+read _ <&8
+exec 8<&-
 waiters_killed=$(lock_waiters)
 wait "$M1" "$M0" "$MO"
 [ "$waiters_killed" = 1 ] && [ ! -e "$work/MK.ran" ] && [ -e "$work/MO.ran" ] \
