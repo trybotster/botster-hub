@@ -105,8 +105,9 @@ botsterq slots 3         # change it (kept across server restarts)
   the same happens if the running-job list cannot be read. What it does not see: a job that
   builds into this target from outside the directory tree (through a different `CARGO_TARGET_DIR`
   setup or a symlink), and a job of another queue. A phased gate whose later phase starts over the
-  cap loses the compiled artifacts of the earlier phase (its candidate directory is outside
-  `target/` and survives); that phase recompiles.
+  cap loses the compiled artifacts of the earlier phase and recompiles them; its candidate
+  directory (`target/candidate` by default, or a directory outside `target/`) survives: the clean
+  moves `target/candidate` aside and back.
   Why not prune by age: `cargo sweep` (0.8.0) was measured on a Hub worktree with a build, a
   clippy run, `cargo sweep --file`, and the same build again. It cleaned 1.1 GiB of 8.7 GB
   (13 percent), and the next build recompiled 293 crates instead of none, because a build that

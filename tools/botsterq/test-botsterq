@@ -745,6 +745,14 @@ wait "$CAPG"
   && pass "a running job in another directory does not block the clean, and its target is untouched" \
   || fail "cap with a job elsewhere" "$(cat "$work/capneighbour.out")"
 
+# 19c3. The candidate directory of test.sh --phase build (target/candidate)
+#       survives the clean: the phases after the build need it.
+make_project "$work/capH"
+mkdir -p "$work/capH/target/candidate"; printf 'export X=1\n' >"$work/capH/target/candidate/env"
+( cd "$work/capH" && BOTSTERQ_TARGET_CAP_GB=0.001 "$Q" run --label CapCandidate -- sh -c 'test -e target/debug/big && echo big-kept || echo big-cleaned; cat target/candidate/env' >"$work/capcand.out" 2>/dev/null )
+[ "$(sed -n 1p "$work/capcand.out")" = big-cleaned ] && [ "$(sed -n 2p "$work/capcand.out")" = "export X=1" ] \
+  && pass "the clean keeps target/candidate (the candidate directory of the build phase)" || fail "cap keeps the candidate" "$(cat "$work/capcand.out")"
+
 # 19d. When the running-job list cannot be read the clean is skipped too, with
 #      the reason, rather than guessing that nobody else is running.
 make_project "$work/capE"
