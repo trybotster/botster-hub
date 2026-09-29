@@ -101,6 +101,13 @@ impl RawSocket {
             {
                 Ok(None)
             }
+            // End of stream inside a frame: the Hub closed the socket while a
+            // frame this client had not read was half written.
+            Err(DaemonTransportError::Protocol(message))
+                if message.starts_with("truncated unix frame") =>
+            {
+                Err(DaemonTransportError::ClientDisconnected)
+            }
             Err(error) => Err(error),
         }
     }
