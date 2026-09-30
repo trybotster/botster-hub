@@ -128,7 +128,7 @@ fn prove_shed_busy_non_blocking() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let lag = SchedulerLagProbe {
         requested_busy_us: 0,
         observed_elapsed_us: 1_800_000,
@@ -160,7 +160,7 @@ fn event_plane_saturation_host_validity_scheduler_lag_is_host_exhaustion() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_product_failure() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
     decoupled.max_ready_operation_wait_us = 1_845_228;
@@ -191,7 +191,7 @@ fn event_plane_saturation_host_validity_disabled_arm_over_budget_is_product_fail
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failure() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 8_000;
     decoupled.max_ready_operation_wait_us = 12_000;
@@ -214,7 +214,7 @@ fn event_plane_saturation_valid_disabled_arm_makes_enabled_breach_product_failur
 
 #[test]
 fn event_plane_saturation_host_validity_ignores_load_average() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let validity = classify_host_validity(
         Some(&botster_hub_client::DaemonObservabilityCounters::default()),
         &idle_scheduler_lag(),
@@ -636,7 +636,7 @@ fn event_plane_saturation_poisoned_builder_keeps_last_snapshot() {
 
 #[test]
 fn event_plane_saturation_early_arm_failure_persists_classified_gates() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let mut builder = ArmRunBuilder::new();
     builder.n_running = 0;
     builder.window_completed = false;
@@ -680,7 +680,7 @@ fn event_plane_saturation_early_arm_failure_persists_classified_gates() {
 
 #[test]
 fn event_plane_saturation_injected_arm_panic_preserves_measurements_and_collects_survivors() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let builder = Arc::new(Mutex::new(ArmRunBuilder::new()));
     let worker_stop = Arc::new(AtomicBool::new(false));
     let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -772,7 +772,7 @@ fn run_injected_arm_panic(
 
 #[test]
 fn event_plane_saturation_persists_host_validity_artifact_before_failure_exit() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let dir = unique_test_dir("event-plane-host-validity-artifact");
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
@@ -850,7 +850,7 @@ fn event_plane_saturation_host_validity_survivors_are_survivors_present() {
 
 #[test]
 fn event_plane_saturation_host_validity_taint_is_environment_tainted() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let _taint = ScopedHarnessTaint::inject("injected event-plane taint");
     let validity = classify_host_validity(
         Some(&botster_hub_client::DaemonObservabilityCounters::default()),
@@ -864,7 +864,7 @@ fn event_plane_saturation_host_validity_taint_is_environment_tainted() {
 
 #[test]
 fn event_plane_saturation_host_validity_fd_controls_host_exhaustion() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let mut decoupled = botster_hub_client::DaemonObservabilityCounters::default();
     decoupled.max_owner_turn_us = 219_723;
     let validity = classify_host_validity(
@@ -973,7 +973,7 @@ fn event_plane_saturation_output_records_carry_emission_time() {
 #[test]
 #[allow(clippy::field_reassign_with_default)]
 fn event_plane_saturation_dataset_records_fault_resync() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let metrics = dummy_op_metrics();
     let mut operations = BTreeMap::new();
     let mut thresholds = BTreeMap::new();

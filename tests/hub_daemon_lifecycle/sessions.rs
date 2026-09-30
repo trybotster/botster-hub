@@ -2086,7 +2086,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
 
 #[test]
 fn session_entity_subscription_projects_stale_row_as_indeterminate() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     let data_dir = unique_test_dir("session-entity-stale");
     let config = explicit_config(&data_dir);
     let session_id = SessionId("session-entity-stale".to_string());
