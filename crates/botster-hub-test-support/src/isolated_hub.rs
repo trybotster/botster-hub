@@ -12,7 +12,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -292,6 +292,7 @@ fn spawn_isolated_hub(
         }
     };
     let hub_pid = child.id();
+    lifeline::arm(hub_pid);
     #[cfg(test)]
     LAST_ISOLATED_HUB_SPAWN_PID.with(|pid| pid.set(Some(hub_pid)));
 
@@ -851,8 +852,129 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
     }
 }
 
+/// A watchdog for the hub's process group. The test process that spawned a hub
+/// can end without running any Drop (a SIGTERM or SIGKILL from a runner, a
+/// timeout, an abort), and the hub, which leads its own group, then lives on
+/// under launchd at full CPU. The watchdog is a shell blocked on a pipe read
+/// that only this process holds open: when the pipe closes for any reason, the
+/// shell kills the group. A clean teardown writes a byte first, so the watchdog
+/// exits without killing a group id the system may have handed to someone else.
+mod lifeline {
+    use super::{BTreeMap, Child, ChildStdin, Command, CommandExt, Mutex, Stdio};
+    use std::io::Write;
+
+    static LIFELINES: Mutex<BTreeMap<u32, (Child, ChildStdin)>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn arm(pgid: u32) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("read -r _ && exit 0; kill -KILL -- \"-$1\"")
+            .arg("botster-hub-test-lifeline")
+            .arg(pgid.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Its own group, so a signal to the test's group leaves it standing.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let Ok(mut child) = command.spawn() else {
+            return;
+        };
+        let Some(stdin) = child.stdin.take() else {
+            return;
+        };
+        LIFELINES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(pgid, (child, stdin));
+    }
+
+    /// Ends the watchdog. With `group_gone` it exits quietly; without, closing
+    /// the pipe makes it kill the group that is still alive.
+    pub(super) fn release(pgid: u32, group_gone: bool) {
+        let entry = LIFELINES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&pgid);
+        let Some((mut child, mut stdin)) = entry else {
+            return;
+        };
+        if group_gone {
+            let _ = stdin.write_all(b"x\n");
+        }
+        drop(stdin);
+        let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod lifeline_tests {
+    use super::*;
+
+    fn spawn_group_leader() -> Child {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("600");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("spawn group leader")
+    }
+
+    /// The pipe closing with a live group (the test process died, or a
+    /// teardown left survivors) kills the group.
+    #[test]
+    fn closing_the_lifeline_kills_a_live_group() {
+        let mut leader = spawn_group_leader();
+        let pgid = leader.id();
+        lifeline::arm(pgid);
+        lifeline::release(pgid, false);
+        let status = leader.wait().expect("wait for the killed leader");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL),
+            "the watchdog must SIGKILL the group: {status:?}"
+        );
+    }
+
+    /// A clean teardown disarms it: the watchdog exits and kills nothing.
+    #[test]
+    fn a_disarmed_lifeline_leaves_the_group_alone() {
+        let mut leader = spawn_group_leader();
+        let pgid = leader.id();
+        lifeline::arm(pgid);
+        lifeline::release(pgid, true);
+        assert!(
+            leader.try_wait().expect("poll the leader").is_none(),
+            "a disarmed watchdog must not signal the group"
+        );
+        leader.kill().expect("stop the leader");
+        leader.wait().expect("reap the leader");
+    }
+}
+
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
+        self.drop_teardown();
+        // Whatever path teardown took, a group still alive here is killed by
+        // the watchdog; a group that is gone lets it stand down.
+        lifeline::release(self.hub_pid, !child_process_group_exists(self.hub_pid));
+    }
+}
+
+impl IsolatedHub {
+    fn drop_teardown(&mut self) {
         match self.lifecycle {
             IsolatedHubLifecycle::Completed => {}
             IsolatedHubLifecycle::QuiescenceUnconfirmed => {
