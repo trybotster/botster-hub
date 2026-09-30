@@ -958,6 +958,28 @@ pub(crate) fn sweep_test_owned_processes() {
     }
 }
 
+/// The guard of a test whose producer never stops (`yes`): each such test keeps
+/// the hub, its worker and the producer at full CPU, and two of them at once
+/// starve the timing proofs (a reader-deadline run answered 23 s after attach,
+/// against a 10 s deadline). Flood tests run one at a time; every other test
+/// still shares the permits with them.
+pub(crate) struct FloodTestGuard {
+    // Field order is drop order: the daemon guard sweeps last-but-one, the
+    // flood lock is released after it.
+    _guard: DaemonTestGuard,
+    _flood: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(crate) fn daemon_test_guard_flood() -> FloodTestGuard {
+    static FLOOD_LOCK: Mutex<()> = Mutex::new(());
+    // The flood lock first: a test waiting for it holds no permit.
+    let flood = FLOOD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    FloodTestGuard {
+        _guard: daemon_test_guard(),
+        _flood: flood,
+    }
+}
+
 /// The guard of a test that touches process-wide harness state: it runs alone.
 pub(crate) fn daemon_test_guard_exclusive() -> DaemonTestGuard {
     daemon_test_guard_with(true)

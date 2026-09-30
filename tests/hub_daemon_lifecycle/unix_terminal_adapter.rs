@@ -1318,7 +1318,7 @@ fn drain_terminal_until(client: &mut RawUnixClient, until: Instant, events: &mut
 /// `reject_remove_first`, a sibling's RemoveSession is refused as
 /// session_not_terminal before the deadline, and must not suppress the close.
 fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &str, reject_remove_first: bool) {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_flood();
     let hub = start_isolated_live_output_hub(name);
     let session_id = format!("{name}-dead");
     let subscription_id = format!("{name}-sub");
@@ -1408,7 +1408,7 @@ fn rejected_remove_session_does_not_suppress_the_reader_deadline_close() {
 
 #[test]
 fn reader_pause_shorter_than_the_deadline_stays_attached() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_flood();
     let hub = start_isolated_live_output_hub("rps");
     let mut reader = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
@@ -1445,7 +1445,7 @@ fn reader_pause_shorter_than_the_deadline_stays_attached() {
 /// stall the idle route.
 #[test]
 fn idle_route_stays_open_while_a_sibling_route_floods() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_flood();
     let hub = start_isolated_live_output_hub("irf");
     let mut client = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
@@ -1594,7 +1594,7 @@ fn detach_ends_the_route_socket_with_eof() {
 /// stream after the client keeps reading it.
 #[test]
 fn stalled_route_socket_reaches_eof_after_the_closed_event() {
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_flood();
     let hub = start_isolated_live_output_hub("sse");
     let mut reader = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut envelopes = Vec::new();
