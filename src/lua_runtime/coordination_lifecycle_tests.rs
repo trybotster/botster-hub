@@ -99,6 +99,21 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// Block until the next control message on `receiver`, or fail at the shared
+/// hang guard. The message is the event; there is no polling.
+fn wait_for_control_message(
+    receiver: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+    what: &str,
+) {
+    let blocking = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    // timer: deadline — the shared test hang guard; the wake arrives before it.
+    let message = blocking.block_on(tokio::time::timeout(TEST_HANG_GUARD, receiver.recv()));
+    assert!(matches!(message, Ok(Some(_))), "{what}");
+}
+
 fn tracked_request(
     bridge: HubCoordinationBridge,
 ) -> (
@@ -778,12 +793,12 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
     let admitted = usage();
     assert!(admitted > 0, "admission must charge callback storage");
     let producer = bridge.clone();
+    // The bridge publishes a progress wake when a request is queued.
+    let (progress, mut queued) = tokio::sync::mpsc::channel(8);
+    bridge.bind_owner_wake(progress);
     let caller = thread::spawn(move || producer.acknowledge(input));
-    let queued = Instant::now() + Duration::from_millis(500);
-    while bridge.test_pending_count() != 1 {
-        assert!(Instant::now() < queued, "the caller must queue its request");
-        thread::yield_now();
-    }
+    wait_for_control_message(&mut queued, "the caller must queue its request");
+    assert_eq!(bridge.test_pending_count(), 1);
     // The Host worker that disposes this request waits in the probe's drop
     // until the test releases it, so the row stays in Terminal while the test
     // looks at it. Without the hold, disposal can finish inside one
@@ -799,8 +814,16 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
         admitted + slot,
         "pending collection capacity stays charged after owner accept"
     );
+    let mut wakes = TestOwnerWakes::bind(&daemon, &state);
     gate.release();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Core runs its queue in order: once this barrier job returns, Core has
+    // answered the coordination request, and the owner can take its response.
+    daemon
+        .runtime()
+        .unwrap()
+        .submit_core(|_| ())
+        .wait(TEST_HANG_GUARD)
+        .unwrap();
     let disposal = crate::daemon::control::coordination::disposal_bytes().unwrap();
     let in_terminal = |state: &DaemonControlState| {
         state.pending_requests.values().any(|entry| {
@@ -810,15 +833,13 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
             )
         })
     };
-    // The Host worker is held, so the row must reach Terminal and stay there.
-    while !in_terminal(&state) {
-        assert!(
-            Instant::now() < deadline,
-            "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
-        );
-        dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
-        thread::yield_now();
-    }
+    // The Host worker is held in the drop probe, so one disposal pass puts the
+    // row in Terminal and it cannot leave until the test releases the worker.
+    dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
+    assert!(
+        in_terminal(&state),
+        "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
+    );
     assert!(
         usage() >= disposal,
         "the disposal lease must remain while the Terminal row is live"
@@ -833,23 +854,22 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
         "the disposal lease must stay while Host disposal is held"
     );
     held_disposal.release();
+    // The Host worker publishes a completion wake when disposal finishes, so
+    // each pass waits for that wake. A stale earlier wake only costs a pass.
     while !state.pending_requests.is_empty() {
         assert!(
-            Instant::now() < deadline,
-            "terminal disposal must retire the acknowledged row"
+            wakes.wait_for_kind(Instant::now() + TEST_HANG_GUARD, "HostProgressPublished"),
+            "Host disposal must publish its completion"
         );
         dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
-        thread::yield_now();
     }
     let _ = caller.join();
-    while usage() != slot {
-        assert!(
-            Instant::now() < deadline,
-            "the last lease endpoint must release after Host disposal"
-        );
-        thread::yield_now();
-    }
-    assert_eq!(usage(), slot);
+    // That the last lease endpoint releases once the disposal work drops is
+    // proven deterministically in `host_disposal` (storage_lease_outlives_the_
+    // payload_and_last_work_handle) and `lua_memory` (storage_lease_keeps_the_
+    // charge_until_the_last_endpoint_drops, ..._after_concurrent_endpoint_drops).
+    // The worker drops its endpoint after it publishes, with no notification to
+    // wait on, so this test does not poll usage for it.
     assert_eq!(state.budget.outstanding(), 0);
     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
     daemon.stop();
