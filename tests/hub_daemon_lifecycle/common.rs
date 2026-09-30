@@ -50,7 +50,11 @@ use crate::support::{
 use super::*;
 pub(crate) use botster_hub::test_internals::TestHubStateStoreExt;
 
-pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Real-daemon tests share this lock. A test that reads or writes state shared
+/// by the whole process (the harness taint, the census program, the start
+/// boundary) takes it exclusively; every other test holds it shared, because
+/// each owns its data directory and its processes.
+pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<std::sync::RwLock<()>> = OnceLock::new();
 
 pub(crate) const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 pub(crate) const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
@@ -567,8 +571,13 @@ pub(crate) fn assert_detached_daemon_stdin(pid: u32) {
     panic!("detached daemon stdin assertion is unsupported on this Unix target for pid {pid}");
 }
 
-pub(crate) fn daemon_test_lock() -> &'static Mutex<()> {
-    REAL_DAEMON_TEST_LOCK.get_or_init(|| Mutex::new(()))
+pub(crate) fn daemon_test_lock() -> &'static std::sync::RwLock<()> {
+    REAL_DAEMON_TEST_LOCK.get_or_init(|| std::sync::RwLock::new(()))
+}
+
+enum DaemonTestLockGuard {
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
 }
 
 thread_local! {
@@ -653,7 +662,7 @@ pub(crate) fn bypass_real_daemon_start_guard(bypass: bool) {
 }
 
 pub(crate) struct DaemonTestGuard {
-    _inner: Option<std::sync::MutexGuard<'static, ()>>,
+    _inner: Option<DaemonTestLockGuard>,
 }
 
 impl Drop for DaemonTestGuard {
@@ -907,7 +916,16 @@ pub(crate) fn sweep_test_owned_processes() {
     }
 }
 
+/// The guard of a test that touches process-wide harness state: it runs alone.
+pub(crate) fn daemon_test_guard_exclusive() -> DaemonTestGuard {
+    daemon_test_guard_with(true)
+}
+
 pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
+    daemon_test_guard_with(false)
+}
+
+fn daemon_test_guard_with(exclusive: bool) -> DaemonTestGuard {
     DAEMON_GUARD_DEPTH.with(|depth| {
         if depth.get() == 0 {
             notify_real_daemon_start_boundary();
@@ -915,7 +933,19 @@ pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
                 check_harness_taint();
                 return DaemonTestGuard { _inner: None };
             }
-            let inner = recovering_mutex_guard(daemon_test_lock());
+            let inner = if exclusive {
+                DaemonTestLockGuard::Exclusive(
+                    daemon_test_lock()
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+            } else {
+                DaemonTestLockGuard::Shared(
+                    daemon_test_lock()
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+            };
             check_harness_taint();
             depth.set(1);
             DaemonTestGuard {
