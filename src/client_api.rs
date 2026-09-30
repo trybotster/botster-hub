@@ -16,9 +16,8 @@ use botster_core::{
     SessionRuntimeErrorKind, SessionSpawnRequest, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_core_daemon::{
-    CoreCompletion, CoreDaemonError, GuardedWriteDecision, GuardedWriteDeliveryState,
-    GuardedWriteRequest, GuardedWriteResult, LifecycleBaselineBudget, ReadinessEvidence,
-    RegistrySessionState, SessionLifecycleBaselinePage, SessionRegistryStateLookup,
+    CoreCompletion, CoreDaemonError, LifecycleBaselineBudget, RegistrySessionState,
+    SessionLifecycleBaselinePage, SessionRegistryStateLookup,
 };
 use botster_hub_client::HistoryUnavailableReason;
 use botster_ui_contract::{
@@ -572,45 +571,6 @@ impl HubClientApi {
                             .map_err(core_error),
                         _ => Err(core_error(CoreDaemonError::Shutdown)),
                     },
-                )));
-            }
-            HubClientRequest::GuardedNotificationWrite {
-                session_id,
-                package_name,
-                data,
-                readiness,
-                now_seconds,
-                ..
-            } => {
-                if !package_allows_guarded_write(packages, &package_name) {
-                    return Err(HubClientError::PackageCapabilityDenied {
-                        request_id,
-                        operation,
-                        package_name,
-                    });
-                }
-                let request = GuardedWriteRequest {
-                    session_id,
-                    client_id: self.identity.client_id.clone(),
-                    data,
-                    readiness,
-                    now_seconds,
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::ticket(
-                    request_id,
-                    operation,
-                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
-                        daemon
-                            .guarded_write(request)
-                            .map(|result| {
-                                respond(HubClientResponseBody::GuardedWrite(
-                                    HubClientGuardedWrite::from(result),
-                                ))
-                            })
-                            .map_err(&core_error)
-                    }),
                 )));
             }
             HubClientRequest::NotifySession {
@@ -1189,7 +1149,6 @@ impl HubClientAdmission {
             | HubClientOperation::Attach
             | HubClientOperation::Detach
             | HubClientOperation::Shutdown
-            | HubClientOperation::GuardedNotificationWrite
             | HubClientOperation::NotifySession
             | HubClientOperation::PublishRoutedEnvelope
             | HubClientOperation::DrainRoutedEnvelopes
@@ -1268,16 +1227,7 @@ pub enum HubClientRequest {
         session_id: SessionId,
         now_seconds: u64,
     },
-    /// Request a hub-admitted guarded notification write into one session.
-    GuardedNotificationWrite {
-        request_id: RequestId,
-        session_id: SessionId,
-        package_name: String,
-        data: Vec<u8>,
-        readiness: ReadinessEvidence,
-        now_seconds: u64,
-    },
-    /// Request a native hub-owned guarded notification write into one session.
+    /// Ring one session: Core proves the caller and the session, the owner queues the ring.
     NotifySession {
         request_id: RequestId,
         session_id: SessionId,
@@ -1402,7 +1352,6 @@ impl HubClientRequest {
             | Self::Attach { request_id, .. }
             | Self::Detach { request_id, .. }
             | Self::Shutdown { request_id, .. }
-            | Self::GuardedNotificationWrite { request_id, .. }
             | Self::NotifySession { request_id, .. }
             | Self::PublishRoutedEnvelope { request_id, .. }
             | Self::DrainRoutedEnvelopes { request_id, .. }
@@ -1437,7 +1386,6 @@ impl HubClientRequest {
             Self::Attach { .. } => HubClientOperation::Attach,
             Self::Detach { .. } => HubClientOperation::Detach,
             Self::Shutdown { .. } => HubClientOperation::Shutdown,
-            Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
             Self::NotifySession { .. } => HubClientOperation::NotifySession,
             Self::PublishRoutedEnvelope { .. } => HubClientOperation::PublishRoutedEnvelope,
             Self::DrainRoutedEnvelopes { .. } => HubClientOperation::DrainRoutedEnvelopes,
@@ -1474,7 +1422,6 @@ pub enum HubClientOperation {
     Attach,
     Detach,
     Shutdown,
-    GuardedNotificationWrite,
     NotifySession,
     PublishRoutedEnvelope,
     DrainRoutedEnvelopes,
@@ -1517,7 +1464,6 @@ pub enum HubClientResponseBody {
     SessionRemoved(bool),
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),
-    GuardedWrite(HubClientGuardedWrite),
     /// The caller is proven and the session runs: the owner may queue a ring.
     RingAccepted,
     RoutedEnvelopePublish(HubClientRoutedEnvelopePublish),
@@ -1574,22 +1520,6 @@ impl From<CoreSession> for HubClientSession {
 pub struct HubClientSpawned {
     pub session: HubClientSession,
     pub events: Vec<HubClientEvent>,
-}
-
-/// Client-facing guarded write result. Delivery states are produced by core.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientGuardedWrite {
-    pub decision: GuardedWriteDecision,
-    pub states: Vec<GuardedWriteDeliveryState>,
-}
-
-impl From<GuardedWriteResult> for HubClientGuardedWrite {
-    fn from(result: GuardedWriteResult) -> Self {
-        Self {
-            decision: result.decision,
-            states: result.states,
-        }
-    }
 }
 
 /// Client-facing routed envelope publish outcome.
@@ -2751,23 +2681,6 @@ fn require_running_session_targets(
         }
     }
     Ok(())
-}
-
-fn package_allows_guarded_write(packages: &PackageRegistry, package_name: &str) -> bool {
-    let Some(record) = packages.package(package_name) else {
-        return false;
-    };
-    if !matches!(record.state, PackageState::Enabled) {
-        return false;
-    }
-
-    record.manifest.capabilities.iter().any(|capability| {
-        capability.surface == CapabilitySurface::SessionActions
-            && capability
-                .scope
-                .as_deref()
-                .is_none_or(|scope| scope == "guarded_session_notification_write")
-    })
 }
 
 #[cfg(test)]

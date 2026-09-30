@@ -6,13 +6,10 @@ use std::time::{Duration, Instant};
 
 use botster_core::{
     ClientId, CoreSessionMetadata, CredentialRecord, CredentialStore, CredentialStoreError,
-    ModeFlags, RequestId, ResizePayload, SessionId, SessionLifecycleState, SessionSpawnRequest,
+    RequestId, ResizePayload, SessionId, SessionLifecycleState, SessionSpawnRequest,
     SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
-use botster_core_daemon::{
-    GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
-    RegistrySessionState, SessionAdoptionState,
-};
+use botster_core_daemon::{RegistrySessionState, SessionAdoptionState};
 use botster_hub::test_internals::TestHubStateStoreExt;
 use botster_hub::{
     CoreEngineOptions, CredentialKeyPurpose, CredentialKeyReference, CredentialProviderKind,
@@ -497,80 +494,6 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
     let listed =
         wait_ticket(restarted.list_sessions()).expect("registry should list adopted shutdown");
     assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
-}
-
-#[test]
-fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daemon() {
-    let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-guarded");
-    let mut runtime = HubRuntime::new(config).expect("hub runtime starts");
-    let request = spawn_request(runtime.config());
-    let session_id = request.session_id.clone();
-    let client_id = ClientId("guarded-client".to_string());
-    let subscription_id = SubscriptionId("guarded-subscription".to_string());
-    let mut logical_clock = 100;
-
-    spawn_through_core(&runtime, request);
-    logical_clock += 1;
-    wait_ticket(botster_hub::test_internals::attach_route(
-        &runtime,
-        client_id.clone(),
-        session_id.clone(),
-        subscription_id.clone(),
-        logical_clock,
-    ))
-    .expect("attach for guarded write");
-    logical_clock += 1;
-
-    let mode_flags = ModeFlags {
-        cursor_visible: true,
-        ..ModeFlags::default()
-    };
-    let written = wait_ticket(runtime.guarded_write(GuardedWriteRequest {
-        session_id: session_id.clone(),
-        client_id: client_id.clone(),
-        data: b"guarded\n".to_vec(),
-        readiness: ReadinessEvidence::ready(mode_flags),
-        now_seconds: logical_clock,
-    }))
-    .expect("ready guarded write should cross core daemon");
-    logical_clock += 1;
-    assert!(matches!(written.decision, GuardedWriteDecision::Write));
-    assert_eq!(
-        written.states,
-        vec![
-            GuardedWriteDeliveryState::Accepted,
-            GuardedWriteDeliveryState::Written
-        ],
-        "hub must not fabricate delivered or acknowledged states"
-    );
-    drain_until(
-        &mut runtime,
-        &client_id,
-        &session_id,
-        &subscription_id,
-        b"echo:guarded",
-        &mut logical_clock,
-    );
-
-    let deferred = wait_ticket(runtime.guarded_write(GuardedWriteRequest {
-        session_id: session_id.clone(),
-        client_id: client_id.clone(),
-        data: b"deferred\n".to_vec(),
-        readiness: ReadinessEvidence::default(),
-        now_seconds: logical_clock,
-    }))
-    .expect("absent readiness evidence should be core-deferred");
-    assert!(matches!(
-        deferred.decision,
-        GuardedWriteDecision::Defer { .. }
-    ));
-    assert_eq!(
-        deferred.states,
-        vec![
-            GuardedWriteDeliveryState::Accepted,
-            GuardedWriteDeliveryState::Deferred
-        ]
-    );
 }
 
 #[test]

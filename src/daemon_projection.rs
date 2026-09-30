@@ -1153,7 +1153,6 @@ fn operation_label(operation: crate::HubClientOperation) -> &'static str {
         crate::HubClientOperation::Attach => "attach",
         crate::HubClientOperation::Detach => "detach",
         crate::HubClientOperation::Shutdown => "shutdown",
-        crate::HubClientOperation::GuardedNotificationWrite => "guarded_notification_write",
         crate::HubClientOperation::NotifySession => "notify_session",
         crate::HubClientOperation::PublishRoutedEnvelope => "publish_routed_envelope",
         crate::HubClientOperation::DrainRoutedEnvelopes => "drain_routed_envelopes",
@@ -1687,11 +1686,11 @@ mod tests {
             (
                 crate::HubClientError::Runtime {
                     request_id: request_id.clone(),
-                    operation: crate::HubClientOperation::GuardedNotificationWrite,
+                    operation: crate::HubClientOperation::NotifySession,
                     kind: crate::HubClientRuntimeErrorKind::NotAttached,
                 },
                 "not_attached",
-                "guarded_notification_write",
+                "notify_session",
             ),
             (
                 crate::HubClientError::PackageCapabilityDenied {

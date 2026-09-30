@@ -216,10 +216,6 @@ pub(crate) struct Doorbell {
 }
 
 impl Doorbell {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Sessions the machine holds state for, for tests and diagnostics.
     #[cfg(test)]
     pub(crate) fn session_count(&self) -> usize {
