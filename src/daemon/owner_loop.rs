@@ -72,10 +72,12 @@ enum BackgroundWork {
     Maintenance(MaintenanceSliceKind),
     PumpObserve,
     InventoryReconcile,
+    Doorbell,
 }
 
-/// Three maintenance reads plus pump observation and inventory reconciliation.
-pub(crate) const BACKGROUND_CORE_WORK_CLASSES: usize = 4;
+/// Three maintenance reads plus pump observation, inventory reconciliation
+/// and the doorbell's single Core ticket.
+pub(crate) const BACKGROUND_CORE_WORK_CLASSES: usize = 5;
 
 fn causal_waiter_upper_bound(
     state: &DaemonControlState,
@@ -241,7 +243,9 @@ mod background_core_capacity_tests {
     fn registers_core_phase(work: BackgroundWork) -> bool {
         match work {
             BackgroundWork::Maintenance(kind) => maintenance_core_work(kind).is_some(),
-            BackgroundWork::PumpObserve | BackgroundWork::InventoryReconcile => true,
+            BackgroundWork::PumpObserve
+            | BackgroundWork::InventoryReconcile
+            | BackgroundWork::Doorbell => true,
             BackgroundWork::DataPlaneProgress
             | BackgroundWork::CoreCompletion
             | BackgroundWork::HostCompletion
@@ -281,6 +285,7 @@ mod background_core_capacity_tests {
             BackgroundWork::Maintenance(MaintenanceSliceKind::Baseline),
             BackgroundWork::PumpObserve,
             BackgroundWork::InventoryReconcile,
+            BackgroundWork::Doorbell,
         ];
         assert!(classes.iter().copied().all(registers_core_phase));
         assert_eq!(classes.len(), BACKGROUND_CORE_WORK_CLASSES);
@@ -312,6 +317,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         BackgroundWork::Deadline => ReadyClass::Deadline,
         BackgroundWork::PumpObserve => ReadyClass::Observe,
         BackgroundWork::InventoryReconcile => ReadyClass::InventoryReconcile,
+        BackgroundWork::Doorbell => ReadyClass::HostBridge,
         BackgroundWork::Maintenance(MaintenanceSliceKind::JournalPull) => ReadyClass::JournalPull,
         BackgroundWork::Maintenance(MaintenanceSliceKind::ProjectionApply) => {
             ReadyClass::ProjectionApply
@@ -411,6 +417,28 @@ pub(crate) fn mark_publication_owner_ready(state: &mut DaemonControlState) {
 
 pub(crate) fn mark_event_owner_ready(state: &mut DaemonControlState) {
     mark_background_ready(state, BackgroundWork::EventOwner);
+}
+
+pub(crate) fn mark_doorbell_ready(state: &mut DaemonControlState) {
+    mark_background_ready(state, BackgroundWork::Doorbell);
+}
+
+/// The doorbell's background waiter: it carries the doorbell's Core ticket
+/// and its one deadline.
+pub(crate) fn doorbell_waiter(
+    state: &mut DaemonControlState,
+) -> Option<crate::owner_identity::WaiterId> {
+    background_waiter_id(state, BackgroundWork::Doorbell)
+}
+
+/// Park the doorbell on a wake it registered before its final look.
+pub(crate) fn park_doorbell(
+    state: &mut DaemonControlState,
+    seen: crate::daemon::owner_signal::Seen,
+) {
+    state
+        .background_signal_waits
+        .insert(BackgroundWork::Doorbell, seen);
 }
 
 /// Mark every parked request whose lock was released since it parked.
@@ -857,6 +885,9 @@ fn run_owner_maintenance_slice(
             }
         }
     }
+    if kind == MaintenanceSliceKind::ProjectionApply {
+        crate::daemon::doorbell_owner::sync_lifecycle(daemon, state);
+    }
     state.maintenance.last_owner_turn = started.elapsed();
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
@@ -1053,6 +1084,13 @@ pub(crate) fn run_background_ready_item(
         }
         BackgroundWork::PumpObserve => run_pump_observe_slice(daemon, state),
         BackgroundWork::InventoryReconcile => run_inventory_reconcile_slice(daemon, state),
+        BackgroundWork::Doorbell => {
+            if crate::daemon::doorbell_owner::drive(daemon, state)
+                == crate::daemon::doorbell_owner::Progress::Runnable
+            {
+                mark_doorbell_ready(state);
+            }
+        }
     }
     publish_maintenance_wakes(state);
     true
@@ -2185,6 +2223,7 @@ pub(crate) struct DaemonControlState {
     terminal_fault: Option<TerminalDrainFault>,
     terminal_lifecycle: TerminalLifecycle,
     pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
+    pub(crate) doorbell: crate::daemon::doorbell_owner::DoorbellOwnerState,
     pub(crate) publication_owner: crate::daemon::publication_owner::PublicationOwnerState,
     pub(crate) logical_clock: u64,
     pub(crate) drain_cursors: BTreeMap<String, u64>,
@@ -2426,6 +2465,7 @@ impl Default for DaemonControlState {
             managed_spawn_waiting_for_host: false,
             terminal_lifecycle,
             event_owner: crate::daemon::event_owner::EventOwnerState::default(),
+            doorbell: crate::daemon::doorbell_owner::DoorbellOwnerState::default(),
             publication_owner: crate::daemon::publication_owner::PublicationOwnerState::default(),
             logical_clock: 1,
             drain_cursors: BTreeMap::new(),

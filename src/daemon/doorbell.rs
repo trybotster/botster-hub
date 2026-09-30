@@ -234,6 +234,12 @@ impl Doorbell {
             .is_some_and(|ring| ring.pending.is_some())
     }
 
+    /// True when the machine holds state for the session: a ring waits or an
+    /// attempt is under way.
+    pub(crate) fn holds(&self, session: &SessionId) -> bool {
+        self.sessions.contains_key(&session.0)
+    }
+
     /// Feed one event for one session at `now`; execute the effects returned.
     pub(crate) fn step(&mut self, session: &SessionId, now: Instant, event: Event) -> Vec<Effect> {
         let mut effects = Vec::new();

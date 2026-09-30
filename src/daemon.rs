@@ -8,6 +8,7 @@
 pub(crate) mod client_events;
 pub(crate) mod control;
 pub(crate) mod doorbell;
+pub(crate) mod doorbell_owner;
 pub(crate) mod error;
 pub(crate) mod event_owner;
 pub(crate) mod owner_budget;
