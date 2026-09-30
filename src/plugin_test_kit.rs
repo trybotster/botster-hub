@@ -881,7 +881,7 @@ impl KitHub {
                     .map_or(true, |router| {
                         router.queued_holders != 0
                             || router.admitted_holders != 0
-                            || router.global_in_flight_bytes != 0
+                            || router.envelopes != 0
                     }),
                 "event_router",
             );

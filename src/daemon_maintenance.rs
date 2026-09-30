@@ -4240,7 +4240,7 @@ mod tests {
         assert!(state.pending_retirements.is_empty());
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4256,7 +4256,7 @@ mod tests {
         assert!(state.event_in_flight.is_empty());
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4274,7 +4274,7 @@ mod tests {
         assert!(state.event_in_flight.is_empty());
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4309,7 +4309,7 @@ mod tests {
         assert!(flight.pull_id.is_none());
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4385,7 +4385,7 @@ mod tests {
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
         assert_eq!(snapshot.admitted_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4405,7 +4405,7 @@ mod tests {
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
         assert_eq!(snapshot.admitted_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
@@ -4535,7 +4535,7 @@ return botster.register({})
         let snapshot = runtime.package_event_router().snapshot().expect("snapshot");
         assert_eq!(snapshot.queued_holders, 0);
         assert_eq!(snapshot.admitted_holders, 0);
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(data_directory);
     }
@@ -4724,7 +4724,7 @@ return botster.register({})
         );
         assert_eq!(snapshot.admitted_holders, 0);
         assert!(
-            snapshot.global_in_flight_bytes > 0,
+            snapshot.envelopes > 0,
             "requeued occupancy must remain until a later slice admits or expires the copy"
         );
         runtime.set_test_forced_admission(None);

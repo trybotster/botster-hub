@@ -3239,7 +3239,6 @@ fn startup_plugin_failure_classification_is_fail_closed() {
     let infrastructure_failures = [
         EventPlaneStatus::ShedFull,
         EventPlaneStatus::ShedBusy,
-        EventPlaneStatus::RejectedOverRate,
         EventPlaneStatus::RejectedOverFanout,
     ];
     for status in infrastructure_failures {
