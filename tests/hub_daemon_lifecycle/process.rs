@@ -691,7 +691,26 @@ impl PanicSafeSetsidChild {
             // killed a moment ago can still exist. Wait for the exit event.
             // timer: deadline — the give-up for a member that never dies.
             let deadline = Instant::now() + Duration::from_secs(5);
-            let _ = botster_hub::process_exit::wait_for_process_group_exit(pgid as u32, deadline);
+            let exited =
+                botster_hub::process_exit::wait_for_process_group_exit(pgid as u32, deadline);
+            self.stdout.take();
+            // Expiry is not proof of exit: a group that outlived SIGKILL is a
+            // failure. While unwinding, the original panic stays the failure.
+            let failure = match exited {
+                Ok(true) => None,
+                Ok(false) => Some(format!(
+                    "process group {pgid} outlived SIGKILL past the deadline"
+                )),
+                Err(error) => Some(format!("wait for process group {pgid} to exit: {error}")),
+            };
+            if let Some(failure) = failure {
+                if thread::panicking() {
+                    eprintln!("{failure}");
+                } else {
+                    panic!("{failure}");
+                }
+            }
+            return;
         }
         self.stdout.take();
     }
