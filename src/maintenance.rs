@@ -170,6 +170,7 @@ const STATUS_COMPATIBILITY_FEATURES: &[&str] = &[
     botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,
     botster_hub_client::FEATURE_ATTACH_OCCUPANCY,
     botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+    botster_hub_client::FEATURE_SESSION_RESTART,
 ];
 
 // Field/struct names from installation/src/receipt.rs:39-100. Serde's generated
