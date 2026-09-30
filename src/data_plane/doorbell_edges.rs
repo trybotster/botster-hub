@@ -178,6 +178,7 @@ mod tests {
             output_seq,
             input_seq,
             composing: false,
+            size: botster_core::ResizePayload { rows: 24, cols: 80 },
         }
     }
 
