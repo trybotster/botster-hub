@@ -191,6 +191,10 @@ struct Ring {
     facts: Option<Facts>,
     last_input_at: Option<Instant>,
     phase: Phase,
+    /// The last baseline read found the cursor in the last two columns, so
+    /// nothing was typed. Only output can move the cursor there, so output is
+    /// an edge that retries this ring (and only this kind of refusal).
+    margin: bool,
 }
 
 impl Ring {
@@ -200,6 +204,7 @@ impl Ring {
             facts: None,
             last_input_at: None,
             phase: Phase::Idle,
+            margin: false,
         }
     }
 }
@@ -374,6 +379,9 @@ fn try_start(ring: &mut Ring, now: Instant, effects: &mut Vec<Effect>) {
             return;
         }
     }
+    // This attempt decides the margin question afresh: a read that fails
+    // leaves the ring under the failure rule (an edge, not output, retries).
+    ring.margin = false;
     ring.phase = Phase::Baseline;
     effects.push(Effect::ReadCursor);
 }
@@ -386,6 +394,9 @@ fn on_facts(ring: &mut Ring, facts: Facts, now: Instant, effects: &mut Vec<Effec
     let modes_changed = previous
         .as_ref()
         .is_some_and(|previous| previous.modes_epoch != facts.modes_epoch);
+    let output_changed = previous
+        .as_ref()
+        .is_some_and(|previous| previous.output_seq != facts.output_seq);
     if input_changed {
         ring.last_input_at = Some(now);
         // A human is typing: abandon the attempt. A probe left in the composer
@@ -398,11 +409,13 @@ fn on_facts(ring: &mut Ring, facts: Facts, now: Instant, effects: &mut Vec<Effec
     }
     // A retry starts only on an edge that can change the gate: a mode change
     // (the cursor reappears) or client input (a CR ends composing). Output
-    // alone never starts an attempt; it only advances one that is under way.
+    // alone never starts an attempt; it only advances one that is under way,
+    // with one exception: a ring refused at the last columns typed nothing,
+    // and only output moves the cursor out of them.
     let retry_edge = input_changed || modes_changed;
     match ring.phase.clone() {
         Phase::Idle => {
-            if retry_edge {
+            if retry_edge || (ring.margin && output_changed) {
                 try_start(ring, now, effects);
             }
         }
@@ -455,7 +468,9 @@ fn on_cursor(ring: &mut Ring, read: Read, now: Instant, effects: &mut Vec<Effect
                 // the cursor and then wraps: it could not be told from a
                 // missing echo, and a stray `zx` would follow. Not safe: type
                 // nothing and wait for the next screen edge, like any other
-                // not-safe state.
+                // not-safe state, except that output also retries it: only
+                // output moves the cursor out of the last columns.
+                ring.margin = true;
                 ring.phase = Phase::Idle;
                 return;
             }

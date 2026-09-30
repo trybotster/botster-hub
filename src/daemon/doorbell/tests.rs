@@ -795,14 +795,15 @@ fn a_cursor_in_the_last_two_columns_is_not_probed() {
             rig.terminal.writes.is_empty(),
             "col {col}: time is not an edge"
         );
-        // The cursor moves left and a mode edge follows: the ring goes through.
+        // Output moves the cursor left, with no mode change and no client
+        // input: only output can do that, so it retries the ring.
         rig.terminal.col = 10;
-        rig.terminal.modes_epoch += 1;
+        rig.terminal.output_seq += 1;
         rig.settle();
         assert_eq!(
             rig.terminal.submitted,
             ["hello"],
-            "col {col}: delivered on the edge"
+            "col {col}: delivered on output"
         );
     }
 }
@@ -860,4 +861,108 @@ fn a_failed_cursor_read_leaves_the_ring_waiting_for_the_next_edge() {
     rig.terminal.modes_epoch += 1;
     rig.settle();
     assert_eq!(rig.terminal.submitted, ["hello"]);
+}
+
+#[test]
+fn a_ring_at_the_margin_keeps_waiting_while_output_leaves_the_cursor_there() {
+    let mut terminal = Terminal::composer();
+    terminal.col = 78;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    for _ in 0..3 {
+        // Output advances but the cursor stays in the last two columns: one
+        // read each time, nothing typed, the ring still pending.
+        rig.terminal.output_seq += 1;
+        rig.settle();
+        assert!(
+            rig.terminal.writes.is_empty(),
+            "nothing is typed at the margin"
+        );
+        assert!(rig.pending());
+    }
+    assert_eq!(
+        rig.log
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReadCursor))
+            .count(),
+        4,
+        "the ring's own read plus one read per output edge"
+    );
+    rig.terminal.col = 20;
+    rig.terminal.output_seq += 1;
+    rig.settle();
+    assert_eq!(rig.terminal.submitted, ["hello"]);
+}
+
+#[test]
+fn the_margin_retry_still_honours_the_gate() {
+    // Refused at the margin, then the gate closes (a dialog hides the cursor,
+    // or a human starts a draft). Output alone must not even read the cursor.
+    let mut terminal = Terminal::composer();
+    terminal.col = 78;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    let reads = |rig: &Rig| {
+        rig.log
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReadCursor))
+            .count()
+    };
+    // A dialog opens: the mode edge retries, the gate refuses.
+    rig.terminal.cursor_visible = false;
+    rig.terminal.modes_epoch += 1;
+    rig.settle();
+    let after_dialog = reads(&rig);
+    // Output alone, under the dialog: no read, no write.
+    rig.terminal.col = 10;
+    rig.terminal.output_seq += 1;
+    rig.settle();
+    assert_eq!(reads(&rig), after_dialog, "no read under a hidden cursor");
+    assert!(rig.terminal.writes.is_empty());
+    // The dialog closes and a human starts a draft: the gate refuses again.
+    rig.terminal.cursor_visible = true;
+    rig.terminal.modes_epoch += 1;
+    rig.terminal.human_types("h");
+    rig.settle();
+    let after_draft = reads(&rig);
+    rig.terminal.output_seq += 1;
+    rig.settle();
+    assert_eq!(reads(&rig), after_draft, "no read over a draft");
+    assert!(rig.terminal.writes.is_empty());
+    assert!(rig.pending());
+}
+
+#[test]
+fn an_attempt_that_read_the_cursor_clears_the_margin_wait() {
+    // Refused at the margin; output moves the cursor and the attempt starts,
+    // but its cursor read fails. The failure rule then applies: output alone
+    // does not restart the ring.
+    let mut terminal = Terminal::composer();
+    terminal.col = 78;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    rig.terminal.col = 10;
+    rig.terminal.output_seq += 1;
+    let facts = rig.terminal.facts();
+    rig.reported = Some(facts.clone());
+    rig.feed(Event::Facts(facts));
+    assert!(rig.read_out, "the output edge starts an attempt");
+    rig.read_out = false;
+    rig.feed(Event::CursorFailed);
+    let reads = rig
+        .log
+        .iter()
+        .filter(|effect| matches!(effect, Effect::ReadCursor))
+        .count();
+    rig.terminal.output_seq += 1;
+    rig.settle();
+    assert_eq!(
+        rig.log
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReadCursor))
+            .count(),
+        reads,
+        "output alone must not restart a ring after a failed read"
+    );
+    assert!(rig.terminal.writes.is_empty() && rig.pending());
 }
