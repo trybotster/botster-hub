@@ -19,3 +19,6 @@ full_moon = { version = "2.2.0", features = ["lua54"] }
 [[bin]]
 name = "botster-plugin-test"
 path = "src/main.rs"
+
+[dev-dependencies]
+libc = "0.2.177"

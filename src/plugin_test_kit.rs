@@ -911,6 +911,11 @@ impl KitHub {
 
 impl Drop for KitHub {
     fn drop(&mut self) {
+        // `HubDaemon::stop` releases worker-backed sessions for adoption at the
+        // next start; it does not end them. The kit has no next start, so Core
+        // shuts every session and worker down first, including a launch that
+        // has not installed its session yet, which `ListSessions` cannot see.
+        self.daemon.shutdown_core_for_kit();
         let _ = self.daemon.stop();
         if self.remove_root {
             let _ = std::fs::remove_dir_all(&self.root);
