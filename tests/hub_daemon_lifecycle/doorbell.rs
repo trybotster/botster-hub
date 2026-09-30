@@ -63,6 +63,11 @@ fn a_ring_types_its_text_and_leaves_no_probe_behind() {
         "doorbell-types",
         "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
     );
+    // Ring a session that is already reading. Output that lands between the
+    // probe's echo and its erase makes the terminal reprint the line, which
+    // is the terminal's behaviour and not the doorbell's.
+    let started = observe_until(&mut connection, "ready", Duration::from_secs(20));
+    assert!(started.contains("ready"), "the program started, got {started:?}");
     ring_session(&mut connection, "doorbell-types-session", "ring-text-one");
     let observed = observe_until(&mut connection, "echo:ring-text-one", Duration::from_secs(20));
     assert!(
@@ -87,6 +92,8 @@ fn a_ring_waits_while_the_program_hides_the_cursor() {
         "printf '\\033[?25l'; IFS= read -r go; printf '\\033[?25h'; \
          while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
     );
+    let hidden = observe_until(&mut connection, "\u{1b}[?25l", Duration::from_secs(20));
+    assert!(hidden.contains("\u{1b}[?25l"), "the cursor is hidden, got {hidden:?}");
     ring_session(&mut connection, "doorbell-hidden-session", "ring-text-two");
     connection
         .send_terminal_frame(
