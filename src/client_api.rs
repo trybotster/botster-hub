@@ -13,17 +13,15 @@ use botster_core::{
     PackageDependencyResolution, PackageFeatureResolution, PackageResolutionState, PackageSource,
     RequestId, RoutedEnvelope, RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome,
     RunnableEntrypointKind, RunnableEntrypointLaunchMode, SessionId, SessionLifecycleState,
-    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnWorkingDirectory, SubscriptionId,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SpawnWorkingDirectory,
 };
 use botster_core_daemon::{
-    CoreCompletion, CoreDaemonError, GuardedWriteDecision, GuardedWriteDeliveryState,
-    GuardedWriteRequest, GuardedWriteResult, LifecycleBaselineBudget, ReadinessEvidence,
-    RegistrySessionState, SessionLifecycleBaselinePage, SessionRegistryStateLookup,
+    CoreDaemonError, GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest,
+    GuardedWriteResult, ReadinessEvidence, RegistrySessionState, SessionRegistryStateLookup,
 };
-use botster_hub_client::HistoryUnavailableReason;
 use botster_ui_contract::{
     PackageNavigationTarget, PackageNoticeReactionDescriptor, PackageSurfaceDescriptor,
-    PackageSurfaceKind, PackageSurfaceOperation, UiActionRequest, UiActionResult, UiNode,
+    PackageSurfaceKind, PackageSurfaceOperation, UiNode,
 };
 
 use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
@@ -33,16 +31,11 @@ use crate::packages::{
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
 use crate::runtime::{
-    CoreOperationTracker, PluginSpawnPoll, STARTUP_CORE_WAIT, SessionTypeSpawnStart,
-    core_bridge_error,
+    PluginSpawnPoll, STARTUP_CORE_WAIT, SessionTypeSpawnStart, core_bridge_error,
 };
 use crate::session_credential::CallerToken;
-use crate::session_types::{
-    HubSessionContext, HubSessionType, HubSessionTypeDefinition, ResolvedSessionType,
-    SessionTypeRequest, list_session_types, list_session_types_for_target,
-    materialize_session_type, show_session_type, show_session_type_definition,
-};
-use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
+use crate::session_types::{SessionTypeRequest, materialize_session_type};
+use crate::{HubRuntime, HubRuntimeError};
 
 /// Outcome of starting one client request.
 ///
@@ -91,10 +84,6 @@ pub struct HubClientPending {
 
 enum HubClientPendingStage {
     Ticket(CoreTicket<HubClientResult<HubClientResponse>>),
-    Operation {
-        tracker: CoreOperationTracker,
-        finish: Box<dyn FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send>,
-    },
     SessionType(SessionTypeSpawnStart),
     /// The spawn succeeded; its reservation token is moving to its record.
     SessionTypeHandoff(SessionTypeSpawnStart, HubClientResult<HubClientResponse>),
@@ -122,22 +111,6 @@ impl HubClientPending {
             request_id,
             operation,
             stage: HubClientPendingStage::Ticket(ticket),
-        }
-    }
-
-    fn operation(
-        request_id: RequestId,
-        operation: HubClientOperation,
-        tracker: CoreOperationTracker,
-        finish: impl FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send + 'static,
-    ) -> Self {
-        Self {
-            request_id,
-            operation,
-            stage: HubClientPendingStage::Operation {
-                tracker,
-                finish: Box::new(finish),
-            },
         }
     }
 
@@ -169,32 +142,6 @@ impl HubClientPending {
                 CoreTicketPoll::Ready(result) => {
                     self.stage = HubClientPendingStage::Done;
                     Some(result)
-                }
-            },
-            HubClientPendingStage::Operation { tracker, .. } => match tracker.poll(runtime) {
-                CoreTicketPoll::Pending => None,
-                CoreTicketPoll::Lost => {
-                    self.stage = HubClientPendingStage::Done;
-                    Some(Err(self.lost()))
-                }
-                CoreTicketPoll::Refused => {
-                    self.stage = HubClientPendingStage::Done;
-                    Some(Err(self.bridge_error(CoreTicketError::Overloaded)))
-                }
-                CoreTicketPoll::Ready(Err(error)) => {
-                    self.stage = HubClientPendingStage::Done;
-                    Some(Err(runtime_error(
-                        self.request_id.clone(),
-                        self.operation,
-                        error,
-                    )))
-                }
-                CoreTicketPoll::Ready(Ok(completion)) => {
-                    let stage = std::mem::replace(&mut self.stage, HubClientPendingStage::Done);
-                    let HubClientPendingStage::Operation { finish, .. } = stage else {
-                        return Some(Err(self.lost()));
-                    };
-                    Some(finish(completion))
                 }
             },
             HubClientPendingStage::SessionType(start) => match start.poll(runtime) {
@@ -261,25 +208,6 @@ impl HubClientPending {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-}
-
-fn history_unavailable_dto(
-    reason: Option<botster_terminal_protocol::HistoryUnavailableReason>,
-) -> Option<HistoryUnavailableReason> {
-    reason.map(|reason| match reason {
-        botster_terminal_protocol::HistoryUnavailableReason::Evicted => {
-            HistoryUnavailableReason::Evicted
-        }
-        botster_terminal_protocol::HistoryUnavailableReason::Restart => {
-            HistoryUnavailableReason::Restart
-        }
-        botster_terminal_protocol::HistoryUnavailableReason::Oversize => {
-            HistoryUnavailableReason::Oversize
-        }
-        botster_terminal_protocol::HistoryUnavailableReason::CaptureFailed => {
-            HistoryUnavailableReason::CaptureFailed
-        }
-    })
 }
 
 /// Transport-neutral local client API handler.
@@ -373,207 +301,8 @@ impl HubClientApi {
             let request_id = request_id.clone();
             move |error: CoreDaemonError| runtime_error(request_id.clone(), operation, error)
         };
-        let profile_id = host_profile().id.to_string();
-        let host_id = runtime.config().host.id.clone();
-        let package_count = packages.packages().len();
 
         let body = match request {
-            HubClientRequest::Status { .. } => {
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::ticket(
-                    request_id,
-                    operation,
-                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
-                        daemon
-                            .list()
-                            .map(|sessions| {
-                                respond(HubClientResponseBody::Status(HubClientStatus {
-                                    profile_id: profile_id.clone(),
-                                    host_id: host_id.clone(),
-                                    session_count: sessions.len(),
-                                    package_count,
-                                }))
-                            })
-                            .map_err(&core_error)
-                    }),
-                )));
-            }
-            HubClientRequest::ListSessions { .. } => {
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::ticket(
-                    request_id,
-                    operation,
-                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
-                        daemon
-                            .list()
-                            .map(|sessions| {
-                                respond(HubClientResponseBody::Sessions(
-                                    sessions
-                                        .into_iter()
-                                        .map(daemon_session_to_core_session)
-                                        .map(HubClientSession::from)
-                                        .collect(),
-                                ))
-                            })
-                            .map_err(&core_error)
-                    }),
-                )));
-            }
-            HubClientRequest::SubscribeEntities { entity_type, .. } => {
-                if entity_type != "session" {
-                    return Err(HubClientError::InvalidRequest {
-                        request_id,
-                        operation,
-                        message: format!("unsupported entity type: {entity_type}"),
-                    });
-                }
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::ticket(
-                    request_id,
-                    operation,
-                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
-                        daemon
-                            .lifecycle_baseline_page(
-                                None,
-                                None,
-                                LifecycleBaselineBudget {
-                                    max_rows: 32,
-                                    max_bytes: 64 * 1024,
-                                    max_elapsed: Duration::from_millis(25),
-                                },
-                            )
-                            .map(|page| {
-                                respond(HubClientResponseBody::SessionLifecycleBaselinePage(page))
-                            })
-                            .map_err(|error| {
-                                // The returned Shutdown hides this cause from the client.
-                                crate::hub_log::hub_log!(
-                                    "hub_client_subscribe_entities_baseline_failed error={error:?}"
-                                );
-                                core_error(CoreDaemonError::Shutdown)
-                            })
-                    }),
-                )));
-            }
-            HubClientRequest::UnsubscribeEntities { .. } => {
-                HubClientResponseBody::Events(Vec::new())
-            }
-            HubClientRequest::RemoveSession { session_id, .. } => {
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => {
-                        runtime.begin_remove_session_for_owner(waiter_id, &session_id)
-                    }
-                    None => runtime.begin_remove_session(&session_id),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::RemoveSession { result, .. } => result
-                            .map(|removed| respond(HubClientResponseBody::SessionRemoved(removed)))
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
-            HubClientRequest::Spawn {
-                session_id,
-                command,
-                ..
-            } => {
-                let Ok(spawn) = credentialed_raw_spawn(
-                    runtime,
-                    request_id.clone(),
-                    session_id,
-                    command,
-                    crate::session_credential::os_entropy,
-                ) else {
-                    return Err(HubClientError::Runtime {
-                        request_id,
-                        operation,
-                        kind: HubClientRuntimeErrorKind::SpawnFailed,
-                    });
-                };
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => {
-                        runtime.begin_spawn_for_owner(waiter_id, spawn.request, spawn.metadata)
-                    }
-                    None => runtime.begin_spawn(spawn.request, spawn.metadata),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::Spawn { result, .. } => result
-                            .map(|outcome| {
-                                respond(HubClientResponseBody::Spawned(HubClientSpawned {
-                                    session: HubClientSession::from(outcome),
-                                    events: Vec::new(),
-                                }))
-                            })
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
-            HubClientRequest::Attach { .. } => {
-                return Err(HubClientError::InvalidRequest {
-                    request_id,
-                    operation,
-                    message: "Attach requires a Unix or WebRTC adapter-bound daemon path"
-                        .to_string(),
-                });
-            }
-            HubClientRequest::Detach {
-                session_id,
-                subscription_id,
-                now_seconds,
-                ..
-            } => {
-                let client_id = self.identity.client_id.clone();
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::ticket(
-                    request_id,
-                    operation,
-                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
-                        daemon
-                            .detach(client_id, session_id, subscription_id, now_seconds)
-                            .map(|()| respond(HubClientResponseBody::Events(Vec::new())))
-                            .map_err(&core_error)
-                    }),
-                )));
-            }
-            HubClientRequest::Shutdown { session_id, .. } => {
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => {
-                        runtime.begin_shutdown_session_for_owner(waiter_id, session_id)
-                    }
-                    None => runtime.begin_shutdown_session(session_id),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::ShutdownSession { result, .. } => result
-                            .map(|()| respond(HubClientResponseBody::Events(Vec::new())))
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
             HubClientRequest::GuardedNotificationWrite {
                 session_id,
                 package_name,
@@ -751,231 +480,6 @@ impl HubClientApi {
                     }),
                 )));
             }
-            HubClientRequest::ReadScreen {
-                request_id: read_request_id,
-                session_id,
-                now_seconds,
-            } => {
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => runtime.begin_read_screen_for_owner(
-                        waiter_id,
-                        read_request_id,
-                        session_id.clone(),
-                        now_seconds,
-                    ),
-                    None => {
-                        runtime.begin_read_screen(read_request_id, session_id.clone(), now_seconds)
-                    }
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::ReadScreen { result, .. } => result
-                            .map(|screen| {
-                                respond(HubClientResponseBody::ReadScreen(HubClientReadScreen {
-                                    session_id,
-                                    text: screen.text.to_string(),
-                                    unavailable: history_unavailable_dto(screen.unavailable),
-                                }))
-                            })
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
-            HubClientRequest::ReadModeFlags {
-                request_id: read_request_id,
-                session_id,
-                now_seconds,
-            } => {
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => runtime.begin_read_mode_flags_for_owner(
-                        waiter_id,
-                        read_request_id,
-                        session_id.clone(),
-                        now_seconds,
-                    ),
-                    None => runtime.begin_read_mode_flags(
-                        read_request_id,
-                        session_id.clone(),
-                        now_seconds,
-                    ),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::ReadModeFlags { result, .. } => result
-                            .map(|readback| {
-                                let mode = readback.mode_flags;
-                                respond(HubClientResponseBody::ModeFlags(HubClientModeFlags {
-                                    session_id,
-                                    kitty_enabled: mode.kitty_enabled,
-                                    cursor_visible: mode.cursor_visible,
-                                    bracketed_paste: mode.bracketed_paste,
-                                    mouse_mode: mode.mouse_mode,
-                                    alt_screen: mode.alt_screen,
-                                    focus_reporting: mode.focus_reporting,
-                                    application_cursor: mode.application_cursor,
-                                    rows: readback.rows,
-                                    cols: readback.cols,
-                                    unavailable: history_unavailable_dto(readback.unavailable),
-                                }))
-                            })
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
-            HubClientRequest::CaptureSnapshot {
-                request_id: snapshot_request_id,
-                session_id,
-                now_seconds,
-            } => {
-                let owner = botster_core_daemon::CaptureOwner(format!(
-                    "client:{}",
-                    self.identity.client_id.0
-                ));
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => runtime.begin_capture_snapshot_for_owner(
-                        waiter_id,
-                        snapshot_request_id,
-                        session_id.clone(),
-                        now_seconds,
-                        owner,
-                    ),
-                    None => runtime.begin_capture_snapshot(
-                        snapshot_request_id,
-                        session_id.clone(),
-                        now_seconds,
-                        owner,
-                    ),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
-                    request_id,
-                    operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::CaptureSnapshot { result, .. } => result
-                            .map(|capture| {
-                                respond(HubClientResponseBody::CaptureSnapshot(
-                                    HubClientCaptureSnapshot {
-                                        session_id,
-                                        capture_id: capture.capture_id.0,
-                                        total_bytes: capture.total_bytes,
-                                        page_bytes: capture.page_bytes,
-                                        pages: capture.pages,
-                                        rows: capture.rows,
-                                        cols: capture.cols,
-                                        unavailable: history_unavailable_dto(capture.unavailable),
-                                    },
-                                ))
-                            })
-                            .map_err(core_error),
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
-                )));
-            }
-            HubClientRequest::ListPackages { .. } => HubClientResponseBody::Packages(
-                packages
-                    .packages()
-                    .into_iter()
-                    .map(|record| HubClientPackage::from_record(packages, record))
-                    .collect(),
-            ),
-            HubClientRequest::ListPackageNavigation { .. } => {
-                HubClientResponseBody::PackageNavigation(
-                    packages
-                        .packages()
-                        .into_iter()
-                        .map(|record| HubClientPackage::from_record(packages, record))
-                        .flat_map(HubClientPackage::navigation_entries)
-                        .collect(),
-                )
-            }
-            HubClientRequest::ListSessionTypes { .. } => {
-                let records = packages.packages();
-                let templates =
-                    list_session_types(&records, &runtime.state()).map_err(|error| {
-                        HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        }
-                    })?;
-                HubClientResponseBody::SessionTypes(templates)
-            }
-            HubClientRequest::ListSessionTypesForTarget { target_id, .. } => {
-                let records = packages.packages();
-                let templates =
-                    list_session_types_for_target(&records, &runtime.state(), &target_id).map_err(
-                        |error| HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        },
-                    )?;
-                HubClientResponseBody::SessionTypes(templates)
-            }
-            HubClientRequest::ShowSessionType {
-                session_type_id, ..
-            } => {
-                let records = packages.packages();
-                let template = show_session_type(&records, &runtime.state(), &session_type_id)
-                    .map_err(|error| HubClientError::SessionType {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: error.kind,
-                        message: error.message,
-                    })?;
-                HubClientResponseBody::SessionTypes(vec![template])
-            }
-            HubClientRequest::ShowSessionTypeDefinition {
-                session_type_id, ..
-            } => {
-                let records = packages.packages();
-                let definition =
-                    show_session_type_definition(&records, &runtime.state(), &session_type_id)
-                        .map_err(|error| HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        })?;
-                HubClientResponseBody::SessionTypeDefinition(Box::new(definition))
-            }
-            HubClientRequest::ResolveSessionType {
-                session_type_id,
-                session_type_request,
-                ..
-            } => {
-                let records = packages.packages();
-                let materialized = materialize_session_type(
-                    runtime.config(),
-                    &records,
-                    &runtime.state(),
-                    &session_type_id,
-                    session_type_request,
-                )
-                .map_err(|error| HubClientError::SessionType {
-                    request_id: request_id.clone(),
-                    operation,
-                    kind: error.kind,
-                    message: error.message,
-                })?;
-                HubClientResponseBody::ResolvedSessionType(Box::new(materialized.resolved))
-            }
             HubClientRequest::SpawnSessionType {
                 session_type_id,
                 session_type_request,
@@ -1028,45 +532,6 @@ impl HubClientApi {
                     request_id, operation, start,
                 )));
             }
-            HubClientRequest::ReadSessionContext {
-                session_id,
-                context_id,
-                key,
-                ..
-            } => {
-                let lookup = context_id.as_deref().unwrap_or(session_id.0.as_str());
-                let context =
-                    runtime
-                        .session_context(lookup)
-                        .ok_or_else(|| HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: "unknown_context",
-                            message: "session context was not found".to_string(),
-                        })?;
-                if context.session_id != session_id {
-                    return Err(HubClientError::SessionType {
-                        request_id,
-                        operation,
-                        kind: "context_session_mismatch",
-                        message: "session context does not belong to the requested session"
-                            .to_string(),
-                    });
-                }
-                let context = if let Some(key) = key {
-                    HubSessionContext {
-                        values: context
-                            .values
-                            .get(&key)
-                            .map(|value| BTreeMap::from([(key, value.clone())]))
-                            .unwrap_or_default(),
-                        ..context
-                    }
-                } else {
-                    context
-                };
-                HubClientResponseBody::SessionContext(context)
-            }
             HubClientRequest::PluginLifecycleStatus { .. } => {
                 let snapshot = runtime.plugin_worker_debug_snapshot();
                 HubClientResponseBody::PluginLifecycle(HubClientPluginLifecycleReport {
@@ -1087,48 +552,6 @@ impl HubClientApi {
                         active_timer_resources: runtime.active_plugin_timer_resources(),
                     },
                 })
-            }
-            HubClientRequest::PluginSurfaceRender {
-                package_name,
-                surface_id,
-                payload,
-                ..
-            } => {
-                admit_plugin_surface_operation(
-                    packages,
-                    &package_name,
-                    &surface_id,
-                    PackageSurfaceOperation::Render,
-                    request_id.clone(),
-                    operation,
-                )?;
-                let body = runtime
-                    .render_plugin_surface(&package_name, &surface_id, payload)
-                    .map_err(|error| plugin_error(request_id.clone(), operation, error))?;
-                HubClientResponseBody::PluginSurface(HubClientPluginSurface {
-                    package_name,
-                    surface_id,
-                    body,
-                })
-            }
-            HubClientRequest::PluginSurfaceAction {
-                package_name,
-                action,
-                ..
-            } => {
-                admit_plugin_surface_operation(
-                    packages,
-                    &package_name,
-                    &action.surface_id.0,
-                    PackageSurfaceOperation::Action,
-                    request_id.clone(),
-                    operation,
-                )?;
-                HubClientResponseBody::PluginActionResult(
-                    runtime
-                        .dispatch_plugin_surface_action(&package_name, &action)
-                        .map_err(|error| plugin_error(request_id.clone(), operation, error))?,
-                )
             }
         };
 
@@ -1231,53 +654,6 @@ impl HubClientAdmission {
 /// Stable local client request protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubClientRequest {
-    /// Return path-neutral hub status.
-    Status { request_id: RequestId },
-    /// Return current core-recorded sessions.
-    ListSessions { request_id: RequestId },
-    /// Subscribe to one explicitly requested entity family.
-    SubscribeEntities {
-        request_id: RequestId,
-        entity_type: String,
-        subscription_id: String,
-    },
-    /// End one connection-owned entity subscription.
-    UnsubscribeEntities {
-        request_id: RequestId,
-        subscription_id: String,
-    },
-    /// Forget one terminal session through CoreDaemon.
-    RemoveSession {
-        request_id: RequestId,
-        session_id: SessionId,
-    },
-    /// Spawn a session from hub defaults, without client-supplied host paths.
-    Spawn {
-        request_id: RequestId,
-        session_id: SessionId,
-        command: String,
-        now_seconds: u64,
-    },
-    /// Attach to one session stream. This does not hydrate global state.
-    Attach {
-        request_id: RequestId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        now_seconds: u64,
-    },
-    /// Detach from one session stream.
-    Detach {
-        request_id: RequestId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        now_seconds: u64,
-    },
-    /// Shut down one session through the hub runtime.
-    Shutdown {
-        request_id: RequestId,
-        session_id: SessionId,
-        now_seconds: u64,
-    },
     /// Request a hub-admitted guarded notification write into one session.
     GuardedNotificationWrite {
         request_id: RequestId,
@@ -1327,51 +703,6 @@ pub enum HubClientRequest {
         request_id: RequestId,
         token: CallerToken,
     },
-    /// Request a screen read where the daemon API supports it.
-    ReadScreen {
-        request_id: RequestId,
-        session_id: SessionId,
-        now_seconds: u64,
-    },
-    /// Request authoritative terminal mode flags where the daemon API supports it.
-    ReadModeFlags {
-        request_id: RequestId,
-        session_id: SessionId,
-        now_seconds: u64,
-    },
-    /// Request a snapshot where the daemon API supports it.
-    CaptureSnapshot {
-        request_id: RequestId,
-        session_id: SessionId,
-        now_seconds: u64,
-    },
-    /// Return sanitized package/provider records.
-    ListPackages { request_id: RequestId },
-    /// Return hub-admitted package navigation intent rows.
-    ListPackageNavigation { request_id: RequestId },
-    /// Return sanitized session type rows.
-    ListSessionTypes { request_id: RequestId },
-    /// Return sanitized session type rows eligible at one admitted spawn point.
-    ListSessionTypesForTarget {
-        request_id: RequestId,
-        target_id: String,
-    },
-    /// Return one sanitized session type row.
-    ShowSessionType {
-        request_id: RequestId,
-        session_type_id: String,
-    },
-    /// Return the authored definition for one editable session type.
-    ShowSessionTypeDefinition {
-        request_id: RequestId,
-        session_type_id: String,
-    },
-    /// Resolve a session type without spawning it.
-    ResolveSessionType {
-        request_id: RequestId,
-        session_type_id: String,
-        session_type_request: SessionTypeRequest,
-    },
     /// Spawn a session from a hub-owned session type.
     SpawnSessionType {
         request_id: RequestId,
@@ -1379,98 +710,34 @@ pub enum HubClientRequest {
         session_type_request: SessionTypeRequest,
         now_seconds: u64,
     },
-    /// Read trusted hub context for one spawned template session.
-    ReadSessionContext {
-        request_id: RequestId,
-        session_id: SessionId,
-        context_id: Option<String>,
-        key: Option<String>,
-    },
     /// Return read-only plugin lifecycle status.
     PluginLifecycleStatus { request_id: RequestId },
-    /// Render one plugin-owned surface through its worker-owned route handler.
-    PluginSurfaceRender {
-        request_id: RequestId,
-        package_name: String,
-        surface_id: String,
-        payload: serde_json::Value,
-    },
-    /// Dispatch one plugin-owned semantic UI action through its worker handler.
-    PluginSurfaceAction {
-        request_id: RequestId,
-        package_name: String,
-        action: UiActionRequest,
-    },
 }
 
 impl HubClientRequest {
     fn request_id(&self) -> &RequestId {
         match self {
-            Self::Status { request_id }
-            | Self::ListSessions { request_id }
-            | Self::SubscribeEntities { request_id, .. }
-            | Self::UnsubscribeEntities { request_id, .. }
-            | Self::RemoveSession { request_id, .. }
-            | Self::Spawn { request_id, .. }
-            | Self::Attach { request_id, .. }
-            | Self::Detach { request_id, .. }
-            | Self::Shutdown { request_id, .. }
-            | Self::GuardedNotificationWrite { request_id, .. }
+            Self::GuardedNotificationWrite { request_id, .. }
             | Self::NotifySession { request_id, .. }
             | Self::PublishRoutedEnvelope { request_id, .. }
             | Self::DrainRoutedEnvelopes { request_id, .. }
             | Self::AcknowledgeRoutedEnvelope { request_id, .. }
             | Self::VerifyCaller { request_id, .. }
-            | Self::ReadScreen { request_id, .. }
-            | Self::ReadModeFlags { request_id, .. }
-            | Self::CaptureSnapshot { request_id, .. }
-            | Self::ListPackages { request_id }
-            | Self::ListPackageNavigation { request_id }
-            | Self::ListSessionTypes { request_id }
-            | Self::ListSessionTypesForTarget { request_id, .. }
-            | Self::ShowSessionType { request_id, .. }
-            | Self::ShowSessionTypeDefinition { request_id, .. }
-            | Self::ResolveSessionType { request_id, .. }
             | Self::SpawnSessionType { request_id, .. }
-            | Self::ReadSessionContext { request_id, .. }
-            | Self::PluginLifecycleStatus { request_id }
-            | Self::PluginSurfaceRender { request_id, .. }
-            | Self::PluginSurfaceAction { request_id, .. } => request_id,
+            | Self::PluginLifecycleStatus { request_id } => request_id,
         }
     }
 
     fn operation(&self) -> HubClientOperation {
         match self {
-            Self::Status { .. } => HubClientOperation::Status,
-            Self::ListSessions { .. } => HubClientOperation::ListSessions,
-            Self::SubscribeEntities { .. } => HubClientOperation::SubscribeEntities,
-            Self::UnsubscribeEntities { .. } => HubClientOperation::UnsubscribeEntities,
-            Self::RemoveSession { .. } => HubClientOperation::RemoveSession,
-            Self::Spawn { .. } => HubClientOperation::Spawn,
-            Self::Attach { .. } => HubClientOperation::Attach,
-            Self::Detach { .. } => HubClientOperation::Detach,
-            Self::Shutdown { .. } => HubClientOperation::Shutdown,
             Self::GuardedNotificationWrite { .. } => HubClientOperation::GuardedNotificationWrite,
             Self::NotifySession { .. } => HubClientOperation::NotifySession,
             Self::PublishRoutedEnvelope { .. } => HubClientOperation::PublishRoutedEnvelope,
             Self::DrainRoutedEnvelopes { .. } => HubClientOperation::DrainRoutedEnvelopes,
             Self::VerifyCaller { .. } => HubClientOperation::VerifyCaller,
             Self::AcknowledgeRoutedEnvelope { .. } => HubClientOperation::AcknowledgeRoutedEnvelope,
-            Self::ReadScreen { .. } => HubClientOperation::ReadScreen,
-            Self::ReadModeFlags { .. } => HubClientOperation::ReadModeFlags,
-            Self::CaptureSnapshot { .. } => HubClientOperation::CaptureSnapshot,
-            Self::ListPackages { .. } => HubClientOperation::ListPackages,
-            Self::ListPackageNavigation { .. } => HubClientOperation::ListPackageNavigation,
-            Self::ListSessionTypes { .. } => HubClientOperation::ListSessionTypes,
-            Self::ListSessionTypesForTarget { .. } => HubClientOperation::ListSessionTypesForTarget,
-            Self::ShowSessionType { .. } => HubClientOperation::ShowSessionType,
-            Self::ShowSessionTypeDefinition { .. } => HubClientOperation::ShowSessionTypeDefinition,
-            Self::ResolveSessionType { .. } => HubClientOperation::ResolveSessionType,
             Self::SpawnSessionType { .. } => HubClientOperation::SpawnSessionType,
-            Self::ReadSessionContext { .. } => HubClientOperation::ReadSessionContext,
             Self::PluginLifecycleStatus { .. } => HubClientOperation::PluginLifecycleStatus,
-            Self::PluginSurfaceRender { .. } => HubClientOperation::PluginSurfaceRender,
-            Self::PluginSurfaceAction { .. } => HubClientOperation::PluginSurfaceAction,
         }
     }
 }
@@ -1524,28 +791,12 @@ pub struct HubClientResponse {
 pub enum HubClientResponseBody {
     /// The session a bearer token proved.
     CallerVerified(SessionId),
-    Status(HubClientStatus),
-    Sessions(Vec<HubClientSession>),
-    SessionLifecycleBaselinePage(SessionLifecycleBaselinePage),
-    SessionRemoved(bool),
     Spawned(HubClientSpawned),
-    Events(Vec<HubClientEvent>),
     GuardedWrite(HubClientGuardedWrite),
     RoutedEnvelopePublish(HubClientRoutedEnvelopePublish),
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
-    ReadScreen(HubClientReadScreen),
-    ModeFlags(HubClientModeFlags),
-    CaptureSnapshot(HubClientCaptureSnapshot),
-    Packages(Vec<HubClientPackage>),
-    PackageNavigation(Vec<HubClientPackageNavigationEntry>),
-    SessionTypes(Vec<HubSessionType>),
-    SessionTypeDefinition(Box<HubSessionTypeDefinition>),
-    ResolvedSessionType(Box<ResolvedSessionType>),
-    SessionContext(HubSessionContext),
     PluginLifecycle(HubClientPluginLifecycleReport),
-    PluginSurface(HubClientPluginSurface),
-    PluginActionResult(UiActionResult),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1553,15 +804,6 @@ pub struct HubClientPluginSurface {
     pub package_name: String,
     pub surface_id: String,
     pub body: UiNode,
-}
-
-/// Path-neutral hub status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientStatus {
-    pub profile_id: String,
-    pub host_id: String,
-    pub session_count: usize,
-    pub package_count: usize,
 }
 
 /// Client-facing session summary.
@@ -1637,44 +879,6 @@ impl From<RoutedEnvelopeDrainOutcome> for HubClientRoutedEnvelopeDrain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubClientRoutedEnvelopeAck {
     pub state: Option<EnvelopeDeliveryState>,
-}
-
-/// Client-facing screen readback response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientReadScreen {
-    pub session_id: SessionId,
-    /// Empty when `unavailable` is set.
-    pub text: String,
-    pub unavailable: Option<HistoryUnavailableReason>,
-}
-
-/// Client-facing authoritative terminal mode response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientModeFlags {
-    pub session_id: SessionId,
-    pub kitty_enabled: bool,
-    pub cursor_visible: bool,
-    pub bracketed_paste: bool,
-    pub mouse_mode: u8,
-    pub alt_screen: bool,
-    pub focus_reporting: bool,
-    pub application_cursor: bool,
-    pub rows: u16,
-    pub cols: u16,
-    pub unavailable: Option<HistoryUnavailableReason>,
-}
-
-/// Client-facing snapshot capture summary. Pages are read by capture id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HubClientCaptureSnapshot {
-    pub session_id: SessionId,
-    pub capture_id: String,
-    pub total_bytes: u64,
-    pub page_bytes: u32,
-    pub pages: u32,
-    pub rows: u16,
-    pub cols: u16,
-    pub unavailable: Option<HistoryUnavailableReason>,
 }
 
 /// Client event stream emitted from hub runtime output.

@@ -1157,6 +1157,20 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
         envelopes.is_empty(),
         "rejected attach must not bind: {envelopes:?}"
     );
+    assert!(
+        occupancy_generation(
+            &status
+                .status
+                .as_ref()
+                .expect("status body after the rejected attach")
+                .live_attach_occupancy,
+            "htm-session",
+            "htm-sub",
+        )
+        .is_none(),
+        "a rejected attach must leave no unbound subscription row: {:?}",
+        status.status.as_ref().map(|body| &body.live_attach_occupancy)
+    );
     drop(stream);
     hub.shutdown().expect("shutdown isolated hub");
 }

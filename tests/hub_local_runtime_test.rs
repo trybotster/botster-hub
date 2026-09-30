@@ -7,12 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{RequestId, SessionId, SessionLifecycleState, SubscriptionId};
-use botster_hub::test_internals::TestHubStateStoreExt;
+use botster_hub::test_internals::{LocalClient, TestHubStateStoreExt};
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
-    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubConfig, HubDaemon, HubStartupOptions, HubStateLoadSource, PackageRegistry,
-    PackageRegistrySnapshot, RuntimeEnvironment, SessionDefaults, TransportBindings,
+    HubClientPackage, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
+    HubClientResponseBody, HubConfig, HubDaemon, HubStartupOptions, HubStateLoadSource,
+    PackageRegistry, PackageRegistrySnapshot, RuntimeEnvironment, SessionDefaults,
+    TransportBindings,
 };
 use botster_terminal_protocol_client::TerminalInputCommand;
 
@@ -64,12 +65,9 @@ fn run_local_runtime() {
 
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("runtime-local-client");
-    assert_status_and_packages(
-        &api,
-        daemon.runtime_mut().expect("runtime initialized"),
-        &packages,
-        1,
-    );
+    let client = LocalClient::new("runtime-local-client");
+    assert_eq!(daemon.status().package_count, 1);
+    assert_packages(&packages, 1);
 
     let snapshot = daemon.package_registry().snapshot();
     daemon.stop();
@@ -148,13 +146,11 @@ fn run_local_runtime() {
     let session_id = SessionId(RUNTIME_SESSION.to_string());
     let subscription_id = SubscriptionId(RUNTIME_SUBSCRIPTION.to_string());
     let mut logical_clock = 10;
-    let flow_registry = reloaded.package_registry().clone();
     let flow = panic::catch_unwind(AssertUnwindSafe(|| {
         session_started = true;
         spawn_attach_input_and_drain(
-            &api,
+            &client,
             reloaded.runtime_mut().expect("runtime initialized"),
-            &flow_registry,
             session_id.clone(),
             subscription_id.clone(),
             &mut logical_clock,
@@ -162,80 +158,31 @@ fn run_local_runtime() {
     }));
 
     if flow.is_err() && session_started {
-        let cleanup_registry = reloaded.package_registry().clone();
-        let _ = api
-            .handle_request(
-                reloaded
-                    .runtime_mut()
-                    .expect("runtime initialized for cleanup"),
-                &cleanup_registry,
-                HubClientRequest::Shutdown {
-                    request_id: request_id("runtime-cleanup-shutdown"),
-                    session_id: session_id.clone(),
-                    now_seconds: logical_clock,
-                },
-            )
-            .wait(reloaded.runtime().expect("runtime initialized for cleanup"));
+        let _ = client.shutdown(
+            reloaded.runtime().expect("runtime initialized for cleanup"),
+            &session_id,
+        );
     }
     if let Err(payload) = flow {
         panic::resume_unwind(payload);
     }
 
-    let shutdown_registry = reloaded.package_registry().clone();
-    let shutdown = api
-        .handle_request(
-            reloaded.runtime_mut().expect("runtime initialized"),
-            &shutdown_registry,
-            HubClientRequest::Shutdown {
-                request_id: request_id("runtime-shutdown"),
-                session_id,
-                now_seconds: logical_clock,
-            },
+    client
+        .shutdown(
+            reloaded.runtime().expect("runtime initialized"),
+            &session_id,
         )
-        .wait(reloaded.runtime().expect("runtime initialized"))
-        .expect("shutdown through client api");
-    let HubClientResponseBody::Events(events) = shutdown.body else {
-        panic!("shutdown should return events");
-    };
-    assert!(events.is_empty());
+        .expect("shutdown through core daemon");
 
     reloaded.stop();
 }
 
-fn assert_status_and_packages(
-    api: &HubClientApi,
-    runtime: &mut botster_hub::HubRuntime,
-    packages: &PackageRegistry,
-    expected_package_count: usize,
-) {
-    let status = api
-        .handle_request(
-            runtime,
-            packages,
-            HubClientRequest::Status {
-                request_id: request_id("runtime-status"),
-            },
-        )
-        .wait(runtime)
-        .expect("status through client api");
-    let HubClientResponseBody::Status(status) = status.body else {
-        panic!("status response expected");
-    };
-    assert_eq!(status.package_count, expected_package_count);
-
-    let response = api
-        .handle_request(
-            runtime,
-            packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("runtime-list-packages"),
-            },
-        )
-        .wait(runtime)
-        .expect("packages through client api");
-    let HubClientResponseBody::Packages(records) = response.body else {
-        panic!("package response expected");
-    };
+fn assert_packages(packages: &PackageRegistry, expected_package_count: usize) {
+    let records = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(packages, record))
+        .collect::<Vec<_>>();
     assert_eq!(records.len(), expected_package_count);
     assert_eq!(records[0].package_name, RUNTIME_PACKAGE);
     assert_eq!(
@@ -250,47 +197,29 @@ fn assert_status_and_packages(
 }
 
 fn spawn_attach_input_and_drain(
-    api: &HubClientApi,
+    client: &LocalClient,
     runtime: &mut botster_hub::HubRuntime,
-    packages: &PackageRegistry,
     session_id: SessionId,
     subscription_id: SubscriptionId,
     logical_clock: &mut u64,
 ) {
-    let spawn = api
-        .handle_request(
-            runtime,
-            packages,
-            HubClientRequest::Spawn {
-                request_id: request_id("runtime-spawn"),
-                session_id: session_id.clone(),
-                command: "printf 'runtime:ready\\n'; while IFS= read -r line; do printf 'runtime:%s\\n' \"$line\"; done".to_string(),
-                now_seconds: *logical_clock,
-            },
-        ).wait(runtime)
-        .expect("spawn through client api");
+    let spawned = client.spawn(
+        runtime,
+        &session_id,
+        "printf 'runtime:ready\\n'; while IFS= read -r line; do printf 'runtime:%s\\n' \"$line\"; done",
+    );
     *logical_clock += 1;
-    let HubClientResponseBody::Spawned(spawned) = spawn.body else {
-        panic!("spawn response expected");
-    };
-    assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
+    assert_eq!(spawned.lifecycle, SessionLifecycleState::Running);
 
     // Attach and bind run as one Core operation inside the shared helper.
     let terminal_adapter = bind_shared_terminal_adapter(
         runtime,
-        api.identity().client_id.clone(),
+        client.client_id.clone(),
         session_id.clone(),
         subscription_id.clone(),
     );
     *logical_clock += 1;
-    read_screen_until(
-        runtime,
-        api,
-        packages,
-        &session_id,
-        "runtime:ready",
-        logical_clock,
-    );
+    read_screen_until(runtime, client, &session_id, "runtime:ready", logical_clock);
 
     inject_terminal_command(
         &terminal_adapter,
@@ -301,14 +230,7 @@ fn spawn_attach_input_and_drain(
     );
     *logical_clock += 1;
 
-    let observed = drain_until(
-        runtime,
-        api,
-        packages,
-        &session_id,
-        INPUT_MARKER,
-        logical_clock,
-    );
+    let observed = drain_until(runtime, client, &session_id, INPUT_MARKER, logical_clock);
     assert!(
         observed
             .windows(INPUT_MARKER.len())
@@ -317,44 +239,35 @@ fn spawn_attach_input_and_drain(
     );
 }
 
+fn observe_lifecycle(runtime: &mut botster_hub::HubRuntime, logical_clock: u64) {
+    let _ = runtime
+        .observe_lifecycle_slice(
+            logical_clock,
+            None,
+            botster_core_daemon::ObserveLifecycleBudget {
+                max_sessions: 32,
+                max_encoded_result_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(20),
+            },
+        )
+        .wait(std::time::Duration::from_secs(30))
+        .expect("core bridge");
+}
+
 fn read_screen_until(
     runtime: &mut botster_hub::HubRuntime,
-    api: &HubClientApi,
-    packages: &PackageRegistry,
+    client: &LocalClient,
     session_id: &SessionId,
     needle: &str,
     logical_clock: &mut u64,
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let _ = runtime
-            .observe_lifecycle_slice(
-                *logical_clock,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(20),
-                },
-            )
-            .wait(std::time::Duration::from_secs(30))
-            .expect("core bridge");
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("runtime-read-screen"),
-                    session_id: session_id.clone(),
-                    now_seconds: *logical_clock,
-                },
-            )
-            .wait(runtime)
-            .expect("read screen through client api");
+        observe_lifecycle(runtime, *logical_clock);
+        let screen = client
+            .read_screen(runtime, session_id, *logical_clock)
+            .expect("read screen through core daemon");
         *logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = response.body else {
-            panic!("read screen response expected");
-        };
         if screen.text.contains(needle) {
             return;
         }
@@ -365,8 +278,7 @@ fn read_screen_until(
 
 fn drain_until(
     runtime: &mut botster_hub::HubRuntime,
-    api: &HubClientApi,
-    packages: &PackageRegistry,
+    client: &LocalClient,
     session_id: &SessionId,
     needle: &[u8],
     logical_clock: &mut u64,
@@ -376,35 +288,12 @@ fn drain_until(
 
     let needle_text = String::from_utf8_lossy(needle);
     while Instant::now() < deadline {
-        let _ = runtime
-            .observe_lifecycle_slice(
-                *logical_clock,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(20),
-                },
-            )
-            .wait(std::time::Duration::from_secs(30))
-            .expect("core bridge");
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("runtime-read-after-drain"),
-                    session_id: session_id.clone(),
-                    now_seconds: *logical_clock,
-                },
-            )
-            .wait(runtime)
+        observe_lifecycle(runtime, *logical_clock);
+        let screen = client
+            .read_screen(runtime, session_id, *logical_clock)
             .expect("read screen");
         *logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = response.body else {
-            panic!("read screen response expected");
-        };
-        observed = screen.text.into_bytes();
+        observed = screen.text.as_bytes().to_vec();
         if observed
             .windows(needle.len())
             .any(|window| window == needle)

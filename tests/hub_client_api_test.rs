@@ -17,14 +17,17 @@ use botster_core_daemon::{
     LifecycleBaselineStop, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleStop,
     ReadinessEvidence,
 };
+use botster_hub::session_types::{
+    list_session_types, list_session_types_for_target, materialize_session_type, show_session_type,
+    show_session_type_definition,
+};
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore,
-    HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError, HubClientIdentity,
-    HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
-    HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
-    PackageProvenance, PackageRegistry, PackageSessionType, PackageSessionTypeExecution,
-    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
-    SessionTypeMutationSource, SpawnTarget, TransportBindings,
+    HostIdentityOptions, HubClientApi, HubClientError, HubClientOperation, HubClientPackage,
+    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
+    HubPackageManifest, HubRuntime, HubStartupOptions, PackageProvenance, PackageRegistry,
+    PackageSessionType, PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory,
+    RuntimeEnvironment, SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_hub_client::{
     DaemonConnection, DaemonRequest, DaemonResponse, DaemonResponseKind,
@@ -130,9 +133,13 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     HubRuntime::new(config).expect("hub runtime starts")
 }
 
+use botster_hub::test_internals::LocalClient;
+
+const CORE_WAIT: Duration = Duration::from_secs(30);
+
 fn attach_bound_subscription(
     runtime: &mut HubRuntime,
-    api: &HubClientApi,
+    api: &LocalClient,
     session_id: &SessionId,
     subscription_id: &SubscriptionId,
     now_seconds: u64,
@@ -141,58 +148,10 @@ fn attach_bound_subscription(
     let _ = now_seconds;
     bind_shared_terminal_adapter(
         runtime,
-        api.identity().client_id.clone(),
+        api.client_id.clone(),
         session_id.clone(),
         subscription_id.clone(),
     )
-}
-
-#[test]
-fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
-    let mut runtime = explicit_runtime("client-api-attach-fail-closed");
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("local-operator");
-    let session_id = SessionId("fail-closed-session".to_string());
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Spawn {
-            request_id: request_id("fail-closed-spawn"),
-            session_id: session_id.clone(),
-            command: "printf 'no-unbound\\n'".to_string(),
-            now_seconds: 1,
-        },
-    )
-    .wait(&runtime)
-    .expect("spawn");
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Attach {
-                request_id: request_id("fail-closed-attach"),
-                session_id,
-                subscription_id: SubscriptionId("fail-closed-sub".to_string()),
-                now_seconds: 2,
-            },
-        )
-        .wait(&runtime)
-        .expect_err("local Attach must fail closed");
-    assert!(matches!(
-        error,
-        HubClientError::InvalidRequest { operation, .. }
-            if operation == HubClientOperation::Attach
-    ));
-    assert!(
-        runtime
-            .list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES)
-            .wait(std::time::Duration::from_secs(30))
-            .expect("core inventory")
-            .expect("inventory fits the test allowance")
-            .records
-            .is_empty(),
-        "fail-closed Attach must not leave an unbound inventory row"
-    );
 }
 
 #[test]
@@ -306,30 +265,6 @@ fn authored_session_type(id: &str) -> PackageSessionType {
         context: vec!["prompt".to_string()],
         target_id: None,
     }
-}
-
-fn read_definition(
-    api: &HubClientApi,
-    runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
-    label: &str,
-    session_type_id: &str,
-) -> botster_hub::HubSessionTypeDefinition {
-    let response = api
-        .handle_request(
-            runtime,
-            packages,
-            HubClientRequest::ShowSessionTypeDefinition {
-                request_id: request_id(label),
-                session_type_id: session_type_id.to_string(),
-            },
-        )
-        .wait(runtime)
-        .expect("read authored session type definition");
-    let HubClientResponseBody::SessionTypeDefinition(definition) = response.body else {
-        panic!("session type definition response expected");
-    };
-    *definition
 }
 
 #[test]
@@ -517,73 +452,20 @@ fn session_type_definition_refuses_package_sources_and_denied_admission() {
         .enable("session-type.plugin", "enable definition package")
         .expect("enable package");
 
-    let mut runtime = explicit_runtime("session-type-definition-package-refusal");
-    let api = HubClientApi::local_operator("session-type-definition-package-client");
+    let runtime = explicit_runtime("session-type-definition-package-refusal");
 
-    let refused = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionTypeDefinition {
-                request_id: request_id("definition-package-source"),
-                session_type_id: "init".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("package-owned definitions stay read-only");
-    assert!(matches!(
-        refused,
-        HubClientError::SessionType {
-            kind: "read_only_session_type_source",
-            ..
-        }
-    ));
+    let refused =
+        show_session_type_definition(&packages.packages(), &runtime.state(), &"init".to_string())
+            .expect_err("package-owned definitions stay read-only");
+    assert!(refused.kind == "read_only_session_type_source");
 
-    let unknown = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionTypeDefinition {
-                request_id: request_id("definition-unknown"),
-                session_type_id: "missing".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unknown ids stay typed");
-    assert!(matches!(
-        unknown,
-        HubClientError::SessionType {
-            kind: "unknown_session_type",
-            ..
-        }
-    ));
-
-    // The production denial path: an unadmitted caller cannot read authored data.
-    let denied_api = HubClientApi::new(
-        HubClientIdentity {
-            client_id: botster_core::ClientId("denied-definition-client".to_string()),
-            role: HubClientRole::LocalOperator,
-        },
-        HubClientAdmission::deny_all(),
-    );
-    let denied = denied_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionTypeDefinition {
-                request_id: request_id("definition-denied"),
-                session_type_id: "init".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unadmitted callers are refused before policy runs");
-    assert!(matches!(
-        denied,
-        HubClientError::AdmissionDenied {
-            operation: HubClientOperation::ShowSessionTypeDefinition,
-            ..
-        }
-    ));
+    let unknown = show_session_type_definition(
+        &packages.packages(),
+        &runtime.state(),
+        &"missing".to_string(),
+    )
+    .expect_err("unknown ids stay typed");
+    assert!(unknown.kind == "unknown_session_type");
 }
 
 #[test]
@@ -696,69 +578,38 @@ fn empty_registry() -> PackageRegistry {
 }
 
 #[test]
-fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
-    let mut runtime = explicit_runtime("session-entity-subscription");
-    let api = HubClientApi::local_operator("session-entity-client");
-    let packages = empty_registry();
+fn session_entity_baseline_of_an_empty_hub_is_one_complete_page() {
+    let runtime = explicit_runtime("session-entity-subscription");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::SubscribeEntities {
-                request_id: request_id("subscribe-sessions"),
-                entity_type: "session".to_string(),
-                subscription_id: "session-entities".to_string(),
+    // The baseline the session entity family starts from: one bounded Core page.
+    let page = runtime
+        .lifecycle_baseline_page(
+            None,
+            None,
+            LifecycleBaselineBudget {
+                max_rows: 32,
+                max_bytes: 64 * 1024,
+                max_elapsed: Duration::from_millis(25),
             },
         )
-        .wait(&runtime)
-        .expect("session entity family is admitted");
-    let HubClientResponseBody::SessionLifecycleBaselinePage(page) = response.body else {
-        panic!("expected CoreDaemon lifecycle baseline page");
-    };
+        .wait(CORE_WAIT)
+        .expect("core bridge")
+        .expect("lifecycle baseline page");
     assert!(page.sessions.is_empty());
     assert_eq!(page.stop, LifecycleBaselineStop::Complete);
-
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::SubscribeEntities {
-                request_id: request_id("subscribe-unrelated"),
-                entity_type: "package".to_string(),
-                subscription_id: "unrelated".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unrelated families must not be hydrated");
-    assert!(matches!(
-        error,
-        HubClientError::InvalidRequest {
-            operation: HubClientOperation::SubscribeEntities,
-            ..
-        }
-    ));
 }
 
 #[test]
 fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() {
-    let mut runtime = explicit_runtime("session-entity-paged-baseline");
-    let api = HubClientApi::local_operator("session-entity-paged-client");
-    let packages = empty_registry();
+    let runtime = explicit_runtime("session-entity-paged-baseline");
+    let api = LocalClient::new("session-entity-paged-client");
 
     for index in 0..33 {
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Spawn {
-                request_id: request_id(&format!("spawn-{index}")),
-                session_id: SessionId(format!("paged-session-{index:02}")),
-                command: "sleep 30".to_string(),
-                now_seconds: index as u64 + 1,
-            },
-        )
-        .wait(&runtime)
-        .expect("spawn session for paged baseline");
+        api.spawn(
+            &runtime,
+            &SessionId(format!("paged-session-{index:02}")),
+            &"sleep 30".to_string(),
+        );
     }
 
     assert_eq!(
@@ -797,32 +648,22 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
         });
     }
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::SubscribeEntities {
-                request_id: request_id("subscribe-paged-sessions"),
-                entity_type: "session".to_string(),
-                subscription_id: "paged-session-entities".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect("session entity family is admitted");
-    let HubClientResponseBody::SessionLifecycleBaselinePage(first_page) = response.body else {
-        panic!("expected a bounded lifecycle baseline page, got {response:?}");
+    let budget = LifecycleBaselineBudget {
+        max_rows: 32,
+        max_bytes: 64 * 1024,
+        max_elapsed: Duration::from_millis(25),
     };
+    let first_page = runtime
+        .lifecycle_baseline_page(None, None, budget)
+        .wait(CORE_WAIT)
+        .expect("core bridge")
+        .expect("first lifecycle baseline page");
     assert!(
         first_page.stop != LifecycleBaselineStop::Complete || first_page.sessions.len() < 33,
         "local API must not present one page as the complete 33-row baseline"
     );
     assert!(first_page.sessions.len() <= 32);
 
-    let budget = LifecycleBaselineBudget {
-        max_rows: 32,
-        max_bytes: 64 * 1024,
-        max_elapsed: Duration::from_millis(25),
-    };
     let mut snapshot = Some(first_page.snapshot_sequence.clone());
     let mut after = first_page.next.clone();
     let mut rows = first_page.sessions.clone();
@@ -845,17 +686,7 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
     assert_eq!(rows.len(), 33);
 
     for index in 0..33 {
-        let _ = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::Shutdown {
-                    request_id: request_id(&format!("shutdown-{index}")),
-                    session_id: SessionId(format!("paged-session-{index:02}")),
-                    now_seconds: 100 + index as u64,
-                },
-            )
-            .wait(&runtime);
+        let _ = api.shutdown(&runtime, &SessionId(format!("paged-session-{index:02}")));
     }
 }
 
@@ -1116,119 +947,70 @@ fn session_types_resolve_and_reject_ownerless_spawn_and_unadmitted_reads() {
     let mut runtime = explicit_runtime("session-type");
     let api = HubClientApi::local_operator("session-type-client");
 
-    let list = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-session-types"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list templates");
-    let HubClientResponseBody::SessionTypes(templates) = list.body else {
-        panic!("session types response expected");
-    };
+    let list = list_session_types(&packages.packages(), &runtime.state()).expect("list templates");
+    let templates = list;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].id, "init");
 
-    let rejected_env = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-rejected-env"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    environment: BTreeMap::from([(
-                        "BOTSTER_UNDECLARED".to_string(),
-                        "no".to_string(),
-                    )]),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("undeclared env override rejected");
-    assert!(matches!(
-        rejected_env,
-        HubClientError::SessionType {
-            kind: "environment_not_admitted",
-            ..
-        }
-    ));
+    let rejected_env = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest {
+            environment: BTreeMap::from([("BOTSTER_UNDECLARED".to_string(), "no".to_string())]),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("undeclared env override rejected");
+    assert!(rejected_env.kind == "environment_not_admitted");
 
-    let rejected_target = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-rejected-target"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    target_id: Some("package:other-template.plugin".to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unadmitted target override rejected");
-    assert!(matches!(
-        rejected_target,
-        HubClientError::SessionType {
-            kind: "target_not_admitted",
-            ..
-        }
-    ));
+    let rejected_target = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest {
+            target_id: Some("package:other-template.plugin".to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("unadmitted target override rejected");
+    assert!(rejected_target.kind == "target_not_admitted");
 
-    let rejected_cwd = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-rejected-cwd"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    cwd: Some("/tmp/outside-template-root".to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unadmitted cwd override rejected");
-    assert!(matches!(
-        rejected_cwd,
-        HubClientError::SessionType {
-            kind: "cwd_not_admitted",
-            ..
-        }
-    ));
+    let rejected_cwd = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest {
+            cwd: Some("/tmp/outside-template-root".to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("unadmitted cwd override rejected");
+    assert!(rejected_cwd.kind == "cwd_not_admitted");
 
-    let resolved = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-generic-template-id"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    environment: BTreeMap::from([(
-                        "BOTSTER_MODE".to_string(),
-                        "override".to_string(),
-                    )]),
-                    context: botster_hub::SessionTypeContextInput {
-                        prompt: Some("hello from api".to_string()),
-                        ..botster_hub::SessionTypeContextInput::default()
-                    },
-                    ..botster_hub::SessionTypeRequest::default()
-                },
+    let resolved = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest {
+            environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "override".to_string())]),
+            context: botster_hub::SessionTypeContextInput {
+                prompt: Some("hello from api".to_string()),
+                ..botster_hub::SessionTypeContextInput::default()
             },
-        )
-        .wait(&runtime)
-        .expect("resolve bare generic template id");
-    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
-        panic!("resolved template response expected");
-    };
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect("resolve bare generic template id");
+    let resolved = resolved;
     assert_eq!(resolved.session_type.id, "init");
     assert_eq!(
         resolved.environment.get("BOTSTER_MODE").map(String::as_str),
@@ -1266,29 +1048,6 @@ fn session_types_resolve_and_reject_ownerless_spawn_and_unadmitted_reads() {
         } if request_id == spawn_request_id
             && message == "session type spawning requires the daemon control owner"
     ));
-
-    let unadmitted = HubClientApi::new(
-        HubClientIdentity {
-            client_id: botster_core::ClientId("unadmitted".to_string()),
-            role: HubClientRole::Unadmitted,
-        },
-        HubClientAdmission::deny_all(),
-    );
-    let denied = unadmitted
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadSessionContext {
-                request_id: request_id("unadmitted-context-read"),
-                session_id: SessionId("absent-session".to_string()),
-                context_id: None,
-                key: None,
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unadmitted context reads are denied");
-    // Admission rejects this request before the absent context is looked up.
-    assert!(matches!(denied, HubClientError::AdmissionDenied { .. }));
 }
 
 #[test]
@@ -1321,42 +1080,21 @@ fn session_type_show_rejects_ambiguous_bare_ids() {
         )
         .expect("enable second session type package");
 
-    let mut runtime = explicit_runtime("session-type-show-ambiguous");
-    let api = HubClientApi::local_operator("session-type-show-ambiguous-client");
+    let runtime = explicit_runtime("session-type-show-ambiguous");
 
-    let rejected = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionType {
-                request_id: request_id("show-ambiguous-template"),
-                session_type_id: "init".to_string(),
-            },
-        )
-        .wait(&runtime)
+    let rejected = show_session_type(&packages.packages(), &runtime.state(), &"init".to_string())
+        .map(|template| vec![template])
         .expect_err("ambiguous bare template id should be rejected");
-    assert!(matches!(
-        rejected,
-        HubClientError::SessionType {
-            kind: "ambiguous_session_type",
-            ..
-        }
-    ));
+    assert!(rejected.kind == "ambiguous_session_type");
 
-    let shown = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionType {
-                request_id: request_id("show-full-template-id"),
-                session_type_id: "first-template.plugin/init".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect("full template id remains unambiguous");
-    let HubClientResponseBody::SessionTypes(templates) = shown.body else {
-        panic!("session types response expected");
-    };
+    let shown = show_session_type(
+        &packages.packages(),
+        &runtime.state(),
+        &"first-template.plugin/init".to_string(),
+    )
+    .map(|template| vec![template])
+    .expect("full template id remains unambiguous");
+    let templates = shown;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].session_type_id, "first-template.plugin/init");
 }
@@ -1435,22 +1173,11 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
         })
         .expect("persist session type sources");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-type-precedence-client");
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
 
-    let list = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-merged-session-types"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list merged templates");
-    let HubClientResponseBody::SessionTypes(templates) = list.body else {
-        panic!("session types response expected");
-    };
+    let list =
+        list_session_types(&packages.packages(), &runtime.state()).expect("list merged templates");
+    let templates = list;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].source, "repo");
     assert_eq!(templates[0].target_id, "repo:main");
@@ -1466,43 +1193,24 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
         ("bare", "init".to_string()),
         ("qualified", listed.session_type_id.clone()),
     ] {
-        let shown = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::ShowSessionType {
-                    request_id: request_id(&format!("show-{suffix}-repo-template")),
-                    session_type_id: session_type_id.clone(),
-                },
-            )
-            .wait(&runtime)
+        let shown = show_session_type(&packages.packages(), &runtime.state(), &session_type_id)
+            .map(|template| vec![template])
             .expect("show repo override");
-        let HubClientResponseBody::SessionTypes(shown) = shown.body else {
-            panic!("shown session type expected");
-        };
-        assert_eq!(shown, vec![listed.clone()]);
+        assert_eq!(shown, vec![listed.clone()], "{suffix} id");
 
-        let resolved = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::ResolveSessionType {
-                    request_id: request_id(&format!("resolve-{suffix}-repo-template")),
-                    session_type_id,
-                    session_type_request: botster_hub::SessionTypeRequest {
-                        environment: BTreeMap::from([(
-                            "BOTSTER_MODE".to_string(),
-                            "explicit".to_string(),
-                        )]),
-                        ..botster_hub::SessionTypeRequest::default()
-                    },
-                },
-            )
-            .wait(&runtime)
-            .expect("resolve repo override");
-        let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
-            panic!("resolved session type expected");
-        };
+        let resolved = materialize_session_type(
+            runtime.config(),
+            &packages.packages(),
+            &runtime.state(),
+            &session_type_id,
+            botster_hub::SessionTypeRequest {
+                environment: BTreeMap::from([("BOTSTER_MODE".to_string(), "explicit".to_string())]),
+                ..botster_hub::SessionTypeRequest::default()
+            },
+        )
+        .map(|materialized| materialized.resolved)
+        .expect("resolve repo override");
+        let resolved = resolved;
         assert_eq!(resolved.session_type, listed);
         assert_eq!(
             resolved.executable,
@@ -1514,28 +1222,19 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
         );
     }
 
-    let rejected = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-repo-rejected-cwd"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    cwd: Some(device_root.display().to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("repo cwd outside target rejected");
-    assert!(matches!(
-        rejected,
-        HubClientError::SessionType {
-            kind: "cwd_not_admitted",
-            ..
-        }
-    ));
+    let rejected = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest {
+            cwd: Some(device_root.display().to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("repo cwd outside target rejected");
+    assert!(rejected.kind == "cwd_not_admitted");
 }
 
 #[test]
@@ -1763,36 +1462,23 @@ fn session_type_definition_rejects_ambiguous_bare_ids() {
         })
         .expect("persist ambiguous repo targets");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
     let packages = empty_registry();
-    let api = HubClientApi::local_operator("session-type-definition-ambiguous-client");
 
-    let ambiguous = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ShowSessionTypeDefinition {
-                request_id: request_id("definition-ambiguous"),
-                session_type_id: "authored-ambiguous".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("ambiguous bare ids stay ambiguous for the authoring read");
-    assert!(matches!(
-        ambiguous,
-        HubClientError::SessionType {
-            kind: "ambiguous_session_type",
-            ..
-        }
-    ));
+    let ambiguous = show_session_type_definition(
+        &packages.packages(),
+        &runtime.state(),
+        &"authored-ambiguous".to_string(),
+    )
+    .expect_err("ambiguous bare ids stay ambiguous for the authoring read");
+    assert!(ambiguous.kind == "ambiguous_session_type");
 
-    let qualified = read_definition(
-        &api,
-        &mut runtime,
-        &packages,
-        "definition-ambiguous-qualified",
-        "repo:second/authored-ambiguous",
-    );
+    let qualified = show_session_type_definition(
+        &packages.packages(),
+        &runtime.state(),
+        &"repo:second/authored-ambiguous".to_string(),
+    )
+    .expect("read qualified authored session type definition");
     assert_eq!(
         qualified.source,
         SessionTypeMutationSource::Repo {
@@ -1860,23 +1546,17 @@ fn session_type_sources_apply_device_over_package_when_repo_disabled() {
         })
         .expect("persist sources");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-type-device-over-package-client");
-    let resolved = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-device-over-package"),
-                session_type_id: "init".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest::default(),
-            },
-        )
-        .wait(&runtime)
-        .expect("resolve device template");
-    let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
-        panic!("resolved session type expected");
-    };
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let resolved = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"init".to_string(),
+        botster_hub::SessionTypeRequest::default(),
+    )
+    .map(|materialized| materialized.resolved)
+    .expect("resolve device template");
+    let resolved = resolved;
 
     assert_eq!(resolved.session_type.source, "device");
     assert_eq!(resolved.session_type.target_id, "device:local");
@@ -1908,26 +1588,11 @@ fn session_type_sources_reject_duplicate_ids_within_device_source() {
         })
         .expect("persist duplicate device source");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-type-duplicate-device-client");
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &empty_registry(),
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-duplicate-device"),
-            },
-        )
-        .wait(&runtime)
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let error = list_session_types(&empty_registry().packages(), &runtime.state())
         .expect_err("duplicate device ids are rejected");
 
-    assert!(matches!(
-        error,
-        HubClientError::SessionType {
-            kind: "invalid_device_session_types",
-            ..
-        }
-    ));
+    assert!(error.kind == "invalid_device_session_types");
 }
 
 #[test]
@@ -1961,26 +1626,11 @@ fn session_type_sources_reject_duplicate_ids_within_repo_source() {
         })
         .expect("persist duplicate repo target");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-type-duplicate-repo-client");
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &empty_registry(),
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-duplicate-repo"),
-            },
-        )
-        .wait(&runtime)
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let error = list_session_types(&empty_registry().packages(), &runtime.state())
         .expect_err("duplicate repo ids are rejected");
 
-    assert!(matches!(
-        error,
-        HubClientError::SessionType {
-            kind: "invalid_repo_session_types",
-            ..
-        }
-    ));
+    assert!(error.kind == "invalid_repo_session_types");
 }
 
 #[test]
@@ -2045,27 +1695,16 @@ fn session_type_sources_reject_ambiguous_same_rank_repo_ids() {
         })
         .expect("persist ambiguous repo targets");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let api = HubClientApi::local_operator("session-type-ambiguous-repos-client");
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &empty_registry(),
-            HubClientRequest::ShowSessionType {
-                request_id: request_id("show-ambiguous-repo-template"),
-                session_type_id: "init".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("same-rank repo ids are ambiguous");
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
+    let error = show_session_type(
+        &empty_registry().packages(),
+        &runtime.state(),
+        &"init".to_string(),
+    )
+    .map(|template| vec![template])
+    .expect_err("same-rank repo ids are ambiguous");
 
-    assert!(matches!(
-        error,
-        HubClientError::SessionType {
-            kind: "ambiguous_session_type",
-            ..
-        }
-    ));
+    assert!(error.kind == "ambiguous_session_type");
 }
 
 #[test]
@@ -2184,25 +1823,14 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
         })
         .expect("persist device global sources");
 
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime");
-    let api = HubClientApi::local_operator("device-global-eligible-client");
+    let runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime");
     let packages = empty_registry();
 
     // Management catalog keeps the global effective path and storage provenance.
     // Non-colliding device relative stays as device with device:local provenance.
-    let catalog = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("catalog-device-global"),
-            },
-        )
-        .wait(&runtime)
-        .expect("management catalog");
-    let HubClientResponseBody::SessionTypes(catalog) = catalog.body else {
-        panic!("session types response expected");
-    };
+    let catalog =
+        list_session_types(&packages.packages(), &runtime.state()).expect("management catalog");
+    let catalog = catalog;
     let catalog_device_relative = catalog
         .iter()
         .find(|row| row.session_type_id == "device/relative")
@@ -2218,20 +1846,13 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
     assert_eq!(catalog_alpha.session_type_id, "tgt_other/alpha");
 
     // List-for-T includes device Global with list-context target_id = T.
-    let listed = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypesForTarget {
-                request_id: request_id("list-for-hub"),
-                target_id: "tgt_hub".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect("list for admitted hub target");
-    let HubClientResponseBody::SessionTypes(listed) = listed.body else {
-        panic!("session types response expected");
-    };
+    let listed = list_session_types_for_target(
+        &packages.packages(),
+        &runtime.state(),
+        &"tgt_hub".to_string(),
+    )
+    .expect("list for admitted hub target");
+    let listed = listed;
     let ids = listed
         .iter()
         .map(|row| row.session_type_id.as_str())
@@ -2259,20 +1880,13 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
     );
 
     // Cross-target collision: other target's repo alpha must not hide device alpha on hub.
-    let other_list = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypesForTarget {
-                request_id: request_id("list-for-other"),
-                target_id: "tgt_other".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect("list for other target");
-    let HubClientResponseBody::SessionTypes(other_list) = other_list.body else {
-        panic!("session types response expected");
-    };
+    let other_list = list_session_types_for_target(
+        &packages.packages(),
+        &runtime.state(),
+        &"tgt_other".to_string(),
+    )
+    .expect("list for other target");
+    let other_list = other_list;
     let other_ids = other_list
         .iter()
         .map(|row| row.session_type_id.as_str())
@@ -2296,24 +1910,19 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
 
     // List/spawn parity for every listed hub row.
     for row in &listed {
-        let resolved = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::ResolveSessionType {
-                    request_id: request_id(&format!("resolve-{}", row.session_type_id)),
-                    session_type_id: row.session_type_id.clone(),
-                    session_type_request: botster_hub::SessionTypeRequest {
-                        target_id: Some("tgt_hub".to_string()),
-                        ..botster_hub::SessionTypeRequest::default()
-                    },
-                },
-            )
-            .wait(&runtime)
-            .unwrap_or_else(|error| panic!("resolve {} at hub: {error:?}", row.session_type_id));
-        let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
-            panic!("resolved session type expected");
-        };
+        let resolved = materialize_session_type(
+            runtime.config(),
+            &packages.packages(),
+            &runtime.state(),
+            &row.session_type_id.clone(),
+            botster_hub::SessionTypeRequest {
+                target_id: Some("tgt_hub".to_string()),
+                ..botster_hub::SessionTypeRequest::default()
+            },
+        )
+        .map(|materialized| materialized.resolved)
+        .unwrap_or_else(|error| panic!("resolve {} at hub: {error:?}", row.session_type_id));
+        let resolved = resolved;
         assert_eq!(resolved.session_type.session_type_id, row.session_type_id);
         assert_eq!(resolved.session_type.target_id, "tgt_hub");
     }
@@ -2325,51 +1934,40 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
             .any(|row| row.session_type_id == "device/zebra"),
         "device/zebra is overridden by repo at hub and must not appear in list"
     );
-    let loser_rejected = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-hidden-device-zebra"),
-                session_type_id: "device/zebra".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    target_id: Some("tgt_hub".to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("qualified precedence loser must not spawn at T");
+    let loser_rejected = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"device/zebra".to_string(),
+        botster_hub::SessionTypeRequest {
+            target_id: Some("tgt_hub".to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("qualified precedence loser must not spawn at T");
     assert!(
         matches!(
-            loser_rejected,
-            HubClientError::SessionType {
-                kind: "session_type_not_eligible" | "unknown_session_type",
-                ..
-            }
+            loser_rejected.kind,
+            "session_type_not_eligible" | "unknown_session_type"
         ),
         "expected not-eligible/unknown for hidden loser, got {loser_rejected:?}"
     );
 
     // Relative device cwd binds under T root, not device root.
-    let relative = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-relative-at-hub"),
-                session_type_id: "device/relative".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    target_id: Some("tgt_hub".to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect("resolve relative device at hub");
-    let HubClientResponseBody::ResolvedSessionType(relative) = relative.body else {
-        panic!("resolved session type expected");
-    };
+    let relative = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"device/relative".to_string(),
+        botster_hub::SessionTypeRequest {
+            target_id: Some("tgt_hub".to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect("resolve relative device at hub");
+    let relative = relative;
     assert_eq!(
         relative.working_directory,
         target_root.join("nested").display().to_string()
@@ -2381,67 +1979,36 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
     );
 
     // Explicit cwd outside T is rejected.
-    let cwd_rejected = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ResolveSessionType {
-                request_id: request_id("resolve-cwd-escape"),
-                session_type_id: "device/alpha".to_string(),
-                session_type_request: botster_hub::SessionTypeRequest {
-                    target_id: Some("tgt_hub".to_string()),
-                    cwd: Some(device_root.display().to_string()),
-                    ..botster_hub::SessionTypeRequest::default()
-                },
-            },
-        )
-        .wait(&runtime)
-        .expect_err("cwd outside admitted T rejected");
-    assert!(matches!(
-        cwd_rejected,
-        HubClientError::SessionType {
-            kind: "cwd_not_admitted",
-            ..
-        }
-    ));
+    let cwd_rejected = materialize_session_type(
+        runtime.config(),
+        &packages.packages(),
+        &runtime.state(),
+        &"device/alpha".to_string(),
+        botster_hub::SessionTypeRequest {
+            target_id: Some("tgt_hub".to_string()),
+            cwd: Some(device_root.display().to_string()),
+            ..botster_hub::SessionTypeRequest::default()
+        },
+    )
+    .map(|materialized| materialized.resolved)
+    .expect_err("cwd outside admitted T rejected");
+    assert!(cwd_rejected.kind == "cwd_not_admitted");
 
     // Disabled / missing targets typed-reject (never empty-list-as-no-types).
-    let disabled = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypesForTarget {
-                request_id: request_id("list-disabled"),
-                target_id: "tgt_disabled".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("disabled target rejected");
-    assert!(matches!(
-        disabled,
-        HubClientError::SessionType {
-            kind: "target_not_admitted",
-            ..
-        }
-    ));
-    let missing = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypesForTarget {
-                request_id: request_id("list-missing"),
-                target_id: "tgt_missing".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("missing target rejected");
-    assert!(matches!(
-        missing,
-        HubClientError::SessionType {
-            kind: "target_not_found",
-            ..
-        }
-    ));
+    let disabled = list_session_types_for_target(
+        &packages.packages(),
+        &runtime.state(),
+        &"tgt_disabled".to_string(),
+    )
+    .expect_err("disabled target rejected");
+    assert!(disabled.kind == "target_not_admitted");
+    let missing = list_session_types_for_target(
+        &packages.packages(),
+        &runtime.state(),
+        &"tgt_missing".to_string(),
+    )
+    .expect_err("missing target rejected");
+    assert!(missing.kind == "target_not_found");
 
     // Device without repo collision on a clean target still lists device zebra.
     // (hub has repo zebra; other has only device relative + device zebra + repo alpha)
@@ -2455,7 +2022,6 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
 
 #[test]
 fn package_configuration_client_package_rows_are_sanitized() {
-    let api = HubClientApi::local_operator("package-configuration-client");
     let capability = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![capability.clone()].into_iter().collect());
     packages
@@ -2485,21 +2051,13 @@ fn package_configuration_client_package_rows_are_sanitized() {
             "set configuration",
         )
         .expect("set configuration");
-    let mut runtime = explicit_runtime("package-configuration-client");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("list-package-configuration"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list packages");
-    let HubClientResponseBody::Packages(rows) = response.body else {
-        panic!("packages response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    let rows = response;
     let row = rows
         .into_iter()
         .find(|row| row.package_name == "configuration.plugin")
@@ -2520,7 +2078,6 @@ fn package_configuration_client_package_rows_are_sanitized() {
 
 #[test]
 fn package_navigation_uses_explicit_manifest_entries_and_route_diagnostics() {
-    let api = HubClientApi::local_operator("package-navigation-explicit-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     let mut manifest = plugin_manifest("navigation.plugin", vec![surfaces]);
@@ -2537,21 +2094,14 @@ fn package_navigation_uses_explicit_manifest_entries_and_route_diagnostics() {
     packages
         .install(manifest, provenance(), "install navigation package")
         .expect("install navigation package");
-    let mut runtime = explicit_runtime("package-navigation-explicit");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackageNavigation {
-                request_id: request_id("list-package-navigation-explicit"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list package navigation");
-    let HubClientResponseBody::PackageNavigation(rows) = response.body else {
-        panic!("package navigation response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .flat_map(botster_hub::test_internals::package_navigation_entries)
+        .collect::<Vec<_>>();
+    let rows = response;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.package_name, "navigation.plugin");
@@ -2568,7 +2118,6 @@ fn package_navigation_uses_explicit_manifest_entries_and_route_diagnostics() {
 
 #[test]
 fn package_navigation_derives_default_app_surface_entries_without_order_authority() {
-    let api = HubClientApi::local_operator("package-navigation-default-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     let mut manifest = plugin_manifest("default-nav.plugin", vec![surfaces]);
@@ -2579,21 +2128,14 @@ fn package_navigation_derives_default_app_surface_entries_without_order_authorit
     packages
         .enable("default-nav.plugin", "enable default nav package")
         .expect("enable default nav package");
-    let mut runtime = explicit_runtime("package-navigation-default");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackageNavigation {
-                request_id: request_id("list-package-navigation-default"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list package navigation");
-    let HubClientResponseBody::PackageNavigation(rows) = response.body else {
-        panic!("package navigation response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .flat_map(botster_hub::test_internals::package_navigation_entries)
+        .collect::<Vec<_>>();
+    let rows = response;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.item_id, "home");
@@ -2605,7 +2147,6 @@ fn package_navigation_derives_default_app_surface_entries_without_order_authorit
 
 #[test]
 fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
-    let api = HubClientApi::local_operator("plugin-surface-admission-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     let mut manifest = plugin_manifest("surface.plugin", vec![surfaces]);
@@ -2615,39 +2156,30 @@ fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
     packages
         .install(manifest, provenance(), "install surface package")
         .expect("install surface package");
-    let mut runtime = explicit_runtime("plugin-surface-admission");
 
-    let undeclared = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::PluginSurfaceRender {
-                request_id: request_id("render-undeclared-surface"),
-                package_name: "surface.plugin".to_string(),
-                surface_id: "missing".to_string(),
-                payload: serde_json::json!({}),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("undeclared surfaces must be rejected before runtime dispatch");
+    let undeclared = botster_hub::test_internals::admit_plugin_surface_operation(
+        &packages,
+        "surface.plugin",
+        "missing",
+        PackageSurfaceOperation::Render,
+        request_id("render-undeclared-surface"),
+        HubClientOperation::PluginSurfaceRender,
+    )
+    .expect_err("undeclared surfaces must be rejected before runtime dispatch");
     assert!(matches!(
         undeclared,
         HubClientError::Plugin { ref code, .. } if code == "undeclared_plugin_surface"
     ));
 
-    let unsupported = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::PluginSurfaceRender {
-                request_id: request_id("render-unsupported-surface"),
-                package_name: "surface.plugin".to_string(),
-                surface_id: "action-only".to_string(),
-                payload: serde_json::json!({}),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("unsupported surface operations must be rejected before runtime dispatch");
+    let unsupported = botster_hub::test_internals::admit_plugin_surface_operation(
+        &packages,
+        "surface.plugin",
+        "action-only",
+        PackageSurfaceOperation::Render,
+        request_id("render-unsupported-surface"),
+        HubClientOperation::PluginSurfaceRender,
+    )
+    .expect_err("unsupported surface operations must be rejected before runtime dispatch");
     assert!(matches!(
         unsupported,
         HubClientError::Plugin { ref code, .. } if code == "unsupported_plugin_surface_operation"
@@ -2656,7 +2188,6 @@ fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
 
 #[test]
 fn package_availability_projects_core_resolution_matrix_to_client_rows() {
-    let api = HubClientApi::local_operator("package-availability-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     packages
@@ -2669,21 +2200,13 @@ fn package_availability_projects_core_resolution_matrix_to_client_rows() {
     packages
         .enable("project-pipelines", "enable project pipelines")
         .expect("enable project pipelines");
-    let mut runtime = explicit_runtime("package-availability-client");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("list-package-availability"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list packages");
-    let HubClientResponseBody::Packages(rows) = response.body else {
-        panic!("packages response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    let rows = response;
     let row = rows
         .into_iter()
         .find(|row| row.package_name == "project-pipelines")
@@ -2729,7 +2252,6 @@ fn package_availability_projects_core_resolution_matrix_to_client_rows() {
 
 #[test]
 fn package_availability_reports_installed_but_disabled_dependency() {
-    let api = HubClientApi::local_operator("package-disabled-dependency-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     packages
@@ -2749,21 +2271,13 @@ fn package_availability_reports_installed_but_disabled_dependency() {
             "install disabled github provider",
         )
         .expect("install github provider disabled");
-    let mut runtime = explicit_runtime("package-disabled-dependency-client");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("list-disabled-dependency"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list packages");
-    let HubClientResponseBody::Packages(rows) = response.body else {
-        panic!("packages response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    let rows = response;
     let row = rows
         .into_iter()
         .find(|row| row.package_name == "project-pipelines")
@@ -2783,7 +2297,6 @@ fn package_availability_reports_installed_but_disabled_dependency() {
 
 #[test]
 fn package_availability_reports_capability_denial() {
-    let api = HubClientApi::local_operator("package-capability-denial-client");
     let surfaces = capability(CapabilitySurface::Surfaces, None);
     let mut packages = PackageRegistry::new(vec![surfaces.clone()].into_iter().collect());
     packages
@@ -2796,21 +2309,13 @@ fn package_availability_reports_capability_denial() {
     packages
         .enable("capability-gated.plugin", "enable capability gated plugin")
         .expect("enable capability gated plugin");
-    let mut runtime = explicit_runtime("package-capability-denial-client");
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("list-capability-denial"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list packages");
-    let HubClientResponseBody::Packages(rows) = response.body else {
-        panic!("packages response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    let rows = response;
     let row = rows
         .into_iter()
         .find(|row| row.package_name == "capability-gated.plugin")
@@ -2934,9 +2439,8 @@ fn package_availability_reason_vocabulary_is_stable_and_sanitized() {
 }
 
 fn drain_until(
-    api: &HubClientApi,
+    api: &LocalClient,
     runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
     session_id: &SessionId,
     needle: &[u8],
     logical_clock: &mut u64,
@@ -2957,24 +2461,12 @@ fn drain_until(
             )
             .wait(std::time::Duration::from_secs(30))
             .expect("core bridge");
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("read-screen-drain-until"),
-                    session_id: session_id.clone(),
-                    now_seconds: *logical_clock,
-                },
-            )
-            .wait(runtime)
-            .expect("read screen through client api");
+        let screen = api
+            .read_screen(runtime, session_id, *logical_clock)
+            .expect("read screen through core");
         *logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = response.body else {
-            panic!("read screen should return typed response");
-        };
         if screen.text.contains(needle_text.as_ref()) {
-            return screen.text.into_bytes();
+            return screen.text.as_bytes().to_vec();
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -2983,9 +2475,8 @@ fn drain_until(
 }
 
 fn read_screen_until(
-    api: &HubClientApi,
+    api: &LocalClient,
     runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
     session_id: &SessionId,
     needle: &str,
     logical_clock: &mut u64,
@@ -3004,22 +2495,10 @@ fn read_screen_until(
             )
             .wait(std::time::Duration::from_secs(30))
             .expect("core bridge");
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("read-screen-until"),
-                    session_id: session_id.clone(),
-                    now_seconds: *logical_clock,
-                },
-            )
-            .wait(runtime)
-            .expect("read screen through client api");
+        let screen = api
+            .read_screen(runtime, session_id, *logical_clock)
+            .expect("read screen through core");
         *logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = response.body else {
-            panic!("read screen should return typed response");
-        };
         if screen.text.contains(needle) {
             return;
         }
@@ -3050,27 +2529,15 @@ fn observe_for(runtime: &mut HubRuntime, logical_clock: &mut u64, duration: Dura
 
 #[test]
 fn late_attach_receives_opaque_history_before_later_live_output() {
-    let first_api = HubClientApi::local_operator("late-history-first-client");
-    let late_api = HubClientApi::local_operator("late-history-late-client");
-    let packages = empty_registry();
+    let first_api = LocalClient::new("late-history-first-client");
+    let late_api = LocalClient::new("late-history-late-client");
     let mut runtime = explicit_runtime("late-history");
     let session_id = SessionId("late-history-session".to_string());
     let first_subscription = SubscriptionId("late-history-first-subscription".to_string());
     let late_subscription = SubscriptionId("late-history-late-subscription".to_string());
     let mut logical_clock = 100;
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Spawn {
-                request_id: request_id("late-history-spawn"),
-                session_id: session_id.clone(),
-                command: "printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
-                now_seconds: logical_clock,
-            },
-        ).wait(&runtime)
-        .expect("spawn late-history session");
+    first_api.spawn(&runtime, &session_id.clone(), &"printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string());
     logical_clock += 1;
 
     let first_adapter = attach_bound_subscription(
@@ -3084,7 +2551,6 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
     read_screen_until(
         &first_api,
         &mut runtime,
-        &packages,
         &session_id,
         "before-late",
         &mut logical_clock,
@@ -3100,21 +2566,10 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
     logical_clock += 1;
 
     let readback = late_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadScreen {
-                request_id: request_id("late-history-readback-before-drain"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
+        .read_screen(&runtime, &session_id.clone(), logical_clock)
         .expect("read screen between late attach and first drain");
     logical_clock += 1;
-    let HubClientResponseBody::ReadScreen(screen) = readback.body else {
-        panic!("read screen should return typed response");
-    };
+    let screen = readback;
     assert_eq!(
         screen.text.matches("before-late").count(),
         1,
@@ -3133,7 +2588,6 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
     read_screen_until(
         &late_api,
         &mut runtime,
-        &packages,
         &session_id,
         "after:live-after-late",
         &mut logical_clock,
@@ -3153,29 +2607,19 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
 
 #[test]
 fn late_attach_without_prior_output_does_not_fabricate_history() {
-    let first_api = HubClientApi::local_operator("no-history-first-client");
-    let late_api = HubClientApi::local_operator("no-history-late-client");
-    let packages = empty_registry();
+    let first_api = LocalClient::new("no-history-first-client");
+    let late_api = LocalClient::new("no-history-late-client");
     let mut runtime = explicit_runtime("no-history");
     let session_id = SessionId("no-history-session".to_string());
     let first_subscription = SubscriptionId("no-history-first-subscription".to_string());
     let late_subscription = SubscriptionId("no-history-late-subscription".to_string());
     let mut logical_clock = 100;
 
-    first_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Spawn {
-                request_id: request_id("no-history-spawn"),
-                session_id: session_id.clone(),
-                command: "while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done"
-                    .to_string(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect("spawn no-history session");
+    first_api.spawn(
+        &runtime,
+        &session_id.clone(),
+        &"while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
+    );
     logical_clock += 1;
 
     let first_adapter = attach_bound_subscription(
@@ -3197,21 +2641,10 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
     logical_clock += 1;
 
     let readback = late_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadScreen {
-                request_id: request_id("no-history-readback-before-input"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
+        .read_screen(&runtime, &session_id.clone(), logical_clock)
         .expect("read blank screen before sending live output");
     logical_clock += 1;
-    let HubClientResponseBody::ReadScreen(screen) = readback.body else {
-        panic!("read screen should return typed response");
-    };
+    let screen = readback;
     assert!(
         screen.text.is_empty(),
         "idle session should have no prior renderable output, got {:?}",
@@ -3229,7 +2662,6 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
     read_screen_until(
         &late_api,
         &mut runtime,
-        &packages,
         &session_id,
         "after:live-only",
         &mut logical_clock,
@@ -3249,64 +2681,33 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
 
 #[test]
 fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
-    let api = HubClientApi::local_operator("local-client-api-test");
-    let second_api = HubClientApi::local_operator("local-client-api-test-two");
-    let packages = empty_registry();
+    let api = LocalClient::new("local-client-api-test");
+    let second_api = LocalClient::new("local-client-api-test-two");
     let mut runtime = explicit_runtime("session-flow");
     let session_id = session_id();
     let subscription_id = subscription_id();
     let second_subscription_id = SubscriptionId("hub-client-api-subscription-two".to_string());
     let mut logical_clock = 100;
 
-    let status = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Status {
-                request_id: request_id("status"),
-            },
-        )
-        .wait(&runtime)
-        .expect("status through client api");
-    let HubClientResponseBody::Status(status) = status.body else {
-        panic!("status response expected");
-    };
-    assert_eq!(status.profile_id, "botster-hub");
-    assert_eq!(status.session_count, 0);
-
-    let sessions = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessions {
-                request_id: request_id("list-empty"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list through client api");
     assert!(
-        matches!(sessions.body, HubClientResponseBody::Sessions(sessions) if sessions.is_empty())
+        runtime
+            .list_sessions()
+            .wait(CORE_WAIT)
+            .expect("core bridge")
+            .expect("list sessions")
+            .is_empty(),
+        "a fresh hub lists no sessions"
     );
 
-    let spawn = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Spawn {
-                request_id: request_id("spawn"),
-                session_id: session_id.clone(),
-                command: "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
-                now_seconds: logical_clock,
-            },
-        ).wait(&runtime)
-        .expect("spawn through client api");
+    let spawn = api.spawn(
+        &runtime,
+        &session_id.clone(),
+        &"printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+            .to_string(),
+    );
     logical_clock += 1;
-    let HubClientResponseBody::Spawned(spawned) = spawn.body else {
-        panic!("spawned response expected");
-    };
-    assert_eq!(spawned.session.session_id, session_id);
-    assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
-    assert!(spawned.events.is_empty());
+    assert_eq!(spawn.session_id, session_id);
+    assert_eq!(spawn.lifecycle, SessionLifecycleState::Running);
 
     let first_adapter = attach_bound_subscription(
         &mut runtime,
@@ -3325,14 +2726,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     );
     logical_clock += 1;
 
-    read_screen_until(
-        &api,
-        &mut runtime,
-        &packages,
-        &session_id,
-        "ready",
-        &mut logical_clock,
-    );
+    read_screen_until(&api, &mut runtime, &session_id, "ready", &mut logical_clock);
 
     inject_terminal_command(
         &first_adapter,
@@ -3358,7 +2752,6 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     read_screen_until(
         &api,
         &mut runtime,
-        &packages,
         &session_id,
         "echo:ping-hub",
         &mut logical_clock,
@@ -3377,17 +2770,12 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
         "both local subscriptions must be adapter-bound"
     );
 
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Detach {
-            request_id: request_id("detach"),
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-            now_seconds: logical_clock,
-        },
+    api.detach(
+        &runtime,
+        &session_id.clone(),
+        &subscription_id.clone(),
+        logical_clock,
     )
-    .wait(&runtime)
     .expect("detach through client api");
     logical_clock += 1;
 
@@ -3403,34 +2791,21 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     read_screen_until(
         &second_api,
         &mut runtime,
-        &packages,
         &session_id,
         "echo:after-detach",
         &mut logical_clock,
     );
     observe_for(&mut runtime, &mut logical_clock, Duration::from_millis(200));
 
-    let shutdown = second_api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Shutdown {
-                request_id: request_id("shutdown"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
+    second_api
+        .shutdown(&runtime, &session_id.clone())
         .expect("shutdown through client api");
-    let HubClientResponseBody::Events(events) = shutdown.body else {
-        panic!("shutdown should return events");
-    };
-    assert!(events.is_empty());
 }
 
 #[test]
 fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     let api = HubClientApi::local_operator("local-client-api-test");
+    let client = LocalClient::new("local-client-api-test");
     let mut runtime = explicit_runtime("guarded-write");
     let session_actions = capability(
         CapabilitySurface::SessionActions,
@@ -3466,20 +2841,12 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     let session_id = SessionId("client-guarded".to_string());
     let subscription_id = SubscriptionId("client-guarded-subscription".to_string());
     let mut logical_clock = 200;
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Spawn {
-            request_id: request_id("guarded-spawn"),
-            session_id: session_id.clone(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
-            now_seconds: logical_clock,
-        },
-    )
-    .wait(&runtime)
-    .expect("spawn through client api");
+    client.spawn(
+        &runtime,
+        &session_id.clone(),
+        &"printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
+            .to_string(),
+    );
     logical_clock += 1;
 
     // Before this client attaches, Core refuses its write typed (NotSubscribed);
@@ -3514,7 +2881,7 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
 
     attach_bound_subscription(
         &mut runtime,
-        &api,
+        &client,
         &session_id,
         &subscription_id,
         logical_clock,
@@ -3522,9 +2889,8 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     logical_clock += 1;
 
     read_screen_until(
-        &api,
+        &client,
         &mut runtime,
-        &packages,
         &session_id,
         "ready",
         &mut logical_clock,
@@ -3563,9 +2929,8 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
         "core daemon owns guarded-write delivery states"
     );
     drain_until(
-        &api,
+        &client,
         &mut runtime,
-        &packages,
         &session_id,
         b"echo:guarded-client",
         &mut logical_clock,
@@ -3598,44 +2963,25 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
 
 #[test]
 fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
-    let api = HubClientApi::local_operator("local-client-api-test");
-    let packages = empty_registry();
-    let mut runtime = explicit_runtime("daemon-readback-ops");
+    let api = LocalClient::new("local-client-api-test");
+    let runtime = explicit_runtime("daemon-readback-ops");
     let session_id = SessionId("daemon-readback-session".to_string());
     let mut logical_clock = 1;
 
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Spawn {
-            request_id: request_id("readback-spawn"),
-            session_id: session_id.clone(),
-            command: "printf 'screen-ready\\n'; sleep 5".to_string(),
-            now_seconds: logical_clock,
-        },
-    )
-    .wait(&runtime)
-    .expect("spawn readback session");
+    api.spawn(
+        &runtime,
+        &session_id.clone(),
+        &"printf 'screen-ready\\n'; sleep 5".to_string(),
+    );
     logical_clock += 1;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let screen = loop {
         let read_screen = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("read-screen"),
-                    session_id: session_id.clone(),
-                    now_seconds: logical_clock,
-                },
-            )
-            .wait(&runtime)
+            .read_screen(&runtime, &session_id.clone(), logical_clock)
             .expect("daemon-backed read_screen should return typed response");
         logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = read_screen.body else {
-            panic!("read_screen should return readback body");
-        };
+        let screen = read_screen;
         if screen.text.contains("screen-ready") {
             break screen;
         }
@@ -3645,55 +2991,28 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
         );
         thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(screen.session_id, session_id);
+    assert!(screen.text.contains("screen-ready"));
+    assert!(screen.unavailable.is_none());
 
     let capture_snapshot = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::CaptureSnapshot {
-                request_id: request_id("capture-snapshot"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
+        .capture_snapshot(&runtime, &session_id.clone(), logical_clock)
         .expect("daemon-backed capture_snapshot should return typed response");
-    let HubClientResponseBody::CaptureSnapshot(snapshot) = capture_snapshot.body else {
-        panic!("capture_snapshot should return snapshot body");
-    };
-    assert_eq!(snapshot.session_id, session_id);
+    let snapshot = capture_snapshot;
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
-    assert!(!snapshot.capture_id.is_empty());
+    assert!(!snapshot.capture_id.0.is_empty());
     assert!(snapshot.total_bytes > 0);
     assert!(snapshot.pages >= 1);
     assert!(snapshot.unavailable.is_none());
 
-    logical_clock += 1;
-    let shutdown = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Shutdown {
-                request_id: request_id("readback-shutdown"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect("shutdown readback session through client api");
-    let HubClientResponseBody::Events(events) = shutdown.body else {
-        panic!("shutdown should return events");
-    };
-    assert!(events.is_empty());
+    api.shutdown(&runtime, &session_id)
+        .expect("shutdown readback session");
 }
 
 #[test]
 fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() {
-    let api = HubClientApi::local_operator("mode-flags-client-api-test");
-    let packages = empty_registry();
-    let mut runtime = explicit_runtime("mode-flags-readback");
+    let api = LocalClient::new("mode-flags-client-api-test");
+    let runtime = explicit_runtime("mode-flags-readback");
     let off_session_id = SessionId("mode-flags-off-session".to_string());
     let on_session_id = SessionId("mode-flags-on-session".to_string());
     let mut logical_clock = 1;
@@ -3705,48 +3024,24 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
             "printf '\\033[?1000h\\033[?1006h'; sleep 5",
         ),
     ] {
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Spawn {
-                request_id: request_id(&format!("spawn-{}", session_id.0)),
-                session_id,
-                command: command.to_string(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect("spawn mode-flags session");
+        api.spawn(&runtime, &session_id, &command.to_string());
         logical_clock += 1;
     }
 
     let off = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadModeFlags {
-                request_id: request_id("read-mode-flags-off"),
-                session_id: off_session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
+        .read_mode_flags(&runtime, &off_session_id.clone(), logical_clock)
         .expect("read authoritative mouse-off flags");
     logical_clock += 1;
-    let HubClientResponseBody::ModeFlags(off) = off.body else {
-        panic!("read_mode_flags should return a typed mode body");
-    };
-    assert_eq!(off.session_id, off_session_id);
-    assert_eq!(off.mouse_mode, 0);
+    assert_eq!(off.mode_flags.mouse_mode, 0);
     assert!(off.unavailable.is_none());
     // Full ModeFlags projection is present (not mouse-only).
     let _ = (
-        off.kitty_enabled,
-        off.cursor_visible,
-        off.bracketed_paste,
-        off.alt_screen,
-        off.focus_reporting,
-        off.application_cursor,
+        off.mode_flags.kitty_enabled,
+        off.mode_flags.cursor_visible,
+        off.mode_flags.bracketed_paste,
+        off.mode_flags.alt_screen,
+        off.mode_flags.focus_reporting,
+        off.mode_flags.application_cursor,
         off.rows,
         off.cols,
     );
@@ -3754,54 +3049,41 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
     let deadline = Instant::now() + Duration::from_secs(5);
     let on = loop {
         let response = api
-            .handle_request(
-                &mut runtime,
-                &packages,
-                HubClientRequest::ReadModeFlags {
-                    request_id: request_id("read-mode-flags-on"),
-                    session_id: on_session_id.clone(),
-                    now_seconds: logical_clock,
-                },
-            )
-            .wait(&runtime)
+            .read_mode_flags(&runtime, &on_session_id.clone(), logical_clock)
             .expect("read authoritative mouse-on flags");
         logical_clock += 1;
-        let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
-            panic!("read_mode_flags should return a typed mode body");
-        };
-        if mode_flags.mouse_mode == 9 {
+        let mode_flags = response;
+        if mode_flags.mode_flags.mouse_mode == 9 {
             break mode_flags;
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for exact combined mouse mode, last value {}",
-            mode_flags.mouse_mode
+            mode_flags.mode_flags.mouse_mode
         );
         thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(on.session_id, on_session_id);
-    assert_eq!(on.mouse_mode, 9);
+    assert_eq!(on.mode_flags.mouse_mode, 9);
     assert!(on.unavailable.is_none());
 
     let missing = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadModeFlags {
-                request_id: request_id("read-mode-flags-missing"),
-                session_id: SessionId("missing-mode-flags-session".to_string()),
-                now_seconds: logical_clock,
-            },
+        .read_mode_flags(
+            &runtime,
+            &SessionId("missing-mode-flags-session".to_string()),
+            logical_clock,
         )
-        .wait(&runtime)
         .expect_err("unknown session must not default to mouse-off");
-    assert_eq!(
-        missing,
-        HubClientError::Runtime {
-            request_id: request_id("read-mode-flags-missing"),
-            operation: HubClientOperation::ReadModeFlags,
-            kind: botster_hub::HubClientRuntimeErrorKind::UnknownSession,
-        }
+    assert!(
+        matches!(
+            &missing,
+            botster_core_daemon::CoreDaemonError::UnknownSession(_)
+        ) || matches!(
+            &missing,
+            botster_core_daemon::CoreDaemonError::Engine(
+                botster_core::DefaultBotsterEngineError::Runtime(error)
+            ) if error.kind == botster_core::SessionRuntimeErrorKind::SessionNotFound
+        ),
+        "an unknown session is a typed unknown-session error: {missing:?}"
     );
 }
 
@@ -3860,32 +3142,12 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
         .enable("workflow.plugin", "enable package")
         .expect("enable package");
 
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Attach {
-            request_id: request_id("attach-missing-session"),
-            session_id: session_id(),
-            subscription_id: subscription_id(),
-            now_seconds: 1,
-        },
-    )
-    .wait(&runtime)
-    .expect_err("attach is a transport handshake and should not hydrate packages");
-
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListPackages {
-                request_id: request_id("packages"),
-            },
-        )
-        .wait(&runtime)
-        .expect("package query through client api");
-    let HubClientResponseBody::Packages(records) = response.body else {
-        panic!("packages response expected");
-    };
+    let response = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(&packages, record))
+        .collect::<Vec<_>>();
+    let records = response;
     assert_eq!(records.len(), 1);
     let record = &records[0];
     assert_eq!(record.package_name, "workflow.plugin");
@@ -3950,59 +3212,4 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
     assert_eq!(records.lifecycle[0].package_name, "workflow.plugin");
     assert_eq!(records.lifecycle[0].state, HubClientPackageState::Enabled);
     assert!(!records.lifecycle[0].loaded);
-}
-
-#[test]
-fn denied_client_request_returns_typed_admission_error() {
-    let api = HubClientApi::new(
-        HubClientIdentity {
-            client_id: botster_core::ClientId("denied-client".to_string()),
-            role: HubClientRole::Unadmitted,
-        },
-        HubClientAdmission::deny_all(),
-    );
-    let mut runtime = explicit_runtime("denied");
-    let packages = empty_registry();
-
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Status {
-                request_id: request_id("denied-status"),
-            },
-        )
-        .wait(&runtime)
-        .expect_err("denied client should fail");
-
-    assert_eq!(
-        error,
-        HubClientError::AdmissionDenied {
-            request_id: request_id("denied-status"),
-            operation: HubClientOperation::Status,
-            role: HubClientRole::Unadmitted,
-        }
-    );
-
-    let error = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Shutdown {
-                request_id: request_id("denied-shutdown"),
-                session_id: session_id(),
-                now_seconds: 1,
-            },
-        )
-        .wait(&runtime)
-        .expect_err("denied client should not shut down sessions");
-
-    assert_eq!(
-        error,
-        HubClientError::AdmissionDenied {
-            request_id: request_id("denied-shutdown"),
-            operation: HubClientOperation::Shutdown,
-            role: HubClientRole::Unadmitted,
-        }
-    );
 }

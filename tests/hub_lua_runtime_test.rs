@@ -15,10 +15,9 @@ use botster_core::{
 use botster_hub::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
 use botster_hub::runtime::{CAUSAL_OWNER_CAPACITY, CausalTransitionStatus};
 use botster_hub::{
-    CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
-    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginRuntime, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
-    default_package_policy,
+    CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions,
+    LuaPluginRuntime, PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget,
+    TransportBindings, Worktree, default_package_policy,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId, UiNodeKind};
 
@@ -1891,30 +1890,16 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     let mut hub = explicit_runtime("project-pipelines-ui");
     hub.load_lua_plugin_package(&registry, "project-pipelines")
         .expect("load project pipelines plugin package");
-    let api = HubClientApi::local_operator("project-pipelines-ui-test");
-
-    let surface = api
-        .handle_request(
-            &mut hub,
-            &registry,
-            HubClientRequest::PluginSurfaceRender {
-                request_id: RequestId("render-project-pipelines-surface".to_string()),
-                package_name: "project-pipelines".to_string(),
-                surface_id: "project-pipelines.create-ticket".to_string(),
-                payload: serde_json::json!({}),
-            },
+    let surface = hub
+        .render_plugin_surface(
+            "project-pipelines",
+            "project-pipelines.create-ticket",
+            serde_json::json!({}),
         )
-        .wait(&hub)
-        .expect("render project pipelines surface through client api");
-    let HubClientResponseBody::PluginSurface(surface) = surface.body else {
-        panic!("plugin surface response expected");
-    };
-    assert_eq!(surface.package_name, "project-pipelines");
-    assert_eq!(surface.surface_id, "project-pipelines.create-ticket");
-    assert_eq!(surface.body.kind, UiNodeKind::Panel);
+        .expect("render project pipelines surface");
+    assert_eq!(surface.kind, UiNodeKind::Panel);
     assert_eq!(
         surface
-            .body
             .id
             .as_ref()
             .and_then(UiAuthoredNodeId::as_literal)
@@ -1922,28 +1907,19 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
         Some("project-pipelines-create-panel")
     );
 
-    let invalid = api
-        .handle_request(
-            &mut hub,
-            &registry,
-            HubClientRequest::PluginSurfaceAction {
-                request_id: RequestId("invalid-project-pipelines-action".to_string()),
-                package_name: "project-pipelines".to_string(),
-                action: ui_action_request(
-                    "invalid-project-pipelines-action",
-                    "project-pipelines.create-ticket",
-                    "project_pipelines.create_ticket",
-                    "project-pipelines-create-form",
-                    serde_json::json!({ "title": "   " }),
-                    serde_json::json!({ "pipeline_id": "local_pipeline" }),
-                ),
-            },
+    let invalid = hub
+        .dispatch_plugin_surface_action(
+            "project-pipelines",
+            &ui_action_request(
+                "invalid-project-pipelines-action",
+                "project-pipelines.create-ticket",
+                "project_pipelines.create_ticket",
+                "project-pipelines-create-form",
+                serde_json::json!({ "title": "   " }),
+                serde_json::json!({ "pipeline_id": "local_pipeline" }),
+            ),
         )
-        .wait(&hub)
-        .expect("submit invalid project pipelines action through client api");
-    let HubClientResponseBody::PluginActionResult(invalid) = invalid.body else {
-        panic!("plugin action response expected");
-    };
+        .expect("submit invalid project pipelines action");
     assert_eq!(invalid.state, UiActionResultState::Rejected);
     assert_eq!(invalid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
@@ -1958,28 +1934,19 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
     assert!(invalid.presentation.is_none());
     assert!(invalid.replacement.is_none());
 
-    let valid = api
-        .handle_request(
-            &mut hub,
-            &registry,
-            HubClientRequest::PluginSurfaceAction {
-                request_id: RequestId("valid-project-pipelines-action".to_string()),
-                package_name: "project-pipelines".to_string(),
-                action: ui_action_request(
-                    "valid-project-pipelines-action",
-                    "project-pipelines.create-ticket",
-                    "project_pipelines.create_ticket",
-                    "project-pipelines-create-form",
-                    serde_json::json!({ "title": "  Runtime ticket  " }),
-                    serde_json::json!({ "pipeline_id": "local.pipeline" }),
-                ),
-            },
+    let valid = hub
+        .dispatch_plugin_surface_action(
+            "project-pipelines",
+            &ui_action_request(
+                "valid-project-pipelines-action",
+                "project-pipelines.create-ticket",
+                "project_pipelines.create_ticket",
+                "project-pipelines-create-form",
+                serde_json::json!({ "title": "  Runtime ticket  " }),
+                serde_json::json!({ "pipeline_id": "local.pipeline" }),
+            ),
         )
-        .wait(&hub)
-        .expect("submit valid project pipelines action through client api");
-    let HubClientResponseBody::PluginActionResult(valid) = valid.body else {
-        panic!("plugin action response expected");
-    };
+        .expect("submit valid project pipelines action");
     assert_eq!(valid.state, UiActionResultState::Accepted);
     assert_eq!(valid.surface_id.0, "project-pipelines.create-ticket");
     assert_eq!(
