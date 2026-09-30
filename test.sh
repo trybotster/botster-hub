@@ -156,7 +156,11 @@ cat "$BOTSTER_CANDIDATE_MANIFEST"
 # Library tests find the session worker beside their executable in
 # target/debug (src/runtime.rs). `--workspace` does not build it because it
 # belongs to the pinned Core dependency, so build it from that pin here.
-if [ "$phase" = all ] || [ "$phase" = build ]; then
+# The shared phase builds it too: botsterq's target cap may clean target/
+# between the build job and the shared job (target/candidate survives, the
+# worker in target/debug does not), and the library tests fail without it.
+# With the worker present this is a no-op.
+if [ "$phase" = all ] || [ "$phase" = build ] || [ "$phase" = shared ]; then
   cargo build --locked -p botster-core-daemon --bin botster-session-worker
 fi
 
