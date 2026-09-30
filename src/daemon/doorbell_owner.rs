@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use botster_core::{RequestId, SessionId};
-use botster_core_daemon::{CoreCompletion, CoreDaemonError, SessionEdges};
+use botster_core_daemon::{CoreCompletion, CoreDaemonError, HostInputOutcome, SessionEdges};
+use botster_terminal_protocol::InputOutcome;
 
 use crate::HubDaemon;
 use crate::daemon::doorbell::{Doorbell, Effect, Event, Facts, Purpose, Read, write_purpose};
@@ -79,6 +80,10 @@ pub(crate) struct Plan {
     live: BTreeSet<String>,
     jobs: VecDeque<Job>,
     timers: BTreeMap<String, Timers>,
+    /// When the one write in flight is cancelled. A write has no deadline of
+    /// its own, and a PTY that never drains would hold the single flight.
+    // timer: deadline: a write the PTY does not take within the echo deadline is cancelled; expiry is the exceptional path
+    write_cancel: Option<Instant>,
 }
 
 impl Plan {
@@ -158,6 +163,7 @@ impl Plan {
     /// refused probe or erase stops the attempt; an accepted probe or erase
     /// needs no event (the machine waits for the output edge).
     pub(crate) fn write_done(&mut self, session: &str, purpose: Purpose, ok: bool, now: Instant) {
+        self.write_cancel = None;
         if !self.live.contains(session) {
             return;
         }
@@ -239,13 +245,24 @@ impl Plan {
         !self.jobs.is_empty()
     }
 
-    /// The earliest timer of any session.
+    /// The earliest timer of any session, or the write cancel.
     pub(crate) fn earliest_timer(&self) -> Option<Instant> {
         self.timers
             .values()
             .flat_map(|timers| [timers.quiet, timers.echo])
             .flatten()
+            .chain(self.write_cancel)
             .min()
+    }
+
+    /// A write went in flight: cancel it at `at` if it has not completed.
+    pub(crate) fn arm_write_cancel(&mut self, at: Instant) {
+        self.write_cancel = Some(at);
+    }
+
+    /// Whether the write in flight is due to be cancelled.
+    pub(crate) fn write_cancel_due(&self, now: Instant) -> bool {
+        self.write_cancel.is_some_and(|at| at <= now)
     }
 
     fn prune_timers(&mut self, session: &str) {
@@ -328,7 +345,9 @@ enum Flight {
     Write {
         session: String,
         purpose: Purpose,
-        ticket: CoreTicket<Result<(), CoreDaemonError>>,
+        tracker: CoreOperationTracker,
+        /// The cancel request, once the cancel deadline passed.
+        cancel: Option<CoreTicket<bool>>,
     },
 }
 
@@ -457,6 +476,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> Progr
     let edges = runtime.doorbell_edges().clone();
     // 1. The ticket in flight: apply its result, or keep waiting for it.
     if let Some(progress) = poll_flight(runtime, state, &edges, now) {
+        arm_deadline(state, now);
         return progress;
     }
     // 2. The edges the data-plane thread stored since the last drive.
@@ -589,13 +609,34 @@ fn poll_flight(
         Flight::Write {
             session,
             purpose,
-            mut ticket,
-        } => match ticket.poll() {
+            mut tracker,
+            mut cancel,
+        } => match tracker.poll(runtime) {
             CoreTicketPoll::Pending => {
+                if cancel.is_none()
+                    && state.doorbell.plan.write_cancel_due(now)
+                    && let Some(id) = tracker.pending_id()
+                    && let Some(waiter_id) = crate::daemon::owner_loop::doorbell_waiter(state)
+                {
+                    let ticket =
+                        runtime.submit_core_for_owner(waiter_id, move |daemon| daemon.cancel(id));
+                    if let Some(seen) = ticket.refused_wait() {
+                        state.doorbell.flight = Some(Flight::Write {
+                            session,
+                            purpose,
+                            tracker,
+                            cancel: None,
+                        });
+                        crate::daemon::owner_loop::park_doorbell(state, seen);
+                        return Some(Progress::Waiting);
+                    }
+                    cancel = Some(ticket);
+                }
                 state.doorbell.flight = Some(Flight::Write {
                     session,
                     purpose,
-                    ticket,
+                    tracker,
+                    cancel,
                 });
                 Some(Progress::Waiting)
             }
@@ -607,14 +648,30 @@ fn poll_flight(
                 None
             }
             CoreTicketPoll::Ready(result) => {
+                // Only a `Written` outcome is delivery. A full lane, a
+                // cancel, an ended session or a lost link all mean the bytes
+                // may not be there, and none of them is retried in a loop.
+                let written = matches!(
+                    result,
+                    Ok(CoreCompletion::HostInput { result: ref host, .. }) if delivered(host)
+                );
                 state
                     .doorbell
                     .plan
-                    .write_done(&session, purpose, result.is_ok(), now);
+                    .write_done(&session, purpose, written, now);
                 None
             }
         },
     }
+}
+
+/// Whether Core's answer to a host write means the bytes reached the PTY.
+/// Only `Written` does: a full lane, a cancel, an ended session, a lost link
+/// and any error all mean they may not have.
+fn delivered(result: &Result<HostInputOutcome, CoreDaemonError>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|outcome| outcome.outcome == InputOutcome::Written)
 }
 
 /// Submit the next queued job as the one Core ticket in flight.
@@ -667,23 +724,22 @@ fn start_next(
             bytes,
             purpose,
         } => {
-            let id = SessionId(session.clone());
-            let ticket = runtime.submit_core_for_optional_owner(Some(waiter_id), move |daemon| {
-                daemon.host_input(id, bytes, now_seconds)
-            });
-            if let Some(seen) = ticket.refused_wait() {
-                // The bytes moved into the closure; the machine treats a
-                // refused write as failed and the next edge retries.
-                state
-                    .doorbell
-                    .plan
-                    .write_done(&session, purpose, false, Instant::now());
-                return Started::Refused(seen);
-            }
+            let tracker = runtime.begin_host_input_for_owner(
+                waiter_id,
+                RequestId(format!("doorbell-write-{now_seconds}")),
+                SessionId(session.clone()),
+                bytes,
+                now_seconds,
+            );
+            state
+                .doorbell
+                .plan
+                .arm_write_cancel(Instant::now() + crate::daemon::doorbell::ECHO_DEADLINE);
             state.doorbell.flight = Some(Flight::Write {
                 session,
                 purpose,
-                ticket,
+                tracker,
+                cancel: None,
             });
         }
     }
@@ -907,6 +963,48 @@ mod tests {
             "the ring still waits"
         );
         assert_eq!(plan.next_job(), None);
+    }
+
+    fn host_outcome(outcome: InputOutcome) -> Result<HostInputOutcome, CoreDaemonError> {
+        Ok(HostInputOutcome {
+            outcome,
+            accepted_payload_bytes: None,
+            written_pty_bytes: None,
+            detail: String::new(),
+        })
+    }
+
+    #[test]
+    fn only_a_written_outcome_is_delivery() {
+        assert!(delivered(&host_outcome(InputOutcome::Written)));
+        for outcome in [
+            InputOutcome::PartialWrite,
+            InputOutcome::WriteFailed,
+            InputOutcome::Cancelled,
+            InputOutcome::RejectedNotWritable,
+            InputOutcome::RejectedLaneFull,
+            InputOutcome::SessionEnded,
+            InputOutcome::OutcomeUnknown,
+        ] {
+            assert!(!delivered(&host_outcome(outcome)), "{outcome:?}");
+        }
+        assert!(!delivered(&Err(CoreDaemonError::Shutdown)));
+    }
+
+    #[test]
+    fn a_write_in_flight_arms_one_cancel_deadline_and_its_end_clears_it() {
+        let mut plan = Plan::default();
+        let now = Instant::now();
+        assert!(!plan.write_cancel_due(now));
+        plan.arm_write_cancel(now + ECHO_DEADLINE);
+        assert_eq!(plan.earliest_timer(), Some(now + ECHO_DEADLINE));
+        assert!(!plan.write_cancel_due(now + ECHO_DEADLINE - Duration::from_millis(1)));
+        assert!(plan.write_cancel_due(now + ECHO_DEADLINE));
+        // A cancelled or refused write completes; the deadline goes with it,
+        // whether or not the session is still tracked.
+        plan.write_done(A, Purpose::Probe, false, now);
+        assert_eq!(plan.earliest_timer(), None);
+        assert!(!plan.write_cancel_due(now + ECHO_DEADLINE));
     }
 
     #[test]
