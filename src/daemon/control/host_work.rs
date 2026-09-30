@@ -35,16 +35,13 @@ pub(crate) enum DocumentAdmission {
 pub(crate) enum HostRecoveryRequired {
     Terminal(TerminalRecovery),
     PackageFamilyWork {
-        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         _work: Box<super::host_family::FamilyWork>,
     },
     PackageFamilies {
-        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         _work: Box<super::host_family::FamilyWork>,
         _fault: crate::runtime::PackageEntityCleanupError,
     },
     PackageEvents {
-        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         _result: Box<HostMutationResult>,
         _fault: Option<crate::package_event_router::EventOwnerWorkError>,
         _submission: Option<HostSubmissionFailure>,
@@ -53,7 +50,6 @@ pub(crate) enum HostRecoveryRequired {
     Package(PackageRecoveryRequired),
     ManagedGit(crate::daemon::control::managed_git::ManagedGitRecoveryRequired),
     Submission {
-        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         failure: HostSubmissionFailure,
         package_restore: Option<(PackageRuntimeEffect, DaemonTransportError)>,
         managed_worktree: Option<crate::managed_git_worktrees::PreparedManagedWorktree>,
@@ -61,61 +57,27 @@ pub(crate) enum HostRecoveryRequired {
 }
 
 pub(crate) struct TerminalRecovery {
-    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     family: Option<Box<super::host_family::FamilyWork>>,
     job: crate::host_disposal::Job,
 }
 
 impl HostRecoveryRequired {
-    /// Recovery rows live until daemon teardown. Live removal must release this permit through OwnerBudget.
-    pub(crate) fn retain_owner_permit(&mut self, permit: crate::daemon::owner_budget::OwnerPermit) {
-        let retained = match self {
-            Self::Terminal(recovery) => &mut recovery.owner_permit,
-            Self::PackageFamilyWork { owner_permit, .. }
-            | Self::PackageEvents { owner_permit, .. }
-            | Self::PackageFamilies { owner_permit, .. }
-            | Self::Submission { owner_permit, .. } => owner_permit,
-            Self::Package(recovery) => &mut recovery.owner_permit,
-            Self::ManagedGit(recovery) => &mut recovery.owner_permit,
-        };
-        assert!(
-            retained.is_none(),
-            "terminal recovery receives the original Owner permit once"
-        );
-        *retained = Some(permit);
-    }
-
     fn into_terminal(self, identity: HostJobIdentity) -> Self {
-        let (owner_permit, family, parts) = match self {
+        let (family, parts) = match self {
             Self::Terminal(_) => return self,
-            Self::PackageFamilyWork {
-                owner_permit,
-                mut _work,
-            } => {
+            Self::PackageFamilyWork { mut _work } => {
                 let Some(parts) = _work.take_terminal_parts(identity) else {
-                    return Self::PackageFamilyWork {
-                        owner_permit,
-                        _work,
-                    };
+                    return Self::PackageFamilyWork { _work };
                 };
-                (owner_permit, Some(_work), parts)
+                (Some(_work), parts)
             }
-            Self::PackageFamilies {
-                owner_permit,
-                mut _work,
-                _fault,
-            } => {
+            Self::PackageFamilies { mut _work, _fault } => {
                 let Some(parts) = _work.take_terminal_parts(identity) else {
-                    return Self::PackageFamilies {
-                        owner_permit,
-                        _work,
-                        _fault,
-                    };
+                    return Self::PackageFamilies { _work, _fault };
                 };
-                (owner_permit, Some(_work), parts.with_payload(_fault))
+                (Some(_work), parts.with_payload(_fault))
             }
             Self::PackageEvents {
-                owner_permit,
                 _result,
                 _fault,
                 _submission,
@@ -135,7 +97,6 @@ impl HostRecoveryRequired {
                         ),
                         (None, None) => {
                             return Self::PackageEvents {
-                                owner_permit,
                                 _result,
                                 _fault,
                                 _submission: None,
@@ -144,7 +105,6 @@ impl HostRecoveryRequired {
                         }
                     };
                 (
-                    owner_permit,
                     None,
                     crate::host_disposal::Parts {
                         storage: None,
@@ -156,7 +116,6 @@ impl HostRecoveryRequired {
                 )
             }
             Self::Package(recovery) => (
-                recovery.owner_permit,
                 None,
                 crate::host_disposal::Parts {
                     storage: None,
@@ -166,17 +125,12 @@ impl HostRecoveryRequired {
                     payload: Box::new((recovery.original, recovery.compensation, recovery._effect)),
                 },
             ),
-            Self::ManagedGit(recovery) => {
-                let (owner, parts) = recovery.into_terminal(identity);
-                (owner, None, parts)
-            }
+            Self::ManagedGit(recovery) => (None, recovery.into_terminal(identity)),
             Self::Submission {
-                owner_permit,
                 failure,
                 package_restore,
                 managed_worktree,
             } => (
-                owner_permit,
                 None,
                 crate::host_disposal::Parts {
                     storage: None,
@@ -188,7 +142,6 @@ impl HostRecoveryRequired {
             ),
         };
         Self::Terminal(TerminalRecovery {
-            owner_permit,
             family,
             job: crate::host_disposal::Job::new(parts),
         })
@@ -243,9 +196,6 @@ pub(crate) fn dispose_terminal_recovery(
                 );
             }
             drop(permit);
-            if let Some(permit) = terminal.owner_permit.take() {
-                state.budget.release(permit);
-            }
             continue;
         }
         state.host_recovery.insert(waiter_id, recovery);
@@ -261,7 +211,6 @@ pub(crate) fn retain_submission(
     state.host_recovery.insert(
         failure.identity.waiter_id,
         HostRecoveryRequired::Submission {
-            owner_permit: None,
             failure,
             package_restore: None,
             managed_worktree: None,
@@ -273,7 +222,6 @@ pub(crate) fn retain_submission(
 /// One package rollback that keeps one host slot until the daemon restarts.
 /// The retained row leaves seven host slots available during degraded operation.
 pub(crate) struct PackageRecoveryRequired {
-    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) original: String,
     pub(crate) compensation: String,
     /// The stranded packages this record covers. An explicit operator enable
@@ -297,7 +245,6 @@ impl PackageRecoveryRequired {
     ) -> Self {
         use crate::daemon::error::{COMPENSATION_MESSAGE_BOUND, bound_compensation_message};
         Self {
-            owner_permit: None,
             original: bound_compensation_message(original, COMPENSATION_MESSAGE_BOUND),
             compensation: bound_compensation_message(compensation, COMPENSATION_MESSAGE_BOUND),
             quarantined_at_ms: crate::daemon::control::session_type_quarantine::unix_millis(
@@ -2024,7 +1971,6 @@ fn retain_family_cleanup(
         state.host_recovery.insert(
             waiter_id,
             HostRecoveryRequired::PackageFamilies {
-                owner_permit: None,
                 _work: Box::new(work),
                 _fault: fault,
             },
@@ -2038,7 +1984,6 @@ fn retain_family_cleanup(
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::PackageFamilyWork {
-            owner_permit: None,
             _work: Box::new(work),
         },
     );
@@ -2060,7 +2005,6 @@ fn retain_event_cleanup(
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::PackageEvents {
-            owner_permit: None,
             _result: Box::new(result),
             _fault: fault,
             _submission: submission,

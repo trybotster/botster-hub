@@ -165,12 +165,11 @@ pub(crate) fn handle_as(
         .expect("host family");
     }
     let request = *request;
-    // Reserve the budget permit before any Core work is admitted. The permit
-    // stays with the pending entry until the response is finished or the
-    // entry is retired; the transport's per-connection limit ends with the
-    // connection, this one does not.
+    // Refuse new work at the obligation bound before any Core work is
+    // admitted: cleanup obligations outlive their connection, so the bound
+    // does not end with it.
     let client = grant_id.clone().or_else(|| client_id.clone());
-    let Some(permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         return send_control_response(
             reply_tx,
             Ok(attach_bind_operator_error(
@@ -179,9 +178,8 @@ pub(crate) fn handle_as(
             )),
             response_delivery_rx,
         );
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(permit);
         return send_control_response(
             reply_tx,
             Ok(attach_bind_operator_error(
@@ -240,7 +238,6 @@ pub(crate) fn handle_as(
         grant_id,
         client,
         core_retirement: None,
-        permit: Some(permit),
         past_deadline: false,
         continuation: crate::daemon::control::pending::ControlContinuation::callback(|_, _| {
             crate::daemon::control::pending::ControlPoll::Pending
@@ -295,13 +292,6 @@ pub(crate) fn finish_status_delivery(
     shutdown: bool,
     received: bool,
 ) -> bool {
-    if let Some(permit) = entry.permit {
-        if let Some(recovery) = state.host_recovery.get_mut(&entry.waiter_id) {
-            recovery.retain_owner_permit(permit);
-        } else {
-            state.budget.release(permit);
-        }
-    }
     if shutdown {
         state.shutdown_waiter = None;
         finish_shutdown_update_reply(state);
@@ -344,22 +334,13 @@ fn finish(
     response: ControlReply,
 ) -> bool {
     let PendingControlRequest {
-        waiter_id,
         completion,
         reply_tx,
         response_delivery_rx,
         grant_id,
         client,
-        permit,
         ..
     } = entry;
-    if let Some(permit) = permit {
-        if let Some(recovery) = state.host_recovery.get_mut(&waiter_id) {
-            recovery.retain_owner_permit(permit);
-        } else {
-            state.budget.release(permit);
-        }
-    }
     let reconcile_after_request = completion.reconciles_after_success();
     let ControlReply::Typed {
         response,
