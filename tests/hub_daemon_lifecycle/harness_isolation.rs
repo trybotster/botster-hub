@@ -39,7 +39,7 @@ fn worker_classifier_accepts_only_validated_candidate() {
 
 #[test]
 fn explicit_shutdown_attributes_cleanup_taint_to_originating_test() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     let data_dir = unique_short_test_dir("gxa");
     fs::create_dir_all(&data_dir).expect("create data dir");
     let daemon = start_cli_daemon(&data_dir);
@@ -313,7 +313,7 @@ fn dead_daemon_backstop_reaps_registry_worker_without_adopting_foreign() {
 
 #[test]
 fn untokened_start_boundary_notify_is_ignored() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     let token = next_real_daemon_start_token();
     let boundary = arm_real_daemon_start_boundary(token);
     notify_real_daemon_start_boundary();
@@ -336,7 +336,7 @@ fn untokened_start_boundary_notify_is_ignored() {
 
 #[test]
 fn harness_taint_keeps_every_recorded_error() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     record_harness_taint("injected first taint");
     record_harness_taint("injected second taint");
     let evidence = harness_taint();
@@ -350,7 +350,7 @@ fn harness_taint_keeps_every_recorded_error() {
 
 #[test]
 fn taint_latch_refuses_next_daemon_start_without_spawning() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     // Scoped: the taint is cleared on every exit path, so a failed assertion
     // here cannot cascade into every later daemon test in the process.
     let taint = ScopedHarnessTaint::inject("injected prove-absence failure");
@@ -429,7 +429,7 @@ fn taint_latch_refuses_next_daemon_start_without_spawning() {
 
 #[test]
 fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
-    let lock = daemon_test_guard();
+    let lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxt");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -473,13 +473,13 @@ fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
     });
     // Shutdown reads the shared taint; hold the guard so a sibling test's
     // guarded taint injection cannot reach this read.
-    let _shutdown_guard = daemon_test_guard();
+    let _shutdown_guard = daemon_test_guard_exclusive();
     daemon.shutdown();
 }
 
 #[test]
 fn injected_taint_race_fails_when_start_guard_is_bypassed() {
-    let lock = daemon_test_guard();
+    let lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let _taint = ScopedHarnessTaint::inject("injected race taint");
     let data_dir = unique_short_test_dir("gxb");
@@ -522,7 +522,7 @@ fn injected_taint_race_fails_when_start_guard_is_bypassed() {
 
 #[test]
 fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
-    let lock = daemon_test_guard();
+    let lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let intended_dir = unique_short_test_dir("gxi");
     let sibling_dir = unique_short_test_dir("gxs");
@@ -575,7 +575,7 @@ fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
     let intended_daemon = intended_started.unwrap_or_else(|panic| {
         panic!("intended start raced the injected taint: {panic:?}")
     });
-    let _shutdown_guard = daemon_test_guard();
+    let _shutdown_guard = daemon_test_guard_exclusive();
     sibling_daemon.shutdown();
     intended_daemon.shutdown();
 }
@@ -671,7 +671,7 @@ fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
 
 #[test]
 fn identity_capture_error_taints_and_blocks_next_start() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     let data_dir = unique_short_test_dir("gic");
     fs::create_dir_all(&data_dir).expect("create data dir");
     let mut daemon = start_cli_daemon(&data_dir);
@@ -695,7 +695,7 @@ fn identity_capture_error_taints_and_blocks_next_start() {
 
 #[test]
 fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     let data_dir = unique_short_test_dir("gua");
     fs::create_dir_all(&data_dir).expect("create data dir");
     let mut decoy = ChildCleanup::spawn_non_botster_decoy();
@@ -763,7 +763,7 @@ fn unresolved_worker_ancestor_taints_and_retains_command_pid() {
 
 #[test]
 fn live_command_without_worker_ancestor_accepts_concurrent_registry_exit() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gce");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -840,7 +840,7 @@ fn save_running_recovery_record(data_dir: &Path, session_id: &str, command_pid: 
 
 #[test]
 fn dead_command_and_dead_recovery_worker_do_not_taint() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxd");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -863,7 +863,7 @@ fn dead_command_and_dead_recovery_worker_do_not_taint() {
 
 #[test]
 fn dead_command_with_live_unverified_recovery_worker_taints() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxu");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -899,7 +899,7 @@ fn dead_command_with_live_unverified_recovery_worker_taints() {
 
 #[test]
 fn dead_command_with_zombie_recovery_worker_does_not_taint() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxz");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -955,7 +955,7 @@ fn dead_command_with_zombie_recovery_worker_does_not_taint() {
 
 #[test]
 fn dead_command_without_recovery_identity_taints_and_does_not_signal() {
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     reset_harness_taint_after_proof();
     let data_dir = unique_short_test_dir("gxr");
     fs::create_dir_all(&data_dir).expect("create data dir");
@@ -1173,7 +1173,7 @@ fn assert_orphan_gone(pid: u32) {
 fn daemon_test_guard_sweeps_a_test_owned_orphan_when_the_test_panics() {
     let (pid_tx, pid_rx) = mpsc::channel();
     let result = thread::spawn(move || {
-        let _guard = daemon_test_guard();
+        let _guard = daemon_test_guard_exclusive();
         let dir = unique_short_test_dir("sweep-panic");
         let pid = spawn_orphan_naming(&dir);
         pid_tx.send(pid).expect("send orphan pid");
@@ -1195,7 +1195,7 @@ fn daemon_test_guard_sweeps_a_test_owned_orphan_when_the_test_panics() {
     // Harness taint is process-global: read it under the guard so a sibling
     // test's guarded taint injection cannot reach this read. Taking the guard
     // itself fails on taint, and the explicit check keeps the message.
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1203,7 +1203,7 @@ fn daemon_test_guard_sweeps_a_test_owned_orphan_when_the_test_panics() {
 fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
     let (pid_tx, pid_rx) = mpsc::channel();
     let result = thread::spawn(move || {
-        let _guard = daemon_test_guard();
+        let _guard = daemon_test_guard_exclusive();
         let dir = unique_short_test_dir("sweep-pass");
         let pid = spawn_orphan_naming(&dir);
         pid_tx.send(pid).expect("send orphan pid");
@@ -1224,7 +1224,7 @@ fn daemon_test_guard_fails_a_passing_test_that_leaves_a_test_owned_orphan() {
     // Harness taint is process-global: read it under the guard so a sibling
     // test's guarded taint injection cannot reach this read. Taking the guard
     // itself fails on taint, and the explicit check keeps the message.
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1260,7 +1260,7 @@ fn spawn_orphan_group_with_resistant_child(dir: &Path) -> (u32, u32) {
 fn daemon_test_guard_kills_a_sigterm_resistant_descendant_of_a_test_owned_orphan() {
     let (pid_tx, pid_rx) = mpsc::channel();
     let result = thread::spawn(move || {
-        let _guard = daemon_test_guard();
+        let _guard = daemon_test_guard_exclusive();
         let dir = unique_short_test_dir("sweep-resist");
         let (leader, child) = spawn_orphan_group_with_resistant_child(&dir);
         pid_tx.send((leader, child)).expect("send fixture pids");
@@ -1288,7 +1288,7 @@ fn daemon_test_guard_kills_a_sigterm_resistant_descendant_of_a_test_owned_orphan
     // Harness taint is process-global: read it under the guard so a sibling
     // test's guarded taint injection cannot reach this read. Taking the guard
     // itself fails on taint, and the explicit check keeps the message.
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
@@ -1303,7 +1303,7 @@ impl Drop for SweepOnDrop {
 #[test]
 fn test_owned_sweep_census_failure_fails_and_taints_without_replacing_a_panic() {
     // Hold the guard so no sibling test observes the taint this proof records.
-    let _lock = daemon_test_guard();
+    let _lock = daemon_test_guard_exclusive();
     for (program, expected) in [
         ("/nonexistent/botster-census", "did not run"),
         ("/usr/bin/false", "exited with"),
@@ -1389,7 +1389,7 @@ fn spawn_foreign_group_with_matched_child(dir: &Path) -> (u32, u32, u32) {
 fn daemon_test_guard_leaves_a_foreign_group_leader_and_sibling_of_a_matched_child() {
     let (pid_tx, pid_rx) = mpsc::channel();
     let result = thread::spawn(move || {
-        let _guard = daemon_test_guard();
+        let _guard = daemon_test_guard_exclusive();
         let dir = unique_short_test_dir("sweep-foreign");
         let pids = spawn_foreign_group_with_matched_child(&dir);
         pid_tx.send(pids).expect("send fixture pids");
@@ -1432,7 +1432,7 @@ fn daemon_test_guard_leaves_a_foreign_group_leader_and_sibling_of_a_matched_chil
     // Harness taint is process-global: read it under the guard so a sibling
     // test's guarded taint injection cannot reach this read. Taking the guard
     // itself fails on taint, and the explicit check keeps the message.
-    let _guard = daemon_test_guard();
+    let _guard = daemon_test_guard_exclusive();
     assert!(harness_taint().is_none(), "a completed sweep must not taint the harness");
 }
 
