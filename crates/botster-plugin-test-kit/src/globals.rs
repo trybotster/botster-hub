@@ -344,11 +344,15 @@ mod tests {
     }
 
     #[test]
-    fn loop_variables_are_not_bound_in_the_loop_expressions() {
+    fn numeric_for_variables_are_not_bound_in_the_loop_expressions() {
         assert_eq!(
             names("for i = i, 10 do local x = i end"),
             [("i".to_string(), false)]
         );
+    }
+
+    #[test]
+    fn generic_for_variables_are_not_bound_in_the_loop_expressions() {
         assert_eq!(
             names("for missing in missing() do local x = missing end"),
             [("missing".to_string(), false)]
