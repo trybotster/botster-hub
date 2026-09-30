@@ -5681,6 +5681,8 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::LifecycleCommitExhausted { .. } => "lifecycle_commit_exhausted",
         CoreDaemonError::MissingScreenResponse(_) => "missing_screen_response",
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
+        CoreDaemonError::SessionEnded(_) => "session_ended",
+        CoreDaemonError::CursorReadUnsupported => "cursor_read_unsupported",
         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
         CoreDaemonError::ExplicitResizeBusy(_) => "explicit_resize_busy",
         CoreDaemonError::PendingLimit(_) => "pending_limit",
