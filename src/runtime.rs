@@ -1190,6 +1190,11 @@ impl HubRuntime {
         &self.owner_signal
     }
 
+    /// The per-session edges the data-plane thread stores for the doorbell.
+    pub(crate) fn doorbell_edges(&self) -> &crate::data_plane::doorbell_edges::DoorbellEdges {
+        self.core_daemon.doorbell_edges()
+    }
+
     /// Block the data-plane thread inside one operation, then fill the Core
     /// request queue until a submission is refused. Dropping the returned
     /// sender releases the data plane.

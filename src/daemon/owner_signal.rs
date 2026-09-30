@@ -40,10 +40,12 @@ pub(crate) enum SignalKey {
     /// release (lock, class slot, completion reservation) may end an armed
     /// `Backpressured` or `LockBusy` admission (Core C2).
     PluginEngine,
+    /// The data-plane thread stored fresh per-session doorbell edges.
+    Doorbell,
 }
 
 impl SignalKey {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         match self {
@@ -54,6 +56,7 @@ impl SignalKey {
             Self::ConnectionPool => 4,
             Self::DataPlaneCapacity => 5,
             Self::PluginEngine => 6,
+            Self::Doorbell => 7,
         }
     }
 }

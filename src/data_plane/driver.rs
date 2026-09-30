@@ -957,6 +957,7 @@ pub(crate) struct CoreDaemonHandle {
     waiter_ids: Arc<WaiterIdSource>,
     completion_wake: Arc<CoreCompletionWake>,
     capacity: DataPlaneCapacity,
+    doorbell_edges: crate::data_plane::doorbell_edges::DoorbellEdges,
     #[cfg(test)]
     refuse_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -970,6 +971,11 @@ pub(crate) struct CoreDaemonHandle {
 }
 
 impl CoreDaemonHandle {
+    /// The coalescing doorbell edges the data-plane thread fills after each pump.
+    pub(crate) fn doorbell_edges(&self) -> &crate::data_plane::doorbell_edges::DoorbellEdges {
+        &self.doorbell_edges
+    }
+
     /// Register a local reply after the owner collects its previous Core phases.
     /// The charge funds channel storage. Shared registration storage remains separate.
     #[allow(dead_code)] // The daemon spawn continuation will register this receipt.
@@ -1468,6 +1474,9 @@ impl DataPlaneDriver {
         close_work: CloseWorkSource,
         owner_signal: Arc<crate::daemon::owner_signal::OwnerSignal>,
     ) -> (Self, CoreDaemonHandle) {
+        let doorbell_edges =
+            crate::data_plane::doorbell_edges::DoorbellEdges::new(Arc::clone(&owner_signal));
+        let thread_doorbell_edges = doorbell_edges.clone();
         let capacity = DataPlaneCapacity::new(owner_signal);
         let thread_capacity = capacity.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -1504,6 +1513,7 @@ impl DataPlaneDriver {
                     close_work,
                     thread_owner_wake,
                     thread_progress_latch,
+                    thread_doorbell_edges,
                 );
                 if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
                     daemon.release_for_restart();
@@ -1523,6 +1533,7 @@ impl DataPlaneDriver {
             waiter_ids,
             completion_wake,
             capacity,
+            doorbell_edges,
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1620,6 +1631,7 @@ fn run_loop(
     close_work: CloseWorkSource,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
     progress_latch: Arc<DataPlaneProgressLatch>,
+    doorbell_edges: crate::data_plane::doorbell_edges::DoorbellEdges,
 ) {
     let RequestQueue {
         receiver: requests,
@@ -1653,6 +1665,7 @@ fn run_loop(
         if let Some(batch) = batch {
             match core_daemon.pump_woken(&batch, now_seconds) {
                 Ok(outcome) => {
+                    doorbell_edges.record_pump_from(core_daemon, &outcome, Instant::now());
                     progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
                     terminal_inventory_changed |= outcome.terminal_inventory_changed;
                     journal_advanced = outcome.journal_advanced;
@@ -2358,6 +2371,7 @@ mod tests {
             waiter_ids: Arc::new(WaiterIdSource::default()),
             completion_wake: Arc::clone(&completion_wake),
             capacity: test_capacity(),
+            doorbell_edges: test_doorbell_edges(),
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
@@ -2567,6 +2581,7 @@ mod tests {
                 waiter_ids: Arc::new(WaiterIdSource::default()),
                 completion_wake: Arc::clone(&wake),
                 capacity: test_capacity(),
+                doorbell_edges: test_doorbell_edges(),
                 refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
                 refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
                 lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
@@ -2627,6 +2642,12 @@ mod tests {
     #[test]
     fn unregistered_submit_disconnected_queue_preserves_colliding_owner_identity() {
         check_unregistered_submit_preserves_owner(false, true, false);
+    }
+
+    fn test_doorbell_edges() -> crate::data_plane::doorbell_edges::DoorbellEdges {
+        crate::data_plane::doorbell_edges::DoorbellEdges::new(Arc::new(
+            crate::daemon::owner_signal::OwnerSignal::default(),
+        ))
     }
 
     fn test_capacity() -> DataPlaneCapacity {
