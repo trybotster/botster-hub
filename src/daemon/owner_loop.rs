@@ -458,19 +458,6 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     }
 }
 
-/// Whether a work item parked on owner capacity can run: one is parked and the
-/// admission sum has room. The level is checked on every wake pass, so an
-/// obligation finishing, a peer leaving and a retained request ending all wake
-/// it without a hook where each leaves, and a wake that comes before the item
-/// parks is not lost.
-fn capacity_waiter_can_resume(state: &DaemonControlState) -> bool {
-    let parked = state.coordination_waiting_for_owner
-        || state.event_owner.waiting_for_owner
-        || state.publication_owner.waiting_for_owner
-        || state.managed_spawn_waiting_for_owner;
-    parked && state.has_room()
-}
-
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
@@ -497,7 +484,13 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             .wakes
             .mark(MaintenanceSliceKind::SubscriberDelivery);
     }
-    if capacity_waiter_can_resume(state) {
+    // A work item parked on owner capacity resumes when the admission sum has
+    // room again. The loop runs this pass before it can block, so each item
+    // that leaves the sum (an obligation, a peer, a retained request) wakes the
+    // parked item without a hook where it leaves, and a wake that comes before
+    // the item parks is not lost. Every branch clears its parked flag as it
+    // wakes, so one park gives one wake.
+    if state.has_room() {
         if state.coordination_waiting_for_owner && state.coordination_fault.is_none() {
             state.coordination_waiting_for_owner = false;
             if !mark_background_ready(state, BackgroundWork::Coordination) {
@@ -507,6 +500,7 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             }
         }
         if state.event_owner.waiting_for_owner {
+            state.event_owner.waiting_for_owner = false;
             mark_event_owner_ready(state);
         }
         state.publication_owner.waiting_for_owner = false;
@@ -9394,10 +9388,11 @@ return botster.register({ handlers = {} })
             assert_eq!(state.pending_requests.len(), 1);
             assert!(!state.has_room(), "{leaves}: the sum is full");
             state.managed_spawn_waiting_for_owner = true;
+            state.event_owner.waiting_for_owner = true;
             publish_completion_wakes(&daemon, &mut state);
             assert!(
-                state.managed_spawn_waiting_for_owner,
-                "{leaves}: the waiter stays parked while the sum is full"
+                state.managed_spawn_waiting_for_owner && state.event_owner.waiting_for_owner,
+                "{leaves}: the waiters stay parked while the sum is full"
             );
             match leaves {
                 "obligation" => {
@@ -9418,6 +9413,10 @@ return botster.register({ handlers = {} })
             assert!(
                 !state.managed_spawn_waiting_for_owner,
                 "{leaves}: the parked waiter resumes"
+            );
+            assert!(
+                !state.event_owner.waiting_for_owner,
+                "{leaves}: the event owner's flag clears as it wakes, so one park is one wake"
             );
         }
         daemon.stop();
