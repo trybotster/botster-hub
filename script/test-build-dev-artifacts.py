@@ -27,6 +27,7 @@ from pathlib import Path
 args = sys.argv[1:]
 record = {"args": args, "cwd": os.getcwd(),
           "revision": os.environ.get("BOTSTER_BUILD_REVISION"),
+          "out_dir": os.environ.get("OUT_DIR"),
           "jobs": os.environ.get("CARGO_BUILD_JOBS"),
           "incremental": os.environ.get("CARGO_INCREMENTAL")}
 with open(os.environ["BUILD_COMMAND_LOG"], "a") as log:
@@ -124,8 +125,7 @@ class BuilderTests(unittest.TestCase):
         self.check_candidate(self.build(), adapter=False)
         commands = self.commands()
         self.assertEqual([row["args"] for row in commands], [HUB_COMMAND, WORKER_COMMAND])
-        self.assertEqual(commands[0]["revision"], self.revision)
-        self.assertIsNone(commands[1]["revision"])
+        self.assertTrue(all(row["revision"] is None for row in commands))
         self.assertTrue(all(row["jobs"] == "2" and row["incremental"] == "0" for row in commands))
         self.assertFalse((self.output / "harness_control").exists())
 
@@ -135,9 +135,17 @@ class BuilderTests(unittest.TestCase):
         manifest = self.check_candidate(self.build("--with-harness-adapter"), adapter=True)
         commands = self.commands()
         self.assertEqual([row["args"] for row in commands], [HUB_COMMAND, WORKER_COMMAND, ADAPTER_COMMAND])
-        self.assertEqual(commands[2]["revision"], manifest["source_revisions"]["botster_hub"])
+        self.assertTrue(all(row["revision"] is None for row in commands))
         self.assertTrue(all(Path(row["cwd"]).resolve() == self.repo.resolve() for row in commands))
         self.assertTrue(all(row["jobs"] == "1" and row["incremental"] == "0" for row in commands))
+
+    def test_cargo_sees_the_caller_environment_unchanged(self):
+        # The script must not reuse a name cargo reads: an exported OUT_DIR in
+        # the caller would change between the script's cargo calls and the
+        # caller's own, and every build script that tracks it would rerun.
+        self.env["OUT_DIR"] = str(self.root / "ambient out dir")
+        self.check_candidate(self.build("--with-harness-adapter"), adapter=True)
+        self.assertTrue(all(row["out_dir"] == self.env["OUT_DIR"] for row in self.commands()))
 
     def test_adapter_build_failure_emits_no_candidate_exports(self):
         self.env["FAIL_ADAPTER"] = "1"
