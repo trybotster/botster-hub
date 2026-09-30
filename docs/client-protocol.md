@@ -145,7 +145,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 53.
+- conformance fixture revision 54.
 
 Conformance fixture revision 51 changes the plugin contract matrix fixture: it
 reads the result shape of `botster.capabilities.config.get()`
@@ -1740,6 +1740,36 @@ clients that need incremental READY-then-history use
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
+
+## Conformance revision 54: `session_restart`
+
+`PROTOCOL_VERSION` stays 14 and `CONFORMANCE_FIXTURE_REVISION` moves from 53 to
+54 for an additive change. The default conformance floor stays at 53, so a
+client built at revision 53 still passes Hello against this Hub.
+
+The Hub advertises the feature `session_restart` in `compatibility.features`.
+It is never in `required_features` by default: a client that offers Restart
+checks for the feature first, or names it in its own `required_features` and
+fails closed on an older Hub.
+
+The feature adds the operator request `restart_session { session_id }` and the
+optional boolean `restartable` on every `/session` entity (absent means false).
+
+`restart_session` starts an ended session again under the same session id,
+from the durable record of the inputs of its original `spawn_session_type`
+(the session type id, target, cwd, context input, and the keys, never the
+values, of a client environment). The session type is resolved again at
+restart. The answer is a `spawned` response, or an `operator_error` whose code
+is one of `unknown_session`, `restart_not_ended`, `restart_record_unavailable`,
+`restart_environment_not_retained`, `restart_not_ready` (Core cannot release
+the session yet, or its previous process group is still alive), or a refusal
+of the re-resolved session type. A restart replaces the session's caller
+token: the old token stops proving the session. The entity keeps its id and is
+never removed: it goes from ended to current.
+
+`restartable` is true when the session has ended and a durable restart record
+exists. A plain `spawn` records no restart inputs, so its sessions are never
+restartable.
 
 ## Host-control protocol 14
 
