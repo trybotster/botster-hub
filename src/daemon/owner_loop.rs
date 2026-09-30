@@ -2324,6 +2324,14 @@ impl DaemonControlState {
     }
 
     /// Move a published result into the cell that was claimed before the write.
+    /// Test seam: the retention cell holds an uncertain write.
+    #[cfg(test)]
+    pub(crate) fn uncertain_publication_holds_write(&self) -> bool {
+        self.uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.write.is_some())
+    }
+
     pub(crate) fn retain_uncertain_publication(
         &mut self,
         waiter_id: crate::owner_identity::WaiterId,

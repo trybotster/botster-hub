@@ -511,8 +511,8 @@ pub(crate) mod tests {
         let action = write.on_completion(&mut daemon, &mut state, result, || None);
         assert!(matches!(action, StateRecordAction::Uncertain));
         assert!(
-            state.uncertain_publication.is_some(),
-            "the publication is retained"
+            state.uncertain_publication_holds_write(),
+            "the uncertain write is retained in the cell"
         );
         assert_eq!(state.document_owner, None, "the document is released");
 
