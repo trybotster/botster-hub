@@ -8,14 +8,13 @@ use botster_core::{
     EndpointId, EnvelopeCursor, EnvelopeId, EnvelopeTarget, RoutedEnvelope, RoutedEnvelopePayload,
     SessionId,
 };
-use botster_core_daemon::ReadinessEvidence;
 use botster_hub_client::{DaemonIdentity, DaemonRequest, DaemonResponse, DaemonResponseKind};
 
 use crate::HubDaemon;
 use crate::client_api::{HubClientApi, HubClientStep};
 use crate::client_api_dto::plugin::{
     daemon_coordination_ack, daemon_coordination_identity, daemon_coordination_messages,
-    daemon_coordination_notify, daemon_coordination_publish,
+    daemon_coordination_publish, daemon_coordination_ring,
 };
 use crate::client_api_dto::response::daemon_coordination;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
@@ -61,6 +60,49 @@ pub(crate) fn defer_client_step(
             }
         }),
     }
+}
+
+/// Answer a ring request once Core has proven the caller and the session, and
+/// queue the ring with the doorbell on the owner. The owner types it when the
+/// session's input takes free text; this answer only says it is queued.
+fn defer_ring(step: HubClientStep, session_id: String, text: String) -> ControlStep {
+    let mut ready = None;
+    let mut pending = None;
+    match step {
+        HubClientStep::Ready(result) => ready = Some(result),
+        HubClientStep::Pending(step) => pending = Some(step),
+    }
+    ControlStep::pending(move |daemon, state| {
+        let result = match ready.take() {
+            Some(result) => result,
+            None => {
+                let Some(runtime) = daemon.runtime() else {
+                    return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                };
+                let Some(pending) = pending.as_mut() else {
+                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                };
+                match pending.poll(runtime) {
+                    None => return ControlPoll::Pending,
+                    Some(result) => result,
+                }
+            }
+        };
+        ControlPoll::Ready(
+            result
+                .map_err(DaemonTransportError::Client)
+                .and_then(|response| {
+                    let HubClientResponseBody::RingAccepted = response.body else {
+                        return Err(DaemonTransportError::UnexpectedResponse);
+                    };
+                    crate::daemon::doorbell_owner::ring(daemon, state, &session_id, text.clone());
+                    Ok(daemon_coordination(
+                        DaemonResponseKind::SessionNotified,
+                        daemon_coordination_ring(),
+                    ))
+                }),
+        )
+    })
 }
 
 pub(crate) fn handle_runtime(
@@ -241,29 +283,17 @@ pub(crate) fn handle_runtime(
             })
         }
         DaemonRequest::NotifySession { session_id, data } => {
-            let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::NotifySession {
                     request_id: request_id("daemon-mcp-notify-session"),
-                    session_id: SessionId(session_id),
-                    data: data.into_bytes(),
-                    readiness: ReadinessEvidence::default(),
-                    now_seconds: now,
+                    session_id: SessionId(session_id.clone()),
                     caller: token,
                 },
                 state.current_waiter_id.expect("owner waiter is assigned"),
             );
-            defer_client_step(step, |body| {
-                let HubClientResponseBody::GuardedWrite(write) = body else {
-                    return Err(DaemonTransportError::UnexpectedResponse);
-                };
-                Ok(daemon_coordination(
-                    DaemonResponseKind::SessionNotified,
-                    daemon_coordination_notify(write.decision, write.states),
-                ))
-            })
+            defer_ring(step, session_id, data)
         }
         _ => unreachable!("messaging runtime family received a non-messaging request"),
     }
