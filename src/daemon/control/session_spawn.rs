@@ -48,17 +48,15 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         send_unavailable(response, "admitted spawn has no callback charge");
         return;
     };
-    let Some(owner_permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         send_unavailable(response, "the Hub owner has no available operation slot");
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(owner_permit);
         send_unavailable(response, "the Hub owner exhausted operation identifiers");
         return;
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
-        state.budget.release(owner_permit);
         send_unavailable(
             response,
             "the Host executor has no available operation slot",
@@ -67,12 +65,10 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     };
     let retirement = runtime.coordination_retirement(waiter_id);
     let Some(reply_bytes) = crate::data_plane::driver::retained_reply_bytes::<()>() else {
-        state.budget.release(owner_permit);
         send_unavailable(response, "Host reply size overflow");
         return;
     };
     if parent.grow(reply_bytes).is_err() {
-        state.budget.release(owner_permit);
         send_unavailable(response, "Host reply capacity exhausted");
         return;
     }
@@ -80,13 +76,11 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         .split_fixed(reply_bytes)
         .expect("the parent admitted the Host reply");
     let Ok((ticket, receipt)) = runtime.session_spawn_host_reply(&retirement, reply_charge) else {
-        state.budget.release(owner_permit);
         send_unavailable(response, "Host reply registration refused");
         return;
     };
     let operation_bytes = std::mem::size_of::<SessionTypeSpawnOperation>();
     if parent.grow(operation_bytes).is_err() {
-        state.budget.release(owner_permit);
         send_unavailable(response, "owner operation capacity exhausted");
         return;
     }
@@ -108,7 +102,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     ) {
         Ok(work) => work,
         Err((reason, _parent, _receipt)) => {
-            state.budget.release(owner_permit);
             send_unavailable(response, reason);
             return;
         }
@@ -137,7 +130,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             grant_id: None,
             client: None,
             core_retirement: None,
-            permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
             continuation: ControlContinuation::SessionType(operation),

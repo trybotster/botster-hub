@@ -1,7 +1,6 @@
 //! Retained worker dispatch for queued event router operations.
 
 use crate::HubDaemon;
-use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::host_executor::{
     HostCommand, HostCompletion, HostJobIdentity, HostResult, HostSubmissionFailure,
@@ -12,7 +11,6 @@ use crate::package_event_router::{EventOwnerWork, EventOwnerWorkId, OwnerStep};
 struct Pending {
     identity: HostJobIdentity,
     event_identity: EventOwnerWorkId,
-    owner_permit: OwnerPermit,
 }
 
 enum Recovery {
@@ -29,7 +27,6 @@ enum Recovery {
 #[derive(Default)]
 pub(crate) struct EventOwnerState {
     terminal: Option<crate::host_disposal::Job>,
-    terminal_owner: Option<OwnerPermit>,
     terminal_retirement_fault: Option<HostWorkPermit>,
     pending: Option<Pending>,
     completion: Option<HostCompletion>,
@@ -39,11 +36,7 @@ pub(crate) struct EventOwnerState {
 }
 
 impl EventOwnerState {
-    pub(crate) fn dispose_terminal(
-        &mut self,
-        runtime: &crate::HubRuntime,
-        budget: &mut crate::daemon::owner_budget::OwnerBudget,
-    ) -> bool {
+    pub(crate) fn dispose_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
         if self.terminal_retirement_fault.is_some() {
             return false;
         }
@@ -57,7 +50,6 @@ impl EventOwnerState {
                         self.terminal_retirement_fault = Some(permit);
                         return false;
                     };
-                    self.terminal_owner = Some(pending.owner_permit);
                     self.terminal = Some(crate::host_disposal::Job::new(
                         crate::host_disposal::Parts {
                             storage: None,
@@ -68,9 +60,6 @@ impl EventOwnerState {
                         },
                     ));
                     return false;
-                }
-                if let Some(owner) = self.terminal_owner.take() {
-                    budget.release(owner);
                 }
                 drop(permit);
                 self.terminal.take();
@@ -177,20 +166,19 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
             "the exact event completion retains its queued operation"
         );
         drop(permit);
-        state.budget.release(pending.owner_permit);
+        drop(pending);
         crate::daemon::control::pending::wake_shutdown_waiter(state);
         return runtime.event_plane_owner_op_ready();
     }
     if state.event_owner.pending.is_some() || !runtime.event_plane_owner_op_ready() {
         return false;
     }
-    let Some(owner_permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         state.event_owner.waiting_for_owner = true;
         return false;
-    };
+    }
     state.event_owner.waiting_for_owner = false;
     let Some(permit) = runtime.host_executor().try_reserve() else {
-        state.budget.release(owner_permit);
         state.event_owner.waiting_for_host = true;
         return false;
     };
@@ -207,14 +195,12 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
                     phase: 0,
                 },
                 event_identity: work.identity().clone(),
-                owner_permit,
             };
             submit(daemon, state, pending, work, permit);
             false
         }
         OwnerStep::Applied(_) | OwnerStep::Idle | OwnerStep::Waiting => {
             drop(permit);
-            state.budget.release(owner_permit);
             crate::daemon::control::pending::wake_shutdown_waiter(state);
             runtime.event_plane_owner_op_ready()
         }

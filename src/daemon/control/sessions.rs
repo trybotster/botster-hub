@@ -31,7 +31,7 @@ use crate::daemon::control::pending::{ControlPoll, ControlStep};
 use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::DaemonTransportError;
 use crate::daemon::owner_budget::{
-    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, OwnerPermit, drive_core_slot,
+    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, drive_core_slot,
 };
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::shutdown::{
@@ -58,7 +58,7 @@ use crate::subscription::route_cleanup::{
 ///
 /// This runs in the owner turn that completes the Attach's Core query, so it
 /// rechecks what that query's wait could have changed (peer admission and
-/// generation, the peer's budget permit, and a live reservation for the same
+/// generation, the peer's owner admission, and a live reservation for the same
 /// route) before it starts a stream: starting one would cancel another
 /// attach's stream on this route.
 pub(crate) fn reserve_webrtc_terminal(
@@ -90,7 +90,7 @@ pub(crate) fn reserve_webrtc_terminal(
             "Attach requires an admitted WebRTC adapter",
         );
     }
-    if !state.budget.peer_holds_permit(&grant_id) {
+    if !state.budget.peer_admitted(&grant_id) {
         return owner_budget_error();
     }
     if state
@@ -1357,8 +1357,8 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("read_screen", &id.0, &error),
                     }))
                 },
-                move |_, state, waiter_id, permit| {
-                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                move |_, state, waiter_id| {
+                    retain_operation_retirement(state, waiter_id, retire_tracker)
                 },
             )
         }
@@ -1409,8 +1409,8 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("read_mode_flags", &id.0, &error),
                     }))
                 },
-                move |_, state, waiter_id, permit| {
-                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                move |_, state, waiter_id| {
+                    retain_operation_retirement(state, waiter_id, retire_tracker)
                 },
             )
         }
@@ -1421,7 +1421,7 @@ pub(crate) fn handle_runtime(
             let owner = CaptureOwner(capture_owner_id(&observability, &client_id));
             // The tracker is shared with the retire hook: a retired capture
             // request cancels the pending operation or releases the capture
-            // it produced, holding its permit until Core accepted that.
+            // it produced, kept as an obligation until Core accepted that.
             let tracker = std::sync::Arc::new(std::sync::Mutex::new(
                 runtime.begin_capture_snapshot_for_owner(
                     state.current_waiter_id.expect("owner waiter is assigned"),
@@ -1462,8 +1462,8 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
                     }))
                 },
-                move |_, state, waiter_id, permit| {
-                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                move |_, state, waiter_id| {
+                    retain_operation_retirement(state, waiter_id, retire_tracker)
                 },
             )
         }
@@ -1555,12 +1555,10 @@ fn capture_owner_id(observability: &DaemonObservability, client_id: &str) -> Str
 /// Used when a deferred attach completed in Core after its owner stopped
 /// being the current attachment (connection closed, route replaced). The
 /// generation is exact, so a replacement stream's generation is never
-/// touched. `permit` was reserved before the attach was admitted and stays
-/// held until Core accepts the release. One ticket is in flight; a refused
+/// touched. The obligation stays until Core accepts the release. One ticket is in flight; a refused
 /// admission resubmits on the next owner turn; a lost driver ends the work.
 pub(crate) fn retain_exact_detach(
     state: &mut DaemonControlState,
-    permit: OwnerPermit,
     client_id: String,
     session_id: String,
     subscription_id: String,
@@ -1569,12 +1567,11 @@ pub(crate) fn retain_exact_detach(
     let waiter_id = state
         .waiter_ids
         .next()
-        .expect("an admitted cleanup permit must have an available waiter identifier");
+        .expect("a cleanup obligation must have an available waiter identifier");
     let mut slot: Option<CoreTicket<Result<(), CoreDaemonError>>> = None;
     crate::daemon::owner_budget::retain_owner_obligation(
         state,
         waiter_id,
-        permit,
         "exact_generation_detach",
         move |daemon, state, waiter_id| match drive_core_slot(
             &mut slot,
@@ -1603,12 +1600,11 @@ pub(crate) fn retain_exact_detach(
 /// Retire one deferred Core operation whose request was abandoned: cancel
 /// the pending operation when it has not run, keep the tracker until its
 /// completion is consumed (Core may still emit one after cancel admission),
-/// and release a capture the completion produced. The permit stays held
+/// and release a capture the completion produced. The obligation stays
 /// until Core accepted the last of those.
 fn retain_operation_retirement(
     state: &mut DaemonControlState,
     waiter_id: crate::owner_identity::WaiterId,
-    permit: OwnerPermit,
     tracker: std::sync::Arc<std::sync::Mutex<CoreOperationTracker>>,
 ) {
     let mut cancel_slot: Option<CoreTicket<bool>> = None;
@@ -1618,7 +1614,6 @@ fn retain_operation_retirement(
     crate::daemon::owner_budget::retain_owner_obligation(
         state,
         waiter_id,
-        permit,
         "operation_retirement",
         move |daemon, state, waiter_id| {
             if let Some(capture) = release_capture.clone() {
@@ -1761,14 +1756,14 @@ fn handle_attach(
             client_id: client_id.clone(),
             grant_id: observability.grant_id.clone(),
         };
-        // A route can only be attached by a peer that holds its budget
-        // permit, so peer cleanup (the only place the permit is taken) is
-        // the only owner a WebRTC route can be left with.
-        let holds_permit = owner
+        // A route can only be attached by an admitted peer, so peer cleanup
+        // (the only place the admission ends) is the only owner a WebRTC
+        // route can be left with.
+        let peer_is_admitted = owner
             .grant_id
             .as_deref()
-            .is_some_and(|grant_id| state.budget.peer_holds_permit(grant_id));
-        if !holds_permit {
+            .is_some_and(|grant_id| state.budget.peer_admitted(grant_id));
+        if !peer_is_admitted {
             return ControlStep::ready(owner_budget_error());
         }
         // A WebRTC attach declares nothing in Core. One read-only Core query
@@ -1836,13 +1831,13 @@ fn handle_attach(
         client_id: client_id.clone(),
         grant_id: None,
     };
-    // Reserve the route key and the cleanup permit before any Core work
-    // exists for this attach; both are released on every failure path.
+    // Reserve the route key before any Core work exists for this attach;
+    // it is released on every failure path.
     let reservation = reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
     if reservation == RouteReservation::Full {
         return ControlStep::ready(attach_route_limit_error());
     }
-    let Some(cleanup_permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         release_failed_attach_route(
             &mut state.pending_runtime,
             &owner,
@@ -1851,8 +1846,7 @@ fn handle_attach(
             reservation,
         );
         return ControlStep::ready(owner_budget_error());
-    };
-    let mut cleanup_permit = Some(cleanup_permit);
+    }
     let identity = state.pending_runtime.start_attach(
         owner.clone(),
         session_id.clone(),
@@ -1880,9 +1874,6 @@ fn handle_attach(
             ))),
             CoreTicketPoll::Ready(result) => result,
         };
-        let permit = cleanup_permit
-            .take()
-            .expect("cleanup permit held until the attach completes");
         match result {
             Ok(generation) => {
                 // Fence before any mutation: the stream must still be this
@@ -1913,7 +1904,6 @@ fn handle_attach(
                     handle.close();
                     retain_exact_detach(
                         state,
-                        permit,
                         client_id.clone(),
                         session_id.clone(),
                         subscription_id.clone(),
@@ -1928,7 +1918,6 @@ fn handle_attach(
                     );
                     return ControlPoll::Ready(Ok(stale_attach_error()));
                 }
-                state.budget.release(permit);
                 let mut response = daemon_response_base(DaemonResponseKind::TerminalAttached);
                 response.terminal_attach = Some(DaemonTerminalAttach::new(
                     session_id.clone(),
@@ -1939,7 +1928,6 @@ fn handle_attach(
             }
             Err(failure) => {
                 handle.close();
-                state.budget.release(permit);
                 let _ = state.pending_runtime.cancel_stream_if(
                     &session_id,
                     &subscription_id,

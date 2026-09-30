@@ -238,10 +238,8 @@ fn one_owner_turn_accepts_a_queued_coordination_request_with_its_charge() {
 fn coordination_owner_capacity_wake_resumes_retained_ingress() {
     let (mut daemon, mut state, root) = fixture("owner-capacity");
     let bridge = daemon.runtime().unwrap().coordination_bridge();
-    let mut permits = Vec::new();
-    while let Some(permit) = state.budget.reserve() {
-        permits.push(permit);
-    }
+    state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+    let held = crate::daemon::owner_budget::hold_test_obligations(&mut state, 1);
     let deadline = Instant::now() + Duration::from_millis(500);
     let caller = request(bridge.clone());
     drive_until(&mut daemon, &mut state, deadline, |state| {
@@ -250,7 +248,7 @@ fn coordination_owner_capacity_wake_resumes_retained_ingress() {
     assert_eq!(bridge.test_pending_count(), 1);
     assert!(bridge.test_admitted_waiters().is_empty());
     assert!(state.pending_requests.is_empty());
-    state.budget.release(permits.pop().unwrap());
+    crate::daemon::owner_budget::finish_test_obligation(&mut state, held[0]);
     drive_until(&mut daemon, &mut state, deadline, |state| {
         !bridge.test_admitted_waiters().is_empty() && state.pending_requests.is_empty()
     });
@@ -258,9 +256,6 @@ fn coordination_owner_capacity_wake_resumes_retained_ingress() {
         caller.join().unwrap(),
         Ok(HubCoordinationResponse::Drain(_))
     ));
-    for permit in permits {
-        state.budget.release(permit);
-    }
     assert_retired(&daemon, &state, &bridge);
     daemon.stop();
     std::fs::remove_dir_all(root).unwrap();

@@ -1,6 +1,5 @@
 //! Retain publication ownership through Host phases and causal table application.
 
-use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::host_executor::{
     HostCommand, HostCompletion, HostJobIdentity, HostResult, HostSubmissionFailure, HostWorkPermit,
@@ -12,7 +11,6 @@ use crate::{HubDaemon, HubRuntime};
 
 struct Pending {
     identity: HostJobIdentity,
-    owner_permit: OwnerPermit,
 }
 
 struct Recovery {
@@ -36,19 +34,13 @@ pub(crate) struct PublicationOwnerState {
 }
 
 impl PublicationOwnerState {
-    pub(crate) fn dispose_terminal(
-        &mut self,
-        runtime: &HubRuntime,
-        budget: &mut crate::daemon::owner_budget::OwnerBudget,
-    ) -> bool {
+    pub(crate) fn dispose_terminal(&mut self, runtime: &HubRuntime) -> bool {
         if let Some(job) = self.terminal.as_mut() {
             if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
                 if let Some(work) = self.work.take() {
                     assert!(runtime.retire_terminal_entity_model(&work));
                 }
-                if let Some(pending) = self.pending.take() {
-                    budget.release(pending.owner_permit);
-                }
+                self.pending.take();
                 drop(permit);
                 self.terminal.take();
                 return true;
@@ -191,12 +183,11 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
             .into_parts();
         if next == Next::Idle {
             drop(permit);
-            let pending = state
+            state
                 .publication_owner
                 .pending
                 .take()
-                .expect("the publication retains its owner permit");
-            state.budget.release(pending.owner_permit);
+                .expect("the publication retains its pending dispatch");
             crate::daemon::control::pending::wake_shutdown_waiter(state);
         } else {
             state.publication_owner.pending.as_mut().unwrap().identity = next_identity;
@@ -205,24 +196,21 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
         return state.publication_owner.ready(runtime);
     }
     if state.publication_owner.pending.is_none() {
-        let Some(owner_permit) = state.budget.reserve() else {
+        if !state.budget.admits_work() {
             state.publication_owner.waiting_for_owner = true;
             return false;
-        };
+        }
         let Some(permit) = runtime.host_executor().try_reserve() else {
-            state.budget.release(owner_permit);
             state.publication_owner.waiting_for_host = true;
             return false;
         };
         let Some(waiter_id) = state.waiter_ids.next() else {
             drop(permit);
-            state.budget.release(owner_permit);
             state.publication_owner.faulted = true;
             return false;
         };
         state.publication_owner.pending = Some(Pending {
             identity: HostJobIdentity::first(waiter_id),
-            owner_permit,
         });
         state.publication_owner.permit = Some(permit);
         state.publication_owner.operation = Some(Operation::AdmitPublication(Default::default()));
@@ -403,7 +391,8 @@ mod tests {
             phase(&daemon, &mut state);
             assert_eq!(runtime.test_family_seq("producer.item"), 1);
             assert!(response.try_recv().is_err());
-            assert_eq!(state.budget.outstanding(), 1);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(
                 !state
                     .publication_owner
@@ -426,7 +415,7 @@ mod tests {
                 assert!(state.publication_owner.faulted);
                 assert_eq!(runtime.test_family_seq("producer.item"), 1);
                 assert!(runtime.entity_publish_retirement_pending());
-                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(state.budget.outstanding(), 0);
                 assert!(state.publication_owner.completion.is_some());
                 assert_eq!(runtime.host_executor().outstanding(), 1);
                 assert!(response.try_recv().is_err());
@@ -464,7 +453,7 @@ mod tests {
                     assert_eq!(runtime.test_fanout_sequence(None), expected);
                     assert!(response.try_recv().is_err());
                     assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 1);
-                    assert_eq!(state.budget.outstanding(), 1);
+                    assert_eq!(state.budget.outstanding(), 0);
                 }
             }
             if mode != "replacement" && mode != "exhaustion" {
@@ -547,7 +536,8 @@ mod tests {
                 .contains(&admitted)
         );
         assert_eq!(runtime.test_family_seq("producer.item"), 2);
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         phase(&daemon, &mut state);
         finish(&daemon, &mut state);
         assert_eq!(state.budget.outstanding(), 0);
@@ -594,7 +584,8 @@ mod tests {
             phase(&daemon, &mut state);
             assert!(runtime.entity_publish_retirement_pending());
             assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
-            assert_eq!(state.budget.outstanding(), 1);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(response.try_recv().is_err());
             phase(&daemon, &mut state);
             assert!(response.try_recv().is_err());
@@ -612,7 +603,7 @@ mod tests {
                     runtime.apply_causal_owner_ops();
                     assert!(state.publication_owner.waiting_for_progress);
                     assert!(state.publication_owner.completion.is_some());
-                    assert_eq!(state.budget.outstanding(), 1);
+                    assert_eq!(state.budget.outstanding(), 0);
                     assert!(runtime.host_executor().try_reserve().is_none());
                     assert!(response.try_recv().is_err());
                 });
@@ -630,7 +621,7 @@ mod tests {
                     assert!(!drive(&daemon, &mut state));
                     assert!(state.publication_owner.faulted);
                     assert!(state.publication_owner.completion.is_some());
-                    assert_eq!(state.budget.outstanding(), 1);
+                    assert_eq!(state.budget.outstanding(), 0);
                     assert!(runtime.host_executor().try_reserve().is_none());
                 } else {
                     runtime.apply_causal_owner_ops();
@@ -687,7 +678,8 @@ mod tests {
         drop(response);
         runtime.step_entity_publish();
         assert!(!runtime.entity_model_available());
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(runtime.causal_scopes().identities(scope).unwrap().len(), 1);
         assert!(!state.publication_owner.ready(runtime));
         daemon.stop();
@@ -724,7 +716,8 @@ mod tests {
         assert!(!state.publication_owner.waiting_for_progress);
         assert!(state.publication_owner.work.is_some());
         assert!(state.publication_owner.permit.is_some());
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(runtime.host_executor().outstanding(), 1);
         assert!(!runtime.entity_model_available());
         assert_eq!(bridge.pending_publish_count(), 1);
@@ -749,8 +742,9 @@ mod tests {
         for capacity in ["host", "owner"] {
             let (mut daemon, root) = daemon(capacity);
             let mut state = DaemonControlState::default();
-            state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(1);
-            let owner_permit = (capacity == "owner").then(|| state.budget.reserve().unwrap());
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+            let held = (capacity == "owner")
+                .then(|| crate::daemon::owner_budget::hold_test_obligations(&mut state, 1));
             let mut host_permits = if capacity == "host" {
                 (0..crate::host_executor::HOST_OPERATION_CAPACITY)
                     .map(|_| {
@@ -781,8 +775,8 @@ mod tests {
                 1
             );
             assert!(!state.publication_owner.ready(daemon.runtime().unwrap()));
-            if let Some(permit) = owner_permit {
-                state.budget.release(permit);
+            if let Some(held) = held.as_ref() {
+                crate::daemon::owner_budget::finish_test_obligation(&mut state, held[0]);
             }
             drop(host_permits.pop());
             absorb(&daemon, &mut state);
