@@ -636,6 +636,15 @@ pub(crate) struct HostWorkPermit {
 }
 
 impl HostWorkPermit {
+    /// Test seam: make every disposal through this permit refuse as a full
+    /// queue, the way a saturated disposal queue does.
+    #[cfg(test)]
+    pub(crate) fn with_refusing_disposal(mut self) -> Self {
+        let (blocked_sender, _blocked_receiver) = mpsc::sync_channel(0);
+        self.disposal = blocked_sender;
+        self
+    }
+
     pub(crate) fn disposal_notifier(&self) -> impl FnOnce() + use<> {
         let wake = Arc::clone(&self.pool.wake);
         move || wake.publish_completion()

@@ -355,15 +355,14 @@ mod tests {
             .expect("runtime")
             .host_executor()
             .try_reserve()
-            .expect("reserve a Host slot");
+            .expect("reserve a Host slot")
+            .with_refusing_disposal();
         let mut record_write = RecordWrite {
             write,
             permit: Some(permit),
             next_host_phase: 2,
             done: false,
         };
-        // With the daemon stopped, the disposal channel has no receiver.
-        daemon.stop();
         record_write.dispose(&mut state, WaiterId(1), prepared);
         let Some(HostRecoveryRequired::Submission { failure, .. }) =
             state.host_recovery.remove(&WaiterId(1))
@@ -374,6 +373,7 @@ mod tests {
             &*failure.command,
             HostCommand::Mutation(HostMutationCommand::Commit(_))
         ));
+        daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove restart record test directory");
     }
 }
