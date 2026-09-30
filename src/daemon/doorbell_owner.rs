@@ -260,9 +260,14 @@ impl Plan {
         self.write_cancel = Some(at);
     }
 
-    /// Whether the write in flight is due to be cancelled.
-    pub(crate) fn write_cancel_due(&self, now: Instant) -> bool {
-        self.write_cancel.is_some_and(|at| at <= now)
+    /// Take the write cancel if it is due. It is taken once: the flight then
+    /// holds the wish to cancel, so the deadline is never re-armed in the past.
+    pub(crate) fn take_write_cancel_due(&mut self, now: Instant) -> bool {
+        if self.write_cancel.is_some_and(|at| at <= now) {
+            self.write_cancel = None;
+            return true;
+        }
+        false
     }
 
     fn prune_timers(&mut self, session: &str) {
@@ -303,6 +308,18 @@ impl Plan {
                 }
             }
         }
+        // A write still queued that its phase no longer wants is dropped: an
+        // input edge can end the attempt after the machine queued its write.
+        let id = SessionId(session.to_string());
+        let machine = &self.machine;
+        self.jobs.retain(|job| match job {
+            Job::Write {
+                session: queued,
+                purpose,
+                ..
+            } if queued == session => machine.wants_write(&id, *purpose),
+            _ => true,
+        });
         self.prune_timers(session);
     }
 
@@ -346,9 +363,28 @@ enum Flight {
         session: String,
         purpose: Purpose,
         tracker: CoreOperationTracker,
-        /// The cancel request, once the cancel deadline passed.
+        /// The cancel deadline passed: a cancel is wanted until it is sent.
+        cancel_wanted: bool,
+        /// The cancel request, once sent.
         cancel: Option<CoreTicket<bool>>,
     },
+}
+
+impl DoorbellOwnerState {
+    #[cfg(test)]
+    pub(crate) fn flight_is_none(&self) -> bool {
+        self.flight.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_jobs(&self) -> bool {
+        self.plan.has_jobs()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_ring(&self, session: &str) -> bool {
+        self.plan.machine.holds(&SessionId(session.to_string()))
+    }
 }
 
 impl Flight {
@@ -422,36 +458,44 @@ pub(crate) fn ring(
 /// A session left the lifecycle projection or ended: the doorbell forgets it.
 /// Called after the projection applies changes, for the sessions it tracks.
 pub(crate) fn sync_lifecycle(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    let ended: Vec<String> = state
-        .doorbell
-        .plan
-        .live()
-        .filter(|session| {
-            state
-                .maintenance
-                .projection
-                .rows
-                .get(session.as_str())
-                .is_some_and(|row| row.live_ended || row.lifecycle_class == "ended")
-                || (state.maintenance.projection.baseline_complete
-                    && !state
-                        .maintenance
-                        .projection
-                        .rows
-                        .contains_key(session.as_str()))
-        })
-        .cloned()
-        .collect();
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let ended = sessions_to_forget(
+        state.doorbell.plan.live(),
+        runtime.doorbell_edges().stamped_sessions(),
+        &state.maintenance.projection,
+    );
     if ended.is_empty() {
         return;
     }
     for session in ended {
         state.doorbell.plan.ended(&session);
-        if let Some(runtime) = daemon.runtime() {
-            runtime.doorbell_edges().forget(&session);
-        }
+        runtime.doorbell_edges().forget(&session);
     }
     crate::daemon::owner_loop::mark_doorbell_ready(state);
+}
+
+/// The sessions to forget: those the doorbell tracks and every session with a
+/// stamped input time, when the projection shows them ended or gone. An
+/// unrung session that ends must not keep its stamp.
+fn sessions_to_forget<'a>(
+    live: impl Iterator<Item = &'a String>,
+    stamped: Vec<String>,
+    projection: &crate::session_projection::SessionProjection,
+) -> Vec<String> {
+    live.cloned()
+        .chain(stamped)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|session| {
+            projection
+                .rows
+                .get(session.as_str())
+                .is_some_and(|row| row.live_ended || row.lifecycle_class == "ended")
+                || (projection.baseline_complete && !projection.rows.contains_key(session.as_str()))
+        })
+        .collect()
 }
 
 /// The doorbell's deadline fired: the owner drives it to compare timers.
@@ -583,11 +627,10 @@ fn poll_flight(
                 state.doorbell.flight = Some(Flight::Cursor { session, tracker });
                 Some(Progress::Waiting)
             }
-            CoreTicketPoll::Refused => {
-                state.doorbell.plan.requeue_front(Job::Cursor { session });
-                None
-            }
-            CoreTicketPoll::Lost => {
+            // A refusal for queue room is caught when the read starts, and it
+            // parks there. One that reaches here has no wait to park on, so
+            // the attempt stops and the next edge starts it again.
+            CoreTicketPoll::Refused | CoreTicketPoll::Lost => {
                 state.doorbell.plan.cursor(&session, None, now);
                 None
             }
@@ -611,11 +654,13 @@ fn poll_flight(
             session,
             purpose,
             mut tracker,
+            mut cancel_wanted,
             mut cancel,
         } => match tracker.poll(runtime) {
             CoreTicketPoll::Pending => {
-                if cancel.is_none()
-                    && state.doorbell.plan.write_cancel_due(now)
+                cancel_wanted |= state.doorbell.plan.take_write_cancel_due(now);
+                if cancel_wanted
+                    && cancel.is_none()
                     && let Some(id) = tracker.pending_id()
                     && let Some(waiter_id) = crate::daemon::owner_loop::doorbell_waiter(state)
                 {
@@ -626,6 +671,7 @@ fn poll_flight(
                             session,
                             purpose,
                             tracker,
+                            cancel_wanted,
                             cancel: None,
                         });
                         crate::daemon::owner_loop::park_doorbell(state, seen);
@@ -637,6 +683,7 @@ fn poll_flight(
                     session,
                     purpose,
                     tracker,
+                    cancel_wanted,
                     cancel,
                 });
                 Some(Progress::Waiting)
@@ -664,6 +711,44 @@ fn poll_flight(
             }
         },
     }
+}
+
+/// Test seam: queue a cursor read for `session` exactly as a ready ring would.
+#[cfg(test)]
+pub(crate) fn test_seed_cursor_job(state: &mut DaemonControlState, session: &str) {
+    let facts = Facts {
+        modes_epoch: 0,
+        output_seq: 0,
+        input_seq: 0,
+        composing: false,
+        cursor_visible: true,
+        bracketed_paste: true,
+        kitty_enabled: false,
+        cols: 80,
+    };
+    let plan = &mut state.doorbell.plan;
+    plan.request_ring(session, "hello".to_string());
+    let Some(Job::Edges { text, .. }) = plan.next_job() else {
+        panic!("a ring queues an edges job");
+    };
+    plan.ring_facts(session, text, Some((facts, None)), Instant::now());
+}
+
+/// Test seam: the baseline read is answered, so the probe write is queued.
+#[cfg(test)]
+pub(crate) fn test_seed_probe_write(state: &mut DaemonControlState, session: &str) {
+    test_seed_cursor_job(state, session);
+    let plan = &mut state.doorbell.plan;
+    assert!(matches!(plan.next_job(), Some(Job::Cursor { .. })));
+    plan.cursor(
+        session,
+        Some(Read {
+            row: 10,
+            col: 2,
+            text_before_cursor: "> ".to_string(),
+        }),
+        Instant::now(),
+    );
 }
 
 /// Whether Core's answer to a host write means the bytes reached the PTY.
@@ -718,6 +803,12 @@ fn start_next(
                 SessionId(session.clone()),
                 now_seconds,
             );
+            if let Some(seen) = tracker.refused_wait() {
+                // No completion will be published: park on queue room, and
+                // the read keeps its place.
+                state.doorbell.plan.requeue_front(Job::Cursor { session });
+                return Started::Refused(seen);
+            }
             state.doorbell.flight = Some(Flight::Cursor { session, tracker });
         }
         Job::Write {
@@ -732,6 +823,16 @@ fn start_next(
                 bytes,
                 now_seconds,
             );
+            if let Some(seen) = tracker.refused_wait() {
+                // The bytes moved into the request. The machine treats a
+                // refused write as failed, the next edge starts it again,
+                // and the owner parks on queue room.
+                state
+                    .doorbell
+                    .plan
+                    .write_done(&session, purpose, false, Instant::now());
+                return Started::Refused(seen);
+            }
             state
                 .doorbell
                 .plan
@@ -740,6 +841,7 @@ fn start_next(
                 session,
                 purpose,
                 tracker,
+                cancel_wanted: false,
                 cancel: None,
             });
         }
@@ -993,19 +1095,56 @@ mod tests {
     }
 
     #[test]
-    fn a_write_in_flight_arms_one_cancel_deadline_and_its_end_clears_it() {
+    fn a_write_in_flight_arms_one_cancel_deadline_taken_once_and_its_end_clears_it() {
         let mut plan = Plan::default();
         let now = Instant::now();
-        assert!(!plan.write_cancel_due(now));
+        assert!(!plan.take_write_cancel_due(now));
         plan.arm_write_cancel(now + ECHO_DEADLINE);
         assert_eq!(plan.earliest_timer(), Some(now + ECHO_DEADLINE));
-        assert!(!plan.write_cancel_due(now + ECHO_DEADLINE - Duration::from_millis(1)));
-        assert!(plan.write_cancel_due(now + ECHO_DEADLINE));
-        // A cancelled or refused write completes; the deadline goes with it,
-        // whether or not the session is still tracked.
+        assert!(!plan.take_write_cancel_due(now + ECHO_DEADLINE - Duration::from_millis(1)));
+        assert!(plan.take_write_cancel_due(now + ECHO_DEADLINE));
+        // Taken once: no timer is left in the past for the owner to re-arm.
+        assert_eq!(plan.earliest_timer(), None);
+        assert!(!plan.take_write_cancel_due(now + ECHO_DEADLINE));
+        // A write that ends before its deadline clears it too, whether or
+        // not the session is still tracked.
+        plan.arm_write_cancel(now + ECHO_DEADLINE);
         plan.write_done(A, Purpose::Probe, false, now);
         assert_eq!(plan.earliest_timer(), None);
-        assert!(!plan.write_cancel_due(now + ECHO_DEADLINE));
+    }
+
+    #[test]
+    fn a_human_input_edge_drops_a_probe_write_that_is_queued_and_not_yet_typed() {
+        let now = Instant::now();
+        let mut plan = Plan::default();
+        ring_ready(&mut plan, A, now);
+        pop_cursor(&mut plan, A);
+        plan.cursor(A, Some(read()), now);
+        assert!(plan.has_jobs(), "the baseline queued the probe write");
+        let mut typed = facts();
+        typed.input_seq = 1;
+        plan.facts(A, typed, now);
+        assert_eq!(
+            plan.next_job(),
+            None,
+            "the human typed first: the probe is not typed into the line"
+        );
+    }
+
+    #[test]
+    fn an_ended_session_that_was_never_rung_is_forgotten_by_its_stamp() {
+        let projection = crate::session_projection::SessionProjection {
+            baseline_complete: true,
+            ..Default::default()
+        };
+        let live = vec![A.to_string()];
+        let forget = sessions_to_forget(live.iter(), vec![B.to_string()], &projection);
+        assert_eq!(forget, [A.to_string(), B.to_string()]);
+        let incomplete = crate::session_projection::SessionProjection::default();
+        assert!(
+            sessions_to_forget(live.iter(), vec![B.to_string()], &incomplete).is_empty(),
+            "before a complete baseline a missing row proves nothing"
+        );
     }
 
     #[test]
