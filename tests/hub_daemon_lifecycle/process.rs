@@ -687,6 +687,11 @@ impl PanicSafeSetsidChild {
         let _ = child.wait();
         if pgid > 1 {
             let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            // Reaping the leader does not mean its group is gone: a member
+            // killed a moment ago can still exist. Wait for the exit event.
+            // timer: deadline — the give-up for a member that never dies.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let _ = botster_hub::process_exit::wait_for_process_group_exit(pgid as u32, deadline);
         }
         self.stdout.take();
     }
