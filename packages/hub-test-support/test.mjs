@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.52");
+assert.equal(metadata.package_version, "0.1.53");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 14);
-assert.equal(metadata.conformance_fixture_revision, 53);
+assert.equal(metadata.conformance_fixture_revision, 54);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -175,7 +175,7 @@ assert.equal(metadata.conformance_fixture_revision, 53);
   ].map((match) => match[1]);
   assert.deepEqual(packageSpecPins, [version]);
   assert.match(readme, /protocol version 14/);
-  assert.match(readme, /conformance revision 53/);
+  assert.match(readme, /conformance revision 54/);
   assert.doesNotMatch(readme, /mode_gated_input|ModeGatedInput|SendInput/);
 }
 assert.deepEqual(metadata.ui_contract, {
@@ -390,7 +390,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 53);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 54);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -428,7 +428,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 53);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 54);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -750,7 +750,7 @@ assert.equal(
   true,
 );
 assert.equal(kindIndex(unavailableFrames, "snapshot_history"), -1);
-assert.equal(lateAttachFixture.conformance_fixture_revision, 53);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 54);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });

@@ -56,7 +56,7 @@ mod typescript;
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
 pub const PROTOCOL_VERSION: u16 = 14;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 53;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 54;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
 /// Protocol 10 is a cold cut: the floor equals the current revision.
@@ -169,6 +169,9 @@ pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 pub const FEATURE_ATTACH_OCCUPANCY: &str = "attach_occupancy";
 /// Optional host-control package-event subscriptions. Not a terminal feature.
 pub const FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS: &str = "package_event_subscriptions";
+/// Optional operator request `restart_session` and the `restartable` flag on `/session`
+/// entities. Advertised, never required: a client checks for it before it offers Restart.
+pub const FEATURE_SESSION_RESTART: &str = "session_restart";
 
 /// Authenticated plaintext carried by one complete local WebRTC control delivery.
 ///
@@ -1703,7 +1706,10 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_HUB_SOURCE_UPDATE.to_string());
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 
@@ -1711,7 +1717,10 @@ impl DaemonCompatibilityRequirement {
     #[must_use]
     pub fn for_ready_then_history_attach() -> Self {
         let mut requirement = Self::current();
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 
@@ -1722,7 +1731,10 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_UNIX_TERMINAL_ADAPTER.to_string());
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 
@@ -1733,7 +1745,10 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_WEBRTC_TERMINAL_ADAPTER.to_string());
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 
@@ -1754,7 +1769,10 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_ATTACH_OCCUPANCY.to_string());
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 
@@ -1765,7 +1783,10 @@ impl DaemonCompatibilityRequirement {
         requirement
             .required_features
             .push(FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.to_string());
-        requirement.minimum_conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
+        // The feature shipped by the default floor: an additive revision above it
+        // must not raise this requirement.
+        requirement.minimum_conformance_fixture_revision =
+            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
         requirement
     }
 }
@@ -1887,6 +1908,7 @@ fn current_feature_list() -> Vec<&'static str> {
     features.push(FEATURE_WEBRTC_TERMINAL_ADAPTER);
     features.push(FEATURE_ATTACH_OCCUPANCY);
     features.push(FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS);
+    features.push(FEATURE_SESSION_RESTART);
     features
 }
 
@@ -4689,7 +4711,7 @@ mod tests {
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a source-update client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
-            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            "unsupported conformance fixture revision {}; requires at least {DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION}",
             48
         )));
 
@@ -4730,7 +4752,7 @@ mod tests {
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a ready-then-history client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
-            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            "unsupported conformance fixture revision {}; requires at least {DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION}",
             48
         )));
 
@@ -4766,7 +4788,7 @@ mod tests {
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a unix-adapter client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
-            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            "unsupported conformance fixture revision {}; requires at least {DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION}",
             48
         )));
 
@@ -4807,7 +4829,7 @@ mod tests {
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("a webrtc-adapter client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
-            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            "unsupported conformance fixture revision {}; requires at least {DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION}",
             48
         )));
 
@@ -4899,7 +4921,7 @@ mod tests {
         let error = ensure_compatible(&requirement, &previous_daemon)
             .expect_err("an occupancy client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
-            "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
+            "unsupported conformance fixture revision {}; requires at least {DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION}",
             48
         )));
 
@@ -5406,7 +5428,7 @@ mod tests {
     #[test]
     fn protocol_fourteen_rejects_protocol_thirteen_and_pins_the_conformance_floor() {
         assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 54);
 
         let protocol_thirteen = DaemonCompatibilityRequirement {
             protocol_version: 13,
@@ -8338,7 +8360,7 @@ mod tests {
     #[test]
     fn protocol_fourteen_and_conformance_fifty_three_define_the_cold_cut_boundary() {
         assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 54);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -8396,13 +8418,65 @@ mod tests {
         assert_eq!(stale.schema_version, 1);
     }
 
+    /// A client built at fixture revision 53 (the TUI pinned to Hub 87beb0d3 or
+    /// the Web at b1a5bcd) must still pass Hello against this Hub, which
+    /// advertises `session_restart` at revision 54 without requiring it.
+    #[test]
+    fn a_client_built_at_fixture_53_passes_hello_against_a_revision_54_hub() {
+        assert_eq!(PROTOCOL_VERSION, 14, "the protocol does not bump");
+        let hub = DaemonCompatibility::current();
+        assert_eq!(hub.conformance_fixture_revision, 54);
+        assert!(hub.features.iter().any(|f| f == FEATURE_SESSION_RESTART));
+
+        // Exactly what a client built at 53 sends: the same protocol, floor 53,
+        // and the required feature list of that build (every feature it knew).
+        let built_at_53 = DaemonCompatibilityRequirement {
+            protocol: hub.protocol.clone(),
+            protocol_version: 14,
+            minimum_conformance_fixture_revision: 53,
+            required_features: default_required_feature_list()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..DaemonCompatibilityRequirement::current()
+        };
+        ensure_compatible(&built_at_53, &hub).expect("a client built at 53 passes Hello");
+
+        // The new feature is never in the default requirement, so the same
+        // client does not ask for it, and a client that wants it must name it.
+        assert!(
+            !built_at_53
+                .required_features
+                .iter()
+                .any(|f| f == FEATURE_SESSION_RESTART)
+        );
+        assert!(
+            !DaemonCompatibilityRequirement::current()
+                .required_features
+                .iter()
+                .any(|f| f == FEATURE_SESSION_RESTART)
+        );
+        let mut wants_restart = built_at_53.clone();
+        wants_restart
+            .required_features
+            .push(FEATURE_SESSION_RESTART.to_string());
+        ensure_compatible(&wants_restart, &hub).expect("a client that names it passes");
+        let mut old_hub = hub.clone();
+        old_hub
+            .features
+            .retain(|feature| feature != FEATURE_SESSION_RESTART);
+        ensure_compatible(&built_at_53, &old_hub).expect("a 53 client needs nothing new");
+        ensure_compatible(&wants_restart, &old_hub)
+            .expect_err("a client that needs restart fails closed on a Hub without the feature");
+    }
+
     #[test]
     fn additive_session_type_definition_read_rides_the_conformance_floor() {
         // `ensure_compatible` compares protocol version with exact equality and
-        // conformance revision with a floor. Protocol 14 is a cold cut, so the
-        // default floor equals the current revision.
+        // conformance revision with a floor. Revision 54 is additive
+        // (`session_restart`), so the default floor stays at 53.
         assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 53);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 54);
         assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 53);
         assert_eq!(
             current_feature_list(),
@@ -8424,6 +8498,7 @@ mod tests {
                 FEATURE_WEBRTC_TERMINAL_ADAPTER,
                 FEATURE_ATTACH_OCCUPANCY,
                 FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+                FEATURE_SESSION_RESTART,
             ],
             "the daemon advertises host-plane capabilities only",
         );
