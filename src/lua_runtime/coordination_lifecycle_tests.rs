@@ -110,7 +110,9 @@ fn wait_for_control_message(
         .build()
         .unwrap();
     // timer: deadline — the shared test hang guard; the wake arrives before it.
-    let message = blocking.block_on(tokio::time::timeout(TEST_HANG_GUARD, receiver.recv()));
+    // The timer must be created inside the runtime's context.
+    let message =
+        blocking.block_on(async { tokio::time::timeout(TEST_HANG_GUARD, receiver.recv()).await });
     assert!(matches!(message, Ok(Some(_))), "{what}");
 }
 
