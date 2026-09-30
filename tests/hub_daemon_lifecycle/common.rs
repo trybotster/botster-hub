@@ -575,8 +575,45 @@ pub(crate) fn daemon_test_lock() -> &'static std::sync::RwLock<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| std::sync::RwLock::new(()))
 }
 
+/// How many real-daemon tests run at once. Measured on a 12-core host: 4 passes
+/// every time (3 of 3 runs, 206 s against 418 s serial); 6, 8 and 12 each fail
+/// two or three tests whose time budgets a busier host breaks (route smokes,
+/// idle-route and stalled-socket proofs).
+const DAEMON_TEST_PARALLELISM: usize = 4;
+
+/// A counting permit: the shared guards wait here, so at most
+/// `DAEMON_TEST_PARALLELISM` real daemons run together.
+struct DaemonPermit;
+
+static DAEMON_PERMITS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl DaemonPermit {
+    fn acquire() -> Self {
+        let (running, wake) = &DAEMON_PERMITS;
+        let mut running = running.lock().unwrap_or_else(|error| error.into_inner());
+        while *running >= DAEMON_TEST_PARALLELISM {
+            running = wake
+                .wait(running)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *running += 1;
+        Self
+    }
+}
+
+impl Drop for DaemonPermit {
+    fn drop(&mut self) {
+        let (running, wake) = &DAEMON_PERMITS;
+        *running.lock().unwrap_or_else(|error| error.into_inner()) -= 1;
+        wake.notify_one();
+    }
+}
+
 enum DaemonTestLockGuard {
-    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Shared(
+        #[allow(dead_code)] DaemonPermit,
+        #[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>,
+    ),
     Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
 }
 
@@ -940,11 +977,12 @@ fn daemon_test_guard_with(exclusive: bool) -> DaemonTestGuard {
                         .unwrap_or_else(|error| error.into_inner()),
                 )
             } else {
-                DaemonTestLockGuard::Shared(
-                    daemon_test_lock()
-                        .read()
-                        .unwrap_or_else(|error| error.into_inner()),
-                )
+                // The lock first, the permit second: a waiting exclusive test
+                // never holds a permit, so it cannot starve the readers.
+                let read = daemon_test_lock()
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                DaemonTestLockGuard::Shared(DaemonPermit::acquire(), read)
             };
             check_harness_taint();
             depth.set(1);
