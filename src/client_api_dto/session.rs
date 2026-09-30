@@ -1,5 +1,4 @@
 use botster_core::{SessionId, SessionLifecycleState};
-use botster_core_daemon::GuardedWriteDeliveryState;
 use botster_hub_client::{
     DaemonEvent, DaemonSession, DaemonSessionType, DaemonSessionTypeContextInput,
     DaemonSessionTypeDefinition, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
@@ -205,17 +204,6 @@ pub(crate) fn daemon_event_from_client(event: HubClientEvent) -> DaemonEvent {
             }
             .to_string(),
         },
-    }
-}
-
-pub(crate) fn guarded_write_delivery_state_label(state: GuardedWriteDeliveryState) -> &'static str {
-    match state {
-        GuardedWriteDeliveryState::Accepted => "accepted",
-        GuardedWriteDeliveryState::Deferred => "deferred",
-        GuardedWriteDeliveryState::Rejected => "rejected",
-        GuardedWriteDeliveryState::Written => "written",
-        GuardedWriteDeliveryState::Delivered => "delivered",
-        GuardedWriteDeliveryState::Acknowledged => "acknowledged",
     }
 }
 

@@ -178,7 +178,7 @@ struct Rig {
 impl Rig {
     fn new(terminal: Terminal) -> Self {
         Self {
-            doorbell: Doorbell::new(),
+            doorbell: Doorbell::default(),
             session: SessionId(SESSION.to_string()),
             terminal,
             now: Instant::now(),

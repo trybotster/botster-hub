@@ -4932,7 +4932,7 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
 }
 
 #[test]
-fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
+fn daemon_notify_session_queues_a_ring_over_socket() {
     let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("daemon-notify-session");
     let config = explicit_config(&data_dir);
@@ -4970,26 +4970,8 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
         .coordination
         .and_then(|coordination| coordination.notify)
         .expect("notify response body");
-    assert!(notify.decision.starts_with("Defer"));
-    assert_eq!(notify.states, vec!["accepted", "deferred"]);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed = String::new();
-    while std::time::Instant::now() < deadline {
-        for event in connection.poll_route_events(Duration::from_millis(30)) {
-            if let Some(bytes) = event.output() {
-                observed.push_str(&live_output_utf8(bytes));
-            }
-        }
-        if observed.contains("echo:notify-socket") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
-    assert!(
-        !observed.contains("echo:notify-socket"),
-        "notify session without observed readiness should not reach PTY input path, got {observed:?}"
-    );
+    assert_eq!(notify.decision, "queued");
+    assert_eq!(notify.states, vec!["accepted", "queued"]);
 
     let shutdown_session = connection
         .request(&botster_hub::DaemonRequest::ShutdownSession {

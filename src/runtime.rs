@@ -22,14 +22,13 @@ use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
     CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
-    DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
-    GuardedWriteResult, LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
-    ObserveLifecycleSlice, PendingOperationId, PublishRoutedEnvelopeRequest, ReadCursorRequest,
-    ReadModeFlagsRequest, ReadScreenRequest, RegistrySessionState, RetentionAccounting,
-    RetentionPolicy, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
-    SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
-    SessionLifecyclePage, SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage,
-    SpawnSessionRequest,
+    DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, LifecycleBaselineBudget,
+    ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice, PendingOperationId,
+    PublishRoutedEnvelopeRequest, ReadCursorRequest, ReadModeFlagsRequest, ReadScreenRequest,
+    RegistrySessionState, RetentionAccounting, RetentionPolicy, RoutedEnvelopeDeliveryStateResult,
+    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaselinePage,
+    SessionLifecycleCursor, SessionLifecyclePage, SessionLifecyclePageError,
+    SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::cell::Cell;
@@ -4950,15 +4949,6 @@ impl HubRuntime {
         self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
             daemon.read_snapshot_page(&capture, page)
         })
-    }
-
-    /// Evaluate guarded-write readiness and inject only through the core daemon.
-    pub fn guarded_write(
-        &self,
-        request: GuardedWriteRequest,
-    ) -> CoreTicket<Result<GuardedWriteResult, CoreDaemonError>> {
-        self.core_daemon
-            .submit(move |daemon| daemon.guarded_write(request))
     }
 
     /// Publish one coordination envelope through the CoreDaemon routed-envelope router.
