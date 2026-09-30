@@ -173,7 +173,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
     if state.event_owner.pending.is_some() || !runtime.event_plane_owner_op_ready() {
         return false;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         state.event_owner.waiting_for_owner = true;
         return false;
     }

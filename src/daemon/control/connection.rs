@@ -149,7 +149,7 @@ fn register_webrtc_admission(
                 peer_generation, ..
             } => *peer_generation = generation,
         }
-        if !state.budget.admit_peer(&grant_id) {
+        if !state.admit_peer(&grant_id) {
             let (mux, peer_generation) = match &admission {
                 WebrtcTerminalAdmission::Admitted {
                     mux,
@@ -474,7 +474,7 @@ fn bind_reserved_subscription(
     };
     // The bind leaves a cleanup obligation until the adapter is bound and
     // delivered, or until the exact generation it created is released.
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::OverLimit));
         return false;

@@ -196,7 +196,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
         return state.publication_owner.ready(runtime);
     }
     if state.publication_owner.pending.is_none() {
-        if !state.budget.admits_work() {
+        if !state.admits_work() {
             state.publication_owner.waiting_for_owner = true;
             return false;
         }

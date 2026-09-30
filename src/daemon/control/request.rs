@@ -169,7 +169,7 @@ pub(crate) fn handle_as(
     // admitted: cleanup obligations outlive their connection, so the bound
     // does not end with it.
     let client = grant_id.clone().or_else(|| client_id.clone());
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         return send_control_response(
             reply_tx,
             Ok(attach_bind_operator_error(

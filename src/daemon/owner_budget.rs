@@ -2,12 +2,36 @@
 //! connection that started it.
 //!
 //! An obligation is retained until its Core resources are released. One plain
-//! bound, [`OWNER_BUDGET_CAPACITY`], counts outstanding obligations: at the
-//! bound the owner refuses new admissions with a typed error instead of
-//! letting a reconnect loop pile obligations up while Core is stuck. Nothing
-//! is discarded at the bound. The other admission bounds live where the work
-//! enters: the accept semaphore (connections), `MAX_OUTSTANDING_REQUESTS`
-//! (requests per connection), and `MAX_ATTACH_ROUTES_PER_OWNER` (routes).
+//! threshold, [`OWNER_BUDGET_CAPACITY`], gates admission. The owner admits new
+//! work only while one sum stays below it: pending obligations, plus admitted
+//! WebRTC peers, plus retained requests. Retained requests count because a
+//! `must_finish` request outlives its client and any retained request may
+//! later leave cleanup. At the threshold the owner refuses new work with a
+//! typed error instead of letting a reconnect loop pile work up while Core is
+//! stuck. Nothing is discarded at the threshold. The other admission bounds
+//! live where the work enters: the accept semaphore (connections),
+//! `MAX_OUTSTANDING_REQUESTS` (requests per connection), and
+//! `MAX_ATTACH_ROUTES_PER_OWNER` (routes).
+//!
+//! The threshold is not an exact cap on obligations. Retaining cleanup for a
+//! Core resource that already exists is never refused: refusing it would leak
+//! the resource. Exact capacity would need a reservation at admission, which
+//! is the permit ledger this module no longer has. So the sum can pass the
+//! threshold, by a bounded amount:
+//!
+//! - A finished request leaves at most one obligation (an exact detach after a
+//!   stale attach, or an operation retirement). The request stops counting as
+//!   the obligation starts, so the sum does not grow.
+//! - A WebRTC peer is released before its route cleanup is retained, so the
+//!   cleanup replaces the peer in the sum. A channel bind is admitted through
+//!   the check and adds one obligation.
+//! - A live unix connection is not counted. Its route cleanup at the end adds
+//!   one obligation. The accept semaphore allows at most
+//!   `DAEMON_MAX_CONNECTIONS` (64) live connections.
+//!
+//! The worst case is therefore [`OWNER_BUDGET_CAPACITY`] plus the units that
+//! are admitted but not counted, times the most cleanup one unit adds: 2112 +
+//! 64 x 1. An attach adds one obligation.
 //!
 //! An obligation keeps at most one Core ticket in flight. A refused admission
 //! resubmits on the next owner turn; a lost driver ends the obligation.
@@ -25,9 +49,11 @@ use crate::admission::budgets::DAEMON_MAX_CONNECTIONS;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::{CoreTicket, CoreTicketPoll};
 
-/// The bound on outstanding cleanup obligations. It keeps the value the
-/// retired permit ledger enforced (every connection and every request it may
-/// have in flight), so no new number is introduced.
+/// The admission threshold on obligations, admitted peers and retained
+/// requests together. It keeps the value the retired permit ledger enforced
+/// (every connection and every request it may have in flight), so no new
+/// number is introduced. See the module documentation for the worst-case
+/// overshoot.
 pub(crate) const OWNER_BUDGET_CAPACITY: usize =
     DAEMON_MAX_CONNECTIONS * (MAX_OUTSTANDING_REQUESTS + 1);
 
@@ -175,11 +201,15 @@ impl OwnerBudget {
         self.obligations.len()
     }
 
-    /// Whether the owner may admit new work: false at the obligation bound.
-    /// A refusal is counted; the caller answers with its typed error.
+    /// Whether the owner may admit new work: false once the sum of pending
+    /// obligations, admitted peers and `retained_requests` reaches the
+    /// threshold. A refusal is counted; the caller answers with its typed
+    /// error. Use [`DaemonControlState::admits_work`], which passes the
+    /// retained request count.
     #[must_use]
-    pub(crate) fn admits_work(&mut self) -> bool {
-        if self.obligations.len() >= self.bound {
+    pub(crate) fn admits_work(&mut self, retained_requests: usize) -> bool {
+        let counted = self.obligations.len() + self.admitted_peers.len() + retained_requests;
+        if counted >= self.bound {
             self.counters.refused = self.counters.refused.saturating_add(1);
             return false;
         }
@@ -192,8 +222,8 @@ impl OwnerBudget {
 
     /// Admit a WebRTC peer, held until peer cleanup. `false` means refused.
     #[must_use]
-    pub(crate) fn admit_peer(&mut self, grant_id: &str) -> bool {
-        if !self.admits_work() {
+    pub(crate) fn admit_peer(&mut self, grant_id: &str, retained_requests: usize) -> bool {
+        if !self.admits_work(retained_requests) {
             return false;
         }
         self.admitted_peers.insert(grant_id.to_string());
@@ -272,7 +302,7 @@ pub(crate) fn allocate_and_retain_owner_obligation(
     let waiter_id = state
         .waiter_ids
         .next()
-        .expect("an admitted owner permit must have an available waiter identifier");
+        .expect("a cleanup obligation must have an available waiter identifier");
     retain_owner_obligation(state, waiter_id, label, poll);
 }
 
@@ -426,6 +456,23 @@ pub(crate) fn drive_core_slot<T: Send + 'static>(
 }
 
 /// Fill the obligation bound in a test: hold `count` obligations that never finish.
+impl DaemonControlState {
+    /// Whether the owner may admit new work. The sum counts pending
+    /// obligations, admitted peers, and every retained request, including a
+    /// `must_finish` request kept after its client left.
+    #[must_use]
+    pub(crate) fn admits_work(&mut self) -> bool {
+        self.budget.admits_work(self.pending_requests.len())
+    }
+
+    /// Admit a WebRTC peer under the same sum. `false` means refused.
+    #[must_use]
+    pub(crate) fn admit_peer(&mut self, grant_id: &str) -> bool {
+        self.budget
+            .admit_peer(grant_id, self.pending_requests.len())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn hold_test_obligations(
     state: &mut DaemonControlState,
@@ -466,15 +513,15 @@ mod tests {
     fn work_is_refused_at_the_obligation_bound_and_counted() {
         let mut state = DaemonControlState::default();
         state.budget = OwnerBudget::with_bound(2);
-        assert!(state.budget.admits_work());
+        assert!(state.admits_work());
         let held = hold_test_obligations(&mut state, 2);
         assert_eq!(state.budget.outstanding(), 2);
-        assert!(!state.budget.admits_work());
+        assert!(!state.admits_work());
         assert_eq!(state.budget.counters.refused, 1);
         assert!(!state.budget.take_capacity_notification());
         finish_test_obligation(&mut state, held[0]);
         assert!(state.budget.take_capacity_notification());
-        assert!(state.budget.admits_work());
+        assert!(state.admits_work());
         assert_eq!(state.budget.counters.refused, 1);
     }
 
@@ -483,14 +530,35 @@ mod tests {
         let mut state = DaemonControlState::default();
         state.budget = OwnerBudget::with_bound(1);
         hold_test_obligations(&mut state, 1);
-        assert!(!state.budget.admit_peer("grant"));
+        assert!(!state.admit_peer("grant"));
         assert!(!state.budget.peer_admitted("grant"));
         assert!(!state.budget.release_peer("grant"));
         let mut open = OwnerBudget::with_bound(1);
-        assert!(open.admit_peer("grant"));
+        assert!(open.admit_peer("grant", 0));
         assert!(open.peer_admitted("grant"));
         assert!(open.release_peer("grant"));
         assert!(!open.release_peer("grant"));
+    }
+
+    /// The threshold compares ONE sum of pending obligations, admitted peers
+    /// and retained requests.
+    #[test]
+    fn the_threshold_sums_obligations_peers_and_retained_requests() {
+        let mut state = DaemonControlState::default();
+        state.budget = OwnerBudget::with_bound(4);
+        hold_test_obligations(&mut state, 1);
+        assert!(state.admit_peer("peer"), "1 obligation + 1 peer is below 4");
+        assert!(state.budget.admits_work(1), "1 + 1 + 1 retained is below 4");
+        assert!(
+            !state.budget.admits_work(2),
+            "1 obligation + 1 peer + 2 retained reaches 4"
+        );
+        assert!(
+            !state.budget.admit_peer("other", 2),
+            "a peer is admitted under the same sum"
+        );
+        assert!(!state.budget.peer_admitted("other"));
+        assert_eq!(state.budget.counters.refused, 2);
     }
 
     #[test]

@@ -1276,7 +1276,7 @@ fn run_control_ingress_item(
             admission_permit,
             cleanup_permit,
         } => {
-            if !state.budget.admits_work() {
+            if !state.admits_work() {
                 state.lifecycle_counters.rejected_connections = state
                     .lifecycle_counters
                     .rejected_connections
@@ -4479,7 +4479,7 @@ mod tests {
         let root = unique_package_control_dir("client-cleanup-webrtc-payload");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        assert!(state.budget.admit_peer("cleanup-connection"));
+        assert!(state.admit_peer("cleanup-connection"));
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let router = daemon.runtime().unwrap().package_event_router().clone();
@@ -4663,7 +4663,7 @@ mod tests {
         let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
             .expect("start client cleanup daemon");
         let mut state = DaemonControlState::default();
-        assert!(state.budget.admit_peer("cleanup-connection"));
+        assert!(state.admit_peer("cleanup-connection"));
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let mailbox = state
@@ -5192,7 +5192,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_package_cleanup_recovery_retains_accepted_requests_without_owner_budget() {
+    fn terminal_package_cleanup_recovery_counts_retained_requests_until_they_finish() {
         for family_failure in [false, true] {
             let root = unique_package_control_dir(if family_failure {
                 "family-recovery-owner-admission"
@@ -5218,6 +5218,7 @@ mod tests {
                 .expect("enable package");
             }
             let mut state = DaemonControlState::default();
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
             let first_reply = start_async_control_request(
                 &mut daemon,
                 &mut state,
@@ -5236,9 +5237,14 @@ mod tests {
                 "beta-client",
                 "beta-request",
             );
-            // Requests hold no owner budget: only cleanup obligations count.
+            // Retained requests count toward the threshold; obligations do not
+            // exist yet.
             assert_eq!(state.budget.outstanding(), 0);
             assert_eq!(state.pending_requests.len(), 2);
+            assert!(
+                !state.admits_work(),
+                "two retained requests reach the threshold of 2"
+            );
             if family_failure {
                 daemon
                     .runtime()
@@ -5277,8 +5283,8 @@ mod tests {
             );
             assert_eq!(state.budget.outstanding(), 0);
             assert!(
-                state.budget.admits_work(),
-                "accepted requests hold no owner budget"
+                state.admits_work(),
+                "the finished request no longer counts; only the retained one does"
             );
             drop(first_reply);
             drop(second_reply);
@@ -8003,6 +8009,31 @@ return botster.register({
         reply_rx
     }
 
+    /// Drive owner turns until the request's reply arrives, whatever its kind
+    /// (a refusal is plain; an admitted worker request is encoded).
+    fn drive_request_to_reply(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        mut reply_rx: crate::daemon::control::message::ControlReplyReceiver,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        // timer: deadline — the shared test hang guard bounds a request that
+        // never answers; the reply is the event.
+        let deadline = Instant::now() + TEST_HANG_GUARD;
+        loop {
+            drive_ready_test_turn(daemon, state);
+            match reply_rx.try_recv() {
+                Ok(reply) => return reply.into_parts().0,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("request reply failed: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the request must reach its reply"
+            );
+            thread::yield_now();
+        }
+    }
+
     fn finish_async_plugin_control(
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
@@ -9174,7 +9205,9 @@ return botster.register({ handlers = {} })
             "bound-client",
             "bound-request",
         );
-        let response = receive_test_control_reply(refused).unwrap();
+        // Drive the request to its reply, so that a request that was admitted
+        // instead of refused reaches the assertion below with its own answer.
+        let response = drive_request_to_reply(&mut daemon, &mut state, refused).unwrap();
         assert_eq!(
             response.error.map(|error| error.code),
             Some(crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED.to_string())
@@ -9182,6 +9215,13 @@ return botster.register({ handlers = {} })
         assert_eq!(state.budget.counters.refused, 1);
         assert!(state.pending_requests.is_empty(), "nothing was admitted");
         finish.store(true, Ordering::SeqCst);
+        // A pending obligation is polled again only when it is marked ready,
+        // so ready the one that can now finish.
+        assert!(crate::daemon::owner_budget::mark_obligation_ready(
+            &mut state,
+            waiters[0],
+            crate::daemon::control::pending::READY_INITIAL,
+        ));
         let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 1 {
             drive_ready_test_turn(&mut daemon, &mut state);
@@ -9198,9 +9238,123 @@ return botster.register({ handlers = {} })
             "bound-client",
             "after-request",
         );
-        let response = finish_async_plugin_control(&mut daemon, &mut state, admitted).unwrap();
+        let response = drive_request_to_reply(&mut daemon, &mut state, admitted).unwrap();
         assert_eq!(response.kind, DaemonResponseKind::Status);
         assert_eq!(state.budget.counters.refused, 1);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H20 bound contract: a `must_finish` request outlives its client, so it
+    /// keeps counting toward the threshold after a disconnect.
+    #[test]
+    fn must_finish_requests_kept_after_their_client_left_still_hold_the_threshold() {
+        let root = unique_package_control_dir("must-finish-threshold");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
+        let first = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "gone",
+            "one",
+        );
+        let second = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "gone",
+            "two",
+        );
+        assert_eq!(state.pending_requests.len(), 2);
+        assert_eq!(state.budget.outstanding(), 0, "no obligation exists");
+        drop(first);
+        drop(second);
+        crate::daemon::control::pending::retire_abandoned_requests(&mut daemon, &mut state, "gone");
+        assert_eq!(
+            state.pending_requests.len(),
+            2,
+            "must_finish requests survive their client"
+        );
+        let refused = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "new-client",
+            "three",
+        );
+        let response = drive_request_to_reply(&mut daemon, &mut state, refused).unwrap();
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED.to_string()),
+            "retained work holds the threshold with no obligation outstanding"
+        );
+        assert_eq!(state.budget.counters.refused, 1);
+        assert!(
+            !state.admit_peer("late-peer"),
+            "a peer is refused under the same sum"
+        );
+        assert!(!state.budget.peer_admitted("late-peer"));
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H20 bound contract, review case: with one obligation below the
+    /// threshold, two deferred requests cannot both be admitted. The first is
+    /// counted the moment it is retained, so the second is refused, and the
+    /// obligation the first leaves replaces its count. Requests stand in for
+    /// deferred attaches: the count is kind-agnostic.
+    #[test]
+    fn two_deferred_requests_at_the_threshold_leave_no_more_than_the_threshold() {
+        let root = unique_package_control_dir("two-deferred-threshold");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(3);
+        crate::daemon::owner_budget::hold_test_obligations(&mut state, 2);
+        let first = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "first-client",
+            "first",
+        );
+        let second = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "second-client",
+            "second",
+        );
+        assert_eq!(state.pending_requests.len(), 1, "the first is retained");
+        let refused = drive_request_to_reply(&mut daemon, &mut state, second).unwrap();
+        assert_eq!(
+            refused.error.map(|error| error.code),
+            Some(crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED.to_string()),
+            "the second is refused at 2 obligations + 1 retained request"
+        );
+        // The first ends as a stale attach does: its retained request is
+        // replaced by exactly one exact-detach obligation.
+        let waiter = *state
+            .pending_requests
+            .keys()
+            .next()
+            .expect("retained request");
+        state.pending_requests.remove(&waiter);
+        crate::daemon::control::sessions::retain_exact_detach(
+            &mut state,
+            "first-client".into(),
+            "session".into(),
+            "subscription".into(),
+            botster_core::TerminalSubscriptionGeneration(1),
+        );
+        assert_eq!(
+            state.budget.outstanding(),
+            3,
+            "the threshold is not passed: 2 held obligations + 1 exact detach"
+        );
+        assert!(!state.admits_work());
+        drop(first);
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }

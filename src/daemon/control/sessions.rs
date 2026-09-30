@@ -1837,7 +1837,7 @@ fn handle_attach(
     if reservation == RouteReservation::Full {
         return ControlStep::ready(attach_route_limit_error());
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         release_failed_attach_route(
             &mut state.pending_runtime,
             &owner,

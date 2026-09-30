@@ -100,7 +100,7 @@ fn accept_confirmed_rollback(
         runtime.defer_confirmed_worktree_rollback(prepared);
         return;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         runtime.defer_confirmed_worktree_rollback(prepared);
         state.managed_spawn_waiting_for_owner = true;
         return;
@@ -256,7 +256,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             return;
         }
     };
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_backpressured",
             "the Hub owner has no available operation slot",

@@ -723,7 +723,7 @@ fn begin_plugin_entity_subscription(
         )));
         return false;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         let _ = request.reply_tx.send(Ok(entity_subscription_error(
             crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED,
             &request.subscription_id,
@@ -801,7 +801,7 @@ pub(crate) fn begin_plugin_entity_resync(
     if state.shutdown_waiter.is_some() || state.plugin_entities.has_resync(&entity_type) {
         return;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         return;
     }
     let Some(waiter_id) = state.waiter_ids.next() else {
@@ -859,7 +859,7 @@ pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut Daemon
     {
         return;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         return;
     }
     let Some(waiter_id) = state.waiter_ids.next() else {
