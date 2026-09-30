@@ -24,11 +24,12 @@ use botster_core_daemon::{
     CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
     DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, GuardedWriteRequest,
     GuardedWriteResult, LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
-    ObserveLifecycleSlice, PendingOperationId, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
-    ReadScreenRequest, RegistrySessionState, RetentionAccounting, RetentionPolicy,
-    RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
-    SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecyclePage,
-    SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
+    ObserveLifecycleSlice, PendingOperationId, PublishRoutedEnvelopeRequest, ReadCursorRequest,
+    ReadModeFlagsRequest, ReadScreenRequest, RegistrySessionState, RetentionAccounting,
+    RetentionPolicy, RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport,
+    SessionAdoptionState, SessionLifecycleBaselinePage, SessionLifecycleCursor,
+    SessionLifecyclePage, SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage,
+    SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::cell::Cell;
@@ -4864,6 +4865,25 @@ impl HubRuntime {
         CoreOperationTracker::new(self.core_daemon.begin_for_owner(
             waiter_id,
             CoreOperation::ReadModeFlags(ReadModeFlagsRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            }),
+        ))
+    }
+
+    /// Start a cursor read for the doorbell. Core answers with
+    /// `CoreCompletion::ReadCursor`.
+    pub(crate) fn begin_read_cursor_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::ReadCursor(ReadCursorRequest {
                 request_id,
                 session_id,
                 now_seconds,
