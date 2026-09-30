@@ -214,40 +214,39 @@ pub(crate) fn write_warm_executable(path: &Path, contents: impl AsRef<str>) {
     let _ = waiter.join();
 }
 
-/// A per-process sequence number for test directory names. The clock alone is
-/// not unique: macOS gives microseconds, so two tests that run at once can draw
-/// the same name, and the sweep, which finds a test's processes by the final
-/// component of its directories, would then kill the other test's daemon.
-/// Fixed width, so no sequence number is a prefix of another.
-fn next_test_dir_sequence() -> String {
+/// A unique stamp for a test directory name, as long as the nanosecond clock
+/// reading it replaces. The clock alone is not unique: macOS gives microseconds,
+/// so two tests that run at once can draw the same name, and the sweep, which
+/// finds a test's processes by the final component of its directories, would
+/// then kill the other test's daemon. The microsecond clock and a per-process
+/// sequence number take the place of the nanoseconds (whose last three digits
+/// are always zero there), so a name stays no longer than before: a Unix socket
+/// path has a hard length limit.
+fn unique_test_stamp() -> u128 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!("{:06}", NEXT.fetch_add(1, Ordering::Relaxed))
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_micros();
+    micros * 1000 + u128::from(NEXT.fetch_add(1, Ordering::Relaxed) % 1000)
 }
 
 pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let mixed = nanos ^ (u128::from(std::process::id()) << 48);
+    let mixed = unique_test_stamp() ^ (u128::from(std::process::id()) << 48);
     let path = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("daemon")
         .join(name)
-        .join(format!("{mixed}-{}", next_test_dir_sequence()));
+        .join(mixed.to_string());
     register_test_owned_dir(&path);
     path
 }
 
 pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
     let path = PathBuf::from("/tmp").join(format!(
-        "bh-{name}-{}-{nanos}-{}",
+        "bh-{name}-{}-{}",
         std::process::id(),
-        next_test_dir_sequence()
+        unique_test_stamp()
     ));
     register_test_owned_dir(&path);
     path
