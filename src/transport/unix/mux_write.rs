@@ -1,9 +1,13 @@
-//! Unix framing and mux scheduling for host-control protocol 14.
+//! Control-connection framing for host-control protocol 14.
 //!
-//! Every frame is one length-prefixed container. Control frames are UTF-8
-//! JSON [`ServerFrame`] payloads. Terminal frames are written as two slices,
-//! the stack container header and the shared `TerminalBody`, through one
-//! vectored write; the body is never copied by Hub.
+//! Every frame is one length-prefixed container. The control socket carries
+//! UTF-8 JSON [`ServerFrame`] payloads only: responses, events and entity
+//! frames. [`MuxWriteState`] keeps one frame in flight, resumes it across
+//! partial writes, and alternates fairly between responses and events.
+//!
+//! Terminal frames never pass through here. Each attached route has its own
+//! socket (`route_socket.rs`), so a stalled reader stalls only its route. That
+//! module shares only the inbound reader in this file.
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::mpsc;
