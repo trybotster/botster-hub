@@ -2652,8 +2652,7 @@ mod tests {
     use botster_core::RequestId;
     use botster_hub_client::{
         ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonRequest, DaemonResponse,
-        DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, PROTOCOL, ServerFrame,
-        write_client_frame,
+        DaemonResponseKind, DaemonUnixFrameReader, PROTOCOL, ServerFrame, write_client_frame,
     };
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
@@ -3376,14 +3375,14 @@ mod tests {
                     .read_frame(&mut client)
                     .expect("sibling event must wake the idle Unix writer")
                 {
-                    DaemonUnixMuxFrame::Server(ServerFrame::Event {
+                    ServerFrame::Event {
                         event:
                             botster_hub_client::DaemonEvent::PackageEvent {
                                 subscription_id,
                                 payload,
                                 ..
                             },
-                    }) => {
+                    } => {
                         assert_eq!(subscription_id, "sibling");
                         assert_eq!(payload, serde_json::json!({"serial": serial}));
                     }
@@ -6282,6 +6281,61 @@ mod tests {
             control_rx.try_recv().is_err(),
             "Unix EOF must not enqueue pair-only DaemonRequest::Detach"
         );
+    }
+
+    /// Terminal frames travel on a route's own socket, so one on the control
+    /// socket closes the connection with a malformed-frame protocol error.
+    #[test]
+    fn a_terminal_frame_on_the_control_socket_closes_the_connection() {
+        let (server, mut client) = UnixStream::pair().expect("create daemon socket pair");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection = thread::spawn(move || handle_connection(server, control_tx));
+
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
+
+        let ControlMessage::RegisterUnixAdmission { reply_tx, .. } =
+            receive_test_control_message(&mut control_rx)
+        else {
+            panic!("expected RegisterUnixAdmission after Hello");
+        };
+        reply_tx.send(()).expect("ack unix admission");
+
+        botster_hub_client::write_unix_terminal_frame(&mut client, "route", 1, 0, b"opaque")
+            .expect("write terminal frame on the control socket");
+        // Without a refusal the Hub sees end of stream, so the read below
+        // fails instead of waiting for a close that never comes.
+        client
+            .shutdown(Shutdown::Write)
+            .expect("end the client write side");
+        let ServerFrame::Close { reason } = reader.read_frame(&mut client).expect("read close")
+        else {
+            panic!("expected a close frame");
+        };
+        assert_eq!(
+            reason,
+            botster_hub_client::DaemonCloseReason::ProtocolError {
+                code: botster_hub_client::DaemonProtocolErrorCode::MalformedFrame
+            }
+        );
+        let error = connection
+            .join()
+            .expect("join daemon connection")
+            .expect_err("a terminal frame on the control socket ends the connection");
+        assert!(
+            matches!(
+                error,
+                crate::daemon::error::DaemonTransportError::Protocol("malformed_frame")
+            ),
+            "{error:?}"
+        );
+        while let Ok(message) = control_rx.try_recv() {
+            assert!(
+                !matches!(message, ControlMessage::Request { .. }),
+                "the refused frame must not reach the owner as a request"
+            );
+        }
     }
 
     #[test]
@@ -9947,10 +10001,10 @@ return botster.register({tools = {{
             held_started.elapsed() < Duration::from_millis(500),
             "setup timing: the held window must stay below half of the callback timeout"
         );
-        let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+        let ServerFrame::Response {
             request_id,
             response: listed,
-        }) = frame
+        } = frame
         else {
             panic!("ListPackages must return a socket response");
         };
@@ -9967,10 +10021,10 @@ return botster.register({tools = {{
             .unwrap();
         let mut responses = BTreeMap::new();
         for _ in 0..call_count {
-            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            let ServerFrame::Response {
                 request_id,
                 response,
-            }) = reader.read_frame(&mut client).unwrap()
+            } = reader.read_frame(&mut client).unwrap()
             else {
                 panic!("the daemon must return a correlated callback response");
             };
@@ -10414,10 +10468,10 @@ return botster.register({tools = {{
             .expect("read capacity refusal");
         let mut refusals = std::collections::BTreeMap::new();
         for frame in [first_refusal, second_refusal] {
-            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            let ServerFrame::Response {
                 request_id,
                 response,
-            }) = frame
+            } = frame
             else {
                 panic!("capacity refusal must use a response frame");
             };
@@ -10523,10 +10577,10 @@ return botster.register({tools = {{
         let mut completed = vec![false; botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1];
         completed[core_refused_id] = true;
         for _ in 0..core_capacity {
-            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            let ServerFrame::Response {
                 request_id,
                 response,
-            }) = reader
+            } = reader
                 .read_frame(&mut client)
                 .expect("read admitted plugin response")
             else {

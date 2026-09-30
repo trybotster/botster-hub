@@ -29,9 +29,9 @@ fn write_raw_hello(stream: &mut UnixStream) -> botster_hub_client::DaemonHelloAc
         .read_frame(stream)
         .expect("read raw hello ack")
     {
-        botster_hub_client::DaemonUnixMuxFrame::Server(
-            botster_hub_client::ServerFrame::HelloAck { ack },
-        ) => ack,
+        
+            botster_hub_client::ServerFrame::HelloAck { ack }
+         => ack,
         other => panic!("expected hello ack, got {other:?}"),
     }
 }
@@ -2303,9 +2303,9 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
                     .read_frame(&mut reader)
                     .expect("drain pipelined status response")
                 {
-                    botster_hub_client::DaemonUnixMuxFrame::Server(
-                        botster_hub_client::ServerFrame::Response { .. },
-                    ) => answered += 1,
+                    
+                        botster_hub_client::ServerFrame::Response { .. }
+                     => answered += 1,
                     _ => {}
                 }
             }

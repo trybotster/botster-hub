@@ -554,7 +554,7 @@ pub(crate) mod mux_write_resume_tests {
     use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::UnixConnectionMux;
     use botster_hub_client::{
-        DaemonEvent, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, ServerFrame,
+        DaemonEvent, DaemonResponseKind, DaemonUnixFrameReader, ServerFrame,
         TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, encode_server_frame,
     };
     use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
@@ -709,29 +709,27 @@ pub(crate) mod mux_write_resume_tests {
         )
     }
 
-    pub(crate) fn response_kind(frame: &DaemonUnixMuxFrame) -> Option<DaemonResponseKind> {
+    pub(crate) fn response_kind(frame: &ServerFrame) -> Option<DaemonResponseKind> {
         match frame {
-            DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. }) => {
-                Some(response.kind)
-            }
+            ServerFrame::Response { response, .. } => Some(response.kind),
             _ => None,
         }
     }
 
-    pub(crate) fn is_package_event(frame: &DaemonUnixMuxFrame) -> bool {
+    pub(crate) fn is_package_event(frame: &ServerFrame) -> bool {
         matches!(
             frame,
-            DaemonUnixMuxFrame::Server(ServerFrame::Event {
+            ServerFrame::Event {
                 event: DaemonEvent::PackageEvent { .. }
-            })
+            }
         )
     }
 
-    pub(crate) fn closed_event_session(frame: &DaemonUnixMuxFrame) -> Option<&str> {
+    pub(crate) fn closed_event_session(frame: &ServerFrame) -> Option<&str> {
         match frame {
-            DaemonUnixMuxFrame::Server(ServerFrame::Event {
+            ServerFrame::Event {
                 event: DaemonEvent::TerminalSubscriptionClosed { session_id, .. },
-            }) => Some(session_id.as_str()),
+            } => Some(session_id.as_str()),
             _ => None,
         }
     }
@@ -762,7 +760,7 @@ pub(crate) mod mux_write_resume_tests {
         let frames = parse_written_mux_frames(&writer.written);
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            DaemonUnixMuxFrame::Server(ServerFrame::Event {
+            ServerFrame::Event {
                 event:
                     DaemonEvent::TerminalSubscriptionClosed {
                         session_id,
@@ -770,7 +768,7 @@ pub(crate) mod mux_write_resume_tests {
                         reason,
                         ..
                     },
-            }) => {
+            } => {
                 assert_eq!(session_id, "session");
                 assert_eq!(*generation, 2);
                 assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
@@ -806,7 +804,7 @@ pub(crate) mod mux_write_resume_tests {
         }
     }
 
-    pub(crate) fn parse_written_mux_frames(written: &[u8]) -> Vec<DaemonUnixMuxFrame> {
+    pub(crate) fn parse_written_mux_frames(written: &[u8]) -> Vec<ServerFrame> {
         let mut cursor = std::io::Cursor::new(written);
         let mut reader = DaemonUnixFrameReader::new();
         let mut frames = Vec::new();
@@ -977,9 +975,9 @@ pub(crate) mod mux_write_resume_tests {
         assert_eq!(frames.len(), 2);
         assert!(frames.iter().any(|frame| matches!(
             frame,
-            DaemonUnixMuxFrame::Server(ServerFrame::Entity {
+            ServerFrame::Entity {
                 entity: botster_hub_client::DaemonEntityFrame::Remove { .. }
-            })
+            }
         )));
         assert!(
             frames

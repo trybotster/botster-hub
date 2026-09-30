@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEvent, DaemonRequest,
     DaemonResponse, DaemonTransportError, DaemonTransportResult, DaemonUnixFrameReader,
-    DaemonUnixMuxFrame, DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame,
-    connect_and_hello_with_requirement, write_client_frame, write_unix_terminal_frame,
+    DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame, connect_and_hello_with_requirement,
+    write_client_frame, write_unix_terminal_frame,
 };
 pub(crate) use botster_hub_test_support::unix_route::{
     RouteEvent, RouteOperationIds, UnixRouteClient, bytes_contain, decode_route_event,
@@ -65,17 +65,33 @@ pub(crate) fn terminal_body_output(bytes: &[u8]) -> Option<Vec<u8>> {
 /// How long `read_frame` waits on one route socket before trying the next.
 const ROUTE_READ_SLICE: Duration = Duration::from_millis(2);
 
+/// One frame read from the control socket or a route socket.
+pub(crate) enum RawFrame {
+    Server(ServerFrame),
+    Terminal(DaemonUnixTerminalFrame),
+}
+
 /// One socket and the reader that keeps its partial frame across timeouts.
 struct RawSocket {
     stream: UnixStream,
     frames: DaemonUnixFrameReader,
+    /// A route socket carries terminal frames; the control socket, server frames.
+    route: bool,
 }
 
 impl RawSocket {
-    fn new(stream: UnixStream) -> Self {
+    fn control(stream: UnixStream) -> Self {
         Self {
             stream,
             frames: DaemonUnixFrameReader::new(),
+            route: false,
+        }
+    }
+
+    fn route(stream: UnixStream) -> Self {
+        Self {
+            route: true,
+            ..Self::control(stream)
         }
     }
 
@@ -83,7 +99,7 @@ impl RawSocket {
     fn read_within(
         &mut self,
         timeout: Option<Duration>,
-    ) -> DaemonTransportResult<Option<DaemonUnixMuxFrame>> {
+    ) -> DaemonTransportResult<Option<RawFrame>> {
         // macOS refuses a timeout on a socket the Hub already shut down; such
         // a socket never blocks, so its buffered frames are still readable.
         if let Err(error) = self.stream.set_read_timeout(timeout)
@@ -91,7 +107,16 @@ impl RawSocket {
         {
             return Err(DaemonTransportError::Io(error));
         }
-        match self.frames.read_frame(&mut self.stream) {
+        let read = if self.route {
+            self.frames
+                .read_terminal_frame(&mut self.stream)
+                .map(RawFrame::Terminal)
+        } else {
+            self.frames
+                .read_frame(&mut self.stream)
+                .map(RawFrame::Server)
+        };
+        match read {
             Ok(frame) => Ok(Some(frame)),
             Err(DaemonTransportError::Io(error))
                 if matches!(
@@ -146,7 +171,7 @@ impl RawUnixClient {
 
     pub(crate) fn from_stream(stream: UnixStream) -> Self {
         Self {
-            control: RawSocket::new(stream),
+            control: RawSocket::control(stream),
             route_sockets: BTreeMap::new(),
             read_timeout: Cell::new(None),
             connect_routes: true,
@@ -211,7 +236,7 @@ impl RawUnixClient {
 
     /// Read one frame of any kind from the control socket or any route
     /// socket. A route socket that ended is dropped. A timeout is an error.
-    pub(crate) fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    pub(crate) fn read_frame(&mut self) -> DaemonTransportResult<RawFrame> {
         let deadline = self
             .read_timeout
             .get()
@@ -266,8 +291,8 @@ impl RawUnixClient {
         for (route, socket) in &mut self.route_sockets {
             loop {
                 match socket.read_within(Some(Duration::from_millis(1))) {
-                    Ok(Some(DaemonUnixMuxFrame::Terminal(frame))) => frames.push(frame),
-                    Ok(Some(DaemonUnixMuxFrame::Server(_))) => {
+                    Ok(Some(RawFrame::Terminal(frame))) => frames.push(frame),
+                    Ok(Some(RawFrame::Server(_))) => {
                         panic!("control frame on route socket {route}")
                     }
                     Ok(None) => break,
@@ -293,7 +318,7 @@ impl RawUnixClient {
             {
                 let stream = UnixStream::connect(path).expect("connect route socket");
                 self.route_sockets
-                    .insert(attach.subscription_id.clone(), RawSocket::new(stream));
+                    .insert(attach.subscription_id.clone(), RawSocket::route(stream));
             }
         }
     }
@@ -324,7 +349,7 @@ impl RawUnixClient {
         let request_id = self.write_request(request);
         loop {
             match self.read_frame().expect("read mux") {
-                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                RawFrame::Server(ServerFrame::Response {
                     request_id: answered,
                     response,
                 }) => {
@@ -337,15 +362,15 @@ impl RawUnixClient {
                     self.drain_route_sockets(frames);
                     return response;
                 }
-                DaemonUnixMuxFrame::Terminal(frame) => frames.push(frame),
-                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => events.push(event),
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {
+                RawFrame::Terminal(frame) => frames.push(frame),
+                RawFrame::Server(ServerFrame::Event { event }) => events.push(event),
+                RawFrame::Server(ServerFrame::Entity { entity }) => {
                     self.entity_frames.push(entity);
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                RawFrame::Server(ServerFrame::Close { reason }) => {
                     panic!("hub closed the connection before the response: {reason:?}")
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
+                RawFrame::Server(ServerFrame::HelloAck { .. }) => {
                     panic!("unexpected second hello ack")
                 }
             }
@@ -372,11 +397,11 @@ impl RawUnixClient {
         self.set_read_timeout(Some(timeout));
         loop {
             match self.read_frame() {
-                Ok(DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. })) => {
+                Ok(RawFrame::Terminal(frame)) => frames.push(frame),
+                Ok(RawFrame::Server(ServerFrame::Response { response, .. })) => {
                     panic!("unsolicited mux wait received a control response: {response:?}")
                 }
-                Ok(DaemonUnixMuxFrame::Server(_)) => {}
+                Ok(RawFrame::Server(_)) => {}
                 Err(_) => break,
             }
         }
@@ -393,11 +418,11 @@ impl RawUnixClient {
         self.set_read_timeout(Some(Duration::from_millis(200)));
         while Instant::now() < deadline && !done(frames) {
             match self.read_frame() {
-                Ok(DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
-                Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response { response, .. })) => {
+                Ok(RawFrame::Terminal(frame)) => frames.push(frame),
+                Ok(RawFrame::Server(ServerFrame::Response { response, .. })) => {
                     panic!("unsolicited terminal wait received a control response: {response:?}")
                 }
-                Ok(DaemonUnixMuxFrame::Server(_)) | Err(_) => {}
+                Ok(RawFrame::Server(_)) | Err(_) => {}
             }
         }
         self.set_read_timeout(None);
