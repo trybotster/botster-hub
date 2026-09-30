@@ -328,3 +328,119 @@ fn a_restart_of_a_session_whose_type_is_gone_is_refused_and_can_be_retried() {
     drop(sessions);
     shutdown_cli_daemon(&data_dir, child);
 }
+
+/// A session type whose script writes its caller token into `fifo`, then ends
+/// on its first run and stays alive on later runs, so a test reads each run's
+/// token and can restart the session.
+fn write_token_session_type_package(root: &Path, fifo: &Path, marker: &Path) {
+    fs::create_dir_all(root.join("bin")).expect("create token package root");
+    fs::write(root.join("plugin.lua"), "return botster.register({})\n")
+        .expect("write token package plugin entrypoint");
+    write_warm_executable(
+        &root.join("bin/init.sh"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$BOTSTER_MCP_TOKEN\" > {fifo}\nif [ -e {marker} ]; then exec cat; fi\n: > {marker}\n",
+            fifo = shell_quote(&fifo.display().to_string()),
+            marker = shell_quote(&marker.display().to_string()),
+        ),
+    );
+    let manifest = serde_json::json!({
+        "name": "runtime.token-session-type",
+        "version": "1.0.0",
+        "kind": "plugin",
+        "botster": ">=0.1.0",
+        "source": { "type": "path", "path": "." },
+        "capabilities": [{ "surface": "surfaces" }],
+        "entrypoints": [
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ],
+        "session_types": [{
+            "id": "token-init",
+            "label": "Token agent",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "traits": ["test"],
+            "lifecycle": "task",
+            "command": "bin/init.sh"
+        }]
+    });
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_string_pretty(&manifest).expect("serialize token package manifest"),
+    )
+    .expect("write token package manifest");
+}
+
+/// A restart gives the session a new caller token. The restarted session's new
+/// token proves it over HTTP MCP, and the token of its first run is refused.
+#[test]
+fn a_restart_replaces_the_callers_token_and_the_old_token_is_refused() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("restart-token");
+    let package_root = unique_test_dir("restart-token-package");
+    let fifo_dir = unique_short_test_dir("restart-token-fifo");
+    fs::create_dir_all(&fifo_dir).expect("create token fifo dir");
+    let fifo = fifo_dir.join("token.fifo");
+    make_fifo(&fifo);
+    write_token_session_type_package(&package_root, &fifo, &fifo_dir.join("first-run-done"));
+    let config = explicit_config(&data_dir);
+    let child = start_cli_daemon(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_root.clone(),
+        },
+    )
+    .expect("enable token session type package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    let mut sessions =
+        botster_hub_client::subscribe_entities(&socket_endpoint(&data_dir), "session", "restart-token")
+            .expect("subscribe to sessions");
+
+    let session_id = "restart-token-session";
+    let spawned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::SpawnSessionType {
+            session_type_id: "token-init".to_string(),
+            session_id: session_id.to_string(),
+            request: botster_hub::DaemonSessionTypeRequest::default(),
+        },
+    )
+    .expect("spawn token session type");
+    assert_eq!(spawned.kind, botster_hub::DaemonResponseKind::Spawned, "{spawned:?}");
+    // The first run writes its token, then its script ends.
+    let first = SessionToken(read_fifo_to_end(&fifo).trim().to_string());
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_restartable(frame, session_id)
+    });
+
+    let restarted = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::RestartSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .expect("restart the ended session");
+    assert_eq!(restarted.kind, botster_hub::DaemonResponseKind::Spawned, "{restarted:?}");
+    // The second run writes its own token and stays alive.
+    let second = SessionToken(read_fifo_to_end(&fifo).trim().to_string());
+    wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
+        session_frame_is_current(frame, session_id)
+    });
+    assert_ne!(first.0, second.0, "a restart issues a new secret");
+
+    let whoami = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "whoami", "arguments": {} }
+    })
+    .to_string();
+    assert_eq!(mcp_http_post(&data_dir, Some(&second), &[], &whoami).status, 200);
+    assert_eq!(
+        mcp_http_post(&data_dir, Some(&first), &[], &whoami).status,
+        401,
+        "the token of the previous run must not prove the restarted session"
+    );
+    coordination_shutdown_session(&data_dir, session_id);
+    drop(sessions);
+    shutdown_cli_daemon(&data_dir, child);
+}
