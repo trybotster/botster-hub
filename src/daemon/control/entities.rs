@@ -12,7 +12,7 @@ use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender};
 use crate::daemon::control::reply::{RetainedPluginResult, RetainedPluginResultCharge};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon::owner_budget::{OwnerPermit, RETAINED_OPERATION_DEADLINE};
+use crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::runtime::PluginEntitySnapshotInvocation;
 use crate::subscription::entity::{
@@ -32,19 +32,13 @@ struct PluginEntityIdentity {
 
 struct PendingEntitySubscribe {
     request: EntitySubscribeRequest,
-    permit: OwnerPermit,
 }
 
 enum PendingPluginEntityKind {
     Disposing,
     Subscribe(PendingEntitySubscribe),
-    Resync {
-        entity_type: std::sync::Arc<String>,
-        permit: OwnerPermit,
-    },
-    Fanout {
-        permit: OwnerPermit,
-    },
+    Resync { entity_type: std::sync::Arc<String> },
+    Fanout,
 }
 
 struct PendingPluginEntity {
@@ -62,7 +56,6 @@ struct PendingPluginEntity {
 
 struct TerminalEntity {
     job: crate::host_disposal::Job,
-    permit: OwnerPermit,
     _invocation: Option<RetainedInvocation>,
 }
 
@@ -118,11 +111,7 @@ impl std::fmt::Debug for PluginEntityState {
 }
 
 impl PluginEntityState {
-    pub(crate) fn dispose_terminal(
-        &mut self,
-        runtime: &crate::HubRuntime,
-        budget: &mut crate::daemon::owner_budget::OwnerBudget,
-    ) -> bool {
+    pub(crate) fn dispose_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
         self.pending.retain(|_, entry| {
             if let Some(terminal) = entry.terminal.as_mut() {
                 if let crate::host_disposal::Poll::Disposed(permit) = terminal.job.poll() {
@@ -131,7 +120,6 @@ impl PluginEntityState {
                         .terminal
                         .take()
                         .expect("terminal entity retains its charge");
-                    budget.release(terminal.permit);
                     drop(terminal._invocation);
                     drop(permit);
                     self.by_waiter.remove(&entry.waiter_id);
@@ -145,16 +133,13 @@ impl PluginEntityState {
             else {
                 return true;
             };
-            let (permit, request): (_, Option<Box<dyn Send>>) =
+            let request: Option<Box<dyn Send>> =
                 match std::mem::replace(&mut entry.kind, PendingPluginEntityKind::Disposing) {
                     PendingPluginEntityKind::Subscribe(subscribe) => {
-                        (subscribe.permit, Some(Box::new(subscribe.request)))
+                        Some(Box::new(subscribe.request))
                     }
-                    PendingPluginEntityKind::Resync {
-                        entity_type,
-                        permit,
-                    } => (permit, Some(Box::new(entity_type))),
-                    PendingPluginEntityKind::Fanout { permit } => (permit, None),
+                    PendingPluginEntityKind::Resync { entity_type } => Some(Box::new(entity_type)),
+                    PendingPluginEntityKind::Fanout => None,
                     PendingPluginEntityKind::Disposing => {
                         unreachable!("terminal entity already owns its disposal")
                     }
@@ -177,7 +162,6 @@ impl PluginEntityState {
                     entry.result.take(),
                     std::mem::take(&mut entry.request_id),
                 ))),
-                permit,
                 _invocation: invocation,
             });
             true
@@ -378,7 +362,6 @@ impl PluginEntityState {
     pub(crate) fn test_insert_delivery_work(
         &mut self,
         waiter: crate::owner_identity::WaiterId,
-        permit: OwnerPermit,
         target: std::sync::Arc<crate::plugin_entity::Target>,
         publication: std::sync::Arc<std::sync::atomic::AtomicBool>,
         executor: &mut crate::host_executor::HostExecutor,
@@ -414,7 +397,7 @@ impl PluginEntityState {
                 deadline_key: None,
                 identity: None,
                 invocation: None,
-                kind: PendingPluginEntityKind::Fanout { permit },
+                kind: PendingPluginEntityKind::Fanout,
                 result: None,
                 work,
             },
@@ -740,16 +723,15 @@ fn begin_plugin_entity_subscription(
         )));
         return false;
     }
-    let Some(permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         let _ = request.reply_tx.send(Ok(entity_subscription_error(
             crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED,
             &request.subscription_id,
             "the daemon holds its maximum retained requests and cleanup; retry later",
         )));
         return false;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(permit);
         let _ = request.reply_tx.send(Ok(entity_subscription_error(
             "owner_waiter_id_exhausted",
             &request.subscription_id,
@@ -758,7 +740,6 @@ fn begin_plugin_entity_subscription(
         return false;
     };
     let Some(request_id) = state.plugin_entities.next_request_id() else {
-        state.budget.release(permit);
         let _ = request.reply_tx.send(Ok(entity_subscription_error(
             "plugin_request_id_exhausted",
             &request.subscription_id,
@@ -767,7 +748,6 @@ fn begin_plugin_entity_subscription(
         return false;
     };
     if daemon.runtime().is_none() {
-        state.budget.release(permit);
         let _ = request
             .reply_tx
             .send(Err(DaemonTransportError::DaemonNotRunning));
@@ -790,7 +770,7 @@ fn begin_plugin_entity_subscription(
         waiter_id,
         request_id,
         identity,
-        PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
+        PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request }),
         crate::plugin_entity::ProviderInput::Subscribe(target),
     );
     let now = Instant::now();
@@ -821,19 +801,16 @@ pub(crate) fn begin_plugin_entity_resync(
     if state.shutdown_waiter.is_some() || state.plugin_entities.has_resync(&entity_type) {
         return;
     }
-    let Some(permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(permit);
         return;
     };
     let Some(request_id) = state.plugin_entities.next_request_id() else {
-        state.budget.release(permit);
         return;
     };
     if daemon.runtime().is_none() {
-        state.budget.release(permit);
         return;
     };
     let identity = PluginEntityIdentity {
@@ -848,7 +825,6 @@ pub(crate) fn begin_plugin_entity_resync(
         identity,
         PendingPluginEntityKind::Resync {
             entity_type: std::sync::Arc::clone(&entity_type),
-            permit,
         },
         crate::plugin_entity::ProviderInput::Resync {
             family: entity_type,
@@ -883,15 +859,13 @@ pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut Daemon
     {
         return;
     }
-    let Some(permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(permit);
         return;
     };
     let Some(request_id) = state.plugin_entities.next_request_id() else {
-        state.budget.release(permit);
         return;
     };
     let mut work = worker::EntityWork::new(None);
@@ -905,7 +879,7 @@ pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut Daemon
         deadline_key: None,
         identity: None,
         invocation: None,
-        kind: PendingPluginEntityKind::Fanout { permit },
+        kind: PendingPluginEntityKind::Fanout,
         result: None,
         work,
     });
@@ -962,15 +936,10 @@ pub(crate) fn drive_plugin_entity_ready_item(
                     .wakes
                     .mark(crate::daemon_maintenance::MaintenanceSliceKind::ProviderResync);
             }
-            let permit = match entry.kind {
-                PendingPluginEntityKind::Disposing => {
-                    unreachable!("terminal entities do not resume normal work")
-                }
-                PendingPluginEntityKind::Subscribe(subscribe) => subscribe.permit,
-                PendingPluginEntityKind::Resync { permit, .. }
-                | PendingPluginEntityKind::Fanout { permit } => permit,
-            };
-            state.budget.release(permit);
+            assert!(
+                !matches!(entry.kind, PendingPluginEntityKind::Disposing),
+                "terminal entities do not resume normal work"
+            );
             crate::daemon::control::pending::wake_shutdown_waiter(state);
         }
         step => {
