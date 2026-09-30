@@ -185,7 +185,7 @@ pub(crate) fn native_tool_descriptors() -> Vec<McpToolDescriptor> {
         ),
         McpToolDescriptor::new(
             "notify_session",
-            "Attempt a guarded-write doorbell into one session.",
+            "Ring one session: the hub types the message into it when its input takes free text, and answers queued.",
             json!({
                 "type": "object",
                 "properties": {

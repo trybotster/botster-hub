@@ -1,12 +1,10 @@
 use botster_core::{EnvelopeCursor, EnvelopeDeliveryState, EnvelopeTarget, RoutedEnvelope};
-use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState};
 use botster_hub_client::{
     DaemonCoordination, DaemonEndpointRef, DaemonEnvelope, DaemonEnvelopeAck,
     DaemonEnvelopeDelivery, DaemonEnvelopePublish, DaemonIdentity, DaemonNotify,
     DaemonPluginLifecycle, DaemonPluginLoadFailure, DaemonPluginWorkerCounters,
 };
 
-use crate::client_api_dto::session::guarded_write_delivery_state_label;
 use crate::daemon_projection::package_state_label;
 use crate::{HubClientPluginLifecycle, HubClientPluginWorkerCounters};
 
@@ -71,10 +69,10 @@ pub(crate) fn daemon_coordination_ack(
     }
 }
 
-pub(crate) fn daemon_coordination_notify(
-    decision: GuardedWriteDecision,
-    states: Vec<GuardedWriteDeliveryState>,
-) -> DaemonCoordination {
+/// The answer to a ring: queued for the doorbell, which types it when the
+/// session's input takes free text. The session check and caller proof refuse
+/// with a typed error before this answer exists.
+pub(crate) fn daemon_coordination_ring() -> DaemonCoordination {
     DaemonCoordination {
         identity: None,
         publish: None,
@@ -82,13 +80,9 @@ pub(crate) fn daemon_coordination_notify(
         next_cursor: None,
         ack: None,
         notify: Some(DaemonNotify {
-            decision: format!("{decision:?}"),
-            state_count: states.len(),
-            states: states
-                .into_iter()
-                .map(guarded_write_delivery_state_label)
-                .map(ToString::to_string)
-                .collect(),
+            decision: "queued".to_string(),
+            state_count: 2,
+            states: vec!["accepted".to_string(), "queued".to_string()],
         }),
     }
 }

@@ -614,20 +614,12 @@ impl HubClientApi {
                 )));
             }
             HubClientRequest::NotifySession {
-                session_id,
-                data,
-                readiness,
-                now_seconds,
-                caller,
-                ..
+                session_id, caller, ..
             } => {
-                let request = GuardedWriteRequest {
-                    session_id,
-                    client_id: self.identity.client_id.clone(),
-                    data,
-                    readiness,
-                    now_seconds,
-                };
+                // The ring is typed later, by the doorbell on the owner, when
+                // the session's input takes free text. Core proves the caller
+                // and that the session runs, in one submission; the owner
+                // queues the ring once this answers.
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 let unauthenticated = unauthenticated_error(&request_id, operation);
@@ -636,14 +628,12 @@ impl HubClientApi {
                     operation,
                     runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         prove_caller(daemon, caller.as_ref(), &unauthenticated)?;
-                        daemon
-                            .guarded_write(request)
-                            .map(|result| {
-                                respond(HubClientResponseBody::GuardedWrite(
-                                    HubClientGuardedWrite::from(result),
-                                ))
-                            })
-                            .map_err(&core_error)
+                        require_running_session_targets(
+                            daemon,
+                            &[EnvelopeTarget::Session { session_id }],
+                        )
+                        .map_err(&core_error)?;
+                        Ok(respond(HubClientResponseBody::RingAccepted))
                     }),
                 )));
             }
@@ -1291,11 +1281,8 @@ pub enum HubClientRequest {
     NotifySession {
         request_id: RequestId,
         session_id: SessionId,
-        data: Vec<u8>,
-        readiness: ReadinessEvidence,
-        now_seconds: u64,
         /// The session's bearer token, when a session asks. Core checks it in
-        /// the same submission as the write. `None` is the operator.
+        /// the same submission as the session check. `None` is the operator.
         caller: Option<CallerToken>,
     },
     /// Publish one routed envelope through core.
@@ -1531,6 +1518,8 @@ pub enum HubClientResponseBody {
     Spawned(HubClientSpawned),
     Events(Vec<HubClientEvent>),
     GuardedWrite(HubClientGuardedWrite),
+    /// The caller is proven and the session runs: the owner may queue a ring.
+    RingAccepted,
     RoutedEnvelopePublish(HubClientRoutedEnvelopePublish),
     RoutedEnvelopeDrain(HubClientRoutedEnvelopeDrain),
     RoutedEnvelopeAck(HubClientRoutedEnvelopeAck),
