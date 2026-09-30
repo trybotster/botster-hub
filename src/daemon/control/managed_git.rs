@@ -65,7 +65,6 @@ pub(crate) struct ManagedSpawnOperation {
 }
 
 pub(crate) struct ManagedGitRecoveryRequired {
-    pub(crate) owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) code: String,
     pub(crate) message: String,
     _prepared: PreparedManagedWorktree,
@@ -73,23 +72,14 @@ pub(crate) struct ManagedGitRecoveryRequired {
 }
 
 impl ManagedGitRecoveryRequired {
-    pub(super) fn into_terminal(
-        self,
-        identity: HostJobIdentity,
-    ) -> (
-        Option<crate::daemon::owner_budget::OwnerPermit>,
-        crate::host_disposal::Parts,
-    ) {
-        (
-            self.owner_permit,
-            crate::host_disposal::Parts {
-                storage: None,
-                identity,
-                permit: self._permit,
-                model: None,
-                payload: Box::new((self._prepared, self.code, self.message)),
-            },
-        )
+    pub(super) fn into_terminal(self, identity: HostJobIdentity) -> crate::host_disposal::Parts {
+        crate::host_disposal::Parts {
+            storage: None,
+            identity,
+            permit: self._permit,
+            model: None,
+            payload: Box::new((self._prepared, self.code, self.message)),
+        }
     }
 }
 
@@ -110,19 +100,17 @@ fn accept_confirmed_rollback(
         runtime.defer_confirmed_worktree_rollback(prepared);
         return;
     }
-    let Some(owner_permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         runtime.defer_confirmed_worktree_rollback(prepared);
         state.managed_spawn_waiting_for_owner = true;
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
         state.managed_spawn_waiting_for_owner = true;
         return;
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
-        state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
         state.managed_spawn_waiting_for_host = true;
         return;
@@ -145,7 +133,6 @@ fn accept_confirmed_rollback(
         host_permit,
     ) {
         runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
-        state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
         if matches!(failure.error, HostSubmitError::Full) {
             state.managed_spawn_waiting_for_host = true;
@@ -184,7 +171,6 @@ fn accept_confirmed_rollback(
             grant_id: None,
             client: None,
             core_retirement: None,
-            permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
             continuation: crate::daemon::control::pending::ControlContinuation::ManagedSpawn(
@@ -270,15 +256,14 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             return;
         }
     };
-    let Some(owner_permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_backpressured",
             "the Hub owner has no available operation slot",
         )));
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
-        state.budget.release(owner_permit);
         let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_unavailable",
             "the Hub owner exhausted unique operation identifiers",
@@ -286,7 +271,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         return;
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
-        state.budget.release(owner_permit);
         let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_backpressured",
             "the bounded host executor has no available operation slot",
@@ -305,7 +289,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         )
         .is_err()
     {
-        state.budget.release(owner_permit);
         let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_unavailable",
             "the host executor stopped before it accepted managed Git work",
@@ -348,7 +331,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             grant_id: None,
             client: None,
             core_retirement: None,
-            permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
             continuation: crate::daemon::control::pending::ControlContinuation::ManagedSpawn(
@@ -1348,7 +1330,6 @@ impl ManagedSpawnOperation {
         state.host_recovery.insert(
             self.waiter_id,
             HostRecoveryRequired::ManagedGit(ManagedGitRecoveryRequired {
-                owner_permit: None,
                 code: error.code,
                 message: error.message,
                 _prepared: prepared,

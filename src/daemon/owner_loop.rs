@@ -1276,7 +1276,7 @@ fn run_control_ingress_item(
             admission_permit,
             cleanup_permit,
         } => {
-            let Some(connection_permit) = state.budget.reserve_connection() else {
+            if !state.budget.admits_work() {
                 state.lifecycle_counters.rejected_connections = state
                     .lifecycle_counters
                     .rejected_connections
@@ -1290,7 +1290,7 @@ fn run_control_ingress_item(
                 drop(admission_permit);
                 drop(cleanup_permit);
                 return Some(false);
-            };
+            }
             state.lifecycle_counters.accepted_connections = state
                 .lifecycle_counters
                 .accepted_connections
@@ -1312,7 +1312,6 @@ fn run_control_ingress_item(
                     entity_capacity_wake,
                     cleanup_permit,
                     shutdown,
-                    connection_permit,
                 )
                 .await
                 {
@@ -1632,15 +1631,9 @@ fn dispose_terminal_host_slice(
     }
     crate::daemon::control::pending::dispose_terminal_requests(runtime, state);
     crate::daemon::control::host_work::dispose_terminal_recovery(runtime, state);
-    let publication = state
-        .publication_owner
-        .dispose_terminal(runtime, &mut state.budget);
-    let events = state
-        .event_owner
-        .dispose_terminal(runtime, &mut state.budget);
-    let entities = state
-        .plugin_entities
-        .dispose_terminal(runtime, &mut state.budget);
+    let publication = state.publication_owner.dispose_terminal(runtime);
+    let events = state.event_owner.dispose_terminal(runtime);
+    let entities = state.plugin_entities.dispose_terminal(runtime);
     let resync = state.package_entity_resync_scan.dispose_terminal(runtime);
     let clients = state
         .client_events
@@ -2133,7 +2126,6 @@ pub(crate) struct UncertainPublicationCell {
     write: Option<UncertainPublicationPayload>,
     rollback: Option<crate::host_mutations::RollbackDescriptor>,
     cleanup: Option<UncertainPublicationCleanup>,
-    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
 }
 
 enum UncertainPublicationPayload {
@@ -2289,7 +2281,6 @@ impl DaemonControlState {
             write: None,
             rollback: None,
             cleanup: None,
-            owner_permit: None,
         }));
         true
     }
@@ -2373,47 +2364,6 @@ impl DaemonControlState {
             }
         };
         Some((kind, cell.rollback.is_some()))
-    }
-
-    /// The control reply can retire only after its unresolved Owner permit moves here.
-    pub(crate) fn retain_uncertain_owner_permit(
-        &mut self,
-        waiter_id: crate::owner_identity::WaiterId,
-        permit: crate::daemon::owner_budget::OwnerPermit,
-    ) {
-        let cell = self
-            .uncertain_publication
-            .as_mut()
-            .expect("uncertain publication has a pre-admitted cell");
-        assert_eq!(
-            cell.waiter_id, waiter_id,
-            "publication cell belongs to the writer"
-        );
-        assert!(
-            cell.write.is_some(),
-            "Owner permit follows uncertain publication"
-        );
-        assert!(cell.owner_permit.is_none(), "Owner permit moves only once");
-        cell.owner_permit = Some(permit);
-    }
-
-    pub(crate) fn has_uncertain_publication(
-        &self,
-        waiter_id: crate::owner_identity::WaiterId,
-    ) -> bool {
-        self.uncertain_publication
-            .as_ref()
-            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.write.is_some())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_uncertain_owner_permit(
-        &self,
-        waiter_id: crate::owner_identity::WaiterId,
-    ) -> bool {
-        self.uncertain_publication
-            .as_ref()
-            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.owner_permit.is_some())
     }
 }
 
@@ -2926,7 +2876,7 @@ mod tests {
                                         disposed: disposed_tx.clone(),
                                     };
                                     let lifecycle = lifecycle.clone();
-                                    entry.retire = Some(Box::new(move |_, _, _, _| {
+                                    entry.retire = Some(Box::new(move |_, _, _| {
                                         drop((probe, lifecycle));
                                     }));
                                 }
@@ -2985,10 +2935,8 @@ mod tests {
                                     state.pending_requests.len(),
                                     crate::host_executor::HOST_OPERATION_CAPACITY
                                 );
-                                assert_eq!(
-                                    state.budget.outstanding(),
-                                    crate::host_executor::HOST_OPERATION_CAPACITY
-                                );
+                                // Requests hold no budget: only cleanup obligations count.
+                                assert_eq!(state.budget.outstanding(), 0);
                                 inspect_tx
                                     .send(Box::new(
                                         daemon
@@ -3203,11 +3151,7 @@ mod tests {
         }
     }
 
-    fn close_cleanup_test_connection(
-        daemon: &mut HubDaemon,
-        state: &mut DaemonControlState,
-        permit: crate::daemon::owner_budget::OwnerPermit,
-    ) {
+    fn close_cleanup_test_connection(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
         use crate::transport::unix::connection::{
             ConnectionCleanupGuard, ConnectionTerminalReason,
         };
@@ -3217,7 +3161,6 @@ mod tests {
             cleanup_permit,
             "cleanup-connection".into(),
             ConnectionTerminalReason::NormalClose,
-            permit,
         ));
         let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().unwrap() else {
             panic!("the connection guard must send its cleanup message");
@@ -3234,7 +3177,6 @@ mod tests {
         let root = unique_package_control_dir("client-event-unix-sibling-wake");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve_connection().unwrap();
         let router = daemon.runtime().unwrap().package_event_router().clone();
         router
             .try_register_contracts(vec![EmittedContract {
@@ -3272,7 +3214,6 @@ mod tests {
                 EntitySubscriptionCapacityWake::default(),
                 cleanup_permit,
                 shutdown_rx,
-                permit,
             ))
         });
         write_client_frame(
@@ -3863,7 +3804,6 @@ mod tests {
         let root = unique_package_control_dir("client-event-waiter-exhaustion");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve_connection().unwrap();
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         state.pending_runtime.admission.host_compatibility.insert(
@@ -3900,10 +3840,10 @@ mod tests {
                 .test_client_holder_count("exhausted-connection"),
             0
         );
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         assert!(state.owner_ready.is_empty());
-        state.budget.release(permit);
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3914,11 +3854,10 @@ mod tests {
             let root = unique_package_control_dir("client-event-ready-exhaustion");
             let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
             let mut state = DaemonControlState::default();
-            let permit = state.budget.reserve_connection().unwrap();
             admit_cleanup_test_subscription(&daemon, &mut state);
             settle_cleanup_test_owner(&mut daemon, &mut state);
             if completed {
-                close_cleanup_test_connection(&mut daemon, &mut state, permit);
+                close_cleanup_test_connection(&mut daemon, &mut state);
                 let item = state.owner_ready.pop_next().unwrap();
                 let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
                 assert!(!dispatch_owner_ready_item(
@@ -3950,7 +3889,7 @@ mod tests {
             } else {
                 state.owner_ready =
                     crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
-                close_cleanup_test_connection(&mut daemon, &mut state, permit);
+                close_cleanup_test_connection(&mut daemon, &mut state);
                 assert!(state.client_events.test_recovery("cleanup-connection"));
                 assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
                 assert_eq!(
@@ -3978,7 +3917,6 @@ mod tests {
         let root = unique_package_control_dir("client-event-unsubscribe-after-unload");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve_connection().unwrap();
         admit_cleanup_test_subscription(&daemon, &mut state);
         state.pending_runtime.admission.host_compatibility.insert(
             "cleanup-connection".into(),
@@ -4034,7 +3972,7 @@ mod tests {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(state.owner_ready.is_empty());
         }
-        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        close_cleanup_test_connection(&mut daemon, &mut state);
         let deadline = Instant::now() + TEST_HANG_GUARD;
         while state.budget.outstanding() != 0 {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
@@ -4053,7 +3991,6 @@ mod tests {
             let root = unique_package_control_dir("client-event-reservation-rollback");
             let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
             let mut state = DaemonControlState::default();
-            let permit = state.budget.reserve_connection().unwrap();
             admit_cleanup_test_subscription(&daemon, &mut state);
             settle_cleanup_test_owner(&mut daemon, &mut state);
             state.pending_runtime.admission.host_compatibility.insert(
@@ -4129,7 +4066,8 @@ mod tests {
             );
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             assert!(state.client_events.has_capacity_waiters());
-            assert_eq!(state.budget.outstanding(), 1);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), 0);
             for _ in 0..3 {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(state.owner_ready.is_empty());
@@ -4155,7 +4093,7 @@ mod tests {
                         .forget_label(&reservation.label, 7)
                 );
             }
-            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            close_cleanup_test_connection(&mut daemon, &mut state);
             let deadline = Instant::now() + TEST_HANG_GUARD;
             while state.budget.outstanding() != 0 {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
@@ -4172,10 +4110,9 @@ mod tests {
         let root = unique_package_control_dir("client-event-global-drain-exhaustion");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve_connection().unwrap();
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
-        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        close_cleanup_test_connection(&mut daemon, &mut state);
         let item = state.owner_ready.pop_next().unwrap();
         let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         assert!(!dispatch_owner_ready_item(
@@ -4235,7 +4172,6 @@ mod tests {
             let root = unique_package_control_dir(&format!("client-cleanup-fault-{fault}"));
             let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
             let mut state = DaemonControlState::default();
-            let permit = state.budget.reserve_connection().unwrap();
             admit_cleanup_test_subscription(&daemon, &mut state);
             settle_cleanup_test_owner(&mut daemon, &mut state);
             let router = daemon.runtime().unwrap().package_event_router().clone();
@@ -4272,7 +4208,7 @@ mod tests {
                 "panic" => connection.test_panic_cleanup(),
                 _ => unreachable!(),
             }
-            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            close_cleanup_test_connection(&mut daemon, &mut state);
             let deadline = Instant::now() + TEST_HANG_GUARD;
             while !state.client_events.test_recovery("cleanup-connection") {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
@@ -4310,7 +4246,6 @@ mod tests {
         let root = unique_package_control_dir("client-cleanup-stopped-before-admission");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve_connection().unwrap();
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let mailbox = state
@@ -4328,7 +4263,7 @@ mod tests {
             )
             .unwrap();
         daemon.runtime_mut().unwrap().test_stop_host_submissions();
-        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        close_cleanup_test_connection(&mut daemon, &mut state);
         let deadline = Instant::now() + TEST_HANG_GUARD;
         while !state.client_events.has_capacity_waiters() {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
@@ -4370,7 +4305,6 @@ mod tests {
             let root = unique_package_control_dir(&format!("client-cleanup-slot-churn-{poison}"));
             let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
             let mut state = DaemonControlState::default();
-            let permit = state.budget.reserve_connection().unwrap();
             admit_cleanup_test_subscription(&daemon, &mut state);
             settle_cleanup_test_owner(&mut daemon, &mut state);
             state.pending_runtime.admission.host_compatibility.insert(
@@ -4466,7 +4400,7 @@ mod tests {
                     router.test_with_inner_held(|| panic!("poison full-slot cleanup"))
                 }));
             }
-            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            close_cleanup_test_connection(&mut daemon, &mut state);
             assert_eq!(state.budget.outstanding(), 1);
             drop(permits.pop());
             let deadline = Instant::now() + TEST_HANG_GUARD;
@@ -4513,7 +4447,7 @@ mod tests {
         let root = unique_package_control_dir("client-cleanup-webrtc-payload");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
-        assert!(state.budget.reserve_peer("cleanup-connection"));
+        assert!(state.budget.admit_peer("cleanup-connection"));
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let router = daemon.runtime().unwrap().package_event_router().clone();
@@ -4629,10 +4563,9 @@ mod tests {
                 unique_package_control_dir(&format!("client-cleanup-forged-completion-{mismatch}"));
             let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
             let mut state = DaemonControlState::default();
-            let permit = state.budget.reserve_connection().unwrap();
             admit_cleanup_test_subscription(&daemon, &mut state);
             settle_cleanup_test_owner(&mut daemon, &mut state);
-            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            close_cleanup_test_connection(&mut daemon, &mut state);
             // Dispatch the admitted child without consuming its completion.
             let item = state
                 .owner_ready
@@ -4698,7 +4631,7 @@ mod tests {
         let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
             .expect("start client cleanup daemon");
         let mut state = DaemonControlState::default();
-        assert!(state.budget.reserve_peer("cleanup-connection"));
+        assert!(state.budget.admit_peer("cleanup-connection"));
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let mailbox = state
@@ -4764,8 +4697,7 @@ mod tests {
             );
             thread::yield_now();
         }
-        let permit = state.budget.take_peer_permit("cleanup-connection").unwrap();
-        state.budget.release(permit);
+        assert!(state.budget.release_peer("cleanup-connection"));
         daemon.stop();
         std::fs::remove_dir_all(root).expect("remove client cleanup test directory");
     }
@@ -4780,10 +4712,6 @@ mod tests {
         let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
             .expect("start client cleanup daemon");
         let mut state = DaemonControlState::default();
-        let connection_permit = state
-            .budget
-            .reserve_connection()
-            .expect("connection permit");
         admit_cleanup_test_subscription(&daemon, &mut state);
         settle_cleanup_test_owner(&mut daemon, &mut state);
         let mut host_permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
@@ -4802,7 +4730,6 @@ mod tests {
             cleanup_permit,
             "cleanup-connection".into(),
             ConnectionTerminalReason::NormalClose,
-            connection_permit,
         ));
         let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().unwrap() else {
             panic!("the connection guard must send its cleanup message");
@@ -5149,7 +5076,8 @@ mod tests {
                     assert!(state.pending_requests.contains_key(&waiter));
                     assert!(state.family_cleanup_waiters.contains_key(&waiter));
                     assert!(state.host_recovery.is_empty());
-                    assert_eq!(state.budget.outstanding(), 1);
+                    // Requests hold no owner budget: only cleanup obligations count.
+                    assert_eq!(state.budget.outstanding(), 0);
                     assert!(
                         daemon
                             .runtime()
@@ -5171,7 +5099,6 @@ mod tests {
             if stale {
                 let Some(
                     crate::daemon::control::host_work::HostRecoveryRequired::PackageFamilyWork {
-                        owner_permit: Some(_),
                         _work,
                         ..
                     },
@@ -5181,7 +5108,7 @@ mod tests {
                 };
                 assert!(_work.test_retained_release());
                 assert!(scopes.is_live(scope));
-                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(state.budget.outstanding(), 0);
                 assert!(
                     daemon
                         .runtime()
@@ -5233,7 +5160,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_package_cleanup_recovery_keeps_owner_admission_for_accepted_requests() {
+    fn terminal_package_cleanup_recovery_retains_accepted_requests_without_owner_budget() {
         for family_failure in [false, true] {
             let root = unique_package_control_dir(if family_failure {
                 "family-recovery-owner-admission"
@@ -5259,7 +5186,6 @@ mod tests {
                 .expect("enable package");
             }
             let mut state = DaemonControlState::default();
-            state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(2);
             let first_reply = start_async_control_request(
                 &mut daemon,
                 &mut state,
@@ -5278,7 +5204,8 @@ mod tests {
                 "beta-client",
                 "beta-request",
             );
-            assert_eq!(state.budget.outstanding(), 2);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), 0);
             assert_eq!(state.pending_requests.len(), 2);
             if family_failure {
                 daemon
@@ -5303,12 +5230,11 @@ mod tests {
             }
             assert!(state.host_recovery.values().any(|recovery| if family_failure {
             matches!(recovery, crate::daemon::control::host_work::HostRecoveryRequired::PackageFamilies {
-                owner_permit: Some(_), ..
+                ..
             })
         } else { matches!(
             recovery,
             crate::daemon::control::host_work::HostRecoveryRequired::PackageEvents {
-                owner_permit: Some(_),
                 ..
             }
         ) }));
@@ -5317,10 +5243,10 @@ mod tests {
                 1,
                 "the other accepted mutation retains its document wait"
             );
-            assert_eq!(state.budget.outstanding(), 2);
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(
-                state.budget.reserve().is_none(),
-                "terminal recovery must not free accepted Owner capacity"
+                state.budget.admits_work(),
+                "accepted requests hold no owner budget"
             );
             drop(first_reply);
             drop(second_reply);
@@ -5331,7 +5257,7 @@ mod tests {
                     client,
                 );
             }
-            assert_eq!(state.budget.outstanding(), 2);
+            assert_eq!(state.budget.outstanding(), 0);
             assert_eq!(state.host_recovery.len(), 1);
             assert_eq!(state.pending_requests.len(), 1);
             let expected_code = if family_failure {
@@ -5350,7 +5276,7 @@ mod tests {
                 .expect("new package work must fail before Host admission");
                 assert_eq!(response.error.expect("recovery error").code, expected_code);
                 assert_eq!(state.host_recovery.len(), 1);
-                assert_eq!(state.budget.outstanding(), 2);
+                assert_eq!(state.budget.outstanding(), 0);
             }
             for request in [DaemonRequest::Status, DaemonRequest::DaemonShutdown] {
                 assert!(
@@ -5493,8 +5419,9 @@ mod tests {
             let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
                 .expect("start queued event cleanup daemon");
             let mut state = DaemonControlState::default();
-            state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(1);
-            let mut owner_permit = (capacity == "owner").then(|| state.budget.reserve().unwrap());
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+            let held = (capacity == "owner")
+                .then(|| crate::daemon::owner_budget::hold_test_obligations(&mut state, 1));
             let mut host_permits = if capacity == "host" {
                 (0..crate::host_executor::HOST_OPERATION_CAPACITY)
                     .map(|_| {
@@ -5529,14 +5456,14 @@ mod tests {
 
             let router = daemon.runtime().unwrap().package_event_router().clone();
             router.test_with_inner_held(|| {
-                if let Some(permit) = owner_permit.take() {
-                    state.budget.release(permit);
+                if let Some(held) = held.as_ref() {
+                    crate::daemon::owner_budget::finish_test_obligation(&mut state, held[0]);
                 }
                 drop(host_permits.pop());
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(!daemon.runtime().unwrap().event_plane_owner_op_ready());
                 assert!(daemon.runtime().unwrap().event_plane_owner_ops_pending());
-                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(state.budget.outstanding(), 0);
                 for _ in 0..3 {
                     assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                     assert!(
@@ -5565,7 +5492,6 @@ mod tests {
         use crate::daemon::control::pending::{OwnerRequestCompletion, PendingControlRequest};
         let waiter_id = crate::owner_identity::WaiterId(id);
         let (reply_tx, _reply) = crate::daemon::control::message::control_reply_channel();
-        let permit = state.budget.reserve().unwrap();
         state.pending_requests.insert(
             waiter_id,
             PendingControlRequest {
@@ -5580,7 +5506,6 @@ mod tests {
                 grant_id: None,
                 client: None,
                 core_retirement: None,
-                permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
                 continuation: crate::daemon::control::pending::ControlContinuation::callback(
@@ -5677,7 +5602,8 @@ mod tests {
         assert!(state.pending_requests.contains_key(&WaiterId(10)));
         assert!(state.family_cleanup_waiters.contains_key(&WaiterId(10)));
         assert!(state.pending_requests[&WaiterId(10)].ready_key.is_none());
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(
             state.causal_wake_after,
             Some(WaiterId(10)),
@@ -7451,7 +7377,8 @@ return botster.register({
                     ));
                     assert_eq!(daemon.runtime().unwrap().causal_operation_count(), 1);
                     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
-                    assert_eq!(state.budget.outstanding(), 1);
+                    // Requests hold no owner budget: only cleanup obligations count.
+                    assert_eq!(state.budget.outstanding(), 0);
                     daemon.runtime().unwrap().apply_causal_owner_ops();
                     assert!(
                         !scopes.is_live(scope),
@@ -7596,7 +7523,7 @@ return botster.register({
                     );
                 }
                 assert!(state.plugin_entities.has_waiter(waiter));
-                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(state.budget.outstanding(), 0);
                 assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
                 assert_eq!(state.plugin_result_budget.retained_bytes(), retained_bytes);
                 assert_eq!(metadata.used(), retained_metadata);
@@ -7752,10 +7679,8 @@ return botster.register({ handlers = {{
         assert!(crate::lua_runtime::wait_for_test_plugin_invocation_gate(
             Duration::ZERO
         ));
-        assert_eq!(
-            state.budget.outstanding(),
-            crate::host_executor::HOST_OPERATION_CAPACITY
-        );
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         assert!(metadata.used() > baseline);
         let mut available = Vec::new();
@@ -7768,18 +7693,29 @@ return botster.register({ handlers = {{
         );
         drop(available);
         crate::lua_runtime::release_test_plugin_invocation_gate();
-        while state.budget.outstanding() != 0
+        let mut answered = Vec::new();
+        while !replies.is_empty()
             || daemon.runtime().unwrap().package_entity_work_pending()
+            || daemon.runtime().unwrap().host_executor().outstanding() != 0
         {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            // Requests hold no owner budget, so the work has finished when
+            // every reply has arrived.
+            replies.retain_mut(|reply| match reply.try_recv() {
+                Ok(response) => {
+                    answered.push(response);
+                    false
+                }
+                Err(_) => true,
+            });
             assert!(
                 Instant::now() < deadline,
                 "providers must publish and finish through the owner dispatcher"
             );
             thread::yield_now();
         }
-        for reply in replies {
-            assert!(receive_test_control_reply(reply).unwrap().error.is_none());
+        for response in answered {
+            assert!(response.into_parts().0.unwrap().error.is_none());
         }
         for mut frame in frames {
             assert!(frame.try_recv().is_ok());
@@ -8017,6 +7953,7 @@ return botster.register({ handlers = {{
         loop {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             if bridge.pending_publish_count() == 0
+                && bridge.retained_counts() == (0, 0)
                 && state.budget.outstanding() == 0
                 && !daemon
                     .runtime()
@@ -8640,7 +8577,8 @@ return botster.register({
             crate::host_executor::HOST_OPERATION_CAPACITY
         );
         assert!(state.plugin_entities.causal_waiters.contains(&waiter));
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert!(
             reply.try_recv().is_err(),
             "the refusal waits for lease retirement admission"
@@ -9228,6 +9166,7 @@ return botster.register({ handlers = {} })
                     && !runtime.entity_publish_retirement_pending()
                     && state.maintenance.event_in_flight.is_empty()
                     && state.maintenance.pending_retirements.is_empty()
+                    && runtime.entity_publish_bridge().retained_counts() == (0, 0)
                     && state.budget.outstanding() == 0
             },
             |daemon, state| {
@@ -9293,6 +9232,77 @@ return botster.register({ handlers = {} })
                 .take(MaintenanceSliceKind::PackageEventDelivery),
             "no owner turn ran, so the marked work is still pending"
         );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H20: at the bound on outstanding cleanup obligations, a new request is
+    /// refused with the typed error before any work is admitted, and the
+    /// refusal ends when an obligation finishes.
+    #[test]
+    fn a_request_at_the_obligation_bound_is_refused_typed_and_admitted_after_one_retires() {
+        assert_eq!(crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY, 2112);
+        let root = unique_package_control_dir("obligation-bound-refusal");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
+        let finish = Arc::new(AtomicBool::new(false));
+        let waiters = [
+            crate::owner_identity::WaiterId(9_000_001),
+            crate::owner_identity::WaiterId(9_000_002),
+        ];
+        for (index, waiter) in waiters.into_iter().enumerate() {
+            let finish = Arc::clone(&finish);
+            crate::daemon::owner_budget::retain_owner_obligation(
+                &mut state,
+                waiter,
+                "bound-test",
+                move |_, _, _| {
+                    // The first obligation finishes on the flag; the second
+                    // stays outstanding.
+                    if index == 0 && finish.load(Ordering::SeqCst) {
+                        crate::daemon::owner_budget::ObligationPoll::Done
+                    } else {
+                        crate::daemon::owner_budget::ObligationPoll::Pending
+                    }
+                },
+            );
+        }
+        assert_eq!(state.budget.outstanding(), 2);
+        let refused = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "bound-client",
+            "bound-request",
+        );
+        let response = receive_test_control_reply(refused).unwrap();
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED.to_string())
+        );
+        assert_eq!(state.budget.counters.refused, 1);
+        assert!(state.pending_requests.is_empty(), "nothing was admitted");
+        finish.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + TEST_HANG_GUARD;
+        while state.budget.outstanding() != 1 {
+            drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < deadline,
+                "a finished obligation returns its capacity"
+            );
+            thread::yield_now();
+        }
+        let admitted = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::Status,
+            "bound-client",
+            "after-request",
+        );
+        let response = finish_async_plugin_control(&mut daemon, &mut state, admitted).unwrap();
+        assert_eq!(response.kind, DaemonResponseKind::Status);
+        assert_eq!(state.budget.counters.refused, 1);
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -10029,7 +10039,8 @@ return botster.register({tools = {{
             1,
             "the blocked plugin row must remain"
         );
-        assert_eq!(state.budget.outstanding(), 1);
+        // Requests hold no owner budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         assert!(
             status_started.elapsed() < Duration::from_secs(2),
             "unrelated owner control exceeded the safety deadline"
@@ -10572,7 +10583,8 @@ return botster.register({tools = {{
                 .next()
                 .expect("same owner row");
             assert_eq!(state.pending_requests.len(), 1);
-            assert_eq!(state.budget.outstanding(), 1);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(state.plugin_result_budget.retained_bytes() > 0);
             let mut reply_rx = Some(reply_rx);
             match retirement {
@@ -10597,7 +10609,7 @@ return botster.register({tools = {{
                 _ => unreachable!(),
             }
             assert!(state.pending_requests.contains_key(&waiter_id));
-            assert_eq!(state.budget.outstanding(), 1);
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(state.plugin_result_budget.retained_bytes() > 0);
             drop(host_permits.pop());
             if retirement.is_none() {
@@ -10981,7 +10993,8 @@ return botster.register({tools = {{
                 );
             }
             assert!(crate::daemon::control::entities::plugin_entity_cleanup_pending(&state));
-            assert_eq!(state.budget.outstanding(), baseline + 2);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), baseline);
             assert!(matches!(
                 shutdown_reply.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -11077,7 +11090,8 @@ return botster.register({tools = {{
                     grant_id: None,
                 },
             );
-            assert_eq!(state.budget.outstanding(), baseline + 1);
+            // Requests hold no owner budget: only cleanup obligations count.
+            assert_eq!(state.budget.outstanding(), baseline);
             let deadline = Instant::now() + TEST_HANG_GUARD;
             while !crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO)
                 || daemon.runtime().unwrap().host_executor().outstanding() != 0
@@ -11113,7 +11127,7 @@ return botster.register({tools = {{
                 );
             }
 
-            assert_eq!(state.budget.outstanding(), baseline + 1);
+            assert_eq!(state.budget.outstanding(), baseline);
             assert!(state.deadlines.is_empty());
             assert!(
                 crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO),

@@ -674,7 +674,6 @@ pub(crate) fn submit_delivery(
         state.host_recovery.insert(
             identity.waiter_id,
             super::host_work::HostRecoveryRequired::Submission {
-                owner_permit: None,
                 failure,
                 package_restore: None,
                 managed_worktree: None,
@@ -751,7 +750,6 @@ mod tests {
         }
 
         let waiter_id = crate::owner_identity::WaiterId(1);
-        let owner_permit = state.budget.reserve().expect("reserve owner row");
         let (reply_tx, reply_rx) = control_reply_channel();
         let mut entry = PendingControlRequest {
             waiter_id,
@@ -765,7 +763,6 @@ mod tests {
             grant_id: None,
             client: None,
             core_retirement: None,
-            permit: Some(owner_permit),
             must_finish: false,
             past_deadline: false,
             continuation: super::super::pending::ControlContinuation::Status(Box::new(
@@ -1245,7 +1242,6 @@ mod tests {
         if let Some(blocker) = blocker.as_mut() {
             assert!(matches!(blocker.poll(), CoreTicketPoll::Ready(())));
         }
-        state.budget.release(entry.permit.take().unwrap());
         drop(entry);
         drop(reply);
         daemon.stop();
@@ -1846,11 +1842,8 @@ mod tests {
         if refuse_delivery {
             assert_eq!(state.host_recovery.len(), 1);
             let waiter = *state.host_recovery.keys().next().unwrap();
-            let super::super::host_work::HostRecoveryRequired::Submission {
-                owner_permit,
-                failure,
-                ..
-            } = state.host_recovery.remove(&waiter).unwrap()
+            let super::super::host_work::HostRecoveryRequired::Submission { failure, .. } =
+                state.host_recovery.remove(&waiter).unwrap()
             else {
                 panic!("delivery fault retains its submission");
             };
@@ -1872,9 +1865,6 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
-            state
-                .budget
-                .release(owner_permit.expect("fault retains its Owner permit"));
         }
         // The finished shutdown sends no second reply, and the fetch's late
         // completion finds nothing parked.

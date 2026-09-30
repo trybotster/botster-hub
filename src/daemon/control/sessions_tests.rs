@@ -63,7 +63,6 @@ fn insert_phase_test_row(
     continuation: crate::daemon::control::pending::ControlContinuation,
 ) {
     use crate::daemon::control::pending::{OwnerRequestCompletion, PendingControlRequest};
-    let permit = state.budget.reserve().unwrap();
     state.pending_requests.insert(
         waiter_id,
         PendingControlRequest {
@@ -78,7 +77,6 @@ fn insert_phase_test_row(
             grant_id: None,
             client: None,
             core_retirement: None,
-            permit: Some(permit),
             must_finish: true,
             past_deadline: false,
             continuation,
@@ -111,10 +109,9 @@ fn run_phase_test_ready(daemon: &mut HubDaemon, state: &mut DaemonControlState) 
         daemon,
         state,
         item,
-        &mut |_, state, mut entry, _| {
+        &mut |_, _, entry, _| {
             finished = true;
             drop(entry.continuation);
-            state.budget.release(entry.permit.take().unwrap());
             false
         },
     );
@@ -1650,7 +1647,6 @@ fn plugin_spawn_capacity_refuses_before_a_new_owner_row() {
         .get(&first_waiter)
         .expect("capacity refusal must keep the first owner row");
     assert!(first_row.must_finish);
-    assert!(first_row.permit.is_some());
     let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
         &first_row.continuation
     else {
@@ -1958,7 +1954,6 @@ fn plugin_unconfirmed_spawn_keeps_its_owner_row_across_the_next_spawn() {
             .get(&first_waiter)
             .expect("owner turns retain the first row without a new wake");
         assert!(entry.must_finish);
-        assert!(entry.permit.is_some());
         let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
             &entry.continuation
         else {
@@ -1991,7 +1986,6 @@ fn plugin_unconfirmed_spawn_keeps_its_owner_row_across_the_next_spawn() {
         .get(&first_waiter)
         .expect("the second spawn must not retire the first owner row");
     assert!(first_row.must_finish);
-    assert!(first_row.permit.is_some());
     let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
         &first_row.continuation
     else {
@@ -3201,10 +3195,8 @@ fn created_worktree_cleanup_retries_release_on_a_live_session() {
 #[test]
 fn accept_confirmed_rollback_waits_for_owner_capacity() {
     let (mut daemon, mut state, root) = spawn_fixture("s2-capacity-wait");
-    let mut held = Vec::new();
-    while let Some(permit) = state.budget.reserve() {
-        held.push(permit);
-    }
+    state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+    let held = crate::daemon::owner_budget::hold_test_obligations(&mut state, 1);
     let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
         target_id: "t1".into(),
         repository_root: root.clone(),
@@ -3245,7 +3237,7 @@ fn accept_confirmed_rollback_waits_for_owner_capacity() {
         1,
         "accept_one must stay bounded while owner capacity is exhausted"
     );
-    state.budget.release(held.pop().expect("held permit"));
+    crate::daemon::owner_budget::finish_test_obligation(&mut state, held[0]);
     publish_completion_wakes(&daemon, &mut state);
     drive_ready_test_turn(&mut daemon, &mut state);
     assert!(
@@ -3253,9 +3245,6 @@ fn accept_confirmed_rollback_waits_for_owner_capacity() {
         "budget release must wake the waiting rollback"
     );
     assert!(!state.managed_spawn_waiting_for_owner);
-    for permit in held {
-        state.budget.release(permit);
-    }
     daemon.stop();
     let _ = std::fs::remove_dir_all(root);
 }

@@ -54,7 +54,7 @@ pub(crate) fn control_step(
                 }
             }
         },
-        move |daemon, state, waiter_id, permit| {
+        move |daemon, _, waiter_id| {
             // An abandoned subscribe retires its provisional slot, as a refusal would.
             if let Some(pending) = abandoned.lock().expect("owner-only resume slot").take() {
                 pending.abandon();
@@ -62,7 +62,6 @@ pub(crate) fn control_step(
             if let Some(runtime) = daemon.runtime() {
                 runtime.retire_owner_core_waiter(waiter_id);
             }
-            state.budget.release(permit);
         },
     )
 }

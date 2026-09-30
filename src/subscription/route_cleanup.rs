@@ -11,7 +11,7 @@
 use botster_core::{ClientId, SessionId, SubscriptionId, TerminalSubscriptionGeneration};
 use botster_core_daemon::{CaptureOwner, CoreDaemon, DetachTerminalSubscriptionResult};
 
-use crate::daemon::owner_budget::{CoreWorkPoll, ObligationPoll, OwnerPermit, drive_core_slot};
+use crate::daemon::owner_budget::{CoreWorkPoll, ObligationPoll, drive_core_slot};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::CoreTicket;
 use crate::subscription::attach_routes::{
@@ -233,7 +233,6 @@ pub(crate) fn apply_cleanup_reports(
 /// refusal, and calls `on_done` once with the totals.
 pub(crate) fn retain_route_cleanup(
     state: &mut DaemonControlState,
-    permit: OwnerPermit,
     label: &'static str,
     capture_owner: Option<CaptureOwner>,
     event_connection: Option<String>,
@@ -248,7 +247,6 @@ pub(crate) fn retain_route_cleanup(
     let mut page: Vec<CleanupCandidate> = Vec::new();
     crate::daemon::owner_budget::allocate_and_retain_owner_obligation(
         state,
-        permit,
         label,
         move |daemon, state, waiter_id| {
             if slot.is_none() {

@@ -684,10 +684,7 @@ mod tests {
         crate::HubDaemon::start(config).unwrap()
     }
 
-    fn retained_fanout(
-        runtime: &crate::HubRuntime,
-        state: &mut crate::daemon::owner_loop::DaemonControlState,
-    ) -> (super::super::PendingPluginEntity, u64) {
+    fn retained_fanout(runtime: &crate::HubRuntime) -> (super::super::PendingPluginEntity, u64) {
         use crate::package_event_router::LeaseIdentity;
         let family = "producer.item";
         runtime.test_store_family_payload(PackageEntityMutation::Upsert {
@@ -735,21 +732,19 @@ mod tests {
                 invocation: None,
                 result: None,
                 work,
-                kind: super::super::PendingPluginEntityKind::Fanout {
-                    permit: state.budget.reserve().unwrap(),
-                },
+                kind: super::super::PendingPluginEntityKind::Fanout,
             },
             scope,
         )
     }
 
     #[test]
-    fn reclaimed_fanout_keeps_its_lease_and_permits_until_causal_table_application() {
+    fn reclaimed_fanout_keeps_its_lease_and_slot_until_causal_table_application() {
         use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
         let daemon = causal_daemon();
         let runtime = daemon.runtime().unwrap();
         let mut state = crate::daemon::owner_loop::DaemonControlState::default();
-        let (mut entry, scope) = retained_fanout(runtime, &mut state);
+        let (mut entry, scope) = retained_fanout(runtime);
         for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
             assert!(matches!(
                 runtime.admit_causal_op(CausalOp::Release {
@@ -775,7 +770,8 @@ mod tests {
                 .model_waiters
                 .contains(&entry.waiter_id)
         );
-        assert_eq!(state.budget.outstanding(), 1);
+        // A retained fanout holds its Host slot and lease, not owner budget.
+        assert_eq!(state.budget.outstanding(), 0);
         assert_reserved_slots(&runtime.host_executor(), 1);
         assert!(runtime.causal_scopes().is_live(scope));
         while runtime.causal_operation_count() > 0 {
@@ -815,19 +811,18 @@ mod tests {
         );
         assert_reserved_slots(runtime.host_executor(), 0);
         assert!(!runtime.causal_scopes().is_live(scope));
-        let super::super::PendingPluginEntityKind::Fanout { permit } = entry.kind else {
+        let super::super::PendingPluginEntityKind::Fanout = entry.kind else {
             unreachable!()
         };
-        state.budget.release(permit);
         assert_eq!(state.budget.outstanding(), 0);
     }
 
     #[test]
-    fn causal_fault_keeps_reclaimed_fanout_and_permits_after_cancellation() {
+    fn causal_fault_keeps_reclaimed_fanout_and_slot_after_cancellation() {
         let daemon = causal_daemon();
         let runtime = daemon.runtime().unwrap();
         let mut state = crate::daemon::owner_loop::DaemonControlState::default();
-        let (mut entry, _scope) = retained_fanout(runtime, &mut state);
+        let (mut entry, _scope) = retained_fanout(runtime);
         let table = runtime.causal_scopes();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             table.test_with_inner_held(|| panic!("inject causal table fault"));
@@ -855,7 +850,7 @@ mod tests {
                 entry.work.model_operation,
                 Some(crate::runtime::entity_model::Operation::FinishFanout { .. })
             ));
-            assert_eq!(state.budget.outstanding(), 1);
+            assert_eq!(state.budget.outstanding(), 0);
             assert_reserved_slots(&runtime.host_executor(), 1);
         }
     }

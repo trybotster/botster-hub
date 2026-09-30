@@ -16,7 +16,6 @@ use crate::HubDaemon;
 use crate::daemon::control::message::ControlReplySender;
 use crate::daemon::control::reply::ControlReply;
 use crate::daemon::error::DaemonTransportResult;
-use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::{DeadlineKey, ReadyClass, ReadyKey, ReadyReasons};
 use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
@@ -206,7 +205,7 @@ impl ControlContinuation {
 }
 
 /// The terminal driver calls this only after it seals normal control ingress.
-/// Each request keeps its Owner permit until Host reports disposal.
+/// Each request stays until Host reports disposal.
 pub(crate) fn dispose_terminal_requests(
     runtime: &crate::HubRuntime,
     state: &mut DaemonControlState,
@@ -234,9 +233,6 @@ pub(crate) fn dispose_terminal_requests(
                     return true;
                 }
                 drop(entry.core_retirement.take());
-                if let Some(permit) = entry.permit.take() {
-                    state.budget.release(permit);
-                }
                 return false;
             }
         }
@@ -304,22 +300,19 @@ pub(crate) fn dispose_terminal_requests(
             ControlContinuation::callback(|_, _| ControlPoll::Pending),
         ));
         drop(entry.core_retirement.take());
-        if let Some(permit) = entry.permit.take() {
-            state.budget.release(permit);
-        }
         false
     });
 }
 
-/// Retirement for a request that owns deferred work. The hook receives the
-/// entry permit. It must cancel, release, or transfer the work to another
-/// bounded owner such as the plugin worker's executor and completion pools.
+/// Retirement for a request that owns deferred work. The hook must cancel,
+/// release, or transfer the work to another bounded owner such as the plugin
+/// worker's executor and completion pools.
 pub(crate) type RetireHook =
-    Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit) + Send>;
+    Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId) + Send>;
 
 /// A deferred request: its continuation, and how to retire it when its
 /// client leaves or its deadline passes. Without a hook, retirement drops
-/// the continuation (a pure read) and releases the permit.
+/// the continuation (a pure read).
 pub(crate) struct PendingStep {
     pub(crate) continuation: ControlContinuation,
     pub(crate) retire: Option<RetireHook>,
@@ -388,9 +381,7 @@ impl ControlStep {
         continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
         + Send
         + 'static,
-        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
-        + Send
-        + 'static,
+        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId) + Send + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
             continuation: crate::daemon::control::pending::ControlContinuation::callback(
@@ -410,8 +401,7 @@ impl From<DaemonTransportResult<DaemonResponse>> for ControlStep {
 
 /// One request the owner accepted and is still waiting to answer.
 ///
-/// The entry owns one budget permit for its whole life. `client` names the
-/// connection or grant that sent it, so cleanup can retire abandoned reads
+/// `client` names the connection or grant that sent it, so cleanup can retire abandoned reads
 /// promptly; a request that must finish (it has Core side effects, or it
 /// owns cleanup) keeps running after its client left.
 pub(crate) struct PendingControlRequest {
@@ -426,7 +416,6 @@ pub(crate) struct PendingControlRequest {
     pub(crate) grant_id: Option<String>,
     pub(crate) client: Option<String>,
     pub(crate) core_retirement: Option<crate::data_plane::driver::CoreWaiterRetirement>,
-    pub(crate) permit: Option<OwnerPermit>,
     pub(crate) must_finish: bool,
     pub(crate) past_deadline: bool,
     pub(crate) continuation: ControlContinuation,
@@ -727,17 +716,15 @@ fn retire(
         .blocked_session_type_roots
         .retain(|_, waiter_id| *waiter_id != entry.waiter_id);
     drop(entry.core_retirement.take());
-    match (entry.permit.take(), entry.retire.take()) {
-        // The request owns Core work: the hook keeps the permit in an
-        // obligation that cancels or releases it.
-        (Some(permit), Some(hook)) => hook(daemon, state, entry.waiter_id, permit),
-        (Some(permit), None) => {
+    match entry.retire.take() {
+        // The request owns Core work: the hook moves it into an obligation
+        // that cancels or releases it.
+        Some(hook) => hook(daemon, state, entry.waiter_id),
+        None => {
             if let Some(runtime) = daemon.runtime() {
                 runtime.retire_owner_core_waiter(entry.waiter_id);
             }
-            state.budget.release(permit);
         }
-        (None, _) => {}
     }
     state.budget.counters.retired_abandoned =
         state.budget.counters.retired_abandoned.saturating_add(1);
@@ -839,13 +826,6 @@ pub(crate) fn poll_ready_request_item(
         state.current_waiter_id = Some(waiter_id);
         let poll = entry.continuation.poll(daemon, state);
         state.current_waiter_id = None;
-        if state.has_uncertain_publication(waiter_id) {
-            let permit = entry
-                .permit
-                .take()
-                .expect("uncertain publication retains its original Owner permit");
-            state.retain_uncertain_owner_permit(waiter_id, permit);
-        }
         let reply = match poll {
             ControlPoll::FinishedInternal => {
                 debug_assert!(entry.retire.is_none());
@@ -853,12 +833,8 @@ pub(crate) fn poll_ready_request_item(
                 state.deadlines.retire(waiter_id);
                 state.host_completions.remove(&waiter_id);
                 let retirement = entry.core_retirement.take();
-                let permit = entry.permit.take();
                 drop(entry);
                 drop(retirement);
-                if let Some(permit) = permit {
-                    state.budget.release(permit);
-                }
                 wake_shutdown_waiter(state);
                 return false;
             }
@@ -1122,7 +1098,6 @@ mod tests {
         );
 
         let mut state = DaemonControlState::default();
-        let permit = state.budget.reserve().unwrap();
         let (completed_tx, completed_rx) = mpsc::channel();
         let ControlStep::Pending(step) = ControlStep::pending_spawn(move |daemon, _| {
             assert!(
@@ -1154,7 +1129,6 @@ mod tests {
                 grant_id: None,
                 client: None,
                 core_retirement: None,
-                permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
                 continuation: step.continuation,
@@ -1315,7 +1289,7 @@ mod tests {
                 entered: entered_tx.clone(),
                 gate: gate.0.clone(),
             };
-            entry.retire = Some(Box::new(move |_, _, _, _| drop(probe)));
+            entry.retire = Some(Box::new(move |_, _, _| drop(probe)));
             assert!(matches!(entry.continuation, ControlContinuation::Status(_)));
         }
         drop(disposed_tx);
@@ -1325,10 +1299,8 @@ mod tests {
             crate::host_executor::HOST_OPERATION_CAPACITY
         );
         assert!(runtime.host_executor().try_reserve().is_none());
-        assert_eq!(
-            state.budget.outstanding(),
-            crate::host_executor::HOST_OPERATION_CAPACITY
-        );
+        // Requests hold no budget: only cleanup obligations count.
+        assert_eq!(state.budget.outstanding(), 0);
         dispose_terminal_requests(runtime, &mut state);
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -1338,10 +1310,7 @@ mod tests {
             state.pending_requests.len(),
             crate::host_executor::HOST_OPERATION_CAPACITY
         );
-        assert_eq!(
-            state.budget.outstanding(),
-            crate::host_executor::HOST_OPERATION_CAPACITY
-        );
+        assert_eq!(state.budget.outstanding(), 0);
         assert_eq!(
             runtime.host_executor().outstanding(),
             crate::host_executor::HOST_OPERATION_CAPACITY
@@ -1352,7 +1321,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !state.pending_requests.is_empty() || runtime.host_executor().prepared_bytes() != 0 {
             dispose_terminal_requests(runtime, &mut state);
-            assert_eq!(state.budget.outstanding(), state.pending_requests.len());
+            assert_eq!(state.budget.outstanding(), 0);
             assert!(
                 Instant::now() < deadline,
                 "all original Host slots must dispose"
@@ -1413,7 +1382,6 @@ mod tests {
         });
         let mut state = DaemonControlState::default();
         let waiter_id = WaiterId(1);
-        let permit = state.budget.reserve().expect("reserve owner permit");
         let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
         let now = Instant::now();
         let arm = state
@@ -1434,7 +1402,6 @@ mod tests {
                 grant_id: None,
                 client: None,
                 core_retirement: None,
-                permit: Some(permit),
                 must_finish,
                 past_deadline: false,
                 continuation: crate::daemon::control::pending::ControlContinuation::callback(
@@ -1483,11 +1450,8 @@ mod tests {
             &mut daemon,
             &mut state,
             item,
-            &mut |_, state, mut entry, _| {
+            &mut |_, _, _entry, _| {
                 finished += 1;
-                state
-                    .budget
-                    .release(entry.permit.take().expect("release owner permit once"));
                 false
             },
         ));
@@ -1531,7 +1495,6 @@ mod tests {
         let mut state = DaemonControlState::default();
         let host_waiter = WaiterId(1);
         let parked_waiter = WaiterId(2);
-        let permit = state.budget.reserve().expect("reserve owner permit");
         let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
         let now = Instant::now();
         state.document_waiters.insert(parked_waiter);
@@ -1549,7 +1512,6 @@ mod tests {
                 grant_id: None,
                 client: None,
                 core_retirement: None,
-                permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
                 continuation: crate::daemon::control::pending::ControlContinuation::callback(
@@ -1593,7 +1555,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove owner ready test directory");
     }
 
-    fn uncertain_publication_keeps_owner_permit(internal_completion: bool) {
+    fn uncertain_publication_is_retained_after_the_request_ends(internal_completion: bool) {
         let (mut daemon, directory) = test_daemon(if internal_completion {
             "uncertain-internal"
         } else {
@@ -1626,7 +1588,6 @@ mod tests {
             panic!("directory sync failure must retain the uncertain write");
         };
         let mut write = Some(write);
-        let permit = state.budget.reserve().expect("reserve Owner permit");
         let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
         drop(reply_rx);
         state.pending_requests.insert(
@@ -1643,7 +1604,6 @@ mod tests {
                 grant_id: None,
                 client: None,
                 core_retirement: None,
-                permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
                 continuation: ControlContinuation::callback(move |_, state| {
@@ -1683,7 +1643,6 @@ mod tests {
             item,
             &mut |_, _, entry, reply| {
                 sent = true;
-                assert!(entry.permit.is_none());
                 let _ = crate::daemon::owner_loop::send_control_reply(
                     entry.reply_tx,
                     reply,
@@ -1693,8 +1652,15 @@ mod tests {
             },
         ));
         assert_eq!(sent, !internal_completion);
-        assert!(state.has_uncertain_owner_permit(waiter_id));
-        assert_eq!(state.budget.outstanding(), 1);
+        assert_eq!(
+            state.uncertain_publication_for_test(waiter_id),
+            Some((
+                crate::daemon::owner_loop::UncertainPublicationKind::State,
+                false
+            )),
+            "the uncertain write stays retained after the request ends"
+        );
+        assert_eq!(state.budget.outstanding(), 0);
         assert!(state.pending_requests.is_empty());
         drop(state);
         daemon.stop();
@@ -1702,12 +1668,12 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_publication_keeps_owner_permit_after_closed_reply() {
-        uncertain_publication_keeps_owner_permit(false);
+    fn uncertain_publication_is_retained_after_a_closed_reply() {
+        uncertain_publication_is_retained_after_the_request_ends(false);
     }
 
     #[test]
-    fn uncertain_publication_keeps_owner_permit_after_internal_completion() {
-        uncertain_publication_keeps_owner_permit(true);
+    fn uncertain_publication_is_retained_after_internal_completion() {
+        uncertain_publication_is_retained_after_the_request_ends(true);
     }
 }
