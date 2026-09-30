@@ -99,23 +99,6 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// Block until the next control message on `receiver`, or fail at the shared
-/// hang guard. The message is the event; there is no polling.
-fn wait_for_control_message(
-    receiver: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
-    what: &str,
-) {
-    let blocking = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
-    // timer: deadline — the shared test hang guard; the wake arrives before it.
-    // The timer must be created inside the runtime's context.
-    let message =
-        blocking.block_on(async { tokio::time::timeout(TEST_HANG_GUARD, receiver.recv()).await });
-    assert!(matches!(message, Ok(Some(_))), "{what}");
-}
-
 fn tracked_request(
     bridge: HubCoordinationBridge,
 ) -> (
@@ -795,12 +778,16 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
     let admitted = usage();
     assert!(admitted > 0, "admission must charge callback storage");
     let producer = bridge.clone();
-    // The bridge publishes a progress wake when a request is queued.
-    let (progress, mut queued) = tokio::sync::mpsc::channel(8);
-    bridge.bind_owner_wake(progress);
+    // Binding the owner wakes also binds the bridge's progress wake, which it
+    // publishes when a request is queued. Each pass blocks on an owner wake.
+    let mut wakes = TestOwnerWakes::bind(&daemon, &state);
     let caller = thread::spawn(move || producer.acknowledge(input));
-    wait_for_control_message(&mut queued, "the caller must queue its request");
-    assert_eq!(bridge.test_pending_count(), 1);
+    while bridge.test_pending_count() != 1 {
+        assert!(
+            wakes.wait(Instant::now() + TEST_HANG_GUARD),
+            "the caller must queue its request"
+        );
+    }
     // The Host worker that disposes this request waits in the probe's drop
     // until the test releases it, so the row stays in Terminal while the test
     // looks at it. Without the hold, disposal can finish inside one
@@ -816,7 +803,6 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
         admitted + slot,
         "pending collection capacity stays charged after owner accept"
     );
-    let mut wakes = TestOwnerWakes::bind(&daemon, &state);
     gate.release();
     // Core runs its queue in order: once this barrier job returns, Core has
     // answered the coordination request, and the owner can take its response.
