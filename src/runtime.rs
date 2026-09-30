@@ -22,13 +22,13 @@ use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
     CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
-    DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, LifecycleBaselineBudget,
-    ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice, PendingOperationId,
-    PublishRoutedEnvelopeRequest, ReadCursorRequest, ReadModeFlagsRequest, ReadScreenRequest,
-    RegistrySessionState, RetentionAccounting, RetentionPolicy, RoutedEnvelopeDeliveryStateResult,
-    SessionAdoptionReport, SessionAdoptionState, SessionLifecycleBaselinePage,
-    SessionLifecycleCursor, SessionLifecyclePage, SessionLifecyclePageError,
-    SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
+    DetachTerminalSubscriptionResult, DrainRoutedEnvelopesRequest, HostInputRequest,
+    LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice,
+    PendingOperationId, PublishRoutedEnvelopeRequest, ReadCursorRequest, ReadModeFlagsRequest,
+    ReadScreenRequest, RegistrySessionState, RetentionAccounting, RetentionPolicy,
+    RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
+    SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecyclePage,
+    SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::cell::Cell;
@@ -4885,6 +4885,28 @@ impl HubRuntime {
             CoreOperation::ReadCursor(ReadCursorRequest {
                 request_id,
                 session_id,
+                now_seconds,
+            }),
+        ))
+    }
+
+    /// Start a host write for the doorbell. Core answers with
+    /// `CoreCompletion::HostInput`; the write has no deadline of its own, and
+    /// the owner cancels it through Core's cancel path.
+    pub(crate) fn begin_host_input_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request_id: RequestId,
+        session_id: SessionId,
+        data: Vec<u8>,
+        now_seconds: u64,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::HostInput(HostInputRequest {
+                request_id,
+                session_id,
+                data,
                 now_seconds,
             }),
         ))
