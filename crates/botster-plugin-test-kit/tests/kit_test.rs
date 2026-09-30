@@ -493,3 +493,50 @@ fn a_consumer_that_loads_before_its_producer_receives_the_producer_events() {
         serde_json::json!({ "items": ["late"] })
     );
 }
+
+/// `HubDaemon::stop` releases worker-backed sessions for adoption at the next
+/// start. The kit has no next start, so dropping it must end every session it
+/// holds: a spawned session's process is gone once the kit is dropped.
+#[test]
+fn dropping_the_kit_ends_the_sessions_it_started() {
+    let fifo = std::path::PathBuf::from(format!("/tmp/bpk-{}-session-pid", std::process::id()));
+    let _ = std::fs::remove_file(&fifo);
+    let path = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("no nul");
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    // The session writes its pid to the FIFO, then blocks reading its terminal.
+    let (pid_tx, pid_rx) = std::sync::mpsc::channel();
+    let reader_path = fifo.clone();
+    std::thread::spawn(move || {
+        let pid = std::fs::read_to_string(&reader_path).expect("the session writes its pid");
+        let _ = pid_tx.send(pid.trim().parse::<i32>().expect("a pid"));
+    });
+
+    let mut kit = start("session-close");
+    let spawned = kit
+        .request(botster_plugin_test_kit::DaemonRequest::Spawn {
+            session_id: "kit-close-session".to_string(),
+            command: format!("sh -c 'echo $$ > {}; exec cat'", fifo.display()),
+        })
+        .expect("spawn settles");
+    assert!(spawned.error.is_none(), "{spawned:?}");
+    // timer: deadline — the session must announce its pid; expiry means the spawn failed.
+    let pid = pid_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the session announced its pid");
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the session is alive before the kit drops"
+    );
+
+    drop(kit);
+
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        // Do not leave the leak this test exists to catch.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(&fifo);
+    assert!(!alive, "session process {pid} outlived the dropped kit");
+}

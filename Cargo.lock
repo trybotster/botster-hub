@@ -541,6 +541,7 @@ dependencies = [
  "botster-hub-client",
  "botster-hub-test-support",
  "full_moon",
+ "libc",
  "mlua",
  "serde",
  "serde_json",

@@ -1465,6 +1465,14 @@ impl HubRuntime {
         self.stop_data_plane_with_release(false);
     }
 
+    /// Plugin test kit: stop the Core driver with a full shutdown, not a
+    /// release for restart. Core ends every session and every launched worker,
+    /// including a launch that has not installed its session yet.
+    #[cfg(feature = "plugin-test-kit")]
+    pub(crate) fn shutdown_core_for_kit(&mut self) {
+        self.stop_data_plane_with_release(false);
+    }
+
     #[cfg(test)]
     pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
         self.core_daemon.test_refuse_next_owner_begins(count);

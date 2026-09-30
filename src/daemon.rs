@@ -337,6 +337,16 @@ impl HubDaemon {
     }
 
     /// Stop the daemon lifecycle. This is idempotent.
+    /// Plugin test kit: end every session and worker of this Hub. `stop`
+    /// releases worker-backed sessions for adoption by the next start; the kit
+    /// has no next start.
+    #[cfg(feature = "plugin-test-kit")]
+    pub(crate) fn shutdown_core_for_kit(&mut self) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.shutdown_core_for_kit();
+        }
+    }
+
     pub fn stop(&mut self) -> HubDaemonStatus {
         self.local_webrtc.stop_all();
         if let Some(runtime) = self.runtime.as_mut() {

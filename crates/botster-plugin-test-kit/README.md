@@ -139,7 +139,7 @@ such a test in its own test target.
 
 ## Limits today
 
-- The in-process kit starts no session worker. Spawning a real session needs `--e2e`.
+- The in-process kit starts a session worker only when a spec spawns a session (for example through a plugin tool), and it ends every session when the kit stops. A spec that needs a session's terminal output or a completed real spawn uses `--e2e`.
 - There is no backend double below Hub policy yet (gate G3).
 - The kit checks the plugin's behaviour, not its Lua source: a bad global in a
   path that no test reaches is not found.
