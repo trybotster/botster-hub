@@ -1533,7 +1533,7 @@ pub(super) fn step(
             submission_step(state, waiter, entry.work.submit(executor, command))
         }
         Stage::Begin => {
-            if matches!(entry.kind, super::PendingPluginEntityKind::Fanout { .. }) {
+            if matches!(entry.kind, super::PendingPluginEntityKind::Fanout) {
                 if !claim_delivery(state, waiter) {
                     return Step::Waiting;
                 }
@@ -1561,7 +1561,7 @@ pub(super) fn step(
                 super::PendingPluginEntityKind::Resync { .. } => {
                     crate::runtime::entity_model::SnapshotOrigin::Resync
                 }
-                super::PendingPluginEntityKind::Fanout { .. } => {
+                super::PendingPluginEntityKind::Fanout => {
                     unreachable!("fanout bypasses snapshot begin")
                 }
                 super::PendingPluginEntityKind::Disposing => unreachable!("disposed entity work"),
@@ -1598,12 +1598,11 @@ pub(super) fn step(
                 next_package_entity_target(state, entry.work.cursor.as_deref())
             };
             let Some(target) = target else {
-                entry.work.stage =
-                    if matches!(entry.kind, super::PendingPluginEntityKind::Fanout { .. }) {
-                        Stage::Release
-                    } else {
-                        Stage::Drain
-                    };
+                entry.work.stage = if matches!(entry.kind, super::PendingPluginEntityKind::Fanout) {
+                    Stage::Release
+                } else {
+                    Stage::Drain
+                };
                 let payload = entry
                     .work
                     .payload
