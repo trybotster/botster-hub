@@ -394,8 +394,9 @@ fn facts_of(edges: &SessionEdges) -> Facts {
         output_seq: edges.output_seq,
         input_seq: edges.input_seq,
         composing: edges.composing,
-        // No mode report yet: no cursor is known, so the gate holds.
-        cursor_visible: flags.is_some_and(|flags| flags.cursor_visible),
+        // No mode report yet: the terminal default shows the cursor, and
+        // hiding it is a mode change that Core reports.
+        cursor_visible: flags.is_none_or(|flags| flags.cursor_visible),
         bracketed_paste: flags.is_some_and(|flags| flags.bracketed_paste),
         kitty_enabled: flags.is_some_and(|flags| flags.kitty_enabled),
         cols: edges.size.cols,
@@ -1138,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn facts_hold_the_gate_until_the_first_mode_report_and_carry_the_width() {
+    fn facts_show_the_default_cursor_before_a_mode_report_and_carry_the_width() {
         let mut edges = SessionEdges {
             modes_epoch: 3,
             mode_flags: None,
@@ -1152,9 +1153,10 @@ mod tests {
         };
         let unknown = facts_of(&edges);
         assert!(
-            !unknown.cursor_visible,
-            "no mode report yet: the gate holds"
+            unknown.cursor_visible,
+            "no mode report yet: the terminal default shows the cursor"
         );
+        assert!(!unknown.bracketed_paste && !unknown.kitty_enabled);
         assert_eq!(
             (unknown.modes_epoch, unknown.output_seq, unknown.input_seq),
             (3, 5, 7)
@@ -1169,5 +1171,13 @@ mod tests {
         });
         let known = facts_of(&edges);
         assert!(known.cursor_visible && known.bracketed_paste && known.kitty_enabled);
+        edges.mode_flags = Some(botster_core::ModeFlags {
+            cursor_visible: false,
+            ..botster_core::ModeFlags::default()
+        });
+        assert!(
+            !facts_of(&edges).cursor_visible,
+            "a reported hidden cursor holds the gate"
+        );
     }
 }
