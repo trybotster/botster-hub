@@ -48,7 +48,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         send_unavailable(response, "admitted spawn has no callback charge");
         return;
     };
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         send_unavailable(response, "the Hub owner has no available operation slot");
         return;
     }

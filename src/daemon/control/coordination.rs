@@ -69,7 +69,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     if state.coordination_fault.is_some() {
         return;
     }
-    if !state.budget.admits_work() {
+    if !state.admits_work() {
         state.coordination_waiting_for_owner = true;
         return;
     }
