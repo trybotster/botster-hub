@@ -189,8 +189,16 @@ Packages emit only their own declared events through
 ingress; it does not wait for handlers. Both return the platform result shape.
 Refusal statuses map to error kinds: `rejected_undeclared`,
 `rejected_foreign`, and `rejected_audience` to `capability_denied`;
-`rejected_over_rate`, `shed_full`, and `shed_busy` to `backpressured`; every
-other rejection to `invalid_request`.
+`shed_full` and `shed_busy` to `backpressured`; every other rejection to
+`invalid_request`.
+
+A consumer whose queue is full loses the copy, and the producer's emit still
+succeeds. When that consumer's queue has room again, the router queues ONE
+marker for each subscription that lost events, and delivers it to the same
+handler: the payload is `{ events_dropped = N }`, where N counts the copies
+dropped since the last marker. A handler must check for `payload.events_dropped`
+and, when it is present, rebuild its view from state (for example by listing
+sessions and entities) instead of treating the payload as an event.
 
 Authorized plugins consume the Hub-owned `/session` family through
 `botster.events.on({ owner = "hub", name = "session_family" }, ...)`. Hub admits those frames as Background

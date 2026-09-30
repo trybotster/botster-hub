@@ -10,7 +10,6 @@ local kinds = {
     rejected_undeclared = "capability_denied",
     rejected_foreign = "capability_denied",
     rejected_audience = "capability_denied",
-    rejected_over_rate = "backpressured",
     shed_full = "backpressured",
     shed_busy = "backpressured",
 }

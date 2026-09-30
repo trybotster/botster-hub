@@ -1,7 +1,6 @@
 //! Send-safe package event router.
 //!
-//! This module owns contracts, exact subscriptions, token buckets, occupancy,
-//! and transient queues. It must not import HubRuntime, CoreDaemon, mlua, plugin
+//! This module owns contracts, exact subscriptions, and transient queues. It must not import HubRuntime, CoreDaemon, mlua, plugin
 //! persistence, or the owner loop.
 
 use std::cell::Cell;
@@ -19,6 +18,10 @@ use crate::subscription::package_events::ClientEventMailbox;
 
 pub const HUB_EVENT_OWNER: &str = "hub";
 
+/// The payload key of the marker a consumer receives after its queue dropped
+/// events for a subscription: `{"events_dropped": <count>}`.
+pub const EVENTS_DROPPED_KEY: &str = "events_dropped";
+
 const WORKTREE_EVENT_NAMES: &[&str] = &[
     "worktree_created",
     "worktree_create_failed",
@@ -34,7 +37,6 @@ pub enum EventPlaneStatus {
     RejectedForeign,
     RejectedInvalid,
     RejectedOversize,
-    RejectedOverRate,
     RejectedOverFanout,
     RejectedWildcard,
     RejectedCausalScope,
@@ -52,31 +54,12 @@ impl EventPlaneStatus {
             Self::RejectedForeign => "rejected_foreign",
             Self::RejectedInvalid => "rejected_invalid",
             Self::RejectedOversize => "rejected_oversize",
-            Self::RejectedOverRate => "rejected_over_rate",
             Self::RejectedOverFanout => "rejected_over_fanout",
             Self::RejectedWildcard => "rejected_wildcard",
             Self::RejectedCausalScope => "rejected_causal_scope",
             Self::RejectedAudience => "rejected_audience",
             Self::ShedFull => "shed_full",
             Self::ShedBusy => "shed_busy",
-        }
-    }
-
-    #[must_use]
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Accepted => 0,
-            Self::RejectedUndeclared => 1,
-            Self::RejectedForeign => 2,
-            Self::RejectedInvalid => 3,
-            Self::RejectedOversize => 4,
-            Self::RejectedOverRate => 5,
-            Self::RejectedOverFanout => 6,
-            Self::RejectedWildcard => 7,
-            Self::RejectedCausalScope => 8,
-            Self::RejectedAudience => 9,
-            Self::ShedFull => 10,
-            Self::ShedBusy => 11,
         }
     }
 }
@@ -381,11 +364,10 @@ impl ReadyDelivery {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventPlaneSnapshot {
-    pub producer_events: BTreeMap<String, usize>,
-    pub producer_bytes: BTreeMap<String, usize>,
     pub consumer_events: BTreeMap<String, usize>,
     pub consumer_bytes: BTreeMap<String, usize>,
-    pub global_in_flight_bytes: usize,
+    /// Envelopes still held (queued, pulled or retiring). Zero at rest.
+    pub envelopes: usize,
     pub admitted_holders: usize,
     pub queued_holders: usize,
 }
@@ -464,10 +446,12 @@ struct AdmittedHolder {
     retired: bool,
 }
 
-#[derive(Default)]
-struct ProducerOccupancy {
-    events: usize,
-    bytes: usize,
+/// Copies a consumer's full queue refused for one subscription. A marker for
+/// them is queued once the queue has room, so the plugin learns it lost events
+/// and can reconcile from state.
+struct DroppedEvents {
+    holder: EventSubscription,
+    count: u64,
 }
 
 #[derive(Default)]
@@ -475,11 +459,9 @@ struct ConsumerQueue {
     events: usize,
     bytes: usize,
     copies: VecDeque<QueuedCopy>,
-}
-
-struct TokenBucket {
-    tokens: f64,
-    last: Instant,
+    /// One entry per full subscription identity (owner, name, handler,
+    /// generations): two handlers of one plugin count separately.
+    dropped: Vec<DroppedEvents>,
 }
 
 struct RouterInner {
@@ -491,7 +473,6 @@ struct RouterInner {
     client_by_id: HashMap<(String, String), (String, String)>,
     subscriptions_per_plugin: HashMap<String, usize>,
     subscription_events_by_plugin: HashMap<String, HashMap<(String, String), usize>>,
-    producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
     /// Consumers with queued copies that no engine refusal has parked; the
     /// only consumers a pull visits.
@@ -514,9 +495,7 @@ struct RouterInner {
     #[cfg(test)]
     snapshot_visits: SnapshotVisits,
     envelopes: HashMap<u64, Envelope>,
-    global_in_flight_bytes: usize,
     admitted: HashMap<u64, HashMap<(String, u64), AdmittedHolder>>,
-    buckets: HashMap<String, TokenBucket>,
     next_envelope: u64,
     next_pull: u64,
     outstanding_pulls: HashSet<u64>,
@@ -645,8 +624,6 @@ impl PackageEventRouter {
         }
         let contract_name_counts = hub_contracts.keys().map(|name| (name.clone(), 1)).collect();
         let contracts = HashMap::from([(HUB_EVENT_OWNER.to_string(), hub_contracts)]);
-        let mut producer = HashMap::new();
-        producer.insert(HUB_EVENT_OWNER.to_string(), ProducerOccupancy::default());
         Self {
             inner: crate::daemon::owner_signal::SignalingMutex::new(
                 RouterInner {
@@ -658,7 +635,6 @@ impl PackageEventRouter {
                     client_by_id: HashMap::new(),
                     subscriptions_per_plugin: HashMap::new(),
                     subscription_events_by_plugin: HashMap::new(),
-                    producer,
                     consumers: HashMap::new(),
                     ready_consumers: BTreeSet::new(),
                     engine_parked: BTreeSet::new(),
@@ -676,9 +652,7 @@ impl PackageEventRouter {
                     #[cfg(test)]
                     snapshot_visits: SnapshotVisits::default(),
                     envelopes: HashMap::new(),
-                    global_in_flight_bytes: 0,
                     admitted: HashMap::new(),
-                    buckets: HashMap::new(),
                     next_envelope: 1,
                     next_pull: 1,
                     outstanding_pulls: HashSet::new(),
@@ -1101,9 +1075,6 @@ impl PackageEventRouter {
         if encoded.len() > inner.policy.payload_max_bytes {
             return EventPlaneStatus::RejectedOversize;
         }
-        if !consume_token(&mut inner, caller_owner, now) {
-            return EventPlaneStatus::RejectedOverRate;
-        }
         let selected: Vec<EventSubscription> = inner
             .subscriptions
             .get(caller_owner)
@@ -1124,20 +1095,10 @@ impl PackageEventRouter {
             return EventPlaneStatus::RejectedOverFanout;
         }
         let size = encoded.len();
-        let producer_event_max = inner.policy.producer_queue_max_events;
-        let producer_byte_max = inner.policy.producer_queue_max_bytes;
-        let global_max = inner.policy.global_in_flight_bytes;
-        let global_bytes = inner.global_bytes();
-        let producer = inner.producer.entry(caller_owner.to_string()).or_default();
-        if producer.events + 1 > producer_event_max
-            || producer.bytes + size > producer_byte_max
-            || global_bytes + size > global_max
-        {
-            return EventPlaneStatus::ShedFull;
-        }
         let consumer_event_max = inner.policy.consumer_queue_max_events;
         let consumer_byte_max = inner.policy.consumer_queue_max_bytes;
         let mut accepted = Vec::new();
+        let mut refused = Vec::new();
         let mut projected: HashMap<String, (usize, usize)> = HashMap::new();
         for subscription in selected {
             let consumer = inner
@@ -1154,24 +1115,21 @@ impl PackageEventRouter {
                 continue;
             };
             if next_events > consumer_event_max || next_bytes > consumer_byte_max {
+                refused.push(subscription);
                 continue;
             }
             *events = next_events;
             *bytes = next_bytes;
             accepted.push(subscription);
         }
+        // A full consumer queue loses the copy for that consumer only. It is
+        // counted, and the consumer is told once its queue has room.
+        for subscription in refused {
+            note_dropped(&mut inner, subscription);
+        }
         if accepted.is_empty() {
-            return if inner
-                .subscriptions
-                .get(caller_owner)
-                .and_then(|events| events.get(name))
-                .is_none_or(Vec::is_empty)
-            {
-                deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
-                EventPlaneStatus::Accepted
-            } else {
-                EventPlaneStatus::ShedFull
-            };
+            deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
+            return EventPlaneStatus::Accepted;
         }
         let envelope_id = inner.next_envelope;
         let Some(next_envelope) = envelope_id.checked_add(1) else {
@@ -1194,10 +1152,6 @@ impl PackageEventRouter {
                 retirement: None,
             },
         );
-        inner.global_in_flight_bytes += size;
-        let producer = inner.producer.entry(caller_owner.to_string()).or_default();
-        producer.events += 1;
-        producer.bytes += size;
         for subscription in accepted {
             enqueue_consumer_copy(&mut inner, envelope_id, size, subscription);
         }
@@ -1352,6 +1306,7 @@ impl PackageEventRouter {
                     pull_id,
                 });
             }
+            flush_dropped_markers(&mut inner, &plugin_key);
         }
         // More to pull only while a consumer is still ready: a consumer an
         // engine refusal parked must not wake the slice that parked it.
@@ -1472,8 +1427,9 @@ impl PackageEventRouter {
             .consumers
             .entry(delivery.holder.plugin_key.clone())
             .or_default();
-        if consumer.events + 1 > consumer_event_max
-            || consumer.bytes + delivery.size > consumer_byte_max
+        if consumer.events > 0
+            && (consumer.events + 1 > consumer_event_max
+                || consumer.bytes + delivery.size > consumer_byte_max)
         {
             inner.outstanding_pulls.insert(delivery.pull_id);
             return Err((Box::new(delivery), EventPlaneStatus::ShedFull));
@@ -1535,16 +1491,6 @@ impl PackageEventRouter {
     pub fn snapshot(&self) -> Result<EventPlaneSnapshot, EventPlaneStatus> {
         let inner = lock_inner(&self.inner)?;
         Ok(EventPlaneSnapshot {
-            producer_events: inner
-                .producer
-                .iter()
-                .map(|(owner, occupancy)| (owner.clone(), occupancy.events))
-                .collect(),
-            producer_bytes: inner
-                .producer
-                .iter()
-                .map(|(owner, occupancy)| (owner.clone(), occupancy.bytes))
-                .collect(),
             consumer_events: inner
                 .consumers
                 .iter()
@@ -1555,7 +1501,7 @@ impl PackageEventRouter {
                 .iter()
                 .map(|(plugin, queue)| (plugin.clone(), queue.bytes))
                 .collect(),
-            global_in_flight_bytes: inner.global_bytes(),
+            envelopes: inner.envelopes.len(),
             admitted_holders: inner
                 .admitted
                 .values()
@@ -1643,10 +1589,6 @@ impl RouterInner {
             .map_or(0, |pending| pending.event_reserve(key))
     }
 
-    fn global_bytes(&self) -> usize {
-        self.global_in_flight_bytes
-    }
-
     fn live_envelope(&self, envelope_id: u64) -> Option<&Envelope> {
         self.envelopes
             .get(&envelope_id)
@@ -1674,7 +1616,6 @@ impl RouterInner {
         if *count == 0 {
             consumers.remove(&holder.plugin_key);
         }
-        // Delivery readiness also depends on the absence of empty buckets.
         if consumers.is_empty() {
             self.queued_by_producer.remove(&holder.owner);
         }
@@ -1751,26 +1692,6 @@ fn name_owned_by_other(inner: &RouterInner, caller: &str, name: &str) -> bool {
             .is_some_and(|events| events.contains_key(name))
     );
     inner.contract_name_counts.contains_key(name)
-}
-
-fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
-    let rate = f64::from(inner.policy.package_rate_per_sec);
-    let burst = f64::from(inner.policy.package_burst);
-    let bucket = inner
-        .buckets
-        .entry(owner.to_string())
-        .or_insert(TokenBucket {
-            tokens: burst,
-            last: now,
-        });
-    let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
-    bucket.last = now;
-    if bucket.tokens < 1.0 {
-        return false;
-    }
-    bucket.tokens -= 1.0;
-    true
 }
 
 struct AdmissionSnapshot {
@@ -2717,6 +2638,11 @@ fn drop_queued_for_owner(
             .count();
         crate::hub_log::hub_log!("event_plane_events_stranded owner={owner} events={retired}");
     }
+    for queue in inner.consumers.values_mut() {
+        queue
+            .dropped
+            .retain(|entry| !unload_removes_subscription(&entry.holder, owner, generation));
+    }
     let mut retired_payloads = Vec::new();
     for copy in dropped {
         inner.forget_queued_copy(&copy.holder);
@@ -2818,16 +2744,6 @@ fn retire_envelope_locked(inner: &mut RouterInner, envelope_id: u64) {
             inner.retiring_by_cleanup.remove(&retirement.cleanup);
         }
     }
-    let owner = &envelope.owner;
-    let size = envelope.size;
-    inner.global_in_flight_bytes = inner
-        .global_in_flight_bytes
-        .checked_sub(size)
-        .expect("each envelope releases its admitted byte charge once");
-    if let Some(producer) = inner.producer.get_mut(owner) {
-        producer.events = producer.events.saturating_sub(1);
-        producer.bytes = producer.bytes.saturating_sub(size);
-    }
 }
 
 /// A restart reaches the same operation bucket even though its dispatch serial changes.
@@ -2885,9 +2801,86 @@ fn enqueue_consumer_copy(
     }
 }
 
+/// Record a copy that `subscription`'s consumer queue had no room for.
+fn note_dropped(inner: &mut RouterInner, subscription: EventSubscription) {
+    let consumer = inner
+        .consumers
+        .entry(subscription.plugin_key.clone())
+        .or_default();
+    if let Some(entry) = consumer
+        .dropped
+        .iter_mut()
+        .find(|entry| entry.holder == subscription)
+    {
+        entry.count = entry.count.saturating_add(1);
+    } else {
+        consumer.dropped.push(DroppedEvents {
+            holder: subscription,
+            count: 1,
+        });
+    }
+}
+
+/// Queue one `{"events_dropped": N}` copy per subscription that lost events.
+/// The marker goes to the handler that lost the events, behind the copies
+/// already queued. It is admitted when the queue has room, and an EMPTY queue
+/// always admits it: the marker is one small fixed copy per subscription, so
+/// a byte cap smaller than the marker can never strand it. A subscription that
+/// no longer exists (removed, or replaced by a new generation) forgets its count.
+fn flush_dropped_markers(inner: &mut RouterInner, plugin_key: &str) {
+    let event_max = inner.policy.consumer_queue_max_events;
+    let byte_max = inner.policy.consumer_queue_max_bytes;
+    let pending = match inner.consumers.get_mut(plugin_key) {
+        Some(queue) if !queue.dropped.is_empty() => std::mem::take(&mut queue.dropped),
+        _ => return,
+    };
+    let mut kept = Vec::new();
+    for entry in pending {
+        let still_subscribed = inner
+            .subscriptions
+            .get(&entry.holder.owner)
+            .and_then(|events| events.get(&entry.holder.name))
+            .is_some_and(|holders| holders.contains(&entry.holder));
+        if !still_subscribed {
+            continue;
+        }
+        let payload = serde_json::json!({ EVENTS_DROPPED_KEY: entry.count });
+        let encoded = serde_json::to_vec(&payload).expect("a marker encodes");
+        let size = encoded.len();
+        let queue = inner.consumers.get(plugin_key).expect("consumer exists");
+        let fits =
+            queue.events == 0 || (queue.events + 1 <= event_max && queue.bytes + size <= byte_max);
+        let envelope_id = inner.next_envelope;
+        let Some(next_envelope) = envelope_id.checked_add(1).filter(|_| fits) else {
+            kept.push(entry);
+            continue;
+        };
+        inner.next_envelope = next_envelope;
+        inner.envelopes.insert(
+            envelope_id,
+            Envelope {
+                id: envelope_id,
+                owner: entry.holder.owner.clone(),
+                name: entry.holder.name.clone(),
+                payload: encoded.into(),
+                payload_json: payload,
+                size,
+                enqueued_at: Instant::now(),
+                remaining_holders: 1,
+                retirement: None,
+            },
+        );
+        enqueue_consumer_copy(inner, envelope_id, size, entry.holder);
+    }
+    if let Some(queue) = inner.consumers.get_mut(plugin_key) {
+        // Counts noted while this ran keep their place behind the kept ones.
+        kept.append(&mut queue.dropped);
+        queue.dropped = kept;
+    }
+}
+
 /// Ensure the queues an owner's package generation can fill exist.
 fn ensure_owner_queues(inner: &mut RouterInner, owner: &str) {
-    inner.producer.entry(owner.to_string()).or_default();
     let mut plugin_keys: BTreeSet<String> = inner
         .subscriptions
         .get(owner)
@@ -4020,23 +4013,6 @@ mod tests {
     fn assert_router_accounting(router: &PackageEventRouter) {
         let inner = lock_inner(&router.inner).expect("accounting lock");
         assert_router_indexes(&inner);
-        let bytes: usize = inner.envelopes.values().map(|envelope| envelope.size).sum();
-        assert_eq!(inner.global_bytes(), bytes);
-        for (owner, occupancy) in &inner.producer {
-            let envelopes: Vec<_> = inner
-                .envelopes
-                .values()
-                .filter(|envelope| &envelope.owner == owner)
-                .collect();
-            assert_eq!(occupancy.events, envelopes.len(), "producer {owner}");
-            assert_eq!(
-                occupancy.bytes,
-                envelopes
-                    .iter()
-                    .map(|envelope| envelope.size)
-                    .sum::<usize>()
-            );
-        }
         for (consumer, queue) in &inner.consumers {
             assert_eq!(queue.events, queue.copies.len(), "consumer {consumer}");
             assert_eq!(
@@ -4159,12 +4135,6 @@ mod tests {
             ),
             EventPlaneStatus::RejectedForeign
         );
-        assert!(
-            !lock_inner(&router.inner)
-                .expect("no token charge")
-                .buckets
-                .contains_key("outsider")
-        );
         run_unload(&router, "first", 2);
         assert_eq!(
             router.try_ingress(
@@ -4178,7 +4148,6 @@ mod tests {
         let inner = lock_inner(&router.inner).expect("last name removed");
         assert_router_indexes(&inner);
         assert!(!inner.contract_name_counts.contains_key("shared"));
-        assert!(!inner.buckets.contains_key("outsider"));
     }
 
     #[test]
@@ -4476,10 +4445,7 @@ mod tests {
         assert_router_accounting(&router);
         assert_eq!(router.snapshot().expect("queued again").queued_holders, 1);
         run_unload(&router, "producer", 1);
-        assert_eq!(
-            router.snapshot().expect("retired").global_in_flight_bytes,
-            0
-        );
+        assert_eq!(router.snapshot().expect("retired").envelopes, 0);
         assert!(
             lock_inner(&router.inner)
                 .expect("membership")
@@ -4539,8 +4505,7 @@ mod tests {
             assert_eq!(snapshot.consumer_bytes["constrained"], size * 2);
             assert_eq!(snapshot.consumer_events["unaffected"], 1);
             assert_eq!(snapshot.queued_holders, 3);
-            assert_eq!(snapshot.producer_events["producer"], 2);
-            assert_eq!(snapshot.global_in_flight_bytes, size * 2);
+            assert_eq!(snapshot.envelopes, 2);
             assert_eq!(
                 router.try_ingress("producer", "ready", &payload, Instant::now()),
                 EventPlaneStatus::Accepted
@@ -4550,12 +4515,223 @@ mod tests {
                 router.snapshot().expect("unaffected fills").consumer_events["unaffected"],
                 2
             );
+            // Every consumer queue is full: the producer is not refused, no copy is
+            // queued, and no envelope is created.
+            let before = router.snapshot().expect("before the last emit");
             assert_eq!(
                 router.try_ingress("producer", "ready", &payload, Instant::now()),
-                EventPlaneStatus::ShedFull
+                EventPlaneStatus::Accepted
             );
+            let after = router.snapshot().expect("after the last emit");
+            assert_eq!(after.queued_holders, before.queued_holders);
+            assert_eq!(after.envelopes, before.envelopes);
             assert_router_accounting(&router);
         }
+    }
+
+    /// A consumer whose queue is full loses copies, never silently: once its
+    /// queue has room it gets ONE marker per subscription with the count, behind
+    /// the copies it already had, and the producer's emits were never refused.
+    #[test]
+    fn a_full_consumer_queue_gets_one_events_dropped_marker_when_room_returns() {
+        let payload = serde_json::json!({"ok": true});
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            consumer_queue_max_events: 2,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        for _ in 0..5 {
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted,
+                "the producer is never refused for a full consumer queue"
+            );
+        }
+        assert_eq!(router.snapshot().unwrap().consumer_events["consumer"], 2);
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("first pull");
+        assert_eq!(batch.len(), 2, "the two queued copies come first");
+        assert!(
+            batch
+                .iter()
+                .all(|delivery| delivery.payload_json == payload)
+        );
+        for delivery in batch.drain(..) {
+            router.complete_pulled_delivery(delivery).expect("complete");
+        }
+        let mut marker = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("marker pull");
+        assert_eq!(marker.len(), 1, "exactly one marker for the subscription");
+        let delivery = marker.pop().expect("marker");
+        assert_eq!(
+            delivery.payload_json,
+            serde_json::json!({ EVENTS_DROPPED_KEY: 3 }),
+            "three of the five emits were dropped"
+        );
+        assert_eq!(delivery.holder.handler_id, "event:producer:ready");
+        router.complete_pulled_delivery(delivery).expect("complete");
+        assert!(
+            router
+                .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+                .expect("last pull")
+                .is_empty(),
+            "the marker is delivered once"
+        );
+        assert_router_accounting(&router);
+        assert_eq!(router.snapshot().unwrap().envelopes, 0);
+    }
+
+    fn subscribe_handler(
+        router: &PackageEventRouter,
+        plugin: &str,
+        handler: &str,
+        generation: u64,
+    ) {
+        assert_eq!(
+            router.try_subscribe(EventSubscription {
+                plugin_key: plugin.to_string(),
+                owner: "producer".to_string(),
+                name: "ready".to_string(),
+                handler_id: handler.to_string(),
+                generation,
+                ..EventSubscription::default()
+            }),
+            EventPlaneStatus::Accepted
+        );
+    }
+
+    fn pull_all(router: &PackageEventRouter) -> Vec<ReadyDelivery> {
+        router
+            .pull_ready_batch(16, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+            .expect("pull")
+    }
+
+    /// Two handlers of one plugin for the same event lose copies separately:
+    /// each gets its own marker with its own count, delivered to that handler.
+    #[test]
+    fn each_handler_of_one_plugin_gets_its_own_events_dropped_marker() {
+        let payload = serde_json::json!({"ok": true});
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            consumer_queue_max_events: 2,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe_handler(&router, "consumer", "handler-a", 1);
+        subscribe_handler(&router, "consumer", "handler-b", 2);
+        // The first emit fills the queue with one copy per handler; the next
+        // three emits are dropped for both.
+        for _ in 0..4 {
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+        }
+        for delivery in pull_all(&router) {
+            assert_eq!(delivery.payload_json, payload);
+            router.complete_pulled_delivery(delivery).expect("complete");
+        }
+        let mut markers = pull_all(&router);
+        markers.sort_by(|a, b| a.holder.handler_id.cmp(&b.holder.handler_id));
+        assert_eq!(markers.len(), 2, "one marker per handler");
+        assert_eq!(markers[0].holder.handler_id, "handler-a");
+        assert_eq!(markers[1].holder.handler_id, "handler-b");
+        for marker in &markers {
+            assert_eq!(
+                marker.payload_json,
+                serde_json::json!({ EVENTS_DROPPED_KEY: 3 }),
+                "each handler lost three copies"
+            );
+        }
+        for marker in markers {
+            router.complete_pulled_delivery(marker).expect("complete");
+        }
+        assert_router_accounting(&router);
+        assert_eq!(router.snapshot().unwrap().envelopes, 0);
+    }
+
+    /// The consumer byte cap may be smaller than the marker. The marker still
+    /// arrives once the queue is empty, with no further producer event.
+    #[test]
+    fn the_marker_arrives_even_when_the_byte_cap_is_smaller_than_the_marker() {
+        let payload = serde_json::json!({"ok": true});
+        let size = serde_json::to_vec(&payload).expect("payload").len();
+        let marker_size = serde_json::to_vec(&serde_json::json!({ EVENTS_DROPPED_KEY: 1 }))
+            .expect("marker")
+            .len();
+        let cap = size + 1;
+        assert!(cap < marker_size, "the cap must be smaller than the marker");
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            payload_max_bytes: cap,
+            consumer_queue_max_bytes: cap,
+            consumer_queue_max_events: 1,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        for _ in 0..2 {
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+        }
+        let mut first = pull_all(&router);
+        assert_eq!(first.len(), 1, "the queue held one copy");
+        router
+            .complete_pulled_delivery(first.pop().expect("copy"))
+            .expect("complete");
+        let mut marker = pull_all(&router);
+        assert_eq!(marker.len(), 1, "the marker arrives with the queue empty");
+        let marker = marker.pop().expect("marker");
+        assert_eq!(
+            marker.payload_json,
+            serde_json::json!({ EVENTS_DROPPED_KEY: 1 })
+        );
+        // A refused admission hands the marker back; the requeue must also
+        // accept it into the now-empty queue.
+        router.requeue_delivery(marker).expect("requeue the marker");
+        let mut again = pull_all(&router);
+        assert_eq!(again.len(), 1, "the requeued marker is delivered");
+        router
+            .complete_pulled_delivery(again.pop().expect("marker"))
+            .expect("complete");
+        assert_router_accounting(&router);
+    }
+
+    /// An unload of the subscription's package forgets the counts: no marker
+    /// goes to a subscription that no longer exists.
+    #[test]
+    fn an_unload_forgets_the_drop_counts_of_its_subscriptions() {
+        let payload = serde_json::json!({"ok": true});
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            consumer_queue_max_events: 1,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        for _ in 0..2 {
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+        }
+        run_unload(&router, "consumer", 1);
+        assert!(
+            pull_all(&router).is_empty(),
+            "no marker for a removed subscription"
+        );
+        assert_router_accounting(&router);
+        assert_eq!(router.snapshot().unwrap().envelopes, 0);
     }
 
     #[test]
@@ -4930,9 +5106,7 @@ mod tests {
     fn policy_is_the_validated_startup_value() {
         let options = PackageEventPlaneOptions {
             payload_max_bytes: 2048,
-            producer_queue_max_bytes: 4096,
             consumer_queue_max_bytes: 4096,
-            global_in_flight_bytes: 8192,
             ..PackageEventPlaneOptions::default()
         };
         let startup = crate::HubStartupOptions {
@@ -4967,40 +5141,7 @@ mod tests {
         assert_eq!(status, EventPlaneStatus::ShedBusy);
         assert!(started.elapsed() < StdDuration::from_millis(5));
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
-    }
-
-    #[test]
-    fn concurrent_emitters_cannot_over_admit() {
-        let router = Arc::new(router());
-        router
-            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
-            .expect("register");
-        subscribe(&router, "consumer-a", "producer", "sample.ready");
-        subscribe(&router, "consumer-b", "producer", "sample.ready");
-        let mut joins = Vec::new();
-        for _ in 0..8 {
-            let router = Arc::clone(&router);
-            joins.push(thread::spawn(move || {
-                router.try_ingress(
-                    "producer",
-                    "sample.ready",
-                    &serde_json::json!({ "ok": true }),
-                    Instant::now(),
-                )
-            }));
-        }
-        for join in joins {
-            let _ = join.join().expect("join");
-        }
-        let snapshot = router.snapshot().expect("snapshot");
-        let producer_events = snapshot
-            .producer_events
-            .get("producer")
-            .copied()
-            .unwrap_or(0);
-        assert!(producer_events <= 256);
-        assert!(snapshot.global_in_flight_bytes <= 16 * 1024 * 1024);
+        assert_eq!(snapshot.envelopes, 0);
     }
 
     #[test]
@@ -5030,16 +5171,9 @@ mod tests {
             .retire_holder(batch[0].envelope_id, "consumer", 1)
             .expect("retire");
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(
-            snapshot
-                .producer_events
-                .get("producer")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
+        assert_eq!(snapshot.envelopes, 0);
         assert_eq!(
             router.try_ingress(
                 "unknown",
@@ -5079,7 +5213,7 @@ mod tests {
         });
         assert_eq!(busy, EventPlaneStatus::ShedBusy);
         let after = router.snapshot().expect("snapshot");
-        assert_eq!(after.global_in_flight_bytes, 0);
+        assert_eq!(after.envelopes, 0);
     }
 
     #[test]
@@ -5389,7 +5523,7 @@ mod tests {
             let copies = if unload_producer { 2 } else { 1 };
             let snapshot = router.snapshot().expect("remaining occupancy");
             assert_eq!(snapshot.queued_holders, copies);
-            assert_eq!(snapshot.producer_events["producer"], 1);
+            assert_eq!(snapshot.envelopes, 1);
             let batch = router
                 .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
                 .expect("new delivery");
@@ -5405,10 +5539,7 @@ mod tests {
                     .expect("complete new copy");
             }
             assert_router_accounting(&router);
-            assert_eq!(
-                router.snapshot().expect("retired").global_in_flight_bytes,
-                0
-            );
+            assert_eq!(router.snapshot().expect("retired").envelopes, 0);
         }
     }
 
@@ -5499,9 +5630,7 @@ mod tests {
         const BYTES: usize = 1024 * 1024;
         let policy = PackageEventPlanePolicy {
             payload_max_bytes: BYTES,
-            producer_queue_max_bytes: BYTES,
             consumer_queue_max_bytes: BYTES,
-            global_in_flight_bytes: BYTES,
             ..PackageEventPlanePolicy::default()
         };
         let router = PackageEventRouter::new(policy);
@@ -5581,22 +5710,7 @@ mod tests {
             assert!(matches!(ops.apply_ready(&router), OwnerStep::Waiting));
             assert_router_accounting(&router);
             assert!(weak_payload.upgrade().is_some());
-            assert_eq!(
-                router
-                    .snapshot()
-                    .expect("retained snapshot")
-                    .global_in_flight_bytes,
-                BYTES
-            );
-            assert_eq!(
-                router.try_ingress(
-                    "unrelated",
-                    "ready",
-                    &serde_json::json!({"ok": true}),
-                    Instant::now()
-                ),
-                EventPlaneStatus::ShedFull
-            );
+            assert_eq!(router.snapshot().expect("retained snapshot").envelopes, 1);
             router
                 .requeue_delivery(delivery)
                 .expect("late requeue is an empty success");
@@ -5607,6 +5721,17 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(router.test_outstanding_pulls(), 0);
+            // The retained payload holds no admission budget, so an unrelated
+            // producer is admitted while the unload worker is parked.
+            assert_eq!(
+                router.try_ingress(
+                    "unrelated",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::Accepted
+            );
             assert_router_accounting(&router);
             resume_tx.send(()).expect("destroy payload");
 
@@ -5615,22 +5740,7 @@ mod tests {
                 UnloadTestPhase::Destroyed
             );
             assert!(weak_payload.upgrade().is_none());
-            assert_eq!(
-                router
-                    .snapshot()
-                    .expect("charge before reap")
-                    .global_in_flight_bytes,
-                BYTES
-            );
-            assert_eq!(
-                router.try_ingress(
-                    "unrelated",
-                    "ready",
-                    &serde_json::json!({"ok": true}),
-                    Instant::now()
-                ),
-                EventPlaneStatus::ShedFull
-            );
+            assert_eq!(router.snapshot().expect("charge before reap").envelopes, 2);
             assert_router_accounting(&router);
             resume_tx.send(()).expect("reap charge");
             let completion = worker
@@ -5641,21 +5751,10 @@ mod tests {
         });
         assert_router_accounting(&router);
         let snapshot = router.snapshot().expect("finished snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
-        assert_eq!(snapshot.producer_events["producer"], 0);
-        assert_eq!(snapshot.producer_bytes["producer"], 0);
-        assert!(snapshot.consumer_events.values().all(|events| *events == 0));
-        assert!(snapshot.consumer_bytes.values().all(|bytes| *bytes == 0));
+        // Only the unrelated producer's own envelope remains; the unloaded
+        // producer's retired payload has been reaped.
+        assert_eq!(snapshot.envelopes, 1);
         assert_eq!(snapshot.admitted_holders, 0);
-        assert_eq!(
-            router.try_ingress(
-                "unrelated",
-                "ready",
-                &serde_json::json!({"ok": true}),
-                Instant::now()
-            ),
-            EventPlaneStatus::Accepted
-        );
         assert_router_accounting(&router);
     }
 
@@ -5675,7 +5774,7 @@ mod tests {
             ),
             EventPlaneStatus::Accepted
         );
-        let before = router.snapshot().expect("before").global_in_flight_bytes;
+        let before = router.snapshot().expect("before").envelopes;
         let mut ops = EventPlaneOwnerOps::default();
         ops.record(OwnerOp {
             kind: OwnerOpKind::Unload,
@@ -5696,10 +5795,7 @@ mod tests {
         });
         assert!(!router.inner.is_poisoned());
         assert_eq!(
-            router
-                .snapshot()
-                .expect("retained charge")
-                .global_in_flight_bytes,
+            router.snapshot().expect("retained charge").envelopes,
             before
         );
         assert_router_accounting(&router);
@@ -5717,13 +5813,7 @@ mod tests {
         assert_ne!(retry.identity(), &identity);
         assert!(ops.complete(run_work(&router, retry)).is_some());
         assert!(ops.is_empty());
-        assert_eq!(
-            router
-                .snapshot()
-                .expect("reaped charge")
-                .global_in_flight_bytes,
-            0
-        );
+        assert_eq!(router.snapshot().expect("reaped charge").envelopes, 0);
         assert_router_accounting(&router);
         let inner = lock_inner(&router.inner).expect("retired rows");
         assert!(inner.envelopes.is_empty());
@@ -5782,8 +5872,8 @@ mod tests {
             router
                 .snapshot()
                 .expect("consumer charge remains")
-                .global_in_flight_bytes,
-            size
+                .envelopes,
+            1
         );
         assert_eq!(
             lock_inner(&router.inner)
@@ -5799,10 +5889,7 @@ mod tests {
         assert!(ops.complete(run_work(&router, restarted)).is_some());
         assert!(ops.is_empty());
         assert_eq!(
-            router
-                .snapshot()
-                .expect("consumer charge reaped")
-                .global_in_flight_bytes,
+            router.snapshot().expect("consumer charge reaped").envelopes,
             0
         );
         assert!(
@@ -5829,14 +5916,14 @@ mod tests {
             ),
             EventPlaneStatus::Accepted
         );
-        let before = router.snapshot().expect("before").global_in_flight_bytes;
+        let before = router.snapshot().expect("before").envelopes;
         let probe_router = Arc::clone(&router);
         *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(move |phase| {
             if phase == UnloadTestPhase::Detached {
                 assert_router_accounting(&probe_router);
                 let inner = lock_inner(&probe_router.inner).expect("replacement recovery");
                 assert_eq!(inner.retiring_by_cleanup[&("producer".into(), 1)].len(), 1);
-                assert_eq!(inner.global_bytes(), before);
+                assert_eq!(inner.envelopes.len(), before);
                 assert!(inner.envelopes.values().all(|envelope| {
                     envelope
                         .retirement
@@ -5859,13 +5946,7 @@ mod tests {
         });
         assert_eq!(result.expect("replacement"), 2);
         assert_router_accounting(&router);
-        assert_eq!(
-            router
-                .snapshot()
-                .expect("retired payload")
-                .global_in_flight_bytes,
-            0
-        );
+        assert_eq!(router.snapshot().expect("retired payload").envelopes, 0);
         assert!(
             lock_inner(&router.inner)
                 .expect("retired bucket")
@@ -5939,20 +6020,11 @@ mod tests {
                 .is_some_and(|events| events.contains_key("new"))
         );
         assert_eq!(inner.envelopes.len(), 1);
-        assert_eq!(
-            inner.global_bytes(),
-            inner
-                .envelopes
-                .values()
-                .map(|envelope| envelope.size)
-                .sum::<usize>()
-        );
     }
 
     #[test]
     fn repeated_delivery_retirement_prunes_holders_without_readmitting_late_acks() {
         let router = PackageEventRouter::new(PackageEventPlanePolicy {
-            package_burst: 1_000,
             ..PackageEventPlanePolicy::default()
         });
         router
@@ -6006,13 +6078,7 @@ mod tests {
             router
                 .complete_pulled_delivery(first)
                 .expect("complete retired pull");
-            assert_eq!(
-                router
-                    .snapshot()
-                    .expect("one holder remains")
-                    .producer_events["producer"],
-                1
-            );
+            assert_eq!(router.snapshot().expect("one holder remains").envelopes, 1);
             assert_router_accounting(&router);
             router
                 .complete_pulled_delivery(deliveries.pop().expect("last copy"))
@@ -6153,8 +6219,6 @@ mod tests {
     fn populated_unload_reports_concurrent_unrelated_publication_without_a_lock_gate() {
         // This measurement reports contention. It does not establish a time bound.
         let policy = PackageEventPlanePolicy {
-            package_burst: u32::MAX,
-            producer_queue_max_events: 512,
             consumer_queue_max_events: 512,
             ..PackageEventPlanePolicy::default()
         };
@@ -6285,7 +6349,7 @@ mod tests {
             .expect("batch");
         assert!(batch.is_empty());
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         assert_router_accounting(&router);
     }
 
@@ -6429,7 +6493,7 @@ mod tests {
                 .expect("retry")
         );
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
     }
 
     #[test]
@@ -6489,72 +6553,9 @@ mod tests {
             EventPlaneStatus::RejectedOversize
         );
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(
-            snapshot
-                .producer_events
-                .get("producer")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-    }
-
-    #[test]
-    fn exhausted_tokens_are_rejected_over_rate_without_occupancy() {
-        let policy = PackageEventPlanePolicy {
-            package_rate_per_sec: 1,
-            package_burst: 1,
-            ..PackageEventPlanePolicy::default()
-        };
-        let router = PackageEventRouter::new(policy);
-        router
-            .try_register_contracts(vec![sample_contract("producer", "sample.ready")])
-            .expect("register");
-        subscribe(&router, "consumer", "producer", "sample.ready");
-        let now = Instant::now();
-        assert_eq!(
-            router.try_ingress(
-                "producer",
-                "sample.ready",
-                &serde_json::json!({ "ok": true }),
-                now
-            ),
-            EventPlaneStatus::Accepted
-        );
-        assert_eq!(
-            router.try_ingress(
-                "producer",
-                "sample.ready",
-                &serde_json::json!({ "ok": true }),
-                now
-            ),
-            EventPlaneStatus::RejectedOverRate
-        );
-        let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.queued_holders, 1);
-        assert_eq!(
-            snapshot
-                .producer_events
-                .get("producer")
-                .copied()
-                .unwrap_or(0),
-            1
-        );
-        let batch = router
-            .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
-            .expect("batch");
-        assert_eq!(batch.len(), 1);
-        router
-            .note_admitted(batch[0].envelope_id, "consumer", 1)
-            .expect("admit");
-        router
-            .retire_holder(batch[0].envelope_id, "consumer", 1)
-            .expect("retire");
-        let after = router.snapshot().expect("after");
-        assert_eq!(after.global_in_flight_bytes, 0);
-        assert_eq!(after.queued_holders, 0);
+        assert_eq!(snapshot.envelopes, 0);
     }
 
     #[test]
@@ -6580,16 +6581,9 @@ mod tests {
             EventPlaneStatus::RejectedOverFanout
         );
         let snapshot = router.snapshot().expect("snapshot");
-        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.envelopes, 0);
         assert_eq!(snapshot.queued_holders, 0);
-        assert_eq!(
-            snapshot
-                .producer_events
-                .get("producer")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
+        assert_eq!(snapshot.envelopes, 0);
     }
 
     #[test]
@@ -6718,7 +6712,7 @@ mod tests {
         assert!(router.test_has_contract("producer", "old"));
         let after = router.snapshot().expect("after");
         assert_eq!(after.queued_holders, 1);
-        assert_eq!(after.global_in_flight_bytes, before.global_in_flight_bytes);
+        assert_eq!(after.envelopes, before.envelopes);
         let batch = router
             .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
             .expect("batch");
@@ -6726,7 +6720,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_plugin_and_client_ingress_does_not_deliver_before_rejection() {
+    fn a_full_plugin_queue_does_not_stop_client_delivery() {
         let policy = PackageEventPlanePolicy {
             consumer_queue_max_events: 1,
             fanout_per_emit_max: 1,
@@ -6765,6 +6759,9 @@ mod tests {
             }),
             EventPlaneStatus::Accepted
         );
+        // The plugin consumer's queue is full: that copy is dropped (and
+        // counted for its marker), the emit is not refused, and the client
+        // mailbox still gets the event.
         assert_eq!(
             router.try_ingress(
                 "producer",
@@ -6772,11 +6769,11 @@ mod tests {
                 &serde_json::json!({ "ok": true }),
                 Instant::now()
             ),
-            EventPlaneStatus::ShedFull
+            EventPlaneStatus::Accepted
         );
         assert!(
-            mailbox.take_ready_event().is_none(),
-            "ShedFull must not deliver to clients"
+            mailbox.take_ready_event().is_some(),
+            "a full plugin queue must not withhold the client event"
         );
 
         let fanout_router = PackageEventRouter::new(PackageEventPlanePolicy {
@@ -6919,7 +6916,7 @@ mod tests {
         };
         let busy = router.snapshot().expect("busy requeue");
         assert_eq!(busy.queued_holders, 0);
-        assert_eq!(busy.global_in_flight_bytes, before.global_in_flight_bytes);
+        assert_eq!(busy.envelopes, before.envelopes);
         assert_eq!(busy.admitted_holders, before.admitted_holders);
         assert_eq!(router.test_outstanding_pulls(), 1);
         router
@@ -6927,10 +6924,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("requeue after release"));
         let restored = router.snapshot().expect("restored");
         assert_eq!(restored.queued_holders, before.queued_holders);
-        assert_eq!(
-            restored.global_in_flight_bytes,
-            before.global_in_flight_bytes
-        );
+        assert_eq!(restored.envelopes, before.envelopes);
         assert_eq!(router.test_outstanding_pulls(), 0);
 
         let mut batch = router
@@ -6948,7 +6942,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("complete after release"));
         let done = router.snapshot().expect("completed");
         assert_eq!(done.queued_holders, 0);
-        assert_eq!(done.global_in_flight_bytes, 0);
+        assert_eq!(done.envelopes, 0);
         assert_eq!(router.test_outstanding_pulls(), 0);
     }
 

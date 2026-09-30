@@ -407,13 +407,8 @@ pub struct PackageEventPlaneOptions {
     pub subscriptions_per_plugin_max: usize,
     pub subscribers_per_event_max: usize,
     pub fanout_per_emit_max: usize,
-    pub producer_queue_max_events: usize,
-    pub producer_queue_max_bytes: usize,
     pub consumer_queue_max_events: usize,
     pub consumer_queue_max_bytes: usize,
-    pub global_in_flight_bytes: usize,
-    pub package_rate_per_sec: u32,
-    pub package_burst: u32,
     pub queue_age_ms: u64,
 }
 
@@ -424,13 +419,8 @@ impl Default for PackageEventPlaneOptions {
             subscriptions_per_plugin_max: 64,
             subscribers_per_event_max: 64,
             fanout_per_emit_max: 64,
-            producer_queue_max_events: 256,
-            producer_queue_max_bytes: 512 * 1024,
             consumer_queue_max_events: 128,
             consumer_queue_max_bytes: 2 * 1024 * 1024,
-            global_in_flight_bytes: 16 * 1024 * 1024,
-            package_rate_per_sec: 100,
-            package_burst: 200,
             queue_age_ms: 1_000,
         }
     }
@@ -455,14 +445,6 @@ impl PackageEventPlaneOptions {
             self.fanout_per_emit_max,
         )?;
         validate_positive_usize(
-            "package_event_plane.producer_queue_max_events",
-            self.producer_queue_max_events,
-        )?;
-        validate_positive_usize(
-            "package_event_plane.producer_queue_max_bytes",
-            self.producer_queue_max_bytes,
-        )?;
-        validate_positive_usize(
             "package_event_plane.consumer_queue_max_events",
             self.consumer_queue_max_events,
         )?;
@@ -470,29 +452,9 @@ impl PackageEventPlaneOptions {
             "package_event_plane.consumer_queue_max_bytes",
             self.consumer_queue_max_bytes,
         )?;
-        validate_positive_usize(
-            "package_event_plane.global_in_flight_bytes",
-            self.global_in_flight_bytes,
-        )?;
-        if self.package_rate_per_sec == 0 {
-            return Err(HubConfigError::InvalidCapacity {
-                field: "package_event_plane.package_rate_per_sec",
-            });
-        }
-        if self.package_burst == 0 {
-            return Err(HubConfigError::InvalidCapacity {
-                field: "package_event_plane.package_burst",
-            });
-        }
         if self.queue_age_ms == 0 {
             return Err(HubConfigError::InvalidCapacity {
                 field: "package_event_plane.queue_age_ms",
-            });
-        }
-        if self.payload_max_bytes > self.producer_queue_max_bytes {
-            return Err(HubConfigError::InvalidEventPlaneConstraint {
-                field: "package_event_plane.payload_max_bytes",
-                constraint: "must be <= producer_queue_max_bytes",
             });
         }
         if self.payload_max_bytes > self.consumer_queue_max_bytes {
@@ -501,28 +463,10 @@ impl PackageEventPlaneOptions {
                 constraint: "must be <= consumer_queue_max_bytes",
             });
         }
-        if self.payload_max_bytes > self.global_in_flight_bytes {
-            return Err(HubConfigError::InvalidEventPlaneConstraint {
-                field: "package_event_plane.payload_max_bytes",
-                constraint: "must be <= global_in_flight_bytes",
-            });
-        }
-        if self.producer_queue_max_bytes > self.global_in_flight_bytes {
-            return Err(HubConfigError::InvalidEventPlaneConstraint {
-                field: "package_event_plane.producer_queue_max_bytes",
-                constraint: "must be <= global_in_flight_bytes",
-            });
-        }
         if self.fanout_per_emit_max > self.subscribers_per_event_max {
             return Err(HubConfigError::InvalidEventPlaneConstraint {
                 field: "package_event_plane.fanout_per_emit_max",
                 constraint: "must be <= subscribers_per_event_max",
-            });
-        }
-        if self.package_burst < self.package_rate_per_sec {
-            return Err(HubConfigError::InvalidEventPlaneConstraint {
-                field: "package_event_plane.package_burst",
-                constraint: "must be >= package_rate_per_sec",
             });
         }
         Ok(())
@@ -535,13 +479,8 @@ impl PackageEventPlaneOptions {
             subscriptions_per_plugin_max: self.subscriptions_per_plugin_max,
             subscribers_per_event_max: self.subscribers_per_event_max,
             fanout_per_emit_max: self.fanout_per_emit_max,
-            producer_queue_max_events: self.producer_queue_max_events,
-            producer_queue_max_bytes: self.producer_queue_max_bytes,
             consumer_queue_max_events: self.consumer_queue_max_events,
             consumer_queue_max_bytes: self.consumer_queue_max_bytes,
-            global_in_flight_bytes: self.global_in_flight_bytes,
-            package_rate_per_sec: self.package_rate_per_sec,
-            package_burst: self.package_burst,
             queue_age: Duration::from_millis(self.queue_age_ms),
         })
     }
@@ -556,13 +495,8 @@ pub struct PackageEventPlanePolicy {
     pub subscriptions_per_plugin_max: usize,
     pub subscribers_per_event_max: usize,
     pub fanout_per_emit_max: usize,
-    pub producer_queue_max_events: usize,
-    pub producer_queue_max_bytes: usize,
     pub consumer_queue_max_events: usize,
     pub consumer_queue_max_bytes: usize,
-    pub global_in_flight_bytes: usize,
-    pub package_rate_per_sec: u32,
-    pub package_burst: u32,
     #[serde(with = "queue_age_millis")]
     pub queue_age: Duration,
 }
@@ -1391,13 +1325,8 @@ mod tests {
         assert_eq!(options.subscriptions_per_plugin_max, 64);
         assert_eq!(options.subscribers_per_event_max, 64);
         assert_eq!(options.fanout_per_emit_max, 64);
-        assert_eq!(options.producer_queue_max_events, 256);
-        assert_eq!(options.producer_queue_max_bytes, 524_288);
         assert_eq!(options.consumer_queue_max_events, 128);
         assert_eq!(options.consumer_queue_max_bytes, 2_097_152);
-        assert_eq!(options.global_in_flight_bytes, 16_777_216);
-        assert_eq!(options.package_rate_per_sec, 100);
-        assert_eq!(options.package_burst, 200);
         assert_eq!(options.queue_age_ms, 1_000);
         let policy = options.into_policy().expect("defaults valid");
         assert_eq!(policy.queue_age, Duration::from_millis(1_000));
@@ -1407,26 +1336,18 @@ mod tests {
     fn package_event_plane_override_becomes_router_policy() {
         let mut options = HubStartupOptions::default();
         options.package_event_plane.payload_max_bytes = 1_024;
-        options.package_event_plane.producer_queue_max_bytes = 4_096;
         options.package_event_plane.consumer_queue_max_bytes = 8_192;
-        options.package_event_plane.global_in_flight_bytes = 16_384;
-        options.package_event_plane.package_rate_per_sec = 5;
-        options.package_event_plane.package_burst = 10;
         let environment =
             RuntimeEnvironment::from_values(Some(PathBuf::from("/tmp/botster-event-plane")), None);
         let config = options
             .build_config_for_environment(&environment)
             .expect("override must validate");
         assert_eq!(config.package_event_plane.payload_max_bytes, 1_024);
-        assert_eq!(config.package_event_plane.package_burst, 10);
+        assert_eq!(config.package_event_plane.consumer_queue_max_bytes, 8_192);
         let replacement = HubStartupOptions {
             package_event_plane: PackageEventPlaneOptions {
                 payload_max_bytes: 2_048,
-                producer_queue_max_bytes: 8_192,
-                consumer_queue_max_bytes: 8_192,
-                global_in_flight_bytes: 16_384,
-                package_rate_per_sec: 7,
-                package_burst: 9,
+                consumer_queue_max_bytes: 4_096,
                 ..PackageEventPlaneOptions::default()
             },
             ..HubStartupOptions::default()
@@ -1434,7 +1355,10 @@ mod tests {
         .build_config_for_environment(&environment)
         .expect("second startup must replace policy");
         assert_eq!(replacement.package_event_plane.payload_max_bytes, 2_048);
-        assert_eq!(replacement.package_event_plane.package_rate_per_sec, 7);
+        assert_eq!(
+            replacement.package_event_plane.consumer_queue_max_bytes,
+            4_096
+        );
         assert_ne!(
             replacement.package_event_plane, config.package_event_plane,
             "a later HubStartupOptions must not keep the first policy"
@@ -1448,13 +1372,8 @@ mod tests {
             "package_event_plane.subscriptions_per_plugin_max",
             "package_event_plane.subscribers_per_event_max",
             "package_event_plane.fanout_per_emit_max",
-            "package_event_plane.producer_queue_max_events",
-            "package_event_plane.producer_queue_max_bytes",
             "package_event_plane.consumer_queue_max_events",
             "package_event_plane.consumer_queue_max_bytes",
-            "package_event_plane.global_in_flight_bytes",
-            "package_event_plane.package_rate_per_sec",
-            "package_event_plane.package_burst",
             "package_event_plane.queue_age_ms",
         ];
         for field in fields {
@@ -1468,21 +1387,12 @@ mod tests {
                     options.subscribers_per_event_max = 0
                 }
                 "package_event_plane.fanout_per_emit_max" => options.fanout_per_emit_max = 0,
-                "package_event_plane.producer_queue_max_events" => {
-                    options.producer_queue_max_events = 0
-                }
-                "package_event_plane.producer_queue_max_bytes" => {
-                    options.producer_queue_max_bytes = 0
-                }
                 "package_event_plane.consumer_queue_max_events" => {
                     options.consumer_queue_max_events = 0
                 }
                 "package_event_plane.consumer_queue_max_bytes" => {
                     options.consumer_queue_max_bytes = 0
                 }
-                "package_event_plane.global_in_flight_bytes" => options.global_in_flight_bytes = 0,
-                "package_event_plane.package_rate_per_sec" => options.package_rate_per_sec = 0,
-                "package_event_plane.package_burst" => options.package_burst = 0,
                 "package_event_plane.queue_age_ms" => options.queue_age_ms = 0,
                 _ => unreachable!(),
             }
@@ -1490,47 +1400,17 @@ mod tests {
             assert!(message.contains(field), "expected {field} in {message}");
         }
 
-        let payload_gt_producer = PackageEventPlaneOptions {
-            payload_max_bytes: 600_000,
-            ..PackageEventPlaneOptions::default()
-        };
-        assert!(payload_gt_producer.validate().is_err());
-
         let payload_gt_consumer = PackageEventPlaneOptions {
             payload_max_bytes: 3 * 1024 * 1024,
-            producer_queue_max_bytes: 4 * 1024 * 1024,
-            global_in_flight_bytes: 8 * 1024 * 1024,
             ..PackageEventPlaneOptions::default()
         };
         assert!(payload_gt_consumer.validate().is_err());
-
-        let payload_gt_global = PackageEventPlaneOptions {
-            payload_max_bytes: 8_192,
-            producer_queue_max_bytes: 8_192,
-            consumer_queue_max_bytes: 8_192,
-            global_in_flight_bytes: 4_096,
-            ..PackageEventPlaneOptions::default()
-        };
-        assert!(payload_gt_global.validate().is_err());
-
-        let producer_gt_global = PackageEventPlaneOptions {
-            producer_queue_max_bytes: 32 * 1024 * 1024,
-            ..PackageEventPlaneOptions::default()
-        };
-        assert!(producer_gt_global.validate().is_err());
 
         let fanout_gt_subscribers = PackageEventPlaneOptions {
             fanout_per_emit_max: 80,
             ..PackageEventPlaneOptions::default()
         };
         assert!(fanout_gt_subscribers.validate().is_err());
-
-        let burst_lt_rate = PackageEventPlaneOptions {
-            package_burst: 10,
-            package_rate_per_sec: 20,
-            ..PackageEventPlaneOptions::default()
-        };
-        assert!(burst_lt_rate.validate().is_err());
     }
 
     fn assert_error_field(options: HubStartupOptions, field: &str) {
