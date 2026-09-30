@@ -19,6 +19,9 @@ enum Behaviour {
     SlowEcho,
     /// A composer that echoes letters but ignores backspaces.
     KeepsLetters,
+    /// A composer that echoes letters and redraws on a backspace (an output
+    /// edge) without moving the cursor back.
+    Redraws,
 }
 
 struct Terminal {
@@ -114,7 +117,9 @@ impl Terminal {
                 self.type_letters(PROBE_TEXT);
             }
         } else if bytes == [0x7f, 0x7f] || bytes == b"\x1b[127u\x1b[127u" {
-            if self.behaviour != Behaviour::KeepsLetters {
+            if self.behaviour == Behaviour::Redraws {
+                self.output_seq += 1;
+            } else if self.behaviour != Behaviour::KeepsLetters {
                 self.backspace(2);
             }
         } else {
@@ -273,6 +278,16 @@ impl Rig {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A read issued after the one that failed: every read the log holds
+    /// beyond the first.
+    fn read_issued_after_failure(&self) -> bool {
+        self.log
+            .iter()
+            .filter(|effect| matches!(effect, Effect::ReadCursor))
+            .count()
+            > 1
     }
 
     fn read_issued(&self) -> bool {
@@ -647,8 +662,11 @@ fn the_echo_is_exactly_two_cells_further() {
 
 #[test]
 fn the_ring_is_not_typed_until_the_cursor_is_back_at_the_baseline() {
+    // The erase redraws (an output edge) but the cursor stays two cells
+    // right: the machine reads it, sees it is not at the baseline, and types
+    // nothing more.
     let mut terminal = Terminal::composer();
-    terminal.behaviour = Behaviour::KeepsLetters;
+    terminal.behaviour = Behaviour::Redraws;
     let mut rig = Rig::new(terminal);
     rig.ring("hello");
     let erase = vec![0x7f, 0x7f];
@@ -682,6 +700,23 @@ fn a_probe_that_wraps_to_the_next_row_is_not_an_echo() {
         text_before_cursor: "zx".to_string(),
     };
     assert!(!echoed(&baseline, &wrapped));
+    // Only the row differs: the same column, two further, and `zx` before it.
+    let baseline = Read {
+        row: 3,
+        col: 10,
+        text_before_cursor: "> ".to_string(),
+    };
+    let other_row = Read {
+        row: 4,
+        col: 12,
+        text_before_cursor: "> zx".to_string(),
+    };
+    assert!(!echoed(&baseline, &other_row));
+    let same_row = Read {
+        row: 3,
+        ..other_row
+    };
+    assert!(echoed(&baseline, &same_row));
 }
 
 /// The erase, in the encoding of a plain (non-kitty) session.
@@ -780,5 +815,49 @@ fn a_cursor_just_left_of_the_last_two_columns_is_probed() {
     let mut rig = Rig::new(terminal);
     rig.ring("hello");
     assert_eq!(rig.writes_of(PROBE), 1);
+    assert_eq!(rig.terminal.submitted, ["hello"]);
+}
+
+/// A ring whose baseline read failed: the machine is idle, the ring pending,
+/// and the gate would pass, so only an edge can restart it.
+fn rig_with_a_failed_baseline_read() -> Rig {
+    let mut rig = Rig::new(Terminal::composer());
+    let facts = rig.terminal.facts();
+    rig.reported = Some(facts.clone());
+    rig.feed(Event::Ring {
+        text: "hello".to_string(),
+        facts,
+        last_input_at: None,
+    });
+    assert!(rig.read_out);
+    rig.read_out = false;
+    rig.feed(Event::CursorFailed);
+    assert!(rig.terminal.writes.is_empty() && rig.pending());
+    rig
+}
+
+#[test]
+fn output_alone_does_not_restart_a_waiting_ring() {
+    let mut rig = rig_with_a_failed_baseline_read();
+    // Output advances (the agent draws); no mode change, no client input.
+    rig.terminal.output_seq += 1;
+    rig.settle();
+    assert!(
+        !rig.read_issued_after_failure(),
+        "output must not start a read"
+    );
+    assert!(
+        rig.terminal.writes.is_empty(),
+        "nothing is typed on output alone"
+    );
+    assert!(rig.pending());
+}
+
+#[test]
+fn a_failed_cursor_read_leaves_the_ring_waiting_for_the_next_edge() {
+    let mut rig = rig_with_a_failed_baseline_read();
+    // A mode edge is the next idle point: the attempt starts over and delivers.
+    rig.terminal.modes_epoch += 1;
+    rig.settle();
     assert_eq!(rig.terminal.submitted, ["hello"]);
 }
