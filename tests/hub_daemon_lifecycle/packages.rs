@@ -7131,14 +7131,14 @@ fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
     let mut snapshots = std::collections::BTreeSet::new();
     while snapshots.len() < 2 {
         match connection.next_frame().expect("shared initial entity frame") {
-            botster_hub_client::DaemonUnixMuxFrame::Server(
+            
                 botster_hub_client::ServerFrame::Entity {
                     entity: botster_hub_client::DaemonEntityFrame::Snapshot {
                         subscription_id,
                         ..
                     },
-                },
-            ) => {
+                }
+             => {
                 snapshots.insert(subscription_id);
             }
             other => panic!("unexpected shared initial frame: {other:?}"),
@@ -7165,15 +7165,15 @@ fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
     );
     assert!(matches!(
         connection.next_frame().expect("retiring provider terminal frame"),
-        botster_hub_client::DaemonUnixMuxFrame::Server(
+        
             botster_hub_client::ServerFrame::Entity {
                 entity: botster_hub_client::DaemonEntityFrame::Error {
                     subscription_id,
                     code,
                     ..
                 },
-            },
-        ) if subscription_id == "retiring-on-shared" && code == "entity_provider_unloaded"
+            }
+         if subscription_id == "retiring-on-shared" && code == "entity_provider_unloaded"
     ));
 
     let definition = botster_hub_client::DaemonSessionTypeDefinition {
@@ -7211,15 +7211,15 @@ fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
     );
     assert!(matches!(
         connection.next_frame().expect("surviving sibling update"),
-        botster_hub_client::DaemonUnixMuxFrame::Server(
+        
             botster_hub_client::ServerFrame::Entity {
                 entity: botster_hub_client::DaemonEntityFrame::Upsert {
                     subscription_id,
                     id,
                     ..
                 },
-            },
-        ) if subscription_id == "surviving-on-shared" && id == "device/g2-sibling"
+            }
+         if subscription_id == "surviving-on-shared" && id == "device/g2-sibling"
     ));
     drop(connection);
     shutdown_cli_daemon(&data_dir, child);

@@ -625,29 +625,36 @@ impl DaemonUnixFrameReader {
         Ok(std::mem::take(&mut self.frame))
     }
 
-    /// Read and decode one frame whose control payload is a [`ServerFrame`].
-    pub fn read_frame<R: Read>(
-        &mut self,
-        reader: &mut R,
-    ) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    /// Read and decode one frame from the control socket. The control socket
+    /// carries [`ServerFrame`]s only: a terminal container there is a protocol
+    /// violation, because terminal frames travel on each route's own socket.
+    pub fn read_frame<R: Read>(&mut self, reader: &mut R) -> DaemonTransportResult<ServerFrame> {
         let raw = self.read_raw_frame(reader, MAX_UNIX_FRAME_BYTES)?;
         match decode_unix_frame::<ServerFrame>(&raw) {
-            Ok(DaemonUnixFrame::Control(frame)) => Ok(DaemonUnixMuxFrame::Server(frame)),
-            Ok(DaemonUnixFrame::Terminal(frame)) => Ok(DaemonUnixMuxFrame::Terminal(frame)),
+            Ok(DaemonUnixFrame::Control(frame)) => Ok(frame),
+            Ok(DaemonUnixFrame::Terminal(_)) => Err(DaemonTransportError::Protocol(
+                "terminal frame on the control socket",
+            )),
             Err(code) => Err(DaemonTransportError::ProtocolViolation(code)),
         }
     }
-}
 
-/// One decoded frame on a client's Unix connection.
-///
-/// Keep variant payloads inline to avoid adding a separate allocation for a
-/// boxed variant.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum DaemonUnixMuxFrame {
-    Server(ServerFrame),
-    Terminal(DaemonUnixTerminalFrame),
+    /// Read and decode one frame from a route socket. A route socket carries
+    /// terminal frames only: a control container there is a protocol
+    /// violation.
+    pub fn read_terminal_frame<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
+        let raw = self.read_raw_frame(reader, MAX_UNIX_FRAME_BYTES)?;
+        match decode_unix_frame::<ServerFrame>(&raw) {
+            Ok(DaemonUnixFrame::Terminal(frame)) => Ok(frame),
+            Ok(DaemonUnixFrame::Control(_)) => Err(DaemonTransportError::Protocol(
+                "control frame on a route socket",
+            )),
+            Err(code) => Err(DaemonTransportError::ProtocolViolation(code)),
+        }
+    }
 }
 
 /// Write one [`ClientFrame`] to the socket.
@@ -750,22 +757,16 @@ impl DaemonRouteStream {
     /// Read the next terminal frame. A timeout keeps any partial frame for
     /// the next read; end of stream is the route's end.
     pub fn read_frame(&mut self) -> DaemonTransportResult<DaemonUnixTerminalFrame> {
-        let frame = match self.frames.read_frame(&mut self.stream) {
+        match self.frames.read_terminal_frame(&mut self.stream) {
             // End of stream inside a frame: the Hub closed the socket while a
             // frame this client had not read was half written. It is the
             // route's end; the partial frame is discarded.
             Err(DaemonTransportError::Protocol(message))
                 if message.starts_with("truncated unix frame") =>
             {
-                return Err(DaemonTransportError::ClientDisconnected);
+                Err(DaemonTransportError::ClientDisconnected)
             }
-            frame => frame?,
-        };
-        match frame {
-            DaemonUnixMuxFrame::Terminal(frame) => Ok(frame),
-            DaemonUnixMuxFrame::Server(_) => Err(DaemonTransportError::Protocol(
-                "control frame on a route socket",
-            )),
+            frame => frame,
         }
     }
 
@@ -989,10 +990,10 @@ impl DaemonConnection {
             // Read directly so the retirement result decides this response's
             // route: return it, park it for its waiter, or discard it.
             match self.frames.read_frame(&mut self.reader)? {
-                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                ServerFrame::Response {
                     request_id: id,
                     response,
-                }) => {
+                } => {
                     let Some(id) = parse_request_id(&id) else {
                         return Err(DaemonTransportError::ProtocolViolation(
                             DaemonProtocolErrorCode::InvalidRequestId,
@@ -1006,24 +1007,19 @@ impl DaemonConnection {
                         self.parked_responses.push((id, response));
                     }
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => {
+                ServerFrame::Event { event } => {
                     self.skipped_events.push(event);
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                ServerFrame::Entity { entity: frame } => {
                     self.skipped_entity_frames.push(frame);
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                ServerFrame::Close { reason } => {
                     self.closed = Some(reason.clone());
                     return Err(DaemonTransportError::ClosedByHub(reason));
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
+                ServerFrame::HelloAck { .. } => {
                     return Err(DaemonTransportError::Protocol(
                         "unexpected hello ack after the handshake",
-                    ));
-                }
-                DaemonUnixMuxFrame::Terminal(_) => {
-                    return Err(DaemonTransportError::Protocol(
-                        "terminal frame on the control socket",
                     ));
                 }
             }
@@ -1036,15 +1032,9 @@ impl DaemonConnection {
         self.wait_response(request_id)
     }
 
-    fn read_next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    fn read_next_frame(&mut self) -> DaemonTransportResult<ServerFrame> {
         let frame = self.frames.read_frame(&mut self.reader)?;
-        if matches!(frame, DaemonUnixMuxFrame::Terminal(_)) {
-            // Terminal frames travel on each route's own socket.
-            return Err(DaemonTransportError::Protocol(
-                "terminal frame on the control socket",
-            ));
-        }
-        if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
+        if let ServerFrame::Response { request_id, .. } = &frame
             && let Some(id) = parse_request_id(request_id)
         {
             self.retire_outstanding(id);
@@ -1065,25 +1055,25 @@ impl DaemonConnection {
     /// A `Response` frame removes its id from the outstanding set. Responses
     /// for ids this connection never submitted are still returned; callers
     /// discard them.
-    pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonUnixMuxFrame> {
+    pub fn next_frame(&mut self) -> DaemonTransportResult<ServerFrame> {
         if let Some((id, response)) = self.parked_responses.pop() {
-            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            return Ok(ServerFrame::Response {
                 request_id: encode_request_id(id),
                 response,
-            }));
+            });
         }
         if !self.skipped_events.is_empty() {
-            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Event {
+            return Ok(ServerFrame::Event {
                 event: self.skipped_events.remove(0),
-            }));
+            });
         }
         if !self.skipped_entity_frames.is_empty() {
-            return Ok(DaemonUnixMuxFrame::Server(ServerFrame::Entity {
+            return Ok(ServerFrame::Entity {
                 entity: self.skipped_entity_frames.remove(0),
-            }));
+            });
         }
         let frame = self.read_next_frame()?;
-        if let DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) = &frame {
+        if let ServerFrame::Close { reason } = &frame {
             self.closed = Some(reason.clone());
         }
         Ok(frame)
@@ -1093,10 +1083,7 @@ impl DaemonConnection {
     ///
     /// Restores the previous socket read timeout. A timeout keeps any partial
     /// frame for the next read.
-    pub fn poll_frame(
-        &mut self,
-        timeout: Duration,
-    ) -> DaemonTransportResult<Option<DaemonUnixMuxFrame>> {
+    pub fn poll_frame(&mut self, timeout: Duration) -> DaemonTransportResult<Option<ServerFrame>> {
         let previous = self
             .stream
             .read_timeout()
@@ -1192,26 +1179,21 @@ impl DaemonConnection {
         }
         loop {
             match self.read_next_frame()? {
-                DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => return Ok(event),
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                ServerFrame::Event { event } => return Ok(event),
+                ServerFrame::Entity { entity: frame } => {
                     self.skipped_entity_frames.push(frame);
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                ServerFrame::Response {
                     request_id,
                     response,
-                }) => self.park_response(&request_id, response)?,
-                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                } => self.park_response(&request_id, response)?,
+                ServerFrame::Close { reason } => {
                     self.closed = Some(reason.clone());
                     return Err(DaemonTransportError::ClosedByHub(reason));
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { .. }) => {
+                ServerFrame::HelloAck { .. } => {
                     return Err(DaemonTransportError::Protocol(
                         "unexpected hello ack after the handshake",
-                    ));
-                }
-                DaemonUnixMuxFrame::Terminal(_) => {
-                    return Err(DaemonTransportError::Protocol(
-                        "terminal frame on the control socket",
                     ));
                 }
             }
@@ -1251,13 +1233,13 @@ impl DaemonEntitySubscription {
     pub fn next_frame(&mut self) -> DaemonTransportResult<DaemonEntityFrame> {
         loop {
             match self.connection.next_frame()? {
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity: frame }) => {
+                ServerFrame::Entity { entity: frame } => {
                     return Ok(frame);
                 }
-                DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
+                ServerFrame::Close { reason } => {
                     return Err(DaemonTransportError::ClosedByHub(reason));
                 }
-                DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => {}
+                _ => {}
             }
         }
     }
@@ -1572,13 +1554,11 @@ mod handshake_deadline_tests {
 fn read_hello_ack(stream: &mut UnixStream) -> DaemonTransportResult<DaemonHelloAck> {
     let mut frames = DaemonUnixFrameReader::new();
     match frames.read_frame(stream)? {
-        DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => Ok(ack),
-        DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
-            Err(DaemonTransportError::ClosedByHub(reason))
-        }
-        DaemonUnixMuxFrame::Server(_) | DaemonUnixMuxFrame::Terminal(_) => Err(
-            DaemonTransportError::Protocol("expected a hello ack as the first server frame"),
-        ),
+        ServerFrame::HelloAck { ack } => Ok(ack),
+        ServerFrame::Close { reason } => Err(DaemonTransportError::ClosedByHub(reason)),
+        _ => Err(DaemonTransportError::Protocol(
+            "expected a hello ack as the first server frame",
+        )),
     }
 }
 
@@ -5312,6 +5292,34 @@ mod tests {
         ));
     }
 
+    /// Each reader refuses the other socket's frame kind with its own message.
+    #[test]
+    fn each_reader_refuses_the_other_sockets_frame_kind() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair");
+        let mut frames = DaemonUnixFrameReader::new();
+        write_unix_terminal_frame(&mut server, "route", 5, 0, b"opaque").expect("terminal");
+        assert!(matches!(
+            frames.read_frame(&mut client),
+            Err(DaemonTransportError::Protocol(
+                "terminal frame on the control socket"
+            ))
+        ));
+        write_server_frame(
+            &mut server,
+            &ServerFrame::Close {
+                reason: DaemonCloseReason::DaemonShutdown,
+            },
+        )
+        .expect("control");
+        let mut frames = DaemonUnixFrameReader::new();
+        assert!(matches!(
+            frames.read_terminal_frame(&mut client),
+            Err(DaemonTransportError::Protocol(
+                "control frame on a route socket"
+            ))
+        ));
+    }
+
     #[test]
     fn package_event_requirement_is_operation_specific() {
         let previous = {
@@ -8500,14 +8508,12 @@ mod tests {
         assert!(second.is_err(), "partial body must time out");
         assert!(frames.has_partial_frame());
         server.write_all(&frame[9..]).expect("write rest");
-        match frames.read_frame(&mut client).expect("complete frame") {
-            DaemonUnixMuxFrame::Terminal(decoded) => {
-                assert_eq!(decoded.route, "sub");
-                assert_eq!(decoded.generation, 3);
-                assert_eq!(decoded.body, b"a");
-            }
-            other => panic!("expected terminal frame, got {other:?}"),
-        }
+        let decoded = frames
+            .read_terminal_frame(&mut client)
+            .expect("complete frame");
+        assert_eq!(decoded.route, "sub");
+        assert_eq!(decoded.generation, 3);
+        assert_eq!(decoded.body, b"a");
         assert!(!frames.has_partial_frame());
     }
 

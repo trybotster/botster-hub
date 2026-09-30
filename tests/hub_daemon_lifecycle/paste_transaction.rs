@@ -127,11 +127,11 @@ fn collect_unix_mux_for(
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         match client.read_frame() {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Terminal(frame)) => frames.push(frame),
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Event { event },
             )) => events.push(event),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Response { response, .. },
             )) => panic!("paste mux received an unpaired response: {response:?}"),
             Ok(_) | Err(_) => {}

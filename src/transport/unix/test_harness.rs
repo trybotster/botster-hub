@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonHelloAck, DaemonRequest,
-    DaemonResponse, DaemonUnixFrameReader, DaemonUnixMuxFrame, PROTOCOL, ServerFrame,
-    write_client_frame,
+    DaemonResponse, DaemonUnixFrameReader, PROTOCOL, ServerFrame, write_client_frame,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -72,7 +71,7 @@ pub(crate) fn read_hello_ack(
     reader: &mut DaemonUnixFrameReader,
 ) -> DaemonHelloAck {
     match reader.read_frame(client).expect("read daemon hello ack") {
-        DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => ack,
+        ServerFrame::HelloAck { ack } => ack,
         other => panic!("expected hello ack, got {other:?}"),
     }
 }
@@ -83,10 +82,10 @@ pub(crate) fn read_response(
     expected_request_id: u64,
 ) -> DaemonResponse {
     match reader.read_frame(client).expect("read daemon response") {
-        DaemonUnixMuxFrame::Server(ServerFrame::Response {
+        ServerFrame::Response {
             request_id,
             response,
-        }) => {
+        } => {
             assert_eq!(request_id, expected_request_id.to_string());
             response
         }

@@ -368,13 +368,13 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
     {
         stream.set_read_timeout(Some(Duration::from_millis(200)));
         match stream.read_frame() {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+            Ok(RawFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Event { .. },
             )) => {}
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Response { response, .. },
             )) => {
                 panic!("attached wait received a control response: {response:?}")
@@ -397,13 +397,13 @@ fn live_generic_core_requests_do_not_drive_idle_terminal_output() {
     stream.set_read_timeout(Some(Duration::from_millis(200)));
     loop {
         match stream.read_frame() {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
+            Ok(RawFrame::Terminal(envelope)) => {
                 envelopes.push(envelope);
             }
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Event { .. },
             )) => {}
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Response { response, .. },
             )) => {
                 panic!("quiet drain received a control response: {response:?}")
@@ -1005,8 +1005,8 @@ fn wait_for_subscription_closed(
         }
         client.set_read_timeout(Some(Duration::from_millis(100)));
         match client.read_frame() {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+            Ok(RawFrame::Terminal(frame)) => frames.push(frame),
+            Ok(RawFrame::Server(
                 botster_hub_client::ServerFrame::Event { event },
             )) => events.push(event),
             Ok(_) => {}
@@ -1300,8 +1300,8 @@ fn drain_terminal_until(client: &mut RawUnixClient, until: Instant, events: &mut
     while Instant::now() < until {
         client.set_read_timeout(Some(Duration::from_millis(100)));
         match client.read_frame() {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(_)) => terminal += 1,
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(botster_hub_client::ServerFrame::Event { event })) => {
+            Ok(RawFrame::Terminal(_)) => terminal += 1,
+            Ok(RawFrame::Server(botster_hub_client::ServerFrame::Event { event })) => {
                 events.push(event)
             }
             Ok(_) | Err(_) => {}

@@ -7,7 +7,7 @@ use botster_core_test_support::route_observer::RouteObserver;
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest,
     DaemonResponse, DaemonResponseKind, DaemonRouteStream, DaemonTransportError,
-    DaemonTransportResult, DaemonUnixMuxFrame, DaemonUnixTerminalFrame, ServerFrame,
+    DaemonTransportResult, DaemonUnixTerminalFrame, ServerFrame,
 };
 use botster_terminal_protocol::{AttachStateCode, InputOutcome, TerminalFrame};
 use botster_terminal_protocol_client::{
@@ -453,7 +453,7 @@ impl UnixRouteClient {
             // Host events (a route's close, lifecycle) arrive on the control
             // socket; keep them for `take_skipped_events`.
             match self.inner.poll_frame(ROUTE_POLL_SLICE) {
-                Ok(Some(DaemonUnixMuxFrame::Server(ServerFrame::Event { event }))) => {
+                Ok(Some(ServerFrame::Event { event })) => {
                     self.polled_events.push(event);
                 }
                 Ok(_) => {}
