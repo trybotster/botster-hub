@@ -1330,6 +1330,7 @@ fn session_entity_patch_explicitly_updates_required_lifecycle_class() {
             traits: Vec::new(),
             interaction: None,
             session_type_lifecycle: None,
+            restartable: false,
         }
     };
     let current = entity("running", Some("running"), "current");

@@ -1766,6 +1766,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("traits?", "string[]"),
             ("interaction?", "string | null"),
             ("session_type_lifecycle?", "string | null"),
+            ("restartable?", "boolean"),
         ],
     );
     emit_union(

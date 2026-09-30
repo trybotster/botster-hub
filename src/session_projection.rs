@@ -25,6 +25,8 @@ pub struct SessionProjectionRow {
     pub live_ended: bool,
     /// Journal sequence that last mutated this row.
     pub change_seq: u64,
+    /// Derived: ended, and the durable restart-record set holds this id.
+    pub restartable: bool,
 }
 
 /// One Hub lifecycle cursor and one canonical session projection.
@@ -122,11 +124,56 @@ impl SessionProjection {
             traits,
             interaction: metadata.get("botster.session_type.interaction").cloned(),
             session_type_lifecycle: metadata.get("botster.session_type.lifecycle").cloned(),
+            restartable: false,
         }
     }
 
-    /// Apply one journal change. Remove is not ended evidence.
+    /// Project one row, including its derived `restartable` flag.
+    #[must_use]
+    pub fn project_row(row: &SessionProjectionRow) -> DaemonSessionEntity {
+        DaemonSessionEntity {
+            restartable: row.restartable,
+            ..Self::project_entity(&row.record)
+        }
+    }
+
+    /// A row is restartable when it has ended and a durable restart record
+    /// exists. The record set is not copied here: ingest asks the published
+    /// Hub state through a lookup, once per row it ingests.
+    fn derive_restartable(lifecycle_class: &str, has_record: bool) -> bool {
+        lifecycle_class == "ended" && has_record
+    }
+
+    /// One durable restart record was set or removed. Returns true when the
+    /// projected row's flag flipped. A row not yet projected derives the flag
+    /// through the lookup when it is ingested.
+    pub fn restart_record_changed(&mut self, session_id: &str, present: bool) -> bool {
+        match self.rows.get_mut(session_id) {
+            Some(row) => {
+                let restartable = Self::derive_restartable(row.lifecycle_class, present);
+                if row.restartable == restartable {
+                    return false;
+                }
+                row.restartable = restartable;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `apply_change_with` for a Hub that keeps no restart records.
+    #[cfg(test)]
     pub fn apply_change(&mut self, change: &SessionLifecycleChange) {
+        self.apply_change_with(change, &|_| false);
+    }
+
+    /// Apply one journal change. Remove is not ended evidence. `has_record`
+    /// says whether a durable restart record exists for a session id.
+    pub fn apply_change_with(
+        &mut self,
+        change: &SessionLifecycleChange,
+        has_record: &dyn Fn(&str) -> bool,
+    ) {
         match &change.kind {
             SessionLifecycleChangeKind::Upsert { record } => {
                 let lifecycle_class = session_lifecycle_class(
@@ -134,6 +181,10 @@ impl SessionProjection {
                     record.lifecycle.as_ref(),
                 );
                 let live_ended = lifecycle_class == "ended";
+                let restartable = Self::derive_restartable(
+                    lifecycle_class,
+                    has_record(&record.session.session_id.0),
+                );
                 self.rows.insert(
                     record.session.session_id.0.clone(),
                     SessionProjectionRow {
@@ -141,6 +192,7 @@ impl SessionProjection {
                         lifecycle_class,
                         live_ended,
                         change_seq: change.cursor.sequence,
+                        restartable,
                     },
                 );
             }
@@ -163,19 +215,34 @@ impl SessionProjection {
         if !complete {
             return;
         }
-        self.ingest_baseline_rows(snapshot.sequence, records);
+        self.ingest_baseline_rows_with(snapshot.sequence, records, &|_| false);
         self.seal_baseline(snapshot);
     }
 
-    /// Insert baseline rows without sealing the snapshot.
+    /// `ingest_baseline_rows_with` for a Hub that keeps no restart records.
+    #[cfg(test)]
     pub fn ingest_baseline_rows(
         &mut self,
         sequence: u64,
         records: impl IntoIterator<Item = SessionLifecycleRecord>,
     ) {
+        self.ingest_baseline_rows_with(sequence, records, &|_| false);
+    }
+
+    /// Insert baseline rows without sealing the snapshot. `has_record` says
+    /// whether a durable restart record exists for a session id; it is asked
+    /// once per ingested row.
+    pub fn ingest_baseline_rows_with(
+        &mut self,
+        sequence: u64,
+        records: impl IntoIterator<Item = SessionLifecycleRecord>,
+        has_record: &dyn Fn(&str) -> bool,
+    ) {
         for record in records {
             let lifecycle_class =
                 session_lifecycle_class(&record.session.registry_state, record.lifecycle.as_ref());
+            let restartable =
+                Self::derive_restartable(lifecycle_class, has_record(&record.session.session_id.0));
             self.rows.insert(
                 record.session.session_id.0.clone(),
                 SessionProjectionRow {
@@ -183,6 +250,7 @@ impl SessionProjection {
                     lifecycle_class,
                     live_ended: false,
                     change_seq: sequence,
+                    restartable,
                 },
             );
         }
@@ -333,6 +401,82 @@ mod tests {
             RegistrySessionState::Exited => 3,
             RegistrySessionState::Stale => 4,
         }
+    }
+
+    fn ended(id: &str) -> SessionLifecycleRecord {
+        record(
+            id,
+            RegistrySessionState::Exited,
+            Some(SessionLifecycleState::Exited { code: Some(0) }),
+        )
+    }
+
+    #[test]
+    fn restartable_flips_only_for_an_ended_row_with_a_durable_record() {
+        let mut projection = SessionProjection::default();
+        projection.replace_complete_baseline(
+            cursor(1),
+            [
+                ended("done"),
+                ended("plain"),
+                record(
+                    "live",
+                    RegistrySessionState::Running,
+                    Some(SessionLifecycleState::Running),
+                ),
+            ],
+        );
+        assert!(!SessionProjection::project_row(&projection.rows["done"]).restartable);
+        assert!(projection.restart_record_changed("done", true));
+        assert!(SessionProjection::project_row(&projection.rows["done"]).restartable);
+        assert!(
+            !projection.restart_record_changed("done", true),
+            "idempotent"
+        );
+        // A record for a running session, or none for a plain Spawn, stays false.
+        assert!(!projection.restart_record_changed("live", true));
+        assert!(!projection.rows["live"].restartable);
+        assert!(!projection.rows["plain"].restartable);
+        assert!(projection.restart_record_changed("done", false));
+        assert!(!projection.rows["done"].restartable);
+    }
+
+    #[test]
+    fn a_record_that_exists_before_its_row_is_projected_is_derived_at_ingest() {
+        let mut projection = SessionProjection::default();
+        let has = |id: &str| id == "late" || id == "run";
+        assert!(!projection.restart_record_changed("late", true));
+        projection.ingest_baseline_rows_with(1, [ended("late"), ended("other")], &has);
+        assert!(projection.rows["late"].restartable);
+        assert!(!projection.rows["other"].restartable);
+        // A live change that ends a running row derives the flag too.
+        projection.apply_change_with(
+            &SessionLifecycleChange {
+                cursor: cursor(2),
+                kind: SessionLifecycleChangeKind::Upsert {
+                    record: ended("run"),
+                },
+            },
+            &has,
+        );
+        assert!(projection.rows["run"].restartable);
+    }
+
+    #[test]
+    fn ingest_asks_the_lookup_once_per_row_and_keeps_no_copy_of_the_record_set() {
+        let mut projection = SessionProjection::default();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let has = |id: &str| {
+            asked.borrow_mut().push(id.to_string());
+            false
+        };
+        projection.ingest_baseline_rows_with(1, [ended("a"), ended("b")], &has);
+        projection.ingest_baseline_rows_with(2, [ended("c")], &has);
+        assert_eq!(
+            *asked.borrow(),
+            ["a", "b", "c"],
+            "one ask per row, only for its rows"
+        );
     }
 
     #[test]
