@@ -170,7 +170,7 @@ impl RecordWrite {
     ) {
         match action {
             StateRecordAction::Submit(command) => {
-                self.submit(daemon, state, waiter_id, session_id, command);
+                self.submit(daemon, state, waiter_id, session_id, *command);
             }
             StateRecordAction::Park => {}
             StateRecordAction::Committed => {

@@ -595,7 +595,7 @@ impl ManagedSpawnOperation {
                     .record_write
                     .as_ref()
                     .is_some_and(StateRecordWrite::awaits_commit);
-                let poll = self.submit_host(daemon, state, phase, command);
+                let poll = self.submit_host(daemon, state, phase, *command);
                 if commit
                     && !matches!(poll, ControlPoll::Pending)
                     && let Some(write) = self.record_write.as_mut()

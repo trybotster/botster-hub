@@ -39,7 +39,7 @@ pub(crate) enum StateRecordAction {
     /// Submit this Host command with the caller's permit and next phase. When
     /// [`StateRecordWrite::awaits_commit`] is true and the submission does not
     /// go Pending, report it through [`StateRecordWrite::commit_not_submitted`].
-    Submit(HostCommand),
+    Submit(Box<HostCommand>),
     /// The document is busy: return Pending. The document owner's release wakes
     /// this waiter, and the next poll calls [`StateRecordWrite::admit`] with
     /// `parked = true`.
@@ -159,8 +159,8 @@ impl StateRecordWrite {
                     .take()
                     .expect("an admitted record write has a prepared mutation");
                 self.phase = Phase::Commit;
-                StateRecordAction::Submit(HostCommand::Mutation(HostMutationCommand::Commit(
-                    HostCommit { prepared },
+                StateRecordAction::Submit(Box::new(HostCommand::Mutation(
+                    HostMutationCommand::Commit(HostCommit { prepared }),
                 )))
             }
             DocumentAdmission::Busy => {
@@ -248,9 +248,9 @@ impl StateRecordWrite {
             },
         };
         self.phase = Phase::Prepare;
-        Ok(StateRecordAction::Submit(HostCommand::Mutation(
+        Ok(StateRecordAction::Submit(Box::new(HostCommand::Mutation(
             HostMutationCommand::Prepare(Box::new(prepare)),
-        )))
+        ))))
     }
 
     fn prepared_result(
@@ -311,7 +311,7 @@ impl StateRecordWrite {
             },
             HostResult::Mutation(HostMutationResult::Recovered(
                 RecoveryOutcome::RegisteredWorktree { failure, .. }
-                | RecoveryOutcome::RestartRecord { failure, .. },
+                | RecoveryOutcome::RestartRecord { failure },
             )) => StateRecordAction::Failed {
                 stage: StateRecordStage::Commit,
                 code: failure.code,
@@ -383,7 +383,10 @@ pub(crate) mod tests {
 
     /// Run the Host mutation an action asks for, on this thread.
     pub(crate) fn run(action: StateRecordAction) -> HostResult {
-        let StateRecordAction::Submit(HostCommand::Mutation(command)) = action else {
+        let StateRecordAction::Submit(command) = action else {
+            panic!("the action submits a Host command");
+        };
+        let HostCommand::Mutation(command) = *command else {
             panic!("the action submits a Host mutation");
         };
         HostResult::Mutation(crate::host_mutations::execute(command, None))
@@ -463,8 +466,9 @@ pub(crate) mod tests {
         let action = first.on_completion(&mut daemon, &mut state, first_prepared, || None);
         assert!(
             matches!(
-                action,
-                StateRecordAction::Submit(HostCommand::Mutation(HostMutationCommand::Prepare(_)))
+                &action,
+                StateRecordAction::Submit(command)
+                    if matches!(**command, HostCommand::Mutation(HostMutationCommand::Prepare(_)))
             ),
             "the stale preparation is prepared again"
         );

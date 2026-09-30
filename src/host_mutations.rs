@@ -968,9 +968,8 @@ pub(crate) enum RollbackDescriptor {
     RegisteredWorktree {
         previous: SharedView<HubState>,
     },
-    RestartRecord {
-        previous: SharedView<HubState>,
-    },
+    /// A failed restart-record commit published nothing, so no view is kept.
+    RestartRecord,
     SessionType {
         previous: SharedView<HubState>,
         repo_file: Option<RepoFileRollback>,
@@ -1001,7 +1000,6 @@ pub(crate) enum RecoveryOutcome {
         failure: HostMutationError,
     },
     RestartRecord {
-        view: SharedView<HubState>,
         failure: HostMutationError,
     },
     SessionType {
@@ -2575,7 +2573,7 @@ fn prepare_state_change(inputs: StateChangeInputs) -> Result<PreparedMutation, H
         ),
         MutationFamily::RestartRecord => (
             PreparedChange::RestartRecord(change),
-            RollbackDescriptor::RestartRecord { previous },
+            RollbackDescriptor::RestartRecord,
         ),
     };
     Ok(PreparedMutation {
@@ -2884,8 +2882,7 @@ fn execute_recovery(recover: HostRecover) -> RecoveryOutcome {
                 failure: recover.failure,
             }
         }
-        RollbackDescriptor::RestartRecord { previous } => RecoveryOutcome::RestartRecord {
-            view: previous,
+        RollbackDescriptor::RestartRecord => RecoveryOutcome::RestartRecord {
             failure: recover.failure,
         },
         RollbackDescriptor::SessionType {
@@ -2937,7 +2934,7 @@ fn families_match(change: &PreparedChange, rollback: &RollbackDescriptor) -> boo
             RollbackDescriptor::RegisteredWorktree { .. }
         ) | (
             PreparedChange::RestartRecord(_),
-            RollbackDescriptor::RestartRecord { .. }
+            RollbackDescriptor::RestartRecord
         ) | (
             PreparedChange::SessionType(_),
             RollbackDescriptor::SessionType { .. }
@@ -3963,7 +3960,7 @@ mod tests {
             };
             assert!(matches!(
                 prepared.rollback,
-                RollbackDescriptor::RestartRecord { .. }
+                RollbackDescriptor::RestartRecord
             ));
             let HostMutationResult::Committed(committed) =
                 execute(HostMutationCommand::Commit(HostCommit { prepared }))
