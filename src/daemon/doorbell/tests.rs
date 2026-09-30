@@ -966,3 +966,30 @@ fn an_attempt_that_read_the_cursor_clears_the_margin_wait() {
     );
     assert!(rig.terminal.writes.is_empty() && rig.pending());
 }
+
+#[test]
+fn every_write_the_machine_makes_has_the_purpose_it_was_built_for() {
+    assert_eq!(write_purpose(PROBE), Purpose::Probe);
+    assert_eq!(write_purpose(&erase_bytes(false)), Purpose::Erase);
+    assert_eq!(write_purpose(&erase_bytes(true)), Purpose::Erase);
+    // A ring is a ring whatever its text or paste mode, even the probe's own text.
+    for text in ["hello", "zx", "", "a\rb"] {
+        for bracketed in [true, false] {
+            assert_eq!(
+                write_purpose(&delivery_bytes(text, bracketed)),
+                Purpose::Ring,
+                "text {text:?}, bracketed {bracketed}"
+            );
+        }
+    }
+    // And the writes a rig actually saw for one full ring have those purposes.
+    let mut rig = Rig::new(Terminal::composer());
+    rig.ring("hello");
+    let purposes = rig
+        .terminal
+        .writes
+        .iter()
+        .map(|bytes| write_purpose(bytes))
+        .collect::<Vec<_>>();
+    assert_eq!(purposes, [Purpose::Probe, Purpose::Erase, Purpose::Ring]);
+}

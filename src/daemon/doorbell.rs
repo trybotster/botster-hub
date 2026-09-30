@@ -313,6 +313,32 @@ fn erase_bytes(kitty_enabled: bool) -> Vec<u8> {
     }
 }
 
+/// What one of the machine's writes is for, so the owner can tell how a
+/// failed write changes the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The `zx` probe. A refused probe stops the attempt: nothing was decided.
+    Probe,
+    /// The erase of a probe. A refused erase stops the attempt too; the next
+    /// attempt's baseline read finds and erases the stray probe.
+    Erase,
+    /// The ring. A refused ring is pending again ([`Event::DeliveryFailed`]).
+    Ring,
+}
+
+/// Tell what a write returned by the machine is for. The three encodings
+/// cannot be confused: a ring always ends in CR (whatever its text), the probe
+/// is exactly `zx`, and an erase is two backspaces in either keyboard encoding.
+pub(crate) fn write_purpose(bytes: &[u8]) -> Purpose {
+    if bytes.last() == Some(&b'\r') {
+        Purpose::Ring
+    } else if bytes == PROBE {
+        Purpose::Probe
+    } else {
+        Purpose::Erase
+    }
+}
+
 /// The ring text as a terminal may safely receive it. The text comes from a
 /// plugin, so no byte of it may act as terminal input: a CR would submit, an
 /// ESC could open a sequence or end the paste early (`ESC [ 201 ~`). Line
