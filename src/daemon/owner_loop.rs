@@ -9205,6 +9205,130 @@ return botster.register({ handlers = {} })
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// H20: an obligation that ends through the owner poll raises the
+    /// capacity notification; one that stays pending does not.
+    #[test]
+    fn a_finished_obligation_raises_the_capacity_notification_and_a_pending_one_does_not() {
+        use crate::daemon::owner_budget::{ObligationPoll, poll_owner_obligation_item};
+        let root = unique_package_control_dir("obligation-capacity-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
+        let pending = crate::owner_identity::WaiterId(9_100_001);
+        let finishing = crate::owner_identity::WaiterId(9_100_002);
+        crate::daemon::owner_budget::retain_owner_obligation(
+            &mut state,
+            pending,
+            "wake-pending",
+            |_, _, _| ObligationPoll::Pending,
+        );
+        crate::daemon::owner_budget::retain_owner_obligation(
+            &mut state,
+            finishing,
+            "wake-finishing",
+            |_, _, _| ObligationPoll::Done,
+        );
+        let mut items = vec![
+            state
+                .owner_ready
+                .pop_next()
+                .expect("first obligation ready"),
+            state
+                .owner_ready
+                .pop_next()
+                .expect("second obligation ready"),
+        ];
+        items.sort_by_key(|item| item.key().waiter_id().0);
+        assert!(poll_owner_obligation_item(
+            &mut daemon,
+            &mut state,
+            items[0]
+        ));
+        assert_eq!(state.budget.outstanding(), 2);
+        assert!(
+            !state.budget.take_capacity_notification(),
+            "a pending obligation returns no capacity"
+        );
+        assert!(poll_owner_obligation_item(
+            &mut daemon,
+            &mut state,
+            items[1]
+        ));
+        assert_eq!(state.budget.outstanding(), 1);
+        assert!(
+            state.budget.take_capacity_notification(),
+            "a finished obligation raises the capacity notification"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H20: at the obligation bound the owner drops an accepted connection
+    /// and counts it; below the bound the same connection is admitted.
+    #[test]
+    fn an_accepted_connection_is_refused_at_the_obligation_bound_and_admitted_below_it() {
+        let root = unique_package_control_dir("connection-bound-refusal");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = transport.enter();
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let mut tasks = Vec::new();
+        let mut accept = |state: &mut DaemonControlState, daemon: &mut HubDaemon| {
+            let (server, _client) = tokio::net::UnixStream::pair().unwrap();
+            let admission = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+            let cleanup = control_tx.clone().try_reserve_owned().unwrap();
+            enqueue_control_message(
+                state,
+                ControlMessage::AcceptedConnection {
+                    stream: server,
+                    admission_permit: admission,
+                    cleanup_permit: cleanup,
+                },
+            )
+            .unwrap_or_else(|_| panic!("enqueue the accepted connection"));
+            let item = state.owner_ready.pop_next().expect("ingress ready");
+            run_control_ingress_item(
+                daemon,
+                state,
+                &transport,
+                control_tx.clone(),
+                &shutdown_tx,
+                &mut tasks,
+                item,
+            )
+        };
+
+        let mut full = DaemonControlState::default();
+        full.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+        crate::daemon::owner_budget::hold_test_obligations(&mut full, 1);
+        assert_eq!(accept(&mut full, &mut daemon), Some(false));
+        assert_eq!(full.lifecycle_counters.rejected_connections, 1);
+        assert_eq!(full.lifecycle_counters.accepted_connections, 0);
+        assert_eq!(
+            full.lifecycle_counters
+                .cleanup_by_reason
+                .get("owner_budget_refused_connection"),
+            Some(&1)
+        );
+
+        let mut open = DaemonControlState::default();
+        open.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
+        crate::daemon::owner_budget::hold_test_obligations(&mut open, 1);
+        assert_eq!(accept(&mut open, &mut daemon), Some(false));
+        assert_eq!(open.lifecycle_counters.accepted_connections, 1);
+        assert_eq!(open.lifecycle_counters.rejected_connections, 0);
+        drop(accept);
+        drop(tasks);
+        drop(_entered);
+        drop(transport);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn the_owner_test_driver_stops_at_its_hang_guard_while_work_stays_ready() {
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
