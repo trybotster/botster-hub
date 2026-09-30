@@ -6,16 +6,15 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use botster_core::{
-    Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, ModeFlags,
+    Capability, CapabilitySurface, ExtensionEntrypoint, ExtensionKind, ExtensionRuntime,
     PackageBlockedReason, PackageConfigurationField, PackageConfigurationFieldType,
     PackageConfigurationSchema, PackageConfigurationSecretValue, PackageConfigurationValue,
     PackageDependency, PackageDependencyKind, PackageFeatureGate, PackageRequirement, RequestId,
     SessionId, SessionLifecycleState, SubscriptionId,
 };
 use botster_core_daemon::{
-    GuardedWriteDecision, GuardedWriteDeliveryState, LifecycleBaselineBudget,
-    LifecycleBaselineStop, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleStop,
-    ReadinessEvidence,
+    LifecycleBaselineBudget, LifecycleBaselineStop, ObserveLifecycleBudget, ObserveLifecycleCursor,
+    ObserveLifecycleStop,
 };
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore,
@@ -2933,55 +2932,6 @@ fn package_availability_reason_vocabulary_is_stable_and_sanitized() {
     );
 }
 
-fn drain_until(
-    api: &HubClientApi,
-    runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
-    session_id: &SessionId,
-    needle: &[u8],
-    logical_clock: &mut u64,
-) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let needle_text = String::from_utf8_lossy(needle);
-
-    while Instant::now() < deadline {
-        let _ = runtime
-            .observe_lifecycle_slice(
-                *logical_clock,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(25),
-                },
-            )
-            .wait(std::time::Duration::from_secs(30))
-            .expect("core bridge");
-        let response = api
-            .handle_request(
-                runtime,
-                packages,
-                HubClientRequest::ReadScreen {
-                    request_id: request_id("read-screen-drain-until"),
-                    session_id: session_id.clone(),
-                    now_seconds: *logical_clock,
-                },
-            )
-            .wait(runtime)
-            .expect("read screen through client api");
-        *logical_clock += 1;
-        let HubClientResponseBody::ReadScreen(screen) = response.body else {
-            panic!("read screen should return typed response");
-        };
-        if screen.text.contains(needle_text.as_ref()) {
-            return screen.text.into_bytes();
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    panic!("timed out waiting for {needle_text:?} on ReadScreen")
-}
-
 fn read_screen_until(
     api: &HubClientApi,
     runtime: &mut HubRuntime,
@@ -3426,174 +3376,6 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
         panic!("shutdown should return events");
     };
     assert!(events.is_empty());
-}
-
-#[test]
-fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
-    let api = HubClientApi::local_operator("local-client-api-test");
-    let mut runtime = explicit_runtime("guarded-write");
-    let session_actions = capability(
-        CapabilitySurface::SessionActions,
-        Some("guarded_session_notification_write"),
-    );
-    let surfaces = capability(CapabilitySurface::Surfaces, None);
-    let mut packages = PackageRegistry::new(
-        vec![session_actions.clone(), surfaces.clone()]
-            .into_iter()
-            .collect(),
-    );
-    packages
-        .install(
-            plugin_manifest("workflow.plugin", vec![session_actions.clone()]),
-            provenance(),
-            "install package",
-        )
-        .expect("install allowed package");
-    packages
-        .enable("workflow.plugin", "enable package")
-        .expect("enable allowed package");
-    packages
-        .install(
-            plugin_manifest("blocked.plugin", vec![surfaces]),
-            provenance(),
-            "install blocked package",
-        )
-        .expect("install blocked package");
-    packages
-        .enable("blocked.plugin", "enable blocked package")
-        .expect("enable blocked package");
-
-    let session_id = SessionId("client-guarded".to_string());
-    let subscription_id = SubscriptionId("client-guarded-subscription".to_string());
-    let mut logical_clock = 200;
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::Spawn {
-            request_id: request_id("guarded-spawn"),
-            session_id: session_id.clone(),
-            command:
-                "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"
-                    .to_string(),
-            now_seconds: logical_clock,
-        },
-    )
-    .wait(&runtime)
-    .expect("spawn through client api");
-    logical_clock += 1;
-
-    // Before this client attaches, Core refuses its write typed (NotSubscribed);
-    // the client sees "not attached", never an Ok that lost the bytes.
-    let unattached = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::GuardedNotificationWrite {
-                request_id: request_id("guarded-unattached"),
-                session_id: session_id.clone(),
-                package_name: "workflow.plugin".to_string(),
-                data: b"unattached\n".to_vec(),
-                readiness: ReadinessEvidence::ready(ModeFlags {
-                    cursor_visible: true,
-                    ..ModeFlags::default()
-                }),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect_err("an unattached client's guarded write must be refused");
-    logical_clock += 1;
-    assert_eq!(
-        unattached,
-        HubClientError::Runtime {
-            request_id: request_id("guarded-unattached"),
-            operation: HubClientOperation::GuardedNotificationWrite,
-            kind: botster_hub::HubClientRuntimeErrorKind::NotAttached,
-        }
-    );
-
-    attach_bound_subscription(
-        &mut runtime,
-        &api,
-        &session_id,
-        &subscription_id,
-        logical_clock,
-    );
-    logical_clock += 1;
-
-    read_screen_until(
-        &api,
-        &mut runtime,
-        &packages,
-        &session_id,
-        "ready",
-        &mut logical_clock,
-    );
-
-    let mode_flags = ModeFlags {
-        cursor_visible: true,
-        ..ModeFlags::default()
-    };
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::GuardedNotificationWrite {
-                request_id: request_id("guarded-write"),
-                session_id: session_id.clone(),
-                package_name: "workflow.plugin".to_string(),
-                data: b"guarded-client\n".to_vec(),
-                readiness: ReadinessEvidence::ready(mode_flags.clone()),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect("allowed package should write through core daemon");
-    logical_clock += 1;
-    let HubClientResponseBody::GuardedWrite(result) = response.body else {
-        panic!("guarded write response expected");
-    };
-    assert!(matches!(result.decision, GuardedWriteDecision::Write));
-    assert_eq!(
-        result.states,
-        vec![
-            GuardedWriteDeliveryState::Accepted,
-            GuardedWriteDeliveryState::Written
-        ],
-        "core daemon owns guarded-write delivery states"
-    );
-    drain_until(
-        &api,
-        &mut runtime,
-        &packages,
-        &session_id,
-        b"echo:guarded-client",
-        &mut logical_clock,
-    );
-
-    let denied = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::GuardedNotificationWrite {
-                request_id: request_id("guarded-denied"),
-                session_id,
-                package_name: "blocked.plugin".to_string(),
-                data: b"blocked\n".to_vec(),
-                readiness: ReadinessEvidence::ready(mode_flags),
-                now_seconds: logical_clock,
-            },
-        )
-        .wait(&runtime)
-        .expect_err("ungranted package should be denied by hub policy");
-    assert_eq!(
-        denied,
-        HubClientError::PackageCapabilityDenied {
-            request_id: request_id("guarded-denied"),
-            operation: HubClientOperation::GuardedNotificationWrite,
-            package_name: "blocked.plugin".to_string(),
-        }
-    );
 }
 
 #[test]

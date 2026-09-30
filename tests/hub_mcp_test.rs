@@ -843,12 +843,10 @@ fn mcp_native_coordination_tools_refuse_an_unknown_session() {
         messages[2]["result"]["structuredContent"]["error"]["code"], "unknown_session",
         "post_message to a missing session is a typed refusal"
     );
-    assert!(
-        messages[3]["result"]["structuredContent"]["notify"]["decision"]
-            .as_str()
-            .expect("notify decision")
-            .contains("unknown session"),
-        "notify_session should report guarded-write fallback for unavailable sessions"
+    assert_eq!(messages[3]["result"]["isError"], true);
+    assert_eq!(
+        messages[3]["result"]["structuredContent"]["error"]["code"], "unknown_session",
+        "notify_session to a missing session is a typed refusal"
     );
 
     let daemon_output = shutdown_cli_daemon(&data_dir, daemon);

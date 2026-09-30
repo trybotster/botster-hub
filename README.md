@@ -83,8 +83,8 @@ After dual coordination kill, **CoreDaemon is the single product owner** of
 hub-native routed envelopes and guarded notification writes:
 
 - Native MCP/daemon tools: `HubClientApi` → `HubRuntime` →
-  `CoreDaemon::{publish,drain,acknowledge}_routed_envelope` and
-  `CoreDaemon::guarded_write`.
+  `CoreDaemon::{publish,drain,acknowledge}_routed_envelope`. `notify_session`
+  queues a ring with the owner-side doorbell.
 - Lua plugins: `botster.coordination.*` uses the same CoreDaemon instance through
   a narrow hub coordination bridge (no hub-local envelope inbox).
 - There is no parallel hub-local `RoutedEnvelopeRouter` product path.
@@ -241,7 +241,6 @@ the only operation that makes a retained reference unavailable.
 | `attach_client` | Exposed on the Unix/WebRTC daemon bind path | Local `HubClientApi::Attach` fail-closes. Successful Attach always binds an adapter. |
 | `detach_client` | Exposed | Explicit client subscription teardown through CoreDaemon. |
 | Bound terminal adapter input | Exposed on Unix and WebRTC terminal routes | Compact binary input, mode-gated input, resize, and Core-owned paste transaction frames stay opaque on the duplex adapter path. WebRTC reassembles one bounded encrypted envelope before Hub validates the opaque Core frame header. |
-| `guarded_write` | Exposed | Hub admits the request; CoreDaemon owns readiness and delivery states. |
 | `publish` / `drain` / `acknowledge` routed envelope | Exposed | Single CoreDaemon coordination bus for native MCP and Lua. |
 | `release_sessions_for_restart` / `adoption_scan` / `adopt_session` | Exposed | Explicit daemon restart/adoption over worker-backed sessions. |
 | `read_screen` / `read_mode_flags` / `capture_snapshot` | Exposed | Daemon-backed terminal readback goes through `HubRuntime` and `CoreDaemon`. `read_mode_flags` returns full `ModeFlags` and freshness. `capture_snapshot` returns metadata only. Opaque GHOSTSNP bytes stay on the attach data plane. |

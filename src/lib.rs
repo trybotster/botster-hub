@@ -149,7 +149,7 @@ pub use botster_hub_client::{
 pub use capabilities::HubCapabilityRuntime;
 pub use client_api::{
     HubClientAdmission, HubClientApi, HubClientCapability, HubClientCaptureSnapshot,
-    HubClientError, HubClientEvent, HubClientGuardedWrite, HubClientIdentity, HubClientModeFlags,
+    HubClientError, HubClientEvent, HubClientIdentity, HubClientModeFlags,
     HubClientObservationKind, HubClientOperation, HubClientPackage, HubClientPackageAvailability,
     HubClientPackageAvailabilityReason, HubClientPackageAvailabilityState,
     HubClientPackageClassification, HubClientPackageConfiguration,
@@ -484,11 +484,6 @@ const HUB_FACADE_DECISIONS: &[HubFacadeDecision] = &[
         "explicit client terminal resize path through the core daemon",
     ),
     HubFacadeDecision::new(
-        "guarded_write",
-        HubFacadeExposure::Exposed,
-        "hub-admitted guarded notification write delegated to core daemon readiness and delivery states",
-    ),
-    HubFacadeDecision::new(
         "publish/drain/acknowledge_routed_envelope",
         HubFacadeExposure::Exposed,
         "native coordination reference tools delegate queue, cursor, and ack semantics to the core daemon routed-envelope primitive",
@@ -754,7 +749,6 @@ mod tests {
         assert!(exposed.contains(&"detach_client"));
         assert!(exposed.contains(&"write_bytes"));
         assert!(exposed.contains(&"resize"));
-        assert!(exposed.contains(&"guarded_write"));
         assert!(exposed.contains(&"publish/drain/acknowledge_routed_envelope"));
         assert!(exposed.contains(&"release_sessions_for_restart/adoption_scan/adopt_session"));
         assert!(exposed.contains(&"read_screen/capture_snapshot"));
