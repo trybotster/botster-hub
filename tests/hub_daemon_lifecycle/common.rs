@@ -575,11 +575,16 @@ pub(crate) fn daemon_test_lock() -> &'static std::sync::RwLock<()> {
     REAL_DAEMON_TEST_LOCK.get_or_init(|| std::sync::RwLock::new(()))
 }
 
-/// How many real-daemon tests run at once. Measured on a 12-core host: 4 passes
-/// every time (3 of 3 runs, 206 s against 418 s serial); 6, 8 and 12 each fail
-/// two or three tests whose time budgets a busier host breaks (route smokes,
-/// idle-route and stalled-socket proofs).
-const DAEMON_TEST_PARALLELISM: usize = 4;
+/// How many real-daemon tests run at once. Measured on a 12-core host, lifecycle
+/// phase, 367 tests (logs in shared/hub-test-speed/locks-final and
+/// lifecycle-rwlock): serial 0 failures in 4 runs, 418 s; 3 at once 1 failure in 4
+/// runs, 245 s; 4 at once 2 failures in 9 runs, 205 s; 12 at once failed in every
+/// run. Each failure was a fixed time budget in a test (5 s for a session's first
+/// bytes, a 2 s process settle, a 10 s reader deadline) missed while several
+/// daemons start together; the failing test differs from run to run and each
+/// passes alone. 3 is the highest value the orchestrator's rule allows when
+/// serial is clean; the samples are too small to separate 2, 3 and 4.
+const DAEMON_TEST_PARALLELISM: usize = 3;
 
 /// A counting permit: the shared guards wait here, so at most
 /// `DAEMON_TEST_PARALLELISM` real daemons run together.
