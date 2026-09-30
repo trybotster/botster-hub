@@ -60,6 +60,7 @@ pub fn undefined_globals(
         scopes: Vec::new(),
         writes: HashSet::new(),
         found: Vec::new(),
+        body_bindings: Vec::new(),
     };
     scan.visit_ast(&ast);
     Ok(scan.found)
@@ -127,6 +128,11 @@ struct Scan<'a> {
     /// also report them as reads.
     writes: HashSet<(usize, usize)>,
     found: Vec<GlobalUse>,
+    /// Names bound only inside one block, keyed by that block's address: the
+    /// variables of a `for` loop and the implicit `self` of a method. The
+    /// parser visits a `for` node before its initializer expressions, so
+    /// binding at the node would also bind the names in those expressions.
+    body_bindings: Vec<(usize, HashSet<String>)>,
 }
 
 impl Scan<'_> {
@@ -156,8 +162,14 @@ impl Scan<'_> {
 }
 
 impl Visitor for Scan<'_> {
-    fn visit_block(&mut self, _block: &Block) {
-        self.scopes.push(HashSet::new());
+    fn visit_block(&mut self, block: &Block) {
+        let address = std::ptr::from_ref(block) as usize;
+        let bound = self
+            .body_bindings
+            .iter()
+            .position(|(body, _)| *body == address)
+            .map(|index| self.body_bindings.swap_remove(index).1);
+        self.scopes.push(bound.unwrap_or_default());
     }
 
     fn visit_block_end(&mut self, _block: &Block) {
@@ -191,29 +203,24 @@ impl Visitor for Scan<'_> {
         self.declare(function.name().token().to_string());
     }
 
+    // The loop variables are in scope in the body, not in the expressions
+    // that follow the `for` keyword (`for i = i, 10 do end` reads the outer `i`).
     fn visit_numeric_for(&mut self, numeric: &NumericFor) {
-        self.scopes.push(HashSet::from([numeric
-            .index_variable()
-            .token()
-            .to_string()]));
-    }
-
-    fn visit_numeric_for_end(&mut self, _numeric: &NumericFor) {
-        self.scopes.pop();
+        self.body_bindings.push((
+            std::ptr::from_ref(numeric.block()) as usize,
+            HashSet::from([numeric.index_variable().token().to_string()]),
+        ));
     }
 
     fn visit_generic_for(&mut self, generic: &GenericFor) {
-        self.scopes.push(
+        self.body_bindings.push((
+            std::ptr::from_ref(generic.block()) as usize,
             generic
                 .names()
                 .iter()
                 .map(|name| name.token().to_string())
                 .collect(),
-        );
-    }
-
-    fn visit_generic_for_end(&mut self, _generic: &GenericFor) {
-        self.scopes.pop();
+        ));
     }
 
     fn visit_assignment(&mut self, assignment: &Assignment) {
@@ -235,6 +242,13 @@ impl Visitor for Scan<'_> {
         };
         let single = name.names().len() == 1 && name.method_name().is_none();
         self.check(first, single);
+        // `function base:method()` binds `self` in its body.
+        if name.method_name().is_some() {
+            self.body_bindings.push((
+                std::ptr::from_ref(declaration.body().block()) as usize,
+                HashSet::from(["self".to_string()]),
+            ));
+        }
     }
 
     fn visit_var(&mut self, variable: &Var) {
@@ -326,6 +340,42 @@ mod tests {
         assert_eq!(
             names("local s = 'x'\nreturn s:upper() .. botster.clock.now().value"),
             []
+        );
+    }
+
+    #[test]
+    fn loop_variables_are_not_bound_in_the_loop_expressions() {
+        assert_eq!(
+            names("for i = i, 10 do local x = i end"),
+            [("i".to_string(), false)]
+        );
+        assert_eq!(
+            names("for missing in missing() do local x = missing end"),
+            [("missing".to_string(), false)]
+        );
+        assert_eq!(
+            names("for k, v in pairs(k) do local x = k .. v end"),
+            [("k".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn loop_variables_are_bound_in_the_body_only() {
+        assert_eq!(
+            names("for i = 1, 3 do local x = i end local y = i"),
+            [("i".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn a_method_binds_self_and_a_plain_function_does_not() {
+        assert_eq!(
+            names("local t = {}\nfunction t:method() return self end\nreturn t"),
+            []
+        );
+        assert_eq!(
+            names("local t = {}\nfunction t.field() return self end\nreturn t"),
+            [("self".to_string(), false)]
         );
     }
 
