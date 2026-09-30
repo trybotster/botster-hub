@@ -33,6 +33,8 @@ struct Terminal {
     output_seq: u64,
     input_seq: u64,
     modes_epoch: u64,
+    /// The terminal's width in cells.
+    cols: u16,
     /// Every write the machine made, in order.
     writes: Vec<Vec<u8>>,
     /// Texts that reached the composer as a submitted line.
@@ -54,6 +56,7 @@ impl Terminal {
             output_seq: 0,
             input_seq: 0,
             modes_epoch: 0,
+            cols: 80,
             writes: Vec::new(),
             submitted: Vec::new(),
             held_echo: false,
@@ -69,6 +72,7 @@ impl Terminal {
             cursor_visible: self.cursor_visible,
             bracketed_paste: self.bracketed_paste,
             kitty_enabled: self.kitty_enabled,
+            cols: self.cols,
         }
     }
 
@@ -678,4 +682,103 @@ fn a_probe_that_wraps_to_the_next_row_is_not_an_echo() {
         text_before_cursor: "zx".to_string(),
     };
     assert!(!echoed(&baseline, &wrapped));
+}
+
+/// The erase, in the encoding of a plain (non-kitty) session.
+fn plain_erase() -> Vec<u8> {
+    erase_bytes(false)
+}
+
+#[test]
+fn abandoning_while_the_probe_waits_sends_no_backspaces() {
+    // Accepted residual risk (orchestrator, 2026-09-29): a human who types
+    // after the probe was written abandons the attempt and nothing else is
+    // sent, because an erase would edit the draft the human is typing.
+    let mut terminal = Terminal::composer();
+    terminal.behaviour = Behaviour::SlowEcho;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    assert_eq!(rig.terminal.writes, [PROBE.to_vec()]);
+    rig.terminal.human_types("h");
+    rig.settle();
+    // The probe's late echo shows after the abandon: still nothing is written.
+    rig.terminal.release_echo();
+    rig.settle();
+    rig.advance(ECHO_DEADLINE);
+    assert_eq!(
+        rig.terminal.writes,
+        [PROBE.to_vec()],
+        "abandon must not send an erase or the ring"
+    );
+    assert!(rig.terminal.submitted.is_empty());
+    assert!(rig.pending(), "the ring waits");
+}
+
+#[test]
+fn abandoning_while_the_erase_is_outstanding_sends_no_more_backspaces() {
+    // The composer keeps its letters, so the erase is never confirmed and the
+    // machine waits for output. A human then types: the attempt is abandoned.
+    let mut terminal = Terminal::composer();
+    terminal.behaviour = Behaviour::KeepsLetters;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    assert_eq!(
+        rig.terminal.writes,
+        [PROBE.to_vec(), plain_erase()],
+        "one probe and one erase before the human types"
+    );
+    rig.terminal.human_types("h");
+    rig.settle();
+    assert_eq!(
+        rig.terminal.writes,
+        [PROBE.to_vec(), plain_erase()],
+        "no second erase and no ring after the abandon"
+    );
+    assert!(rig.terminal.submitted.is_empty());
+    assert!(rig.pending(), "the ring waits");
+}
+
+#[test]
+fn a_cursor_in_the_last_two_columns_is_not_probed() {
+    // Cursor at column 78 or 79 of an 80-column row: the two-cell probe would
+    // reach the last cell, where the terminal wraps. Nothing is typed, there
+    // is no timer, and the ring waits for the next edge.
+    for col in [78, 79] {
+        let mut terminal = Terminal::composer();
+        terminal.col = col;
+        let mut rig = Rig::new(terminal);
+        rig.ring("hello");
+        assert!(rig.terminal.writes.is_empty(), "col {col}: nothing typed");
+        assert!(
+            rig.quiet_wake.is_none() && rig.echo_deadline.is_none(),
+            "col {col}: no timer"
+        );
+        assert!(rig.pending(), "col {col}: the ring waits");
+        // Time alone changes nothing.
+        rig.advance(Duration::from_secs(60));
+        assert!(
+            rig.terminal.writes.is_empty(),
+            "col {col}: time is not an edge"
+        );
+        // The cursor moves left and a mode edge follows: the ring goes through.
+        rig.terminal.col = 10;
+        rig.terminal.modes_epoch += 1;
+        rig.settle();
+        assert_eq!(
+            rig.terminal.submitted,
+            ["hello"],
+            "col {col}: delivered on the edge"
+        );
+    }
+}
+
+#[test]
+fn a_cursor_just_left_of_the_last_two_columns_is_probed() {
+    // Column 77 of 80: the probe fills 77 and 78, the cursor ends on 79.
+    let mut terminal = Terminal::composer();
+    terminal.col = 77;
+    let mut rig = Rig::new(terminal);
+    rig.ring("hello");
+    assert_eq!(rig.writes_of(PROBE), 1);
+    assert_eq!(rig.terminal.submitted, ["hello"]);
 }

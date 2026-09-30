@@ -29,14 +29,17 @@
 //!
 //! Accepted residual risks (user decision 2026-09-28): a free-text field
 //! inside a dialog echoes like a composer, and a vim-style normal mode treats
-//! `z` and `x` as commands. Two more, named here because they are not covered
-//! by a guard: a human who types between the probe and its erase leaves `zx`
-//! inside the draft (the stray-probe cleanup only sees a trailing `zx`; the
-//! window is at most [`ECHO_DEADLINE`] plus the erase round trip, and the
-//! human's input aborts the attempt at once); and a probe that wraps at the
-//! last column moves to another row, so it does not count as an echo: the
-//! machine then types nothing more, and a later attempt erases the stray `zx`
-//! it finds before the cursor.
+//! `z` and `x` as commands. One more, accepted by the orchestrator on
+//! 2026-09-29 (`orchestrator-user-decisions.md`, "Doorbell residual risks"): a
+//! human who types between the probe and its erase leaves `zx` inside the
+//! draft. The stray-probe cleanup only sees a trailing `zx`; the window is at
+//! most [`ECHO_DEADLINE`] plus the erase round trip. The human's input edge
+//! abandons the attempt at once and the machine sends NO backspaces, because
+//! erasing would edit a draft the human is typing.
+//!
+//! A probe that would wrap at the last column is not a risk: with the cursor
+//! in the last two columns the machine does not probe at all, and waits for
+//! the next screen edge like any other not-safe state.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -67,6 +70,9 @@ pub(crate) struct Facts {
     pub(crate) cursor_visible: bool,
     pub(crate) bracketed_paste: bool,
     pub(crate) kitty_enabled: bool,
+    /// The terminal's width in cells (the session's size), so the machine can
+    /// tell that a probe would not fit before the last column.
+    pub(crate) cols: u16,
 }
 
 /// One cursor read, from one read of the terminal model.
@@ -343,6 +349,12 @@ fn at_baseline(baseline: &Read, read: &Read) -> bool {
     read.row == baseline.row && read.col == baseline.col
 }
 
+/// The cursor sits in the last two columns of its row, so the two-cell probe
+/// would not fit before the last one.
+fn last_columns(read: &Read, facts: &Facts) -> bool {
+    read.col.saturating_add(PROBE.len() as u16) >= facts.cols
+}
+
 /// Check the gate; start a baseline read, arm the one quiet wake, or wait for
 /// an edge.
 fn try_start(ring: &mut Ring, now: Instant, effects: &mut Vec<Effect>) {
@@ -435,6 +447,15 @@ fn on_cursor(ring: &mut Ring, read: Read, now: Instant, effects: &mut Vec<Effect
         Phase::Baseline => {
             // Re-check the gate: facts may have moved while the read was out.
             if !facts.cursor_visible || facts.composing || ring.pending.is_none() {
+                ring.phase = Phase::Idle;
+                return;
+            }
+            if last_columns(&read, &facts) {
+                // The probe would reach the last cell, where a terminal holds
+                // the cursor and then wraps: it could not be told from a
+                // missing echo, and a stray `zx` would follow. Not safe: type
+                // nothing and wait for the next screen edge, like any other
+                // not-safe state.
                 ring.phase = Phase::Idle;
                 return;
             }
