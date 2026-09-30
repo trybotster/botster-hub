@@ -458,6 +458,19 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     }
 }
 
+/// Whether a work item parked on owner capacity can run: one is parked and the
+/// admission sum has room. The level is checked on every wake pass, so an
+/// obligation finishing, a peer leaving and a retained request ending all wake
+/// it without a hook where each leaves, and a wake that comes before the item
+/// parks is not lost.
+fn capacity_waiter_can_resume(state: &DaemonControlState) -> bool {
+    let parked = state.coordination_waiting_for_owner
+        || state.event_owner.waiting_for_owner
+        || state.publication_owner.waiting_for_owner
+        || state.managed_spawn_waiting_for_owner;
+    parked && state.has_room()
+}
+
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
@@ -484,7 +497,7 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             .wakes
             .mark(MaintenanceSliceKind::SubscriberDelivery);
     }
-    if state.budget.take_capacity_notification() {
+    if capacity_waiter_can_resume(state) {
         if state.coordination_waiting_for_owner && state.coordination_fault.is_none() {
             state.coordination_waiting_for_owner = false;
             if !mark_background_ready(state, BackgroundWork::Coordination) {
@@ -9359,59 +9372,102 @@ return botster.register({ handlers = {} })
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// H20: an obligation that ends through the owner poll raises the
-    /// capacity notification; one that stays pending does not.
+    /// H20: a work item parked on owner capacity resumes when ANY counted item
+    /// leaves the sum (an obligation finishing, a peer leaving, a retained
+    /// request ending), and stays parked while the sum is full.
     #[test]
-    fn a_finished_obligation_raises_the_capacity_notification_and_a_pending_one_does_not() {
-        use crate::daemon::owner_budget::{ObligationPoll, poll_owner_obligation_item};
-        let root = unique_package_control_dir("obligation-capacity-wake");
+    fn a_parked_waiter_resumes_when_any_counted_item_leaves_the_sum() {
+        let root = unique_package_control_dir("capacity-waiter-resume");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        for leaves in ["obligation", "peer", "request"] {
+            let mut state = DaemonControlState::default();
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(3);
+            let held = crate::daemon::owner_budget::hold_test_obligations(&mut state, 1);
+            assert!(state.admit_peer("peer"));
+            let _reply = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::Status,
+                "client",
+                "one",
+            );
+            assert_eq!(state.pending_requests.len(), 1);
+            assert!(!state.has_room(), "{leaves}: the sum is full");
+            state.managed_spawn_waiting_for_owner = true;
+            publish_completion_wakes(&daemon, &mut state);
+            assert!(
+                state.managed_spawn_waiting_for_owner,
+                "{leaves}: the waiter stays parked while the sum is full"
+            );
+            match leaves {
+                "obligation" => {
+                    crate::daemon::owner_budget::finish_test_obligation(&mut state, held[0])
+                }
+                "peer" => assert!(state.budget.release_peer("peer")),
+                _ => {
+                    let waiter = *state
+                        .pending_requests
+                        .keys()
+                        .next()
+                        .expect("retained request");
+                    state.pending_requests.remove(&waiter);
+                }
+            }
+            assert!(state.has_room(), "{leaves}: the sum has room again");
+            publish_completion_wakes(&daemon, &mut state);
+            assert!(
+                !state.managed_spawn_waiting_for_owner,
+                "{leaves}: the parked waiter resumes"
+            );
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// H20: requests that finish through the owner loop without leaving any
+    /// obligation free capacity, and a work item parked on the full threshold
+    /// resumes through the production wake pass.
+    #[test]
+    fn a_waiter_parked_at_the_threshold_resumes_when_retained_requests_finish() {
+        let root = unique_package_control_dir("request-finish-resumes-waiter");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
         let mut state = DaemonControlState::default();
         state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(2);
-        let pending = crate::owner_identity::WaiterId(9_100_001);
-        let finishing = crate::owner_identity::WaiterId(9_100_002);
-        crate::daemon::owner_budget::retain_owner_obligation(
-            &mut state,
-            pending,
-            "wake-pending",
-            |_, _, _| ObligationPoll::Pending,
-        );
-        crate::daemon::owner_budget::retain_owner_obligation(
-            &mut state,
-            finishing,
-            "wake-finishing",
-            |_, _, _| ObligationPoll::Done,
-        );
-        let mut items = vec![
-            state
-                .owner_ready
-                .pop_next()
-                .expect("first obligation ready"),
-            state
-                .owner_ready
-                .pop_next()
-                .expect("second obligation ready"),
-        ];
-        items.sort_by_key(|item| item.key().waiter_id().0);
-        assert!(poll_owner_obligation_item(
+        let first = start_async_control_request(
             &mut daemon,
             &mut state,
-            items[0]
-        ));
-        assert_eq!(state.budget.outstanding(), 2);
-        assert!(
-            !state.budget.take_capacity_notification(),
-            "a pending obligation returns no capacity"
+            DaemonRequest::Status,
+            "client-one",
+            "one",
         );
-        assert!(poll_owner_obligation_item(
+        let second = start_async_control_request(
             &mut daemon,
             &mut state,
-            items[1]
-        ));
-        assert_eq!(state.budget.outstanding(), 1);
+            DaemonRequest::Status,
+            "client-two",
+            "two",
+        );
+        assert_eq!(state.pending_requests.len(), 2);
+        assert_eq!(state.budget.outstanding(), 0, "no obligation exists");
+        state.managed_spawn_waiting_for_owner = true;
+        publish_completion_wakes(&daemon, &mut state);
         assert!(
-            state.budget.take_capacity_notification(),
-            "a finished obligation raises the capacity notification"
+            state.managed_spawn_waiting_for_owner,
+            "the item stays parked while two retained requests hold the threshold"
+        );
+        // Both requests finish through the owner loop. Neither leaves an
+        // obligation, so nothing but the request count changes.
+        drive_request_to_reply(&mut daemon, &mut state, first).unwrap();
+        drive_request_to_reply(&mut daemon, &mut state, second).unwrap();
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.budget.outstanding(), 0);
+        // The owner loop begins every iteration with this pass, before it can
+        // block, so one always follows the last change; the test helper
+        // returns at the reply, before that next iteration.
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(
+            !state.managed_spawn_waiting_for_owner,
+            "the parked item resumed when the requests finished"
         );
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();

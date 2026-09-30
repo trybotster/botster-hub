@@ -13,6 +13,12 @@
 //! `MAX_OUTSTANDING_REQUESTS` (requests per connection), and
 //! `MAX_ATTACH_ROUTES_PER_OWNER` (routes).
 //!
+//! A work item parked on owner capacity resumes when the same sum has room
+//! again. The owner checks that level on every wake pass, so each item that
+//! leaves the sum (an obligation, a peer, or a retained request) wakes it,
+//! with no hook at the places an item leaves and no wake lost to a race with
+//! parking.
+//!
 //! The threshold is not an exact cap on obligations. Retaining cleanup for a
 //! Core resource that already exists is never refused: refusing it would leak
 //! the resource. Exact capacity would need a reservation at admission, which
@@ -105,8 +111,6 @@ pub(crate) struct OwnerBudgetCounters {
 
 pub(crate) struct OwnerBudget {
     bound: usize,
-    /// An obligation finished since the last capacity notification.
-    released: bool,
     /// Admitted WebRTC peers, by grant id, until peer cleanup.
     admitted_peers: std::collections::BTreeSet<String>,
     obligations: std::collections::BTreeMap<crate::owner_identity::WaiterId, CleanupObligation>,
@@ -163,7 +167,6 @@ impl OwnerBudget {
                     self.obligations
                         .remove(&waiter)
                         .expect("the obligation retires after disposal");
-                    self.released = true;
                     drop(permit);
                 }
             } else if let Some(permit) = executor.try_reserve() {
@@ -188,7 +191,6 @@ impl OwnerBudget {
     pub(crate) fn with_bound(bound: usize) -> Self {
         Self {
             bound,
-            released: false,
             admitted_peers: std::collections::BTreeSet::new(),
             obligations: std::collections::BTreeMap::new(),
             counters: OwnerBudgetCounters::default(),
@@ -208,16 +210,17 @@ impl OwnerBudget {
     /// retained request count.
     #[must_use]
     pub(crate) fn admits_work(&mut self, retained_requests: usize) -> bool {
-        let counted = self.obligations.len() + self.admitted_peers.len() + retained_requests;
-        if counted >= self.bound {
+        if !self.has_room(retained_requests) {
             self.counters.refused = self.counters.refused.saturating_add(1);
             return false;
         }
         true
     }
 
-    pub(crate) fn take_capacity_notification(&mut self) -> bool {
-        std::mem::take(&mut self.released)
+    /// Whether the counted sum is below the threshold. Counts nothing.
+    #[must_use]
+    pub(crate) fn has_room(&self, retained_requests: usize) -> bool {
+        self.obligations.len() + self.admitted_peers.len() + retained_requests < self.bound
     }
 
     /// Admit a WebRTC peer, held until peer cleanup. `false` means refused.
@@ -388,7 +391,6 @@ pub(crate) fn poll_owner_obligation_item(
             if let Some(runtime) = daemon.runtime() {
                 runtime.retire_owner_core_waiter(waiter_id);
             }
-            state.budget.released = true;
         }
         ObligationPoll::Pending | ObligationPoll::ReadyAgain => {
             let ready_again = matches!(result, ObligationPoll::ReadyAgain);
@@ -465,6 +467,13 @@ impl DaemonControlState {
         self.budget.admits_work(self.pending_requests.len())
     }
 
+    /// Whether the admission sum has room, without counting a refusal. A work
+    /// item parked on owner capacity resumes on this.
+    #[must_use]
+    pub(crate) fn has_room(&self) -> bool {
+        self.budget.has_room(self.pending_requests.len())
+    }
+
     /// Admit a WebRTC peer under the same sum. `false` means refused.
     #[must_use]
     pub(crate) fn admit_peer(&mut self, grant_id: &str) -> bool {
@@ -497,7 +506,6 @@ pub(crate) fn finish_test_obligation(
 ) {
     assert!(state.budget.obligations.remove(&waiter_id).is_some());
     state.deadlines.retire(waiter_id);
-    state.budget.released = true;
 }
 
 #[cfg(test)]
@@ -518,9 +526,7 @@ mod tests {
         assert_eq!(state.budget.outstanding(), 2);
         assert!(!state.admits_work());
         assert_eq!(state.budget.counters.refused, 1);
-        assert!(!state.budget.take_capacity_notification());
         finish_test_obligation(&mut state, held[0]);
-        assert!(state.budget.take_capacity_notification());
         assert!(state.admits_work());
         assert_eq!(state.budget.counters.refused, 1);
     }
