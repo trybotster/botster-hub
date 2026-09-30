@@ -162,7 +162,7 @@ pub(crate) fn handle_peer_closed(
     };
     // A duplicate close (the grant's permit was already taken by an earlier
     // close) has no effect: no counters, no route cleanup.
-    let first_close = state.budget.peer_holds_permit(&grant_id);
+    let first_close = state.budget.peer_admitted(&grant_id);
     if first_close {
         let cleanup_reason = format!("webrtc_{}", terminal_record.cause);
         *state
@@ -230,7 +230,7 @@ pub(crate) fn handle_peer_closed(
     // for any other grant.
     let cleaning_grants: BTreeSet<String> = removed_grants
         .iter()
-        .filter(|grant| state.budget.peer_holds_permit(grant))
+        .filter(|grant| state.budget.peer_admitted(grant))
         .cloned()
         .collect();
     let snapshot: BTreeSet<(String, String)> = attached_subscriptions
@@ -375,25 +375,23 @@ pub(crate) fn handle_peer_closed(
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
     let _ = control_tx;
     // Every removed grant (primary and fail-closed siblings) retires its
-    // abandoned reads. Every grant still holding its permit hands it to its
-    // own cleanup obligation, or releases it when it owns no route.
+    // abandoned reads. Every grant still admitted hands its routes to its
+    // own cleanup obligation, or ends when it owns no route.
     for removed in &removed_grants {
         crate::daemon::control::entities::retire_plugin_entity_connection(daemon, state, removed);
         retire_abandoned_requests(daemon, state, removed);
     }
     for grant in &cleaning_grants {
-        let Some(permit) = state.budget.take_peer_permit(grant) else {
+        if !state.budget.release_peer(grant) {
             continue;
-        };
+        }
         let candidates = candidates_by_grant.remove(grant).unwrap_or_default();
         if daemon.runtime().is_none() {
-            state.budget.release(permit);
             continue;
         }
         let now = tick(&mut state.logical_clock);
         retain_route_cleanup(
             state,
-            permit,
             "webrtc_peer_cleanup",
             None,
             Some(grant.clone()),

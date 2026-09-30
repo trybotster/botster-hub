@@ -530,10 +530,8 @@ mod tests {
     fn indexed_release_progresses_when_owner_capacity_refuses_new_providers() {
         let (mut daemon, directory) = daemon("release-full-owner");
         let mut state = DaemonControlState::default();
-        let mut permits = Vec::new();
-        while let Some(permit) = state.budget.reserve() {
-            permits.push(permit);
-        }
+        state.budget = crate::daemon::owner_budget::OwnerBudget::with_bound(1);
+        let held = crate::daemon::owner_budget::hold_test_obligations(&mut state, 1);
         let scope = add_release(&daemon, "releases");
         daemon
             .runtime()
@@ -549,15 +547,12 @@ mod tests {
                 Instant::now() < limit,
                 "existing releases must not need new Owner capacity"
             );
-            assert_eq!(state.budget.outstanding(), permits.len());
+            assert_eq!(state.budget.outstanding(), held.len());
             std::thread::yield_now();
         }
         assert_eq!(state.lifecycle_counters.package_entity_resync_attempts, 1);
         assert!(!state.plugin_entities.has_resync("missing.family"));
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
-        for permit in permits {
-            state.budget.release(permit);
-        }
         daemon.stop();
         std::fs::remove_dir_all(directory).unwrap();
     }

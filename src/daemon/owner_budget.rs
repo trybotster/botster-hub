@@ -1,16 +1,13 @@
-//! Bounded ownership for every owner-thread operation that outlives the
-//! request or connection that started it.
+//! Cleanup obligations: owner-thread work that outlives the request or
+//! connection that started it.
 //!
-//! One global budget of [`OWNER_BUDGET_CAPACITY`] permits covers accepted
-//! connections, accepted control requests, and cleanup obligations. A permit
-//! is reserved before the owner admits work and stays held until the work
-//! completes or transfers to a cleanup obligation, so a connection that
-//! disconnects with cleanup outstanding does not free capacity for new
-//! admissions. Nothing is discarded at the limit: new admissions are refused
-//! with a typed error instead, and no path creates a permit past capacity.
-//! Every accepted resource physically carries its permit: a Unix connection
-//! in its cleanup guard, a WebRTC peer in the budget's peer table, a pending
-//! request in its entry.
+//! An obligation is retained until its Core resources are released. One plain
+//! bound, [`OWNER_BUDGET_CAPACITY`], counts outstanding obligations: at the
+//! bound the owner refuses new admissions with a typed error instead of
+//! letting a reconnect loop pile obligations up while Core is stuck. Nothing
+//! is discarded at the bound. The other admission bounds live where the work
+//! enters: the accept semaphore (connections), `MAX_OUTSTANDING_REQUESTS`
+//! (requests per connection), and `MAX_ATTACH_ROUTES_PER_OWNER` (routes).
 //!
 //! An obligation keeps at most one Core ticket in flight. A refused admission
 //! resubmits on the next owner turn; a lost driver ends the obligation.
@@ -28,10 +25,9 @@ use crate::admission::budgets::DAEMON_MAX_CONNECTIONS;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::{CoreTicket, CoreTicketPoll};
 
-/// Global permit capacity: every connection holds one permit for its whole
-/// lifetime including cleanup, and every accepted request holds one while it
-/// is pending. Attach and reserved-bind requests reserve a second permit for
-/// the cleanup they may leave behind, so they are refused earlier under load.
+/// The bound on outstanding cleanup obligations. It keeps the value the
+/// retired permit ledger enforced (every connection and every request it may
+/// have in flight), so no new number is introduced.
 pub(crate) const OWNER_BUDGET_CAPACITY: usize =
     DAEMON_MAX_CONNECTIONS * (MAX_OUTSTANDING_REQUESTS + 1);
 
@@ -41,11 +37,6 @@ pub(crate) const RETAINED_OPERATION_DEADLINE: Duration = Duration::from_secs(30)
 
 /// Operator error code when the budget refuses a new request.
 pub(crate) const OWNER_BUDGET_EXHAUSTED: &str = "owner_budget_exhausted";
-
-/// One unit of the owner budget. Not `Clone`: it is returned through
-/// [`OwnerBudget::release`] or converted into an obligation.
-#[derive(Debug)]
-pub(crate) struct OwnerPermit(());
 
 /// Outcome of one obligation poll.
 pub(crate) enum ObligationPoll {
@@ -63,12 +54,10 @@ type ObligationFn = Box<
         + Send,
 >;
 
-/// Owner work that must complete: it holds its permit until done.
+/// Owner work that must complete.
 pub(crate) struct CleanupObligation {
     terminal: Option<crate::host_disposal::Job>,
-    waiter_id: crate::owner_identity::WaiterId,
     label: &'static str,
-    permit: OwnerPermit,
     ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
     deadline_key: Option<crate::daemon::owner_schedule::DeadlineKey>,
     last_core_phase: u64,
@@ -78,7 +67,7 @@ pub(crate) struct CleanupObligation {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct OwnerBudgetCounters {
-    /// Admissions refused because no permit was free.
+    /// Admissions refused because the obligation bound was reached.
     pub refused: u64,
     /// Pending reads retired because their client left or the deadline passed.
     pub retired_abandoned: u64,
@@ -89,18 +78,18 @@ pub(crate) struct OwnerBudgetCounters {
 }
 
 pub(crate) struct OwnerBudget {
-    capacity: usize,
-    outstanding: usize,
+    bound: usize,
+    /// An obligation finished since the last capacity notification.
     released: bool,
-    /// Permits reserved by admitted WebRTC peers, keyed by grant id.
-    peer_permits: std::collections::BTreeMap<String, OwnerPermit>,
+    /// Admitted WebRTC peers, by grant id, until peer cleanup.
+    admitted_peers: std::collections::BTreeSet<String>,
     obligations: std::collections::BTreeMap<crate::owner_identity::WaiterId, CleanupObligation>,
     pub(crate) counters: OwnerBudgetCounters,
 }
 
 impl Default for OwnerBudget {
     fn default() -> Self {
-        Self::with_capacity(OWNER_BUDGET_CAPACITY)
+        Self::with_bound(OWNER_BUDGET_CAPACITY)
     }
 }
 
@@ -108,9 +97,8 @@ impl std::fmt::Debug for OwnerBudget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OwnerBudget")
-            .field("capacity", &self.capacity)
-            .field("outstanding", &self.outstanding)
-            .field("peer_permits", &self.peer_permits.len())
+            .field("bound", &self.bound)
+            .field("admitted_peers", &self.admitted_peers.len())
             .field("obligations", &self.obligations.len())
             .field("counters", &self.counters)
             .finish()
@@ -146,11 +134,10 @@ impl OwnerBudget {
                 .expect("terminal cleanup retains its obligation");
             if let Some(job) = obligation.terminal.as_mut() {
                 if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
-                    let obligation = self
-                        .obligations
+                    self.obligations
                         .remove(&waiter)
                         .expect("the obligation retires after disposal");
-                    self.release(obligation.permit);
+                    self.released = true;
                     drop(permit);
                 }
             } else if let Some(permit) = executor.try_reserve() {
@@ -172,77 +159,55 @@ impl OwnerBudget {
         self.obligations.is_empty()
     }
 
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_bound(bound: usize) -> Self {
         Self {
-            capacity,
-            outstanding: 0,
+            bound,
             released: false,
-            peer_permits: std::collections::BTreeMap::new(),
+            admitted_peers: std::collections::BTreeSet::new(),
             obligations: std::collections::BTreeMap::new(),
             counters: OwnerBudgetCounters::default(),
         }
     }
 
-    /// Permits held by connections, peers, pending requests, and obligations.
+    /// Outstanding cleanup obligations.
     #[cfg(any(test, feature = "plugin-test-kit"))]
     pub(crate) fn outstanding(&self) -> usize {
-        self.outstanding
-    }
-
-    #[cfg(test)]
-    pub(crate) fn queued_obligations(&self) -> usize {
         self.obligations.len()
     }
 
-    /// Reserve one permit, or refuse when the budget is exhausted.
+    /// Whether the owner may admit new work: false at the obligation bound.
+    /// A refusal is counted; the caller answers with its typed error.
     #[must_use]
-    pub(crate) fn reserve(&mut self) -> Option<OwnerPermit> {
-        if self.outstanding >= self.capacity {
+    pub(crate) fn admits_work(&mut self) -> bool {
+        if self.obligations.len() >= self.bound {
             self.counters.refused = self.counters.refused.saturating_add(1);
-            return None;
+            return false;
         }
-        self.outstanding += 1;
-        Some(OwnerPermit(()))
-    }
-
-    pub(crate) fn release(&mut self, permit: OwnerPermit) {
-        let OwnerPermit(()) = permit;
-        self.outstanding = self.outstanding.saturating_sub(1);
-        self.released = true;
+        true
     }
 
     pub(crate) fn take_capacity_notification(&mut self) -> bool {
         std::mem::take(&mut self.released)
     }
 
-    /// Reserve the permit an accepted connection carries in its cleanup
-    /// guard until its cleanup completes. `None` means the connection must
-    /// be refused.
+    /// Admit a WebRTC peer, held until peer cleanup. `false` means refused.
     #[must_use]
-    pub(crate) fn reserve_connection(&mut self) -> Option<OwnerPermit> {
-        self.reserve()
-    }
-
-    /// Reserve the permit an admitted WebRTC peer holds until peer cleanup.
-    #[must_use]
-    pub(crate) fn reserve_peer(&mut self, grant_id: &str) -> bool {
-        match self.reserve() {
-            Some(permit) => {
-                self.peer_permits.insert(grant_id.to_string(), permit);
-                true
-            }
-            None => false,
+    pub(crate) fn admit_peer(&mut self, grant_id: &str) -> bool {
+        if !self.admits_work() {
+            return false;
         }
+        self.admitted_peers.insert(grant_id.to_string());
+        true
     }
 
-    /// Take the permit for one peer's cleanup, when the peer was admitted.
-    pub(crate) fn take_peer_permit(&mut self, grant_id: &str) -> Option<OwnerPermit> {
-        self.peer_permits.remove(grant_id)
+    /// End one peer's admission. `true` when the peer was admitted.
+    pub(crate) fn release_peer(&mut self, grant_id: &str) -> bool {
+        self.admitted_peers.remove(grant_id)
     }
 
-    /// Whether a peer still holds its permit; attach admission requires it.
-    pub(crate) fn peer_holds_permit(&self, grant_id: &str) -> bool {
-        self.peer_permits.contains_key(grant_id)
+    /// Whether a peer is still admitted; attach admission requires it.
+    pub(crate) fn peer_admitted(&self, grant_id: &str) -> bool {
+        self.admitted_peers.contains(grant_id)
     }
 
     pub(crate) fn clear_obligation_deadline(
@@ -260,7 +225,6 @@ impl OwnerBudget {
 pub(crate) fn retain_owner_obligation(
     state: &mut DaemonControlState,
     waiter_id: crate::owner_identity::WaiterId,
-    permit: OwnerPermit,
     label: &'static str,
     poll: impl FnMut(
         &mut HubDaemon,
@@ -279,9 +243,7 @@ pub(crate) fn retain_owner_obligation(
         waiter_id,
         CleanupObligation {
             terminal: None,
-            waiter_id,
             label,
-            permit,
             ready_key: None,
             deadline_key: Some(arm.key()),
             last_core_phase: 0,
@@ -298,7 +260,6 @@ pub(crate) fn retain_owner_obligation(
 
 pub(crate) fn allocate_and_retain_owner_obligation(
     state: &mut DaemonControlState,
-    permit: OwnerPermit,
     label: &'static str,
     poll: impl FnMut(
         &mut HubDaemon,
@@ -312,7 +273,7 @@ pub(crate) fn allocate_and_retain_owner_obligation(
         .waiter_ids
         .next()
         .expect("an admitted owner permit must have an available waiter identifier");
-    retain_owner_obligation(state, waiter_id, permit, label, poll);
+    retain_owner_obligation(state, waiter_id, label, poll);
 }
 
 pub(crate) fn mark_obligation_ready(
@@ -397,7 +358,7 @@ pub(crate) fn poll_owner_obligation_item(
             if let Some(runtime) = daemon.runtime() {
                 runtime.retire_owner_core_waiter(waiter_id);
             }
-            state.budget.release(obligation.permit);
+            state.budget.released = true;
         }
         ObligationPoll::Pending | ObligationPoll::ReadyAgain => {
             let ready_again = matches!(result, ObligationPoll::ReadyAgain);
@@ -464,78 +425,82 @@ pub(crate) fn drive_core_slot<T: Send + 'static>(
     }
 }
 
+/// Fill the obligation bound in a test: hold `count` obligations that never finish.
+#[cfg(test)]
+pub(crate) fn hold_test_obligations(
+    state: &mut DaemonControlState,
+    count: usize,
+) -> Vec<crate::owner_identity::WaiterId> {
+    (0..count)
+        .map(|_| {
+            let waiter_id = state.waiter_ids.next().expect("test waiter identifier");
+            retain_owner_obligation(state, waiter_id, "test_hold", |_, _, _| {
+                ObligationPoll::Pending
+            });
+            waiter_id
+        })
+        .collect()
+}
+
+/// End one held test obligation the way a finished obligation ends.
+#[cfg(test)]
+pub(crate) fn finish_test_obligation(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+) {
+    assert!(state.budget.obligations.remove(&waiter_id).is_some());
+    state.deadlines.retire(waiter_id);
+    state.budget.released = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn budget_refuses_at_capacity_and_counts_it() {
-        let mut budget = OwnerBudget::with_capacity(2);
-        let first = budget.reserve().expect("first");
-        let second = budget.reserve().expect("second");
-        assert!(budget.reserve().is_none());
-        assert_eq!(budget.counters.refused, 1);
-        assert_eq!(budget.outstanding(), 2);
-        budget.release(first);
-        assert!(budget.reserve().is_some());
-        budget.release(second);
+    fn the_bound_keeps_the_value_the_permit_ledger_enforced() {
+        assert_eq!(OWNER_BUDGET_CAPACITY, 2112);
     }
 
     #[test]
-    fn connection_permit_survives_disconnect_until_cleanup_completes() {
+    fn work_is_refused_at_the_obligation_bound_and_counted() {
         let mut state = DaemonControlState::default();
-        state.budget = OwnerBudget::with_capacity(1);
-        let permit = state
-            .budget
-            .reserve_connection()
-            .expect("connection permit");
-        // The transport permit is gone; the budget permit is not.
-        assert!(state.budget.reserve_connection().is_none());
-        retain_owner_obligation(
-            &mut state,
-            crate::owner_identity::WaiterId(1),
-            permit,
-            "test",
-            |_, _, _| ObligationPoll::Pending,
-        );
-        assert!(
-            state.budget.reserve_connection().is_none(),
-            "a new connection cannot replenish the budget while cleanup remains"
-        );
-        assert_eq!(state.budget.queued_obligations(), 1);
-        assert_eq!(state.budget.outstanding(), 1);
+        state.budget = OwnerBudget::with_bound(2);
+        assert!(state.budget.admits_work());
+        let held = hold_test_obligations(&mut state, 2);
+        assert_eq!(state.budget.outstanding(), 2);
+        assert!(!state.budget.admits_work());
+        assert_eq!(state.budget.counters.refused, 1);
+        assert!(!state.budget.take_capacity_notification());
+        finish_test_obligation(&mut state, held[0]);
+        assert!(state.budget.take_capacity_notification());
+        assert!(state.budget.admits_work());
+        assert_eq!(state.budget.counters.refused, 1);
     }
 
     #[test]
-    fn nothing_creates_a_permit_past_capacity() {
-        let mut budget = OwnerBudget::with_capacity(0);
-        assert!(budget.reserve().is_none());
-        assert!(budget.reserve_connection().is_none());
-        assert!(!budget.reserve_peer("grant"));
-        assert!(budget.take_peer_permit("grant").is_none());
-        assert!(!budget.peer_holds_permit("grant"));
-        assert_eq!(budget.outstanding(), 0);
-    }
-
-    #[test]
-    fn peer_permit_is_taken_once() {
-        let mut budget = OwnerBudget::with_capacity(1);
-        assert!(budget.reserve_peer("grant"));
-        assert!(!budget.reserve_peer("other"));
-        assert!(budget.take_peer_permit("grant").is_some());
-        assert!(budget.take_peer_permit("grant").is_none());
+    fn a_peer_is_refused_at_the_bound_and_ends_once() {
+        let mut state = DaemonControlState::default();
+        state.budget = OwnerBudget::with_bound(1);
+        hold_test_obligations(&mut state, 1);
+        assert!(!state.budget.admit_peer("grant"));
+        assert!(!state.budget.peer_admitted("grant"));
+        assert!(!state.budget.release_peer("grant"));
+        let mut open = OwnerBudget::with_bound(1);
+        assert!(open.admit_peer("grant"));
+        assert!(open.peer_admitted("grant"));
+        assert!(open.release_peer("grant"));
+        assert!(!open.release_peer("grant"));
     }
 
     #[test]
     fn obligation_uses_the_shared_deadline_index() {
         let mut state = DaemonControlState::default();
-        state.budget = OwnerBudget::with_capacity(2);
+        state.budget = OwnerBudget::with_bound(2);
         assert!(state.deadlines.next_deadline().is_none());
-        let permit = state.budget.reserve().expect("permit");
         retain_owner_obligation(
             &mut state,
             crate::owner_identity::WaiterId(1),
-            permit,
             "first",
             |_, _, _| ObligationPoll::Pending,
         );

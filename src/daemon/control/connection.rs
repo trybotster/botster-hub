@@ -149,7 +149,7 @@ fn register_webrtc_admission(
                 peer_generation, ..
             } => *peer_generation = generation,
         }
-        if !state.budget.reserve_peer(&grant_id) {
+        if !state.budget.admit_peer(&grant_id) {
             let (mux, peer_generation) = match &admission {
                 WebrtcTerminalAdmission::Admitted {
                     mux,
@@ -472,13 +472,13 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
-    // The bind holds one budget permit from here until the adapter is bound
-    // and delivered, or until the exact generation it created is released.
-    let Some(permit) = state.budget.reserve() else {
+    // The bind leaves a cleanup obligation until the adapter is bound and
+    // delivered, or until the exact generation it created is released.
+    if !state.budget.admits_work() {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::OverLimit));
         return false;
-    };
+    }
     // Claim the reservation before any Core work. A second channel for this
     // label now finds it bound and is rejected as a duplicate, so it can
     // never run an attach that replaces the route this bind creates. The
@@ -491,7 +491,6 @@ fn bind_reserved_subscription(
         .mark_bound(&label, peer_generation)
         .is_none()
     {
-        state.budget.release(permit);
         let _ = reply_tx.send(Err(BindReservedError::Bound));
         return false;
     }
@@ -522,7 +521,6 @@ fn bind_reserved_subscription(
         None;
     crate::daemon::owner_budget::allocate_and_retain_owner_obligation(
         state,
-        permit,
         "reserved_bind",
         move |daemon, state, waiter_id| {
             if let Some(stale) = stale_generation {

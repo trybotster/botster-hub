@@ -69,13 +69,12 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     if state.coordination_fault.is_some() {
         return;
     }
-    let Some(permit) = state.budget.reserve() else {
+    if !state.budget.admits_work() {
         state.coordination_waiting_for_owner = true;
         return;
-    };
+    }
     let Some(waiter_id) = state.waiter_ids.next() else {
         state.coordination_fault = Some(CoordinationFault::SchedulerExhausted);
-        state.budget.release(permit);
         return;
     };
     let pending = match runtime.coordination_bridge().take_pending_for_owner() {
@@ -84,7 +83,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             if matches!(poll, crate::lua_runtime::CoordinationIngressPoll::Poisoned) {
                 state.coordination_fault = Some(CoordinationFault::QueuePoisoned);
             }
-            state.budget.release(permit);
             return;
         }
     };
@@ -123,7 +121,6 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             grant_id: None,
             client: None,
             core_retirement: Some(retirement),
-            permit: Some(permit),
             must_finish: true,
             past_deadline: false,
             continuation: ControlContinuation::Coordination(

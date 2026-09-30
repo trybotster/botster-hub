@@ -405,10 +405,8 @@ fn running_publication_waits_for_the_routed_host_receipt() {
                 resync_reason: None,
             }
         };
-        let permit = state.budget.reserve().expect("reserve owner row");
         let identity = state.plugin_entities.test_insert_delivery_work(
             waiter,
-            permit,
             Arc::clone(&target),
             Arc::clone(&live),
             &mut executor,
@@ -507,10 +505,8 @@ fn rejected_delivery_does_not_hold_the_terminal_frame() {
     let expected = crate::owner_identity::OwnerWorkIdentity::first(waiter);
     let (live, _) = arm_package_entity_delivery(&mut state, &target, expected, 1, true, 1)
         .expect("arm publication");
-    let permit = state.budget.reserve().expect("reserve owner row");
     let identity = state.plugin_entities.test_insert_delivery_work(
         waiter,
-        permit,
         Arc::clone(&target),
         Arc::clone(&live),
         &mut executor,
@@ -548,15 +544,10 @@ fn provider_retirement_keeps_a_shared_connection_sibling() {
         .clone()
         .try_reserve_owned()
         .expect("cleanup permit");
-    let permit = state
-        .budget
-        .reserve_connection()
-        .expect("connection permit");
     let mut guard = ConnectionCleanupGuard::new(
         cleanup_permit,
         "shared-client".to_string(),
         ConnectionTerminalReason::Eof,
-        permit,
     );
     guard.add_entity_subscription("retiring".to_string());
     guard.add_entity_subscription("sibling".to_string());
@@ -621,15 +612,10 @@ fn confirmed_unix_disconnect_retires_terminating_subscription() {
         .clone()
         .try_reserve_owned()
         .expect("cleanup permit");
-    let permit = state
-        .budget
-        .reserve_connection()
-        .expect("connection permit");
     let mut guard = ConnectionCleanupGuard::new(
         cleanup_permit,
         "retiring-client".to_string(),
         ConnectionTerminalReason::Eof,
-        permit,
     );
     guard.add_entity_subscription("retiring".to_string());
     drop(guard);
