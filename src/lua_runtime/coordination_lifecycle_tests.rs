@@ -54,6 +54,51 @@ impl Drop for OperationDrop {
     }
 }
 
+/// Holds the Host worker that disposes a request inside the request's drop
+/// probe until released, so a test can look at the row while disposal is
+/// still in flight instead of racing the worker.
+#[derive(Clone)]
+struct DisposalGate(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl DisposalGate {
+    fn new() -> Self {
+        Self(std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    fn release(&self) {
+        let (released, wake) = &*self.0;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+}
+
+/// Blocks in `drop` until its gate is released. Install it as a pending
+/// request's drop probe: the Host worker that disposes the request waits here.
+struct HeldDrop(DisposalGate);
+
+impl Drop for HeldDrop {
+    fn drop(&mut self) {
+        let (released, wake) = &*(self.0).0;
+        let mut open = released.lock().unwrap();
+        while !*open {
+            open = wake.wait(open).unwrap();
+        }
+    }
+}
+
+/// Releases its gate when dropped, so a failed assertion cannot leave a Host
+/// worker blocked in a `HeldDrop`.
+struct ReleaseOnDrop(DisposalGate);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 fn tracked_request(
     bridge: HubCoordinationBridge,
 ) -> (
@@ -739,6 +784,13 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
         assert!(Instant::now() < queued, "the caller must queue its request");
         thread::yield_now();
     }
+    // The Host worker that disposes this request waits in the probe's drop
+    // until the test releases it, so the row stays in Terminal while the test
+    // looks at it. Without the hold, disposal can finish inside one
+    // `dispose_terminal_requests` call and the row is never seen.
+    let held_disposal = DisposalGate::new();
+    let _release_on_failure = ReleaseOnDrop(held_disposal.clone());
+    bridge.test_set_pending_drop_probe(HeldDrop(held_disposal.clone()));
     crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
     assert_eq!(bridge.test_admitted_waiters().len(), 1);
     let slot = std::mem::size_of::<PendingCoordinationRequest>();
@@ -750,31 +802,45 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
     gate.release();
     let deadline = Instant::now() + Duration::from_secs(5);
     let disposal = crate::daemon::control::coordination::disposal_bytes().unwrap();
-    let mut saw_terminal_lease = false;
+    let in_terminal = |state: &DaemonControlState| {
+        state.pending_requests.values().any(|entry| {
+            matches!(
+                entry.continuation,
+                crate::daemon::control::pending::ControlContinuation::Terminal(..)
+            )
+        })
+    };
+    // The Host worker is held, so the row must reach Terminal and stay there.
+    while !in_terminal(&state) {
+        assert!(
+            Instant::now() < deadline,
+            "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
+        );
+        dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
+        thread::yield_now();
+    }
+    assert!(
+        usage() >= disposal,
+        "the disposal lease must remain while the Terminal row is live"
+    );
+    dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
+    assert!(
+        in_terminal(&state),
+        "the row stays in Terminal while Host disposal is held"
+    );
+    assert!(
+        usage() >= disposal,
+        "the disposal lease must stay while Host disposal is held"
+    );
+    held_disposal.release();
     while !state.pending_requests.is_empty() {
         assert!(
             Instant::now() < deadline,
             "terminal disposal must retire the acknowledged row"
         );
         dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
-        if state.pending_requests.values().any(|entry| {
-            matches!(
-                entry.continuation,
-                crate::daemon::control::pending::ControlContinuation::Terminal(..)
-            )
-        }) {
-            assert!(
-                usage() >= disposal,
-                "the disposal lease must remain while the Terminal row is live"
-            );
-            saw_terminal_lease = true;
-        }
         thread::yield_now();
     }
-    assert!(
-        saw_terminal_lease,
-        "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
-    );
     let _ = caller.join();
     while usage() != slot {
         assert!(
