@@ -180,7 +180,10 @@ case "$phase" in
     exit 0
     ;;
   lifecycle)
-    BOTSTER_ENV=test exec cargo test -p botster-hub --no-fail-fast --test hub_daemon_lifecycle_test "$@"
+    # --workspace, not -p botster-hub: a package selection unifies dev-dependency
+    # features differently, so `-p` rebuilt botster-hub and two test-support
+    # crates after the build phase had compiled them for --workspace.
+    BOTSTER_ENV=test exec cargo test --workspace --no-fail-fast --test hub_daemon_lifecycle_test "$@"
     ;;
   shared)
     # Every test target except the lifecycle target, from cargo metadata, so a
