@@ -9,7 +9,7 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -857,16 +857,26 @@ fn remove_data_dir_path(data_dir: &Path) -> Result<(), IsolatedHubError> {
 /// timeout, an abort), and the hub, which leads its own group, then lives on
 /// under launchd at full CPU. The watchdog is a shell blocked on a pipe read
 /// that only this process holds open: when the pipe closes for any reason, the
-/// shell kills the group. A clean teardown writes a byte first, so the watchdog
-/// exits without killing a group id the system may have handed to someone else.
-mod lifeline {
-    use super::{BTreeMap, Child, ChildStdin, Command, CommandExt, Mutex, Stdio};
-    use std::io::Write;
+/// shell kills the group.
+///
+/// One `Lifeline` belongs to one hub start, and its owner (the start function
+/// while it runs, then the `IsolatedHub`) retires it by dropping it: a group
+/// that is gone gets a byte first, so the watchdog exits without signalling;
+/// a group still alive is killed by the watchdog. No watchdog outlives the
+/// start it guards.
+struct Lifeline {
+    pgid: u32,
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
 
-    static LIFELINES: Mutex<BTreeMap<u32, (Child, ChildStdin)>> = Mutex::new(BTreeMap::new());
+impl Lifeline {
+    fn arm(pgid: u32) -> Result<Self, IsolatedHubError> {
+        Self::arm_with(Path::new("/bin/sh"), pgid)
+    }
 
-    pub(super) fn arm(pgid: u32) {
-        let mut command = Command::new("/bin/sh");
+    fn arm_with(shell: &Path, pgid: u32) -> Result<Self, IsolatedHubError> {
+        let mut command = Command::new(shell);
         command
             .arg("-c")
             .arg("read -r _ && exit 0; kill -KILL -- \"-$1\"")
@@ -884,43 +894,63 @@ mod lifeline {
                 Ok(())
             });
         }
-        let Ok(mut child) = command.spawn() else {
-            return;
-        };
+        let mut child = command.spawn().map_err(|source| IsolatedHubError::Spawn {
+            path: shell.to_path_buf(),
+            source,
+        })?;
         let Some(stdin) = child.stdin.take() else {
-            return;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(IsolatedHubError::Spawn {
+                path: shell.to_path_buf(),
+                source: std::io::Error::other("watchdog stdin was not piped"),
+            });
         };
-        LIFELINES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(pgid, (child, stdin));
+        Ok(Self {
+            pgid,
+            child,
+            stdin: Some(stdin),
+        })
     }
 
-    /// Ends the watchdog. With `group_gone` it exits quietly; without, closing
-    /// the pipe makes it kill the group that is still alive.
-    pub(super) fn release(pgid: u32, group_gone: bool) {
-        let entry = LIFELINES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&pgid);
-        let Some((mut child, mut stdin)) = entry else {
-            return;
-        };
-        if group_gone {
+    /// Ends the watchdog and returns how it exited: success when it stood down
+    /// on a byte because the group was gone, failure when it killed the group.
+    fn retire(mut self) -> Option<ExitStatus> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Option<ExitStatus> {
+        let mut stdin = self.stdin.take()?;
+        if !child_process_group_exists(self.pgid) {
             let _ = stdin.write_all(b"x\n");
         }
         drop(stdin);
-        let _ = child.wait();
+        self.child.wait().ok()
     }
+}
+
+impl Drop for Lifeline {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Retires the old watchdog of a hub that has stopped, then installs the new
+/// one. Restart uses it so the old start's watchdog never outlives its group.
+fn replace_lifeline(slot: &mut Option<Lifeline>, new: Lifeline) -> Option<ExitStatus> {
+    let retired = slot.take().and_then(Lifeline::retire);
+    *slot = Some(new);
+    retired
 }
 
 #[cfg(test)]
 mod lifeline_tests {
     use super::*;
 
-    fn spawn_group_leader() -> Child {
-        let mut command = Command::new("/bin/sleep");
-        command.arg("600");
+    /// A group leader that lives until the test lets go of its stdin.
+    fn spawn_group_leader() -> (Child, ChildStdin) {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("read -r _").stdin(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {
@@ -929,17 +959,17 @@ mod lifeline_tests {
                 Ok(())
             });
         }
-        command.spawn().expect("spawn group leader")
+        let mut leader = command.spawn().expect("spawn group leader");
+        let stdin = leader.stdin.take().expect("leader stdin");
+        (leader, stdin)
     }
 
-    /// The pipe closing with a live group (the test process died, or a
-    /// teardown left survivors) kills the group.
+    /// Retiring with a live group (a teardown left survivors) kills the group.
     #[test]
-    fn closing_the_lifeline_kills_a_live_group() {
-        let mut leader = spawn_group_leader();
-        let pgid = leader.id();
-        lifeline::arm(pgid);
-        lifeline::release(pgid, false);
+    fn retiring_a_lifeline_with_a_live_group_kills_it() {
+        let (mut leader, _hold) = spawn_group_leader();
+        let lifeline = Lifeline::arm(leader.id()).expect("arm the watchdog");
+        lifeline.retire();
         let status = leader.wait().expect("wait for the killed leader");
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
@@ -948,28 +978,54 @@ mod lifeline_tests {
         );
     }
 
-    /// A clean teardown disarms it: the watchdog exits and kills nothing.
+    /// A group that is already gone: the watchdog stands down on the byte and
+    /// signals nothing (its exit status is success, not the failure of a kill).
     #[test]
-    fn a_disarmed_lifeline_leaves_the_group_alone() {
-        let mut leader = spawn_group_leader();
-        let pgid = leader.id();
-        lifeline::arm(pgid);
-        lifeline::release(pgid, true);
-        assert!(
-            leader.try_wait().expect("poll the leader").is_none(),
-            "a disarmed watchdog must not signal the group"
+    fn retiring_a_lifeline_after_its_group_is_gone_signals_nothing() {
+        let (mut leader, hold) = spawn_group_leader();
+        let lifeline = Lifeline::arm(leader.id()).expect("arm the watchdog");
+        drop(hold);
+        leader.wait().expect("the leader ends when its stdin closes");
+        let status = lifeline.retire().expect("the watchdog exits");
+        assert!(status.success(), "a disarmed watchdog must stand down: {status:?}");
+    }
+
+    /// Restart: the old start's watchdog is retired before the new one runs.
+    #[test]
+    fn replacing_a_lifeline_retires_the_old_one() {
+        let (mut old_leader, old_hold) = spawn_group_leader();
+        let (new_leader, _new_hold) = spawn_group_leader();
+        let mut slot = Some(Lifeline::arm(old_leader.id()).expect("arm the old watchdog"));
+        drop(old_hold);
+        old_leader.wait().expect("the old leader ends");
+        let retired = replace_lifeline(
+            &mut slot,
+            Lifeline::arm(new_leader.id()).expect("arm the new watchdog"),
         );
-        leader.kill().expect("stop the leader");
-        leader.wait().expect("reap the leader");
+        assert!(
+            retired.expect("the old watchdog was retired").success(),
+            "the old watchdog must stand down"
+        );
+        assert_eq!(
+            slot.as_ref().map(|lifeline| lifeline.pgid),
+            Some(new_leader.id())
+        );
+    }
+
+    /// Setup that cannot start the watchdog fails; it never continues unguarded.
+    #[test]
+    fn a_watchdog_that_cannot_start_is_an_error() {
+        let refused = Lifeline::arm_with(Path::new("/nonexistent/botster-shell"), 1);
+        assert!(matches!(refused, Err(IsolatedHubError::Spawn { .. })));
     }
 }
 
 impl Drop for IsolatedHub {
     fn drop(&mut self) {
         self.drop_teardown();
-        // Whatever path teardown took, a group still alive here is killed by
-        // the watchdog; a group that is gone lets it stand down.
-        lifeline::release(self.hub_pid, !child_process_group_exists(self.hub_pid));
+        // Whatever path teardown took, retiring the watchdog kills a group
+        // still alive and lets it stand down for one that is gone.
+        drop(self.lifeline.take());
     }
 }
 
