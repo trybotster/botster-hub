@@ -25,7 +25,8 @@ supervisor. State (socket, slot count, pid files) lives in
 botsterq run --label "hub lib" -- cargo test --locked -p botster-hub --lib
 botsterq run --label "hub lifecycle" --exclusive -- ./test.sh --locked --test hub_daemon_lifecycle_test
 botsterq run --label "hub tests" --exclusive --deadline 20m -- ./test.sh --locked   # shorter hang guard
-botsterq list            # queued and running jobs: id, state, enqueue time, label @ owner dir
+botsterq list            # queued and running jobs: id, state, enqueue time, label @ owner dir; a run still waiting for admission shows as `waiting` (id `-`)
+botsterq wait <id>        # block until job <id> ends; exit with its status (130 if it was cancelled, 1 if unknown)
 botsterq audit           # jobs that overlapped an exclusive job (from the events log)
 botsterq cancel <id>     # remove a queued job, or SIGTERM a running job's process group
 botsterq slots           # show how many jobs run at once (default 2)
