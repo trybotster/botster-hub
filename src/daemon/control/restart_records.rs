@@ -327,3 +327,53 @@ pub(crate) fn finish_removed_session(
         None => ControlPoll::Ready(Ok(response)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::control::host_work::HostRecoveryRequired;
+    use crate::daemon::control::state_record::tests as writer;
+    use crate::host_executor::HostResult;
+    use crate::host_mutations::HostMutationResult;
+
+    /// The executor refuses the disposal of a prepared mutation that will not
+    /// commit. The refused command still holds that mutation, so the owner
+    /// retains it as Host recovery and does not drop it.
+    #[test]
+    fn a_disposal_the_executor_refuses_is_retained_as_host_recovery_not_dropped() {
+        let (mut daemon, directory) = writer::test_daemon();
+        let mut state = DaemonControlState::default();
+        let (write, action) =
+            StateRecordWrite::begin(&daemon, WaiterId(1), writer::target("disposed-session"))
+                .expect("begin the write");
+        let HostResult::Mutation(HostMutationResult::Prepared(prepared)) = writer::run(action)
+        else {
+            panic!("the record write prepares");
+        };
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve a Host slot");
+        let mut record_write = RecordWrite {
+            write,
+            permit: Some(permit),
+            next_host_phase: 2,
+            done: false,
+        };
+        // With the daemon stopped, the disposal channel has no receiver.
+        daemon.stop();
+        record_write.dispose(&mut state, WaiterId(1), prepared);
+        let Some(HostRecoveryRequired::Submission { failure, .. }) =
+            state.host_recovery.remove(&WaiterId(1))
+        else {
+            panic!("the refused disposal is retained as Host recovery");
+        };
+        assert!(matches!(
+            &*failure.command,
+            HostCommand::Mutation(HostMutationCommand::Commit(_))
+        ));
+        std::fs::remove_dir_all(directory).expect("remove restart record test directory");
+    }
+}

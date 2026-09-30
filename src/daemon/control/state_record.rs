@@ -326,3 +326,207 @@ impl StateRecordWrite {
         action
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::daemon::control::host_work::release_document;
+    use crate::restart_records::{RestartContext, RestartRecord};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Parallel tests can read the same clock value; the counter keeps each
+    // test daemon's directory, and so its directory lock, distinct.
+    static NEXT_DAEMON: AtomicU64 = AtomicU64::new(0);
+
+    /// A started Hub daemon with File state authority, and its data directory.
+    pub(crate) fn test_daemon() -> (HubDaemon, std::path::PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let directory = std::path::PathBuf::from("target")
+            .join("botster-hub-test-data")
+            .join(format!(
+                "state-record-writer-{unique}-{}",
+                NEXT_DAEMON.fetch_add(1, Ordering::Relaxed)
+            ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "state-record-writer".to_string(),
+                display_name: "State Record Writer".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build state record writer test config");
+        (
+            HubDaemon::start(config).expect("start test daemon"),
+            directory,
+        )
+    }
+
+    pub(crate) fn target(session_id: &str) -> StateRecordTarget {
+        StateRecordTarget::RestartRecord {
+            session_id: session_id.to_string(),
+            record: Some(RestartRecord {
+                session_type_id: "init".to_string(),
+                target_id: None,
+                cwd: None,
+                environment_keys: Vec::new(),
+                context: RestartContext::default(),
+            }),
+        }
+    }
+
+    /// Run the Host mutation an action asks for, on this thread.
+    pub(crate) fn run(action: StateRecordAction) -> HostResult {
+        let StateRecordAction::Submit(HostCommand::Mutation(command)) = action else {
+            panic!("the action submits a Host mutation");
+        };
+        HostResult::Mutation(crate::host_mutations::execute(command, None))
+    }
+
+    fn begin(
+        daemon: &HubDaemon,
+        waiter: u64,
+        session_id: &str,
+    ) -> (StateRecordWrite, StateRecordAction) {
+        StateRecordWrite::begin(daemon, WaiterId(waiter), target(session_id))
+            .expect("begin the write")
+    }
+
+    /// Feed the result of the Host step `action` asks for back to the write.
+    fn step(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        write: &mut StateRecordWrite,
+        action: StateRecordAction,
+    ) -> StateRecordAction {
+        write.on_completion(daemon, state, run(action), || None)
+    }
+
+    fn finish(mut daemon: HubDaemon, directory: std::path::PathBuf) {
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove state record writer test directory");
+    }
+
+    fn holds(daemon: &HubDaemon, session_id: &str) -> bool {
+        daemon
+            .state_view()
+            .1
+            .restart_records
+            .contains_key(session_id)
+    }
+
+    #[test]
+    fn a_busy_document_parks_the_write_and_the_release_lets_it_commit() {
+        let (mut daemon, directory) = test_daemon();
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(WaiterId(9));
+        let (mut write, action) = begin(&daemon, 1, "parked-session");
+        let action = step(&mut daemon, &mut state, &mut write, action);
+        assert!(matches!(action, StateRecordAction::Park));
+        assert!(write.is_parked());
+        assert!(state.document_waiters.contains(&WaiterId(1)));
+        assert!(!holds(&daemon, "parked-session"));
+
+        release_document(&mut state, WaiterId(9));
+        assert!(
+            !state.document_waiters.contains(&WaiterId(1)),
+            "the release wakes the parked waiter"
+        );
+        let action = write.admit(&daemon, &mut state, true);
+        assert!(write.awaits_commit());
+        let committed = step(&mut daemon, &mut state, &mut write, action);
+        assert!(matches!(committed, StateRecordAction::Committed));
+        assert!(holds(&daemon, "parked-session"));
+        assert_eq!(state.document_owner, None);
+        finish(daemon, directory);
+    }
+
+    #[test]
+    fn a_stale_preparation_is_prepared_again_and_then_commits() {
+        let (mut daemon, directory) = test_daemon();
+        let mut state = DaemonControlState::default();
+        // The first writer prepares against the current revision...
+        let (mut first, first_action) = begin(&daemon, 1, "first-session");
+        let first_prepared = run(first_action);
+        // ...and a second writer commits before the first is admitted.
+        let (mut second, second_action) = begin(&daemon, 2, "second-session");
+        let action = step(&mut daemon, &mut state, &mut second, second_action);
+        let committed = step(&mut daemon, &mut state, &mut second, action);
+        assert!(matches!(committed, StateRecordAction::Committed));
+
+        let action = first.on_completion(&mut daemon, &mut state, first_prepared, || None);
+        assert!(
+            matches!(
+                action,
+                StateRecordAction::Submit(HostCommand::Mutation(HostMutationCommand::Prepare(_)))
+            ),
+            "the stale preparation is prepared again"
+        );
+        let action = step(&mut daemon, &mut state, &mut first, action);
+        let committed = step(&mut daemon, &mut state, &mut first, action);
+        assert!(matches!(committed, StateRecordAction::Committed));
+        assert!(holds(&daemon, "first-session"));
+        assert!(holds(&daemon, "second-session"));
+        finish(daemon, directory);
+    }
+
+    #[test]
+    fn a_commit_submission_that_does_not_go_pending_frees_the_publication_claim() {
+        let (mut daemon, directory) = test_daemon();
+        let mut state = DaemonControlState::default();
+        let (mut write, action) = begin(&daemon, 1, "refused-session");
+        let action = step(&mut daemon, &mut state, &mut write, action);
+        assert!(write.awaits_commit());
+        assert!(matches!(action, StateRecordAction::Submit(_)));
+        assert!(
+            !state.reserve_uncertain_publication(WaiterId(2)),
+            "the claim is held while the commit is in flight"
+        );
+        write.commit_not_submitted(&mut state);
+        assert!(
+            state.reserve_uncertain_publication(WaiterId(2)),
+            "a refused submission frees the claim"
+        );
+        finish(daemon, directory);
+    }
+
+    #[test]
+    fn an_uncertain_publication_is_retained_and_refuses_the_next_write_at_the_cell() {
+        let (mut daemon, directory) = test_daemon();
+        let mut state = DaemonControlState::default();
+        let (mut write, action) = begin(&daemon, 1, "uncertain-session");
+        let action = step(&mut daemon, &mut state, &mut write, action);
+        crate::persistence::FileHubStateStore::inject_next_directory_sync_failure(&directory);
+        let result = run(action);
+        assert!(matches!(
+            result,
+            HostResult::Mutation(HostMutationResult::PublishedUncertain { .. })
+        ));
+        let action = write.on_completion(&mut daemon, &mut state, result, || None);
+        assert!(matches!(action, StateRecordAction::Uncertain));
+        assert!(
+            state.uncertain_publication.is_some(),
+            "the publication is retained"
+        );
+        assert_eq!(state.document_owner, None, "the document is released");
+
+        let (mut second, second_action) = begin(&daemon, 2, "second-session");
+        let action = step(&mut daemon, &mut state, &mut second, second_action);
+        let StateRecordAction::Failed { stage, discard, .. } = action else {
+            panic!("the retention cell is taken, so the next write fails");
+        };
+        assert_eq!(stage, StateRecordStage::PublicationSlot);
+        assert!(
+            discard.is_some(),
+            "the refused write hands back its prepared mutation"
+        );
+        assert_eq!(state.document_owner, None);
+        finish(daemon, directory);
+    }
+}
