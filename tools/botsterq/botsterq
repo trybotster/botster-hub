@@ -3,6 +3,7 @@
 #
 #   botsterq run [--label <text>] [--exclusive] [--deadline <duration>] -- <command...>
 #   botsterq list
+#   botsterq wait <id>
 #   botsterq cancel <id>
 #   botsterq audit
 #   botsterq slots [N]
@@ -57,7 +58,7 @@ self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
 supervisor="$(dirname "$self")/botsterq-job"
 
 usage() {
-  sed -n '3,7p' "$0" | sed 's/^# //' >&2
+  sed -n '3,9p' "$0" | sed 's/^# //' >&2
   exit 2
 }
 
@@ -325,6 +326,39 @@ cmd_list() {
     enqueued=$(ts -i "$id" 2>/dev/null | sed -n 's/^Enqueue time: [A-Za-z]* [A-Za-z]* *[0-9]* \([0-9:]*\) .*/\1/p')
     printf '%-5s %-8s %-9s %s\n' "$id" "$job_state" "${enqueued:-?}" "$label"
   done
+  # Runs still waiting for admission are not in task-spooler yet (an exclusive
+  # job ahead of them, or the admission lock). Each has a record named by the
+  # client's pid; a record whose client is gone is stale and skipped.
+  for record in $(ls -tr "$state"/run/*.waiting 2>/dev/null); do
+    pid=$(basename "$record"); pid=${pid%%-*}
+    kill -0 "$pid" 2>/dev/null || continue
+    IFS='	' read -r rec_exclusive rec_epoch rec_label rec_cwd <"$record" || continue
+    marker=; [ "$rec_exclusive" = 1 ] && marker=" [exclusive]"
+    printf '%-5s %-8s %-9s %s\n' "-" waiting "$(date -r "$rec_epoch" +%H:%M:%S 2>/dev/null || echo '?')" "$rec_label$marker @ $rec_cwd (client pid $pid)"
+  done
+}
+
+# Blocks until job <id> has ended and exits with the job's status. A job removed
+# from the queue by `botsterq cancel` releases the wait (status 130).
+cmd_wait() {
+  [ "$#" -eq 1 ] || usage
+  wait_id=$1
+  ensure_server
+  ts -l | awk -v id="$wait_id" '$1 == id { found = 1 } END { exit !found }' \
+    || { echo "botsterq: no job $wait_id" >&2; exit 1; }
+  ( ts -w "$wait_id" >/dev/null 2>&1 ) &
+  wait_child=$!
+  wait_record="$state/run/wait-$$.waitfor.$wait_id"
+  echo "$wait_child" >"$wait_record"
+  trap 'kill "$wait_child" 2>/dev/null; rm -f "$wait_record"; exit 130' INT TERM HUP
+  wait_status=0
+  wait "$wait_child" || wait_status=$?
+  rm -f "$wait_record"
+  # Released by a cancel: the job is gone from the queue and never reported a status.
+  if [ "$wait_status" -ge 128 ] && ! ts -l | awk -v id="$wait_id" '$1 == id { found = 1 } END { exit !found }'; then
+    wait_status=130
+  fi
+  exit "$wait_status"
 }
 
 # Reads the events log (one start and one end line per job) and prints every
@@ -515,12 +549,12 @@ cmd_run() {
     if [ -n "${admission_started:-}" ] && [ -z "${admission_over:-}" ]; then
       printf x >&9 2>/dev/null || true
       wait 2>/dev/null || true
-      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel"
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel" "$state/run/$token.waiting"
     fi
     # Admission already over: its files are this run's to remove (the interrupt
     # can land between the end of the admission and the normal removal).
     if [ -n "${admission_over:-}" ]; then
-      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel"
+      rm -f "$state/run/$token.admitted" "$state/run/$token.admitcancel" "$state/run/$token.waiting"
     fi
     # The signal may arrive before the admitted id is stored; the token names
     # the job either way, so resolve its id and stop it.
@@ -540,6 +574,9 @@ cmd_run() {
   admission_started=1
   cancel_fifo="$state/run/$token.admitcancel"
   mkfifo "$cancel_fifo"
+  # What `list` shows for a run that is still waiting for admission: the job is
+  # not in task-spooler yet. Removed wherever the cancel fifo is.
+  printf '%s\t%s\t%s\t%s\n' "$exclusive" "$(date +%s)" "$label" "$(pwd)" >"$state/run/$token.waiting"
   exec 9<>"$cancel_fifo"
   # Test holds (fifos): the interrupt tests stop `run` at exactly these points.
   if [ -n "${BOTSTERQ_TEST_RUN_BEFORE_ADMISSION:-}" ]; then
@@ -554,7 +591,7 @@ cmd_run() {
   admission_over=1
   exec 9>&-
   id=$(cat "$admitted_file" 2>/dev/null || true)
-  rm -f "$admitted_file" "$state/run/$token.admitcancel"
+  rm -f "$admitted_file" "$state/run/$token.admitcancel" "$state/run/$token.waiting"
   [ -n "$id" ] || { echo "botsterq: could not queue the job" >&2; exit 1; }
   ( ts -w "$id" >/dev/null 2>&1 ) &
   waiter=$!
@@ -576,6 +613,7 @@ shift
 case "$subcommand" in
   run) cmd_run "$@" ;;
   list) cmd_list ;;
+  wait) cmd_wait "$@" ;;
   cancel) cmd_cancel "$@" ;;
   audit) cmd_audit ;;
   slots) cmd_slots "$@" ;;

@@ -698,6 +698,42 @@ wait "$Z1" "$ZO"
   && pass "a queued exclusive job cancelled by id while an ordinary run waits for it: that run is admitted and runs, and the cancelled job's own run exits 130" \
   || fail "waiter release" "z2=$codeZ2 ZO.ran=$([ -e "$work/ZO.ran" ] && echo yes || echo no) state=$zo_state err=$(cat "$work/ZO.err")"
 
+# 8n. `list` shows a run that still waits for admission (it is not in
+#     task-spooler yet), marked `waiting`, and `wait <id>` blocks until a job ends
+#     and exits with its status, or exits 130 when the job is cancelled.
+"$Q" slots 2 >/dev/null
+"$Q" run --label WL1 --exclusive -- sh -c 'sleep 4' >/dev/null 2>&1 &
+WL1=$!
+await_state "WL1 [exclusive] @" running
+"$Q" run --label WL2 --exclusive -- sh -c 'sleep 1' >/dev/null 2>&1 &
+WL2=$!
+await_state "WL2 [exclusive] @" queued
+"$Q" run --label WLO -- true >/dev/null 2>"$work/WLO.err" &
+WLO=$!
+await_text "$work/WLO.err" "waiting for exclusive job"
+listing=$("$Q" list)
+echo "$listing" | grep -q "waiting .*WLO @ " \
+  && pass "list shows a run that waits for admission, marked waiting" \
+  || fail "list waiting" "$listing"
+# wait <id>: a queued job that is cancelled releases the wait (130, no hang)
+wl2id=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[WL2 [exclusive] @ ") { print $1 }')
+"$Q" wait "$wl2id" >/dev/null 2>&1 &
+WW=$!
+await_file "$BOTSTERQ_HOME/run/wait-*.waitfor.$wl2id"
+"$Q" cancel "$wl2id" >/dev/null 2>&1
+wait "$WW" 2>/dev/null; codeWait=$?
+wait "$WL1" "$WL2" "$WLO" 2>/dev/null
+[ "$codeWait" = 130 ] && pass "wait on a job cancelled from the queue ends with 130" || fail "wait cancelled" "code=$codeWait"
+"$Q" run --label WT -- sh -c 'sleep 1; exit 3' >/dev/null 2>&1 &
+WT=$!
+await_state "WT @" running
+wtid=$(TS_SOCKET="$BOTSTERQ_HOME/queue.sock" ts -l | awk 'index($0, "[WT @ ") { print $1 }')
+"$Q" wait "$wtid" >/dev/null 2>&1; codeWT=$?
+wait "$WT" 2>/dev/null
+[ "$codeWT" = 3 ] && pass "wait <id> exits with the job's status" || fail "wait status" "code=$codeWT"
+"$Q" wait 99999 >/dev/null 2>&1; codeNone=$?
+[ "$codeNone" = 1 ] && pass "wait on an unknown id exits 1" || fail "wait unknown" "code=$codeNone"
+
 # 19b. Target cap. A job whose directory is a cargo workspace with a target/
 #     above the cap gets `cargo clean --target-dir target` there before its
 #     command starts, and one line says so; under the cap, or with the cap off,
