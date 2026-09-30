@@ -236,6 +236,20 @@ impl Doorbell {
         self.sessions.contains_key(&session.0)
     }
 
+    /// Whether the machine's current phase is the one that asked for a write
+    /// of this purpose. A write that was queued and not yet typed stops being
+    /// wanted when the attempt ends, for example when the human types.
+    pub(crate) fn wants_write(&self, session: &SessionId, purpose: Purpose) -> bool {
+        self.sessions
+            .get(&session.0)
+            .is_some_and(|ring| match (&ring.phase, purpose) {
+                (Phase::Probing { .. }, Purpose::Probe)
+                | (Phase::Erasing { .. }, Purpose::Erase)
+                | (Phase::Delivering { .. }, Purpose::Ring) => true,
+                _ => false,
+            })
+    }
+
     /// Feed one event for one session at `now`; execute the effects returned.
     pub(crate) fn step(&mut self, session: &SessionId, now: Instant, event: Event) -> Vec<Effect> {
         let mut effects = Vec::new();

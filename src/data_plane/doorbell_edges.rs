@@ -78,24 +78,37 @@ impl DoorbellEdges {
         now: Instant,
         mut read: impl FnMut(&SessionId) -> Option<SessionEdges>,
     ) {
-        let mut stored = false;
-        {
+        // The lock is held only for in-memory map work. Reading `session_edges`
+        // loads the registry and may be slow, so it runs with no lock held and
+        // the owner never waits behind it.
+        let to_read: Vec<SessionId> = {
             let mut table = self.table();
             for session in &outcome.input_advanced {
                 table.input_at.insert(session.0.clone(), now);
             }
-            let named = outcome
+            let mut seen = BTreeSet::new();
+            outcome
                 .modes_advanced
                 .iter()
                 .chain(&outcome.output_advanced)
-                .chain(&outcome.input_advanced);
-            let mut seen = BTreeSet::new();
-            for session in named {
-                if !table.watched.contains(&session.0) || !seen.insert(session.0.clone()) {
-                    continue;
-                }
-                if let Some(edges) = read(session) {
-                    table.latest.insert(session.0.clone(), edges);
+                .chain(&outcome.input_advanced)
+                .filter(|session| {
+                    table.watched.contains(&session.0) && seen.insert(session.0.clone())
+                })
+                .cloned()
+                .collect()
+        };
+        let reads: Vec<(String, SessionEdges)> = to_read
+            .iter()
+            .filter_map(|session| read(session).map(|edges| (session.0.clone(), edges)))
+            .collect();
+        let mut stored = false;
+        {
+            let mut table = self.table();
+            for (session, edges) in reads {
+                // Unwatched or forgotten while the read ran: store nothing.
+                if table.watched.contains(&session) {
+                    table.latest.insert(session, edges);
                     stored = true;
                 }
             }
@@ -136,6 +149,12 @@ impl DoorbellEdges {
         table.watched.remove(session);
         table.latest.remove(session);
         table.input_at.remove(session);
+    }
+
+    /// Every session with a stamped input time, so the owner can forget the
+    /// ones that ended whether or not they were ever rung.
+    pub(crate) fn stamped_sessions(&self) -> Vec<String> {
+        self.table().input_at.keys().cloned().collect()
     }
 
     /// When the session's client input last advanced, if it ever did.
@@ -214,6 +233,38 @@ mod tests {
         });
         assert_eq!(reads, ["a"], "an unwatched session is never read");
         assert_eq!(map.take_latest().len(), 1);
+    }
+
+    #[test]
+    fn the_edges_are_read_with_no_lock_held() {
+        let (map, _) = rig();
+        map.watch("a");
+        map.record_pump(&outcome(&[], &["a"], &[]), Instant::now(), |_| {
+            assert!(
+                map.shared.table.try_lock().is_ok(),
+                "the owner must not wait behind a registry read"
+            );
+            Some(edges(0, 1))
+        });
+        assert_eq!(map.take_latest().len(), 1);
+    }
+
+    #[test]
+    fn a_session_unwatched_while_its_read_runs_stores_nothing() {
+        let (map, _) = rig();
+        map.watch("a");
+        map.record_pump(&outcome(&[], &["a"], &[]), Instant::now(), |_| {
+            map.unwatch("a");
+            Some(edges(0, 1))
+        });
+        assert!(!map.has_latest());
+    }
+
+    #[test]
+    fn every_stamped_session_can_be_listed_for_forgetting() {
+        let (map, _) = rig();
+        map.record_pump(&outcome(&[], &[], &["a", "b"]), Instant::now(), |_| None);
+        assert_eq!(map.stamped_sessions(), ["a", "b"]);
     }
 
     #[test]

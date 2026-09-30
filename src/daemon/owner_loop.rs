@@ -3736,6 +3736,80 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn a_refused_doorbell_cursor_read_parks_keeps_its_place_and_runs_when_there_is_room() {
+        let root = unique_package_control_dir("refused-doorbell-cursor");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        crate::daemon::doorbell_owner::test_seed_cursor_job(&mut state, "sess-a");
+        let release = daemon.runtime().unwrap().test_fill_core_request_queue();
+        assert!(matches!(
+            crate::daemon::doorbell_owner::drive(&daemon, &mut state),
+            crate::daemon::doorbell_owner::Progress::Waiting
+        ));
+        assert!(
+            state.doorbell.flight_is_none(),
+            "a refused begin holds no flight: no completion will come"
+        );
+        assert!(
+            state.doorbell.has_jobs(),
+            "the read keeps its place in the queue"
+        );
+        let seen = *state
+            .background_signal_waits
+            .get(&BackgroundWork::Doorbell)
+            .expect("the refused read parked on queue room");
+        drop(release);
+        crate::daemon::owner_signal::test_wait_until_moved(
+            daemon.runtime().unwrap().owner_signal(),
+            seen,
+        );
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(
+            !state
+                .background_signal_waits
+                .contains_key(&BackgroundWork::Doorbell),
+            "the data plane's dequeue wakes the parked doorbell"
+        );
+        crate::daemon::doorbell_owner::drive(&daemon, &mut state);
+        assert!(
+            !state.doorbell.flight_is_none(),
+            "the read is submitted once there is room"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_doorbell_write_fails_the_attempt_and_parks_until_there_is_room() {
+        let root = unique_package_control_dir("refused-doorbell-write");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        crate::daemon::doorbell_owner::test_seed_probe_write(&mut state, "sess-a");
+        let release = daemon.runtime().unwrap().test_fill_core_request_queue();
+        assert!(matches!(
+            crate::daemon::doorbell_owner::drive(&daemon, &mut state),
+            crate::daemon::doorbell_owner::Progress::Waiting
+        ));
+        assert!(
+            state.doorbell.flight_is_none(),
+            "a refused write holds no flight"
+        );
+        assert!(
+            state
+                .background_signal_waits
+                .contains_key(&BackgroundWork::Doorbell),
+            "the refused write parked on queue room"
+        );
+        assert!(
+            state.doorbell.holds_ring("sess-a"),
+            "the ring still waits for the next edge"
+        );
+        drop(release);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Each refusal retires a registered phase, so the admitted retry
     /// completes with a later phase than the owner last saw. The owner must
     /// still ready the work and consume the result (S4a review of e8cefce0).

@@ -6269,6 +6269,16 @@ impl CoreOperationTracker {
         }
     }
 
+    /// For a begin refused for lack of queue room, the owner's registered
+    /// wait: it moves when the data-plane thread next dequeues a request. A
+    /// refused begin publishes no completion, so the owner parks on this.
+    pub(crate) fn refused_wait(&self) -> Option<crate::daemon::owner_signal::Seen> {
+        match &self.stage {
+            CoreOperationStage::Begin { ticket, .. } => ticket.refused_wait(),
+            CoreOperationStage::Pending { .. } | CoreOperationStage::Done => None,
+        }
+    }
+
     /// Pending id once `begin` returned it.
     #[must_use]
     pub fn pending_id(&self) -> Option<PendingOperationId> {
