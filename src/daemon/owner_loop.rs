@@ -6993,6 +6993,23 @@ return botster.register({
         .expect("write controlled entity gate lua plugin");
     }
 
+    /// A hand-driven loop services Host completions, plugin completions and
+    /// the causal queue itself. Each of those owner wakes is coalesced: it
+    /// sends one message and sends none again until its notification is
+    /// taken, as `publish_completion_wakes` takes it in the owner loop. Take
+    /// them before servicing, so the next completion wakes a blocked test.
+    fn take_serviced_wake_notifications(daemon: &HubDaemon, state: &DaemonControlState) {
+        let runtime = daemon.runtime().unwrap();
+        let executor = runtime.host_executor();
+        let _ = executor.take_completion_notification();
+        let _ = executor.take_capacity_notification();
+        let _ = state.plugin_result_budget.take_completion_notification();
+        let _ = state.plugin_result_budget.take_release_notification();
+        let _ = runtime.take_causal_capacity_notification();
+        let _ = runtime.causal_scopes().take_progress_notification();
+        let _ = runtime.take_entity_model_notification();
+    }
+
     fn collect_entity_test_host_completions(daemon: &HubDaemon, state: &mut DaemonControlState) {
         while let crate::host_executor::HostCompletionPoll::Ready(completion) =
             daemon.runtime().unwrap().host_executor().poll_completion()
@@ -7617,6 +7634,7 @@ return botster.register({ handlers = {{
         )
         .unwrap();
         let mut state = DaemonControlState::default();
+        let mut wakes = TestOwnerWakes::bind(&daemon, &state);
         daemon
             .runtime()
             .unwrap()
@@ -7647,6 +7665,7 @@ return botster.register({ handlers = {{
                 let mut provider_completed = false;
                 let mut refused = false;
                 loop {
+                    take_serviced_wake_notifications(&daemon, &state);
                     let completed = run_completion_drain_slice_for_owner(
                         daemon.runtime().unwrap(),
                         &mut state.maintenance,
@@ -7682,6 +7701,23 @@ return botster.register({ handlers = {{
                     // a hand-driven loop does the same, or a request parked on Core
                     // lock contention never runs again.
                     mark_signaled_requests(&mut state);
+                    // The owner loop also drains the causal queue and wakes every request
+                    // parked on it (CausalDrain, CausalProgress; see
+                    // a_request_parked_on_the_causal_queue_runs_again_only_when_its_wake_is_published).
+                    // This loop collects Host completions itself, so it takes only that part
+                    // of the owner's wake publication.
+                    let runtime = daemon.runtime().unwrap();
+                    while runtime.causal_owner_ops_ready() {
+                        runtime.apply_causal_owner_ops();
+                    }
+                    for waiter in std::mem::take(&mut state.plugin_entities.causal_waiters) {
+                        crate::daemon::control::entities::mark_plugin_entity_ready(
+                            &mut state,
+                            waiter,
+                            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                            crate::daemon::control::pending::READY_HOST_COMPLETION,
+                        );
+                    }
                     // Collect admission phases before retaining each completed provider.
                     collect_entity_test_host_completions(&daemon, &mut state);
                     if let Some(item) = state.owner_ready.pop_next() {
@@ -7694,11 +7730,21 @@ return botster.register({ handlers = {{
                             &mut budget
                         ));
                     }
-                    assert!(
-                        Instant::now() < deadline,
-                        "Lua snapshot {index} must complete"
-                    );
-                    thread::yield_now();
+                    let stuck = || {
+                        format!(
+                            "Lua snapshot {index} must complete: provider_completed={provider_completed} refused={refused} outstanding={} jobs_in_flight={} ready={} stages={:?} entities={:?}",
+                            daemon.runtime().unwrap().host_executor().outstanding(),
+                            daemon.runtime().unwrap().host_executor().jobs_in_flight(),
+                            state.owner_ready.len(),
+                            state.plugin_entities.test_stages(),
+                            state.plugin_entities
+                        )
+                    };
+                    assert!(Instant::now() < deadline, "{}", stuck());
+                    // Ready work runs at once; otherwise the owner blocks on its wakes.
+                    if state.owner_ready.is_empty() {
+                        assert!(wakes.wait(deadline), "{}", stuck());
+                    }
                 }
                 assert!(Instant::now() < deadline, "Core admission must recover");
             };
@@ -7751,18 +7797,22 @@ return botster.register({ handlers = {{
                 "snapshot_seq": 1, "id": "entity-1"}), None,
         ).unwrap();
         crate::daemon::control::entities::begin_package_entity_fanout(&daemon, &mut state);
-        let deadline = Instant::now() + TEST_HANG_GUARD;
-        while crate::daemon::control::entities::plugin_entity_cleanup_pending(&state)
-            || daemon.runtime().unwrap().has_package_entity_fanout()
-        {
-            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
-            assert!(
-                Instant::now() < deadline,
-                "snapshots and fanout must complete without a cancellation deadline: {:?}",
-                state.plugin_entities
-            );
-            thread::yield_now();
-        }
+        drive_owner_until(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            TEST_HANG_GUARD,
+            |daemon, state| {
+                !crate::daemon::control::entities::plugin_entity_cleanup_pending(state)
+                    && !daemon.runtime().unwrap().has_package_entity_fanout()
+            },
+            |_, state| {
+                format!(
+                    "snapshots and fanout must complete without a cancellation deadline: {:?}",
+                    state.plugin_entities
+                )
+            },
+        );
         for mut reply in replies {
             assert!(
                 reply
@@ -7792,15 +7842,14 @@ return botster.register({ handlers = {{
                 "the sequence-1 mutation is superseded"
             );
         }
-        let drain_deadline = Instant::now() + TEST_HANG_GUARD;
-        while daemon.runtime().unwrap().host_executor().outstanding() != 0 {
-            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
-            assert!(
-                Instant::now() < drain_deadline,
-                "Host work must retire after snapshots and fanout complete"
-            );
-            thread::yield_now();
-        }
+        drive_owner_until(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            TEST_HANG_GUARD,
+            |daemon, _| daemon.runtime().unwrap().host_executor().outstanding() == 0,
+            |_, _| "Host work must retire after snapshots and fanout complete".to_string(),
+        );
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         let bridge = daemon.runtime().unwrap().entity_publish_bridge();
         let publication = bridge.test_queue_publish(
@@ -7809,27 +7858,24 @@ return botster.register({ handlers = {{
                 "snapshot_seq": 2, "id": "entity-1"}),
             None,
         );
-        let deadline = Instant::now() + TEST_HANG_GUARD;
-        loop {
-            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
-            if bridge.pending_publish_count() == 0
-                && bridge.retained_counts() == (0, 0)
-                && state.budget.outstanding() == 0
-                && !daemon
-                    .runtime()
-                    .unwrap()
-                    .entity_publish_retirement_pending()
-                && !daemon.runtime().unwrap().has_package_entity_fanout()
-                && !crate::daemon::control::entities::plugin_entity_cleanup_pending(&state)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the next mutation must reach every subscriber"
-            );
-            thread::yield_now();
-        }
+        drive_owner_until(
+            &mut daemon,
+            &mut state,
+            &mut wakes,
+            TEST_HANG_GUARD,
+            |daemon, state| {
+                bridge.pending_publish_count() == 0
+                    && bridge.retained_counts() == (0, 0)
+                    && state.budget.outstanding() == 0
+                    && !daemon
+                        .runtime()
+                        .unwrap()
+                        .entity_publish_retirement_pending()
+                    && !daemon.runtime().unwrap().has_package_entity_fanout()
+                    && !crate::daemon::control::entities::plugin_entity_cleanup_pending(state)
+            },
+            |_, _| "the next mutation must reach every subscriber".to_string(),
+        );
         assert_eq!(
             publication.try_recv().unwrap().unwrap().last_accepted_seq,
             2
@@ -7847,6 +7893,55 @@ return botster.register({ handlers = {{
         assert_eq!(bridge.retained_counts(), (0, 0));
         assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         drop(frames);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A request parked on the causal queue runs again only when the owner
+    /// publishes its wake. The hand-driven loop this replaced marked signaled
+    /// waiters and collected Host completions but never published the causal
+    /// progress wake, so a snapshot that met a queued causal operation stayed
+    /// parked with its Host permit forever.
+    #[test]
+    fn a_request_parked_on_the_causal_queue_runs_again_only_when_its_wake_is_published() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let root = unique_package_control_dir("entity-causal-queue-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let waiter = state.waiter_ids.next().expect("a waiter identity");
+        state.plugin_entities.causal_waiters.insert(waiter);
+        // The queue holds one causal operation, then drains: the progress
+        // the parked request waits for has happened.
+        assert!(matches!(
+            daemon
+                .runtime()
+                .unwrap()
+                .admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight,
+                }),
+            CausalAdmitResult::Applied
+        ));
+        daemon.runtime().unwrap().apply_causal_owner_ops();
+        assert_eq!(daemon.runtime().unwrap().causal_operation_count(), 0);
+        // What the hand-driven loop ran leaves the request parked.
+        mark_signaled_requests(&mut state);
+        assert!(state.owner_ready.pop_next().is_none());
+        assert!(state.plugin_entities.causal_waiters.contains(&waiter));
+        // The owner's wake publication releases it.
+        publish_completion_wakes(&mut daemon, &mut state);
+        while let Some(item) = state.owner_ready.pop_next() {
+            assert!(!dispatch_owner_ready_item(
+                &mut daemon,
+                &mut state,
+                item,
+                &mut crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now()),
+            ));
+        }
+        assert!(
+            !state.plugin_entities.causal_waiters.contains(&waiter),
+            "publishing the causal wake releases the parked request"
+        );
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }

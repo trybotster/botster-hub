@@ -444,6 +444,15 @@ impl PluginEntityState {
         moved
     }
 
+    /// Test only: the stage of every pending row, for a failure message.
+    #[cfg(test)]
+    pub(crate) fn test_stages(&self) -> Vec<String> {
+        self.pending
+            .values()
+            .map(|entry| format!("{:?}", entry.work.stage))
+            .collect()
+    }
+
     /// Test only: waiters parked on a plugin-engine release.
     #[cfg(test)]
     pub(crate) fn signal_waiter_count(&self) -> usize {
