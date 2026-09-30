@@ -173,7 +173,18 @@ impl RecordWrite {
                 self.submit(daemon, state, waiter_id, session_id, command);
             }
             StateRecordAction::Park => {}
-            StateRecordAction::Committed => self.done = true,
+            StateRecordAction::Committed => {
+                // The durable set changed: re-derive this id's `restartable`.
+                let present = daemon
+                    .state_view()
+                    .1
+                    .restart_records
+                    .contains_key(session_id);
+                state
+                    .maintenance
+                    .restart_record_changed(session_id, present);
+                self.done = true;
+            }
             StateRecordAction::Failed {
                 code,
                 message,
@@ -182,7 +193,7 @@ impl RecordWrite {
             } => {
                 not_durable(session_id, &format!("{code}: {message}"));
                 if let Some(prepared) = discard {
-                    self.dispose(waiter_id, *prepared);
+                    self.dispose(state, waiter_id, *prepared);
                 }
                 self.done = true;
             }
@@ -258,8 +269,15 @@ impl RecordWrite {
     }
 
     /// Drop a prepared mutation that will never commit on a Host worker, not
-    /// on the owner thread.
-    fn dispose(&mut self, waiter_id: WaiterId, prepared: crate::host_mutations::PreparedMutation) {
+    /// on the owner thread. When the executor refuses the disposal, the
+    /// refused command holds the prepared mutation: retain it as Host
+    /// recovery, which disposes it on a Host worker later. Never drop it here.
+    fn dispose(
+        &mut self,
+        state: &mut DaemonControlState,
+        waiter_id: WaiterId,
+        prepared: crate::host_mutations::PreparedMutation,
+    ) {
         let Some(permit) = self.permit.take() else {
             return;
         };
@@ -269,8 +287,7 @@ impl RecordWrite {
         };
         let command = HostCommand::Mutation(HostMutationCommand::Commit(HostCommit { prepared }));
         if let Err(failure) = permit.dispose(identity, command) {
-            // The executor refused the disposal; the command drops here.
-            drop(failure);
+            let _ = retain_submission(state, failure);
         }
     }
 }
@@ -280,8 +297,8 @@ fn not_durable(session_id: &str, reason: &str) {
     crate::hub_log::hub_log!("restart_record_not_durable session_id={session_id} reason={reason}");
 }
 
-/// A removal is done in Core. Retire the session's context and, when a
-/// restart record exists, delete it before the reply.
+/// A removal is done in Core. When a restart record exists, delete it before
+/// the reply.
 pub(crate) fn finish_removed_session(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -290,9 +307,6 @@ pub(crate) fn finish_removed_session(
     response: DaemonResponse,
     recording: &mut Option<(Box<RecordWrite>, DaemonResponse)>,
 ) -> ControlPoll {
-    if let Some(runtime) = daemon.runtime() {
-        runtime.retire_removed_session_context(session_id);
-    }
     if !daemon
         .state_view()
         .1

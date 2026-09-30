@@ -12,8 +12,18 @@ fn session_frame_is_ended(frame: &botster_hub_client::DaemonEntityFrame, session
     fields.get("lifecycle_class").and_then(serde_json::Value::as_str) == Some("ended")
 }
 
+fn session_frame_is_restartable(frame: &botster_hub_client::DaemonEntityFrame, session_id: &str) -> bool {
+    let fields = match frame {
+        botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. } if id == session_id => entity,
+        botster_hub_client::DaemonEntityFrame::Patch { id, patch, .. } if id == session_id => patch,
+        _ => return false,
+    };
+    session_frame_is_ended(frame, session_id)
+        && fields.get("restartable").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 /// A session-type spawn records how to restart the session before its reply,
-/// and removing the ended session deletes the record and retires its context.
+/// and removing the ended session deletes the record.
 #[test]
 fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
     let _guard = daemon_test_guard();
@@ -63,8 +73,9 @@ fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
     assert!(record.get("environment_keys").is_none(), "{record}");
 
     // The fixture script exits after a second; wait for the entity to end.
+    // The entity turns restartable as it ends: the record is already durable.
     wait_for_entity_frame(&mut sessions, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, |frame| {
-        session_frame_is_ended(frame, session_id)
+        session_frame_is_restartable(frame, session_id)
     });
     let removed = botster_hub::daemon_transport_request(
         &config,
@@ -79,20 +90,6 @@ fn a_session_type_spawn_records_its_restart_inputs_and_removal_deletes_them() {
     assert!(
         state["restart_records"].get(session_id).is_none(),
         "removal deletes the restart record: {state}"
-    );
-    let context = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ReadSessionContext {
-            session_id: session_id.to_string(),
-            context_id: None,
-            key: Some("prompt".to_string()),
-        },
-    )
-    .expect("read context after removal");
-    assert_ne!(
-        context.kind,
-        botster_hub::DaemonResponseKind::SessionContext,
-        "removal retires the session context: {context:?}"
     );
     drop(sessions);
     shutdown_cli_daemon(&data_dir, child);
@@ -122,8 +119,9 @@ fn a_restart_of_an_unknown_running_or_unrecorded_session_is_refused_with_its_cod
     let data_dir = unique_short_test_dir("restart-refusals");
     let package_root = unique_test_dir("restart-refusals-package");
     write_session_type_context_package(&package_root);
-    // A session that stays running for the whole test.
-    write_warm_executable(&package_root.join("bin/init.sh"), "#!/bin/sh\nsleep 60\n");
+    // A session that stays running until its terminal closes: `cat` blocks on
+    // its terminal input, and the test ends it by shutting the daemon down.
+    write_warm_executable(&package_root.join("bin/init.sh"), "#!/bin/sh\ncat\n");
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
     let enabled = botster_hub::daemon_transport_request(

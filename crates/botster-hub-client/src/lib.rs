@@ -3796,6 +3796,9 @@ pub struct DaemonSessionEntity {
     pub interaction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_type_lifecycle: Option<String>,
+    /// True when the session has ended and Hub holds a durable record to restart it from.
+    #[serde(default)]
+    pub restartable: bool,
 }
 
 /// Entity-frame vocabulary scoped to one daemon subscription.
@@ -4290,6 +4293,7 @@ mod tests {
             traits: Vec::new(),
             interaction: None,
             session_type_lifecycle: None,
+            restartable: false,
         };
         let frames = vec![
             DaemonEntityFrame::Snapshot {

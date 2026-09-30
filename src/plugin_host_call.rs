@@ -267,9 +267,7 @@ fn outcome(
                 hub_id_bytes,
             );
             match fund(lease, bytes) {
-                Ok(()) => HostOutcome::Session(Some(Box::new(SessionProjection::project_entity(
-                    &row.record,
-                )))),
+                Ok(()) => HostOutcome::Session(Some(Box::new(SessionProjection::project_row(row)))),
                 Err(refusal) => HostOutcome::Refused(refusal),
             }
         }
@@ -305,7 +303,7 @@ fn outcome(
                     break;
                 }
                 bytes = with_next;
-                chosen[count] = Some(&row.record);
+                chosen[count] = Some(row);
                 count += 1;
             }
             match fund(lease, bytes) {
@@ -313,7 +311,7 @@ fn outcome(
                     let rows: Vec<DaemonSessionEntity> = chosen[..count]
                         .iter()
                         .flatten()
-                        .map(|record| SessionProjection::project_entity(record))
+                        .map(|row| SessionProjection::project_row(row))
                         .collect();
                     let next_after = more
                         .then(|| rows.last().map(|row| row.session_uuid.clone()))
