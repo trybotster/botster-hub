@@ -148,8 +148,14 @@ fn cli_smoke_reports_missing_first_party_prerequisites() {
         command_output_text(&output)
     );
     let text = command_output_text(&output);
-    assert!(text.contains("smoke=local_runtime"));
-    assert!(text.contains("missing_prerequisite=botster-web"));
+    assert!(
+        text.contains("smoke=local_runtime"),
+        "smoke printed no local_runtime header: {text}"
+    );
+    assert!(
+        text.contains("missing_prerequisite=botster-web"),
+        "smoke did not report the missing botster-web prerequisite: {text}"
+    );
     let failure = local_webrtc_smoke_failure_evidence(&output, &data_dir);
     assert!(failure.contains("smoke failed before local WebRTC bootstrap"));
     assert!(failure.contains("missing_prerequisite=botster-web"));
