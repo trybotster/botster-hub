@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# Core v1, by git rev (repo-plan section 3: a pin PR moves it).
+botster-core = { git = "https://github.com/trybotster/botster-core", rev = "644f632f194f62ad7fe14e66482ee01083706e30" }
+# The fake Core of botster-contracts, at the tag that the Core rev above pins (contracts-v0.1.46), NOT at the Hub's own
+# contracts tag: two tags are two crates, and the fake must implement the same `CoreApi` trait as `botster_core::Core`. It
+# moves with the Core pin. The Hub reads the Core contract types only through `botster_core::contract`.
+botster-fake-core = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.46" }
+
+data-encoding = "2"
+getrandom = "0.4"
+mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
+rustix = { version = "1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+signal-hook-mio = { version = "0.2", features = ["support-v1_0"] }
+tempfile = "3"
+toml = "0.9"
