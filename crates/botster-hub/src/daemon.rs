@@ -14,6 +14,7 @@ use crate::phase::{
 use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
 use crate::store::{remove_session_dir, restore_spawns, SpawnStore, StoreConfig};
+use crate::watch::WatchLimits;
 use botster_core::contract::prelude::{CoreApi, CoreLimits, Now, OpenConfig, SessionId};
 use botster_core::Core;
 use mio::net::UnixListener;
@@ -41,6 +42,8 @@ pub struct DaemonConfig {
     pub handle_signals: bool,
     /// The spawn operation store (design section 4a).
     pub store: StoreConfig,
+    /// The watch table (design section 4; HC BD-1 `max_watches` at least 32).
+    pub watches: WatchLimits,
 }
 
 impl DaemonConfig {
@@ -57,6 +60,12 @@ impl DaemonConfig {
                 request: 32,
                 bulk: 4,
                 events: 64,
+                fanout: 256,
+                baseline_rows: 256,
+            },
+            watches: WatchLimits {
+                max_watches: 32,
+                chunk_rows: 64,
             },
             core_limits: CoreLimits::default(),
             worker_path,
@@ -171,6 +180,7 @@ impl Daemon {
             phase.clone(),
             lifecycle_tx.clone(),
             config.counts,
+            config.watches,
         )
         .with_store(store);
         let owner = {
