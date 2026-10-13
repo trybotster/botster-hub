@@ -1,6 +1,6 @@
 //! The pinned botster-contracts checkout: the root of the git checkout that cargo made for the Hub's contract crates.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,12 +45,12 @@ pub fn root(root: &Path) -> Result<PathBuf> {
         .args(["metadata", "--format-version", "1", "--locked"])
         .output()
         .context("run cargo metadata")?;
-    if !out.status.success() {
-        bail!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    crate::ci::succeeded(
+        "cargo metadata",
+        out.status.success(),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+    .map_err(anyhow::Error::msg)?;
     let json = String::from_utf8(out.stdout).context("cargo metadata is not UTF-8")?;
     root_from_metadata(&json).map_err(anyhow::Error::msg)
 }

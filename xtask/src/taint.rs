@@ -28,15 +28,62 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         }
     }
     let (scanned, hits) = scan_files(&files, &tokens);
-    for (file, line, token) in &hits {
-        eprintln!("{file}:{line}: banned name '{token}'");
+    let (lines, verdict) = report(scanned, tokens.len(), &hits);
+    for line in lines {
+        println!("{line}");
     }
-    println!(
-        "taint: {scanned} files scanned, {} names from botster-contracts",
-        tokens.len()
-    );
-    if !hits.is_empty() {
-        bail!("{} hit(s)", hits.len());
+    verdict.map_err(anyhow::Error::msg)
+}
+
+/// The report of a scan of `scanned` files with `names` banned names: one line for each hit, then the summary; and the
+/// verdict, which fails on any hit.
+pub fn report(
+    scanned: usize,
+    names: usize,
+    hits: &[(String, usize, String)],
+) -> (Vec<String>, Result<(), String>) {
+    let mut lines: Vec<String> = hits
+        .iter()
+        .map(|(file, line, token)| format!("{file}:{line}: banned name '{token}'"))
+        .collect();
+    lines.push(format!(
+        "taint: {scanned} files scanned, {names} names from botster-contracts"
+    ));
+    let verdict = if hits.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} hit(s)", hits.len()))
+    };
+    (lines, verdict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_hit_is_reported_and_any_hit_fails() {
+        assert_eq!(
+            report(3, 2, &[]),
+            (
+                vec!["taint: 3 files scanned, 2 names from botster-contracts".to_string()],
+                Ok(())
+            )
+        );
+        let hits = [
+            ("a.rs".to_string(), 4, "old".to_string()),
+            ("b.md".to_string(), 1, "older".to_string()),
+        ];
+        assert_eq!(
+            report(3, 2, &hits),
+            (
+                vec![
+                    "a.rs:4: banned name 'old'".to_string(),
+                    "b.md:1: banned name 'older'".to_string(),
+                    "taint: 3 files scanned, 2 names from botster-contracts".to_string(),
+                ],
+                Err("2 hit(s)".to_string())
+            )
+        );
     }
-    Ok(())
 }

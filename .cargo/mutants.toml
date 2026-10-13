@@ -1,33 +1,43 @@
 # cargo-mutants settings of the mutants step (`cargo xtask mutants`, xtask/src/mutants.rs). The step tests the HIGH-path
 # code of the diff (ci/high-tier-paths.txt).
 #
-# Excluded: only the I/O shells of the xtask, each whole function. A shell reads files, starts git, cargo or nextest, and
-# prints; a test cannot run the gate inside the gate's own test run. Each shell's decisions are pure functions with tests,
-# named after each entry.
+# Excluded: only the I/O shells of the xtask, as Core does (Core .cargo/mutants.toml): each entry excludes the whole-body
+# replacement of one function, and nothing inside it. A shell reads files, starts git, cargo or nextest, and prints; a test
+# cannot run the gate inside the gate's own test run. Each shell's decisions are pure functions with tests, named at each
+# entry, and their mutants stay in the run. Never add an entry to make a job pass.
 
 exclude_globs = ["**/tests/**", "tests/**"]
 
 exclude_re = [
-    # lists::command: reads the three lists and the pinned ledger. Decisions: parse_rows, parse_ids, parse_ledger,
-    # same_contract, verdict (lists::tests).
-    'xtask/src/lists\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
-    # contracts::root: runs cargo metadata. Decision: root_from_metadata (contracts::tests).
-    'xtask/src/contracts\.rs:\d+:\d+: (replace root( ->| with)|.* in root$)',
-    # taint::command: reads the denylist and the tracked files. Decisions: botster_gate_kit::taint (its tests in Core).
-    'xtask/src/taint\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
-    # forbid_unsafe::command: reads the tracked manifests and sources. Decisions: botster_gate_kit::unsafe_exception (its
-    # tests in Core); the Hub's policy: the_workspace_forbids_unsafe_code_with_no_exception.
-    'xtask/src/forbid_unsafe\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # lists::command -> Ok(()): reads the three lists and the pinned ledger, and prints the report; the body replaced by
+    # Ok(()) checks nothing. Decisions: parse_rows, parse_ids, parse_ledger, same_contract, verdict (lists::tests).
+    'xtask/src/lists\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
+    # contracts::root -> Ok(Default::default()): runs cargo metadata. Decisions: root_from_metadata
+    # (the_root_is_two_levels_above_the_locator_crate, a_missing_twice_listed_or_short_locator_is_an_error) and
+    # ci::succeeded (a_failed_process_is_named_with_its_detail).
+    'xtask/src/contracts\.rs:\d+:\d+: replace root -> Result<PathBuf> with Ok\(Default::default\(\)\)$',
+    # taint::command -> Ok(()): reads the denylist and the tracked files. Decisions: botster_gate_kit::taint (its tests in
+    # Core) and report (each_hit_is_reported_and_any_hit_fails).
+    'xtask/src/taint\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
+    # forbid_unsafe::command -> Ok(()): reads the tracked manifests and sources. Decisions: botster_gate_kit::unsafe_exception
+    # (its tests in Core); the Hub's policy: the_workspace_forbids_unsafe_code_with_no_exception.
+    'xtask/src/forbid_unsafe\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
     # budget::command: runs cargo metadata and nextest under the tier's deadline. Decisions: parse_tier, slow_members,
-    # over_limit, slowest, nextest_args (budget::tests).
+    # over_limit, slowest, nextest_args (budget::tests). This entry is still the broad form: H212-I3 replaces the shell
+    # with the bounded run of botster-gate-kit (Core PR "gate-kit: shared verdicts"), and that change narrows it.
     'xtask/src/budget\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
     # mutants::command: runs git diff and cargo mutants. Decisions: pathspecs, changes_rust, run_args, verdict
-    # (mutants::tests).
+    # (mutants::tests). This entry is still the broad form: H212-I1 replaces the verdict with the outcome verdict of
+    # botster-gate-kit (Core PR "gate-kit: shared verdicts"), and that change narrows it.
     'xtask/src/mutants\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
-    # ci::command and ci::cargo: run the steps. Decisions: STEPS, summary (ci::tests).
-    'xtask/src/ci\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
-    'xtask/src/ci\.rs:\d+:\d+: (replace cargo( ->| with)|.* in cargo$)',
-    # main and repo_root: the process entry. Decision: choose (tests in main.rs).
-    'xtask/src/main\.rs:\d+:\d+: (replace main( ->| with)|.* in main$)',
-    'xtask/src/main\.rs:\d+:\d+: (replace repo_root( ->| with)|.* in repo_root$)',
+    # ci::command -> Ok(()): runs the steps and prints the summary. Decisions: STEPS
+    # (the_steps_are_the_minimal_gate_in_order), summary (the_summary_names_each_result_and_time) and verdict
+    # (the_gate_fails_when_any_step_failed_and_names_each).
+    'xtask/src/ci\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
+    # ci::cargo -> Ok(()): runs cargo. Decision: succeeded (a_failed_process_is_named_with_its_detail).
+    'xtask/src/ci\.rs:\d+:\d+: replace cargo -> Result<\(\)> with Ok\(\(\)\)$',
+    # main -> Ok(()) and repo_root -> Ok(Default::default()): the process entry. Decision: choose
+    # (a_name_picks_its_command_with_the_rest_of_the_arguments, no_name_or_an_unknown_one_gives_the_usage).
+    'xtask/src/main\.rs:\d+:\d+: replace main -> Result<\(\)> with Ok\(\(\)\)$',
+    'xtask/src/main\.rs:\d+:\d+: replace repo_root -> Result<PathBuf> with Ok\(Default::default\(\)\)$',
 ]

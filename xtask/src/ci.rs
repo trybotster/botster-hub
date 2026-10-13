@@ -10,15 +10,30 @@ use std::time::Instant;
 /// One step: its name and how it runs.
 type Step = (&'static str, fn(&Path) -> Result<()>);
 
+/// `Ok` when a process succeeded, or the error that names it with `detail` (its stderr, or its exit status).
+///
+/// # Errors
+/// The process failed.
+pub fn succeeded(what: &str, success: bool, detail: &str) -> Result<(), String> {
+    if success {
+        Ok(())
+    } else {
+        Err(format!("{what} failed: {}", detail.trim_end()))
+    }
+}
+
+/// Runs cargo with `args`, with its output on the terminal.
 fn cargo(root: &Path, args: &[&str]) -> Result<()> {
     let status = Command::new("cargo")
         .current_dir(root)
         .args(args)
         .status()?;
-    if !status.success() {
-        bail!("cargo {} failed ({status})", args.join(" "));
-    }
-    Ok(())
+    succeeded(
+        &format!("cargo {}", args.join(" ")),
+        status.success(),
+        &status.to_string(),
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// The steps of the gate, in order.
@@ -63,6 +78,23 @@ pub fn summary(results: &[(&str, bool, f64)]) -> Vec<String> {
     lines
 }
 
+/// The verdict of the gate: it fails when a step failed, and names each failed step.
+///
+/// # Errors
+/// The failed steps.
+pub fn verdict(results: &[(&str, bool, f64)]) -> Result<(), String> {
+    let failed: Vec<&str> = results
+        .iter()
+        .filter(|(_, passed, _)| !passed)
+        .map(|(name, _, _)| *name)
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("ci failed: {}", failed.join(", ")))
+    }
+}
+
 /// The gate.
 ///
 /// # Errors
@@ -84,11 +116,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     for line in summary(&results) {
         println!("{line}");
     }
-    let failed: Vec<&str> = results.iter().filter(|r| !r.1).map(|r| r.0).collect();
-    if !failed.is_empty() {
-        bail!("ci failed: {}", failed.join(", "));
-    }
-    Ok(())
+    verdict(&results).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
@@ -111,6 +139,29 @@ mod tests {
                 "slow",
                 "mutants"
             ]
+        );
+    }
+
+    #[test]
+    fn a_failed_process_is_named_with_its_detail() {
+        assert_eq!(succeeded("cargo fmt", true, "x"), Ok(()));
+        assert_eq!(
+            succeeded("cargo fmt", false, "exit status: 1\n"),
+            Err("cargo fmt failed: exit status: 1".to_string())
+        );
+    }
+
+    #[test]
+    fn the_gate_fails_when_any_step_failed_and_names_each() {
+        assert_eq!(verdict(&[("fmt", true, 0.1), ("lists", true, 0.2)]), Ok(()));
+        assert_eq!(verdict(&[]), Ok(()));
+        assert_eq!(
+            verdict(&[
+                ("fmt", false, 0.1),
+                ("lists", true, 0.2),
+                ("mutants", false, 3.0)
+            ]),
+            Err("ci failed: fmt, mutants".to_string())
         );
     }
 
