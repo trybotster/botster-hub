@@ -168,6 +168,45 @@ fn rt_2_orphan_session_dir_deleted() {
     assert_eq!(daemon.wait().code(), 0);
 }
 
+/// Design section 4a, "The session directory", and step 6 (Sol S2-HD-13): the orphan sweep deletes a crash-left
+/// directory (no row, no record), keeps the directory of a `starting` record (the index is loaded before the sweep), and
+/// never follows or deletes a symlink.
+#[test]
+fn the_orphan_sweep_keeps_starting_records_and_symlinks() {
+    let tmp = short_root();
+    let roots = roots_in(tmp.path());
+    let sessions = roots.data_root.join("sessions");
+    fs::create_dir_all(sessions.join("crashed/uploads")).unwrap();
+    fs::create_dir_all(sessions.join("pending/uploads")).unwrap();
+    let target = tmp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep"), b"x").unwrap();
+    std::os::unix::fs::symlink(&target, sessions.join("link")).unwrap();
+    let ops = roots.data_root.join("store/ops");
+    fs::create_dir_all(&ops).unwrap();
+    let key = "b".repeat(26);
+    let record = serde_json::json!({
+        "version": 1,
+        "record_key": key,
+        "operation_id": "c".repeat(26),
+        "session_id": "pending",
+        "state": "starting",
+        "admitted_at_ms": 1,
+    });
+    fs::write(ops.join(format!("{key}.json")), record.to_string()).unwrap();
+    let daemon = Daemon::start(&roots, uid(), config()).unwrap();
+    assert!(!sessions.join("crashed").exists());
+    assert!(sessions.join("pending/uploads").is_dir());
+    assert!(fs::symlink_metadata(sessions.join("link")).is_ok());
+    assert!(target.join("keep").exists());
+    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    assert_eq!(
+        ask(&daemon, &outbox, 1, Request::Shutdown),
+        Answer::Stopping
+    );
+    assert_eq!(daemon.wait().code(), 0);
+}
+
 /// Design section 4a, "Load at start": a record that cannot be resolved fails the start `data_root_unusable` before the
 /// socket is bound; after the operator removes it, the Hub starts.
 #[test]

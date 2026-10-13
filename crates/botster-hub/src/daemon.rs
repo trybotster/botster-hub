@@ -13,7 +13,7 @@ use crate::phase::{
 };
 use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
-use crate::store::{restore_spawns, SpawnStore, StoreConfig};
+use crate::store::{remove_session_dir, restore_spawns, SpawnStore, StoreConfig};
 use botster_core::contract::prelude::{CoreApi, CoreLimits, Now, OpenConfig, SessionId};
 use botster_core::Core;
 use mio::net::UnixListener;
@@ -181,12 +181,13 @@ impl Daemon {
                 .spawn(move || run_owner(owner, owner_poll, phase, lifecycle_tx, adopted_tx))
                 .map_err(internal)?
         };
-        let rows = match adopted.recv() {
-            Ok(Ok(rows)) => rows,
+        // The rows after adoption and the sessions of the `starting` records: the session directories to keep.
+        let keep = match adopted.recv() {
+            Ok(Ok(keep)) => keep,
             Ok(Err(message)) => return Err(adoption_failed(owner, message)),
             Err(_) => return Err(adoption_failed(owner, "the owner ended first".into())),
         };
-        delete_orphan_session_dirs(roots, &rows);
+        delete_orphan_session_dirs(roots, &keep);
 
         // Step 7: bind `hub.sock` (HC TB-L1; 0600) after adoption (lead ruling Q4), then start `io`.
         let unavailable = |error: std::io::Error| {
@@ -322,18 +323,25 @@ fn stop_owner(phase: &SharedPhase, lifecycle: &SyncSender<Lifecycle>, owner: Joi
     let _ = owner.join();
 }
 
-/// RT-2: a session directory is deleted with its row, so a directory with no row after adoption is an orphan.
-fn delete_orphan_session_dirs(roots: &Roots, rows: &BTreeSet<SessionId>) {
-    let Ok(entries) = fs::read_dir(roots.data_root.join("sessions")) else {
+/// RT-2: a session directory is deleted with its row, so a directory with no row and no `starting` record after
+/// adoption is an orphan (design section 4a, "The session directory"; step 6). Only directories are deleted, read with
+/// no-follow: a symlink is never followed and never deleted. This sweep is the one recovery path for every leftover
+/// directory. It runs before the bind, so no spawn runs during it.
+fn delete_orphan_session_dirs(roots: &Roots, keep: &BTreeSet<SessionId>) {
+    let sessions = roots.data_root.join("sessions");
+    let Ok(entries) = fs::read_dir(&sessions) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let known = name
-            .to_str()
-            .is_some_and(|n| rows.contains(&SessionId(n.into())));
-        if !known {
-            let _ = fs::remove_dir_all(entry.path());
+        // `DirEntry::file_type` does not follow a symlink.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !keep.contains(&SessionId(name.clone())) {
+            let _ = remove_session_dir(&sessions, &name);
         }
     }
 }
@@ -392,7 +400,18 @@ fn owner_loop(
                     if let Some(store) = owner.store_mut() {
                         let _ = restore_spawns(store);
                     }
-                    let _ = adopted.try_send(Ok(owner.view().keys().cloned().collect()));
+                    // The store index was loaded and checked before the owner started (`SpawnStore::open`), so the
+                    // `starting` records are known here (Sol S2-HD-13).
+                    let mut keep: BTreeSet<SessionId> = owner.view().keys().cloned().collect();
+                    if let Some(store) = owner.store() {
+                        keep.extend(
+                            store
+                                .starting()
+                                .into_iter()
+                                .map(|r| SessionId(r.session_id)),
+                        );
+                    }
+                    let _ = adopted.try_send(Ok(keep));
                 }
                 Adoption::Failed(message) => {
                     let _ = adopted.try_send(Err(message.clone()));

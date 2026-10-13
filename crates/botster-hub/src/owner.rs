@@ -278,6 +278,13 @@ impl<C: CoreApi> Owner<C> {
                 );
             }
             Err(CreateRefused::Busy) => reply.send(failed(FailKind::Busy, Effect::None)),
+            Err(CreateRefused::BadSession) => {
+                self.spawn_fault(format!(
+                    "the session id {:?} cannot name a directory",
+                    session.0
+                ));
+                reply.send(failed(FailKind::Internal, Effect::None));
+            }
             Err(CreateRefused::Closed) => {
                 let kind = if self.phase.stopping() {
                     FailKind::HubShutdown
@@ -610,6 +617,10 @@ impl<C: CoreApi> Owner<C> {
                 if state == SessionState::Released {
                     self.view.remove(&id);
                     self.row_gone(&id);
+                    // RT-2: the session directory goes with its row (design section 4a, "The session directory").
+                    if let Some(store) = self.store.as_mut() {
+                        store.release_session(&id.0);
+                    }
                 } else {
                     // During adoption, the sighting waits for `Completed{AdoptAll}` (`adoption_sighting`).
                     let sighting =
@@ -849,10 +860,18 @@ mod tests {
     }
 
     fn spawn(name: &str) -> Request {
+        spawn_with(name, spawn_request())
+    }
+
+    fn spawn_with(name: &str, request: SpawnRequest) -> Request {
         Request::Spawn {
             session: sid(name),
-            request: Box::new(spawn_request()),
+            request: Box::new(request),
         }
+    }
+
+    fn session_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        root.join("sessions").join(name)
     }
 
     /// Start step 6: `AdoptAll` completes, the bridge becomes ready, and requests before it were refused `NotReady`.
@@ -1146,6 +1165,66 @@ mod tests {
             "Start was begun"
         );
         assert_eq!(rig.owner.spawn_faults(), 0);
+        // The session directory exists before `accepted` (design section 4a, "The session directory").
+        for dir in [
+            session_dir(tmp.path(), "a"),
+            session_dir(tmp.path(), "a").join("uploads"),
+        ] {
+            let meta = std::fs::symlink_metadata(&dir).unwrap();
+            assert!(meta.is_dir(), "{dir:?}");
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+                0o700
+            );
+        }
+        stop(rig);
+    }
+
+    /// The session directory: a `Released` row's directory is deleted by a store job.
+    #[test]
+    fn a_released_row_deletes_its_session_directory() {
+        let tmp = short_root();
+        let mut rig = store_rig(tmp.path(), &FakeStore::new());
+        rig.adopt();
+        rig.owner.store_mut().unwrap().end_recovery();
+        fail_next(
+            rig.owner.core(),
+            "Start",
+            ErrorCode::StartFailed(StartFailReason::CwdMissing),
+        );
+        rig.submit(1, spawn("a"));
+        flow_settle(&mut rig);
+        rig.answers();
+        assert!(session_dir(tmp.path(), "a").is_dir());
+        rig.submit(2, Request::Op(Box::new(Op::Remove { id: sid("a") })));
+        flow_settle(&mut rig);
+        assert!(
+            matches!(&rig.answers()[..], [(2, Answer::Op(OpResult::Ok(_)))]),
+            "Remove completed"
+        );
+        assert!(!rig.owner.view().contains_key(&sid("a")));
+        assert!(!session_dir(tmp.path(), "a").exists());
+        assert_eq!(rig.owner.store().unwrap().dir_deletes(), 0);
+        stop(rig);
+    }
+
+    /// A session id that cannot name a directory is an owner bug: logged, `internal`, `effect: none`, nothing written.
+    #[test]
+    fn a_session_id_that_is_no_path_component_is_internal() {
+        let tmp = short_root();
+        let mut rig = store_rig(tmp.path(), &FakeStore::new());
+        rig.adopt();
+        for (id, name) in [(1, "../x"), (2, ".."), (3, "")] {
+            rig.submit(id, spawn(name));
+            flow_settle(&mut rig);
+            assert_eq!(
+                rig.answers(),
+                vec![(id, failed(FailKind::Internal, Effect::None))]
+            );
+        }
+        assert_eq!(rig.owner.spawn_faults(), 3);
+        assert_eq!(records(tmp.path()), 0);
+        assert!(!tmp.path().join("x").exists());
         stop(rig);
     }
 
@@ -1155,19 +1234,23 @@ mod tests {
         let tmp = short_root();
         let mut rig = store_rig(tmp.path(), &FakeStore::new());
         rig.adopt();
-        rig.submit(1, spawn(&"x".repeat(4096)));
+        let mut request = spawn_request();
+        request.argv.clear();
+        rig.submit(1, spawn_with("a", request));
         flow_settle(&mut rig);
         let answers = rig.answers();
         assert!(
             matches!(
                 &answers[..],
                 [(1, Answer::Spawn(SpawnAnswer::Refused { error, effect: Effect::None }))]
-                    if error.code == ErrorCode::IdTooLong
+                    if matches!(error.code, ErrorCode::InvalidInput { .. })
             ),
             "{answers:?}"
         );
         assert!(rig.owner.store().unwrap().is_empty());
         assert_eq!(records(tmp.path()), 0);
+        // The forget deletes the session directory after the record.
+        assert!(!session_dir(tmp.path(), "a").exists());
         stop(rig);
     }
 
