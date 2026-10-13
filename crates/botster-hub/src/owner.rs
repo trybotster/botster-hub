@@ -15,16 +15,19 @@ use crate::store::{
     install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnStore, StoreEvent,
     Terminal,
 };
-use crate::watch::{Row, WatchFrame, WatchKey, WatchLimits, Watches};
+use crate::watch::{Activity, Row, WatchFrame, WatchKey, WatchLimits, Watches};
 use botster_core::contract::prelude::{
-    CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult, SessionId,
-    SessionState, SpawnRequest, StartFailReason,
+    ActivitySource, CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult,
+    SessionId, SessionState, SpawnRequest, StartFailReason,
 };
 use botster_hub_contract::prelude::{CloseReason, HubShutdownData};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// HC section 6 `activity_idle_ms`, the Hub's default (design section 4, "The view row").
+pub const ACTIVITY_IDLE: Duration = Duration::from_millis(3000);
 
 /// The per-turn counts (section 2; parameters with small test values, HP LM-5 rule). Each is at least 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,26 @@ enum Waiter {
     },
     /// The Hub's own `Remove` of a U3 row (the cleanup obligation).
     SpawnRemove { session: SessionId },
+    /// The label writer's one `UpdateMetadata` of a session, with the full map that it sent.
+    SetLabels {
+        session: SessionId,
+        labels: BTreeMap<String, String>,
+        reply: ReplyTo,
+    },
+}
+
+/// A queued `SetLabels` (design section 4, "The label writer").
+#[derive(Debug)]
+struct LabelEdit {
+    set: BTreeMap<String, String>,
+    remove: Vec<String>,
+    reply: ReplyTo,
+}
+
+/// What an event did to the view: the delta that the watches get.
+enum ViewChange {
+    Row(SessionId),
+    Removed(SessionId),
 }
 
 /// A spawn whose `starting` write is in flight: `Create` is begun only when it is durable (the order rule).
@@ -133,6 +156,13 @@ pub struct Owner<C: CoreApi> {
     now: Instant,
     /// The route reservations and the route table (client protocol design, section 2), when the daemon serves clients.
     routes: Option<Routes>,
+    /// `activity_idle_ms`: the TM-4 silence threshold of every session (design section 4, "The view row").
+    activity_idle: Duration,
+    /// The sessions whose threshold this process has set (the threshold is not in Core's registry).
+    thresholds: BTreeSet<SessionId>,
+    /// The label writer: the queued writes of each session, and the sessions with an `UpdateMetadata` in flight.
+    label_queues: BTreeMap<SessionId, VecDeque<LabelEdit>>,
+    labels_busy: BTreeSet<SessionId>,
 }
 
 impl<C: CoreApi> Owner<C> {
@@ -167,6 +197,100 @@ impl<C: CoreApi> Owner<C> {
             now_ms: 0,
             now: Instant::now(),
             routes: None,
+            activity_idle: ACTIVITY_IDLE,
+            thresholds: BTreeSet::new(),
+            label_queues: BTreeMap::new(),
+            labels_busy: BTreeSet::new(),
+        }
+    }
+
+    /// Sets `activity_idle_ms`. For a live change, the owner sets the threshold again for every row (TM-4: a new
+    /// threshold starts a new idle period).
+    pub fn set_activity_idle(&mut self, idle: Duration) {
+        let changed = self.activity_idle != idle;
+        self.activity_idle = idle;
+        if changed {
+            let sessions: Vec<SessionId> = self.thresholds.iter().cloned().collect();
+            for id in sessions {
+                self.set_threshold(&id);
+            }
+        }
+    }
+
+    /// The threshold call. An `UnknownSession` error is a row that is gone; its `Released` follows.
+    fn set_threshold(&mut self, id: &SessionId) {
+        if let Err(error) = self
+            .core
+            .set_silence_threshold(id, Some(self.activity_idle))
+        {
+            if !matches!(error.code, ErrorCode::UnknownSession) {
+                eprintln!(
+                    "botster-hub: the silence threshold of {}: {}",
+                    id.0,
+                    error_text(&error)
+                );
+            }
+        }
+    }
+
+    /// Replaces a view row through `edit`. It returns the delta only when the row changed.
+    fn update_row(&mut self, id: &SessionId, edit: impl FnOnce(&mut Row)) -> Option<ViewChange> {
+        let current = self.view.get(id)?;
+        let mut row = Row::clone(current);
+        edit(&mut row);
+        if row == **current {
+            return None;
+        }
+        self.view.insert(id.clone(), Arc::new(row));
+        Some(ViewChange::Row(id.clone()))
+    }
+
+    /// The label writer: begins the next queued `SetLabels` of `session` when none is in flight.
+    fn next_labels(&mut self, session: &SessionId) {
+        if self.labels_busy.contains(session) {
+            return;
+        }
+        loop {
+            let Some(mut edit) = self
+                .label_queues
+                .get_mut(session)
+                .and_then(VecDeque::pop_front)
+            else {
+                self.label_queues.remove(session);
+                return;
+            };
+            let Some(row) = self.view.get(session) else {
+                edit.reply.send(Answer::CoreRefused(CoreError::new(
+                    ErrorCode::UnknownSession,
+                    "no such session",
+                )));
+                continue;
+            };
+            let mut labels = row.labels.clone();
+            for key in &edit.remove {
+                labels.remove(key);
+            }
+            labels.extend(edit.set);
+            edit.reply.mark_dispatched();
+            let op = Op::UpdateMetadata {
+                id: session.clone(),
+                labels: labels.clone(),
+            };
+            match self.core.begin(op) {
+                Ok(op) => {
+                    self.labels_busy.insert(session.clone());
+                    self.waiters.insert(
+                        op,
+                        Waiter::SetLabels {
+                            session: session.clone(),
+                            labels,
+                            reply: edit.reply,
+                        },
+                    );
+                    return;
+                }
+                Err(error) => edit.reply.send(Answer::CoreRefused(error)),
+            }
         }
     }
 
@@ -256,16 +380,7 @@ impl<C: CoreApi> Owner<C> {
             .core
             .list()
             .into_iter()
-            .map(|row| {
-                let id = row.id.clone();
-                (
-                    id,
-                    Arc::new(Row {
-                        id: row.id,
-                        state: row.state,
-                    }),
-                )
-            })
+            .map(|record| (record.id.clone(), Arc::new(Row::from_record(record))))
             .collect();
         match self.core.begin(Op::AdoptAll) {
             Ok(op) => {
@@ -334,22 +449,14 @@ impl<C: CoreApi> Owner<C> {
                 let Some(event) = fan.batch.get(fan.next_event).cloned() else {
                     return;
                 };
-                let session = match &event {
-                    Event::SessionState { id, state, .. } => {
-                        Some((id.clone(), *state == SessionState::Released))
-                    }
-                    _ => None,
+                fan.delta = match self.apply(event) {
+                    Some(ViewChange::Removed(id)) => Some((id.clone(), WatchFrame::Removed(id))),
+                    Some(ViewChange::Row(id)) => self
+                        .view
+                        .get(&id)
+                        .map(|row| (id, WatchFrame::Delta(row.clone()))),
+                    None => None,
                 };
-                self.apply(event);
-                fan.delta = session.and_then(|(id, released)| {
-                    if released {
-                        Some((id.clone(), WatchFrame::Removed(id)))
-                    } else {
-                        self.view
-                            .get(&id)
-                            .map(|row| (id, WatchFrame::Delta(row.clone())))
-                    }
-                });
                 fan.started = true;
                 fan.next_watch = None;
                 budget -= 1;
@@ -699,6 +806,21 @@ impl<C: CoreApi> Owner<C> {
     fn dispatch(&mut self, item: Item) {
         let Item { request, mut reply } = item;
         match request {
+            // One writer of the labels (design section 4, "The label writer").
+            Request::Op(op) if matches!(*op, Op::UpdateMetadata { .. }) => {
+                reply.send(failed(FailKind::Internal, Effect::None));
+            }
+            Request::SetLabels {
+                session,
+                set,
+                remove,
+            } => {
+                self.label_queues
+                    .entry(session.clone())
+                    .or_default()
+                    .push_back(LabelEdit { set, remove, reply });
+                self.next_labels(&session);
+            }
             Request::Op(op) => {
                 reply.mark_dispatched();
                 match self.core.begin(*op) {
@@ -777,72 +899,144 @@ impl<C: CoreApi> Owner<C> {
         }
     }
 
-    fn apply(&mut self, event: Event) {
+    /// Applies one Core event to the owner state. It returns the view change, which the fan-out sends to the watches.
+    fn apply(&mut self, event: Event) -> Option<ViewChange> {
         match event {
             Event::Completed { op, result } => match self.waiters.remove(&op) {
-                Some(Waiter::Reply(reply)) => reply.send(Answer::Op(result)),
-                Some(Waiter::Adopt) => match result {
-                    OpResult::Ok(_) => {
-                        self.adoption = Adoption::Done;
-                        self.adoption_sighting();
-                        self.bridge.set_ready();
+                Some(Waiter::SetLabels {
+                    session,
+                    labels,
+                    reply,
+                }) => {
+                    self.labels_busy.remove(&session);
+                    // The base of the next write is the map that Core now holds; `MetadataChanged` comes later and
+                    // reads the same map. An error leaves the row as it was.
+                    let change = if matches!(result, OpResult::Ok(_)) {
+                        self.update_row(&session, |row| row.labels = labels)
+                    } else {
+                        None
+                    };
+                    reply.send(Answer::Op(result));
+                    self.next_labels(&session);
+                    change
+                }
+                Some(Waiter::Reply(reply)) => {
+                    reply.send(Answer::Op(result));
+                    None
+                }
+                Some(Waiter::Adopt) => {
+                    match result {
+                        OpResult::Ok(_) => {
+                            self.adoption = Adoption::Done;
+                            self.adoption_sighting();
+                            self.bridge.set_ready();
+                        }
+                        OpResult::Err(error) => {
+                            self.adoption = Adoption::Failed(error_text(&error))
+                        }
+                        // `OpResult` is non-exhaustive; an unknown result is not a proof of adoption.
+                        _ => self.adoption = Adoption::Failed("unknown adoption result".into()),
                     }
-                    OpResult::Err(error) => self.adoption = Adoption::Failed(error_text(&error)),
-                    // `OpResult` is non-exhaustive; an unknown result is not a proof of adoption.
-                    _ => self.adoption = Adoption::Failed("unknown adoption result".into()),
-                },
+                    None
+                }
                 Some(Waiter::SpawnCreate {
                     operation_id,
                     session,
                     reply,
-                }) => self.create_completed(operation_id, session, reply, result),
+                }) => {
+                    self.create_completed(operation_id, session, reply, result);
+                    None
+                }
                 Some(Waiter::SpawnStart {
                     operation_id,
                     session,
-                }) => self.start_completed(operation_id, session, result),
+                }) => {
+                    self.start_completed(operation_id, session, result);
+                    None
+                }
                 Some(Waiter::SpawnRemove { session }) => {
                     self.removing.remove(&session);
                     // An error leaves the marker: the next `Created` sighting begins `Remove` again.
                     if matches!(result, OpResult::Ok(_)) {
                         self.row_gone(&session);
                     }
+                    None
                 }
                 // A `Completed` after the stop took the waiters, or of an op with no waiter: dropped.
-                None => {}
+                None => None,
             },
             Event::SessionState { id, state, .. } => {
-                if state == SessionState::Released {
+                let change = if state == SessionState::Released {
                     self.view.remove(&id);
                     self.row_gone(&id);
+                    self.thresholds.remove(&id);
+                    // Queued label writes of a gone row get the op's own answer.
+                    for edit in self.label_queues.remove(&id).into_iter().flatten() {
+                        edit.reply.send(Answer::CoreRefused(CoreError::new(
+                            ErrorCode::UnknownSession,
+                            "the session is released",
+                        )));
+                    }
                     // RT-2: the session directory goes with its row (design section 4a, "The session directory").
                     if let Some(store) = self.store.as_mut() {
                         store.release_session(&id.0);
                     }
+                    Some(ViewChange::Removed(id.clone()))
                 } else {
                     // During adoption, the sighting waits for `Completed{AdoptAll}` (`adoption_sighting`).
                     let sighting =
                         state == SessionState::Created && self.adoption == Adoption::Done;
-                    let row = Arc::new(Row {
-                        id: id.clone(),
-                        state,
-                    });
-                    self.view.insert(id.clone(), row);
+                    let set_exit = |row: &mut Row| {
+                        row.state = state;
+                        if let SessionState::Exited(exit) = state {
+                            row.exit = Some(exit);
+                        }
+                    };
+                    let change = if self.view.contains_key(&id) {
+                        self.update_row(&id, set_exit)
+                    } else {
+                        // A new row: Core's record gives the other fields. A row that is gone has its `Released` next.
+                        self.core.get(&id).ok().map(|record| {
+                            let mut row = Row::from_record(record);
+                            set_exit(&mut row);
+                            self.view.insert(id.clone(), Arc::new(row));
+                            ViewChange::Row(id.clone())
+                        })
+                    };
+                    // TM-4 is the activity timer; the threshold is per process, so it is set once per session here.
+                    if self.thresholds.insert(id.clone()) {
+                        self.set_threshold(&id);
+                    }
                     if sighting {
                         self.begin_remove(&id);
                     }
-                }
+                    change
+                };
                 // R-124: a worker's formats appear with its state (`Launched`, adoption) and leave with its row.
                 if let Some(routes) = self.routes.as_ref() {
                     routes.refresh_formats(&self.core, self.view.keys());
                 }
+                change
             }
+            Event::SizeChanged { id, size, .. } => self.update_row(&id, |row| row.size = size),
+            Event::MetadataChanged { id, .. } => match self.core.get(&id) {
+                Ok(record) => self.update_row(&id, |row| row.labels = record.labels),
+                Err(_) => None,
+            },
+            Event::Activity {
+                id,
+                source: ActivitySource::Output,
+                ..
+            } => self.update_row(&id, |row| row.activity = Activity::Active),
+            Event::Silent { id, .. } => self.update_row(&id, |row| row.activity = Activity::Idle),
             Event::RouteClosed { .. } | Event::RouteAdopted { .. } => {
                 if let Some(routes) = self.routes.as_mut() {
                     routes.event(&event);
                 }
+                None
             }
             // Other events change no owner state, and the session watches carry only rows.
-            _ => {}
+            _ => None,
         }
     }
 
@@ -867,11 +1061,20 @@ impl<C: CoreApi> Owner<C> {
         }
         for (_, waiter) in self.waiters.drain() {
             match waiter {
-                Waiter::Reply(reply) | Waiter::SpawnCreate { reply, .. } => {
+                Waiter::Reply(reply)
+                | Waiter::SpawnCreate { reply, .. }
+                | Waiter::SetLabels { reply, .. } => {
                     reply.send(shutdown(Effect::Unknown));
                 }
                 Waiter::Adopt | Waiter::SpawnStart { .. } | Waiter::SpawnRemove { .. } => {}
             }
+        }
+        // Queued label writes never reached Core.
+        for edit in std::mem::take(&mut self.label_queues)
+            .into_values()
+            .flatten()
+        {
+            edit.reply.send(shutdown(Effect::None));
         }
         // A spawn whose record write or forget did not complete: the record can be on disk.
         for (_, admit) in self.admitting.drain() {
