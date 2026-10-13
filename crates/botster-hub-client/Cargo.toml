@@ -1,0 +1,23 @@
+[package]
+name = "botster-hub-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The connection code that the TUI and the CLI share (lead ruling Q2; design-hub-client-protocol.md section 6): socket
+# discovery, the socket-owner check, the control framing and handshake, route connect, and the CLI-AT4 reconnect
+# attempts. Its wire types come from botster-hub-contract. HIGH path (ci/high-tier-paths.txt): identity (RT-5, TB-L2).
+
+[lints]
+workspace = true
+
+[dependencies]
+botster-hub-contract.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

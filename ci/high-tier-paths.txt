@@ -11,3 +11,4 @@ ci/**                        # gate code and pool plumbing (rule 1); this list
 Cargo.toml                   # gate code: the workspace lints, unsafe_code = "forbid", and the pins (rule 1)
 rust-toolchain.toml          # gate code: the toolchain of every step (rule 1)
 crates/botster-hub/**        # process control, identity and the durable store of the daemon (lead, 2026-10-12)
+crates/botster-hub-client/** # identity: the client's socket-owner check (HC RT-5) and the route token handshake (TB-L2)
