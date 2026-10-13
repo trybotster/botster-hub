@@ -14,5 +14,22 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 botster-hub-contract.workspace = true
 botster-plugin-contract.workspace = true
+botster-route-codec.workspace = true
+getrandom.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+
+# The peer uid (TB-L3): SO_PEERCRED on Linux, getpeereid on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["net"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

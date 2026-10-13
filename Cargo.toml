@@ -14,11 +14,19 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 anyhow = "1"
+# Route ids and tokens on the wire: base64url with no padding (the same major as Core v1).
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# The OS CSPRNG for route ids and tokens (the same major as Core v1).
+getrandom = "0.4"
+# getpeereid on macOS (TB-L3); rustix has SO_PEERCRED for Linux only, and std's peer_cred is unstable.
+nix = { version = "0.31", default-features = false, features = ["socket", "user"] }
 regex = "1"
 # The effective uid and file metadata with no `unsafe` (the same major as Core v1).
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The constant-time route token compare (TB-L2).
+subtle = "2.6"
 tempfile = "3"
 toml = "0.9"
 
@@ -27,6 +35,7 @@ toml = "0.9"
 # instead, with no [patch] (lead, 2026-10-12): Cargo treats two tags as two crates.
 botster-cli-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
 botster-hub-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
+botster-route-codec = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
 botster-plugin-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
 
 # The gate code that Core shares (repo plan section 5): a reference by git rev of Core v1, never a copy.
