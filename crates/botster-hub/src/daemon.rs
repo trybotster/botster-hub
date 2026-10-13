@@ -7,7 +7,7 @@
 use crate::bridge::{Bridge, LaneCaps};
 use crate::failure::{FailCode, StartFailure};
 use crate::fsutil::ensure_dir;
-use crate::owner::{Adoption, Owner, TurnCounts};
+use crate::owner::{guarded, Adoption, Owner, TurnCounts};
 use crate::phase::{
     request_stop, Ended, Lifecycle, Phase, SharedPhase, StopCause, LIFECYCLE_CAPACITY,
 };
@@ -234,44 +234,42 @@ impl Daemon {
     /// `main`'s wait (design section 5, the stop order): it releases the lock after `SocketRemoved`, and returns when both
     /// threads have ended.
     pub fn wait(mut self) -> Exit {
-        let mut cause = None;
-        let mut owner = None;
-        let mut io = None;
-        while owner.is_none() || io.is_none() {
+        let mut state = WaitState::default();
+        while state.owner.is_none() || state.io.is_none() {
             let Ok(message) = self.lifecycle.recv() else {
                 break;
             };
-            match message {
-                Lifecycle::StopRequested(first) => cause = cause.or(Some(first)),
-                Lifecycle::OwnerGone(ended) => owner = Some(ended),
-                Lifecycle::SocketRemoved => self.release_lock(),
-                Lifecycle::IoGone(ended) => {
-                    io = Some(ended);
-                    if ended == Ended::Panicked {
-                        // `io` panic: main stops the owner, removes the socket itself and releases the lock.
-                        self.phase.advance(Phase::Running, Phase::Stopping);
-                        let _ = fs::remove_file(&self.socket);
-                        self.phase.advance(Phase::OwnerDone, Phase::SocketRemoved);
-                    }
-                }
-            }
-            // A thread that ends before any stop: main moves `Running` to `Stopping` (it sends no message).
-            if (owner.is_some() || io.is_some())
-                && self.phase.advance(Phase::Running, Phase::Stopping)
-            {
-                cause = cause.or(Some(StopCause::OwnerFailed));
-            }
-            if owner.is_some() && io == Some(Ended::Panicked) {
-                self.release_lock();
-            }
+            self.on_message(&mut state, message);
         }
         self.release_lock();
         let _ = self.owner.join();
         let _ = self.io.join();
         Exit {
-            cause,
-            owner: owner.unwrap_or(Ended::Panicked),
-            io: io.unwrap_or(Ended::Panicked),
+            cause: state.cause,
+            owner: state.owner.unwrap_or(Ended::Panicked),
+            io: state.io.unwrap_or(Ended::Panicked),
+        }
+    }
+
+    /// One lifecycle message of `main`'s wait.
+    fn on_message(&mut self, state: &mut WaitState, message: Lifecycle) {
+        match message {
+            Lifecycle::StopRequested(first) => state.cause = state.cause.or(Some(first)),
+            Lifecycle::OwnerGone(ended) => state.owner = Some(ended),
+            Lifecycle::SocketRemoved => self.release_lock(),
+            Lifecycle::IoGone(ended) => {
+                state.io = Some(ended);
+                // `io` ends cleanly only after `LockReleased`; an earlier end is a panic, and main starts the stop.
+                if self.phase.advance(Phase::Running, Phase::Stopping) {
+                    state.cause = state.cause.or(Some(StopCause::IoFailed));
+                }
+            }
+        }
+        // `io` panic (design section 5): after `OwnerGone`, main removes `hub.sock` itself, then releases the lock.
+        if state.io == Some(Ended::Panicked) && state.owner.is_some() && self.lock.is_some() {
+            let _ = fs::remove_file(&self.socket);
+            self.phase.advance(Phase::OwnerDone, Phase::SocketRemoved);
+            self.release_lock();
         }
     }
 
@@ -283,6 +281,14 @@ impl Daemon {
                 .advance(Phase::SocketRemoved, Phase::LockReleased);
         }
     }
+}
+
+/// What `main`'s wait has seen.
+#[derive(Debug, Default)]
+struct WaitState {
+    cause: Option<StopCause>,
+    owner: Option<Ended>,
+    io: Option<Ended>,
 }
 
 fn adoption_failed(owner: JoinHandle<()>, message: String) -> StartFailure {
@@ -322,12 +328,9 @@ fn run_owner(
     lifecycle: SyncSender<Lifecycle>,
     adopted: SyncSender<Result<BTreeSet<SessionId>, String>>,
 ) {
-    let ended = match catch_unwind(AssertUnwindSafe(|| {
-        owner_loop(&mut owner, &mut poll, &phase, &adopted)
-    })) {
-        Ok(()) => Ended::Clean,
-        Err(_) => Ended::Panicked,
-    };
+    let ended = guarded(&mut owner, |owner| {
+        owner_loop(owner, &mut poll, &phase, &adopted)
+    });
     if ended == Ended::Panicked || !matches!(owner.adoption(), Adoption::Done) {
         request_stop(&phase, &lifecycle, StopCause::OwnerFailed);
     }
@@ -498,5 +501,115 @@ impl Io {
                 let _ = self.lifecycle.try_send(Lifecycle::SocketRemoved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phase::Wake;
+    use crate::roots::{Env, Platform};
+
+    struct NoWake;
+
+    impl Wake for NoWake {
+        fn wake(&self) {}
+    }
+
+    /// `io` panic (design section 5): main starts the stop, keeps the socket and the lock until `OwnerGone`, then removes
+    /// the socket and releases the lock, in that order (RT-4).
+    #[test]
+    fn io_panic_main_removes_socket_after_owner_then_releases_lock() {
+        let tmp = tempfile::Builder::new()
+            .prefix("bh-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let roots = crate::roots::derive(&Env {
+            botster_config_dir: Some(tmp.path().join("c").into()),
+            botster_data_dir: Some(tmp.path().join("d").into()),
+            botster_hub_socket: None,
+            xdg_config_home: None,
+            xdg_runtime_dir: None,
+            home: PathBuf::from("/nonexistent"),
+            uid: 0,
+            platform: Platform::current(),
+        });
+        let lock = start::take_lock(&roots).unwrap();
+        fs::create_dir_all(roots.socket.parent().unwrap()).unwrap();
+        fs::write(&roots.socket, b"").unwrap();
+        let phase = SharedPhase::new();
+        let (_tx, lifecycle) = sync_channel(LIFECYCLE_CAPACITY);
+        let noop = || std::thread::spawn(|| {});
+        let mut daemon = Daemon {
+            identity: Identity {
+                hub_id: "h".into(),
+                incarnation: "i".into(),
+            },
+            socket: roots.socket.clone(),
+            bridge: Arc::new(Bridge::new(
+                LaneCaps {
+                    control: 1,
+                    request: 1,
+                    bulk: 1,
+                },
+                phase.clone(),
+                Arc::new(NoWake),
+            )),
+            phase: phase.clone(),
+            lifecycle,
+            lock: Some(lock),
+            owner: noop(),
+            io: noop(),
+        };
+        let mut state = WaitState::default();
+        daemon.on_message(&mut state, Lifecycle::IoGone(Ended::Panicked));
+        assert_eq!(phase.get(), Phase::Stopping);
+        assert_eq!(state.cause, Some(StopCause::IoFailed));
+        assert!(
+            roots.socket.exists(),
+            "the socket stays until the owner is gone"
+        );
+        assert!(
+            start::take_lock(&roots).is_err(),
+            "the lock stays until the owner is gone"
+        );
+        // The owner sees `Stopping`, drains, and moves to `OwnerDone`.
+        assert!(phase.advance(Phase::Stopping, Phase::OwnerDone));
+        daemon.on_message(&mut state, Lifecycle::OwnerGone(Ended::Clean));
+        assert!(!roots.socket.exists());
+        assert_eq!(phase.get(), Phase::LockReleased);
+        start::take_lock(&roots).unwrap();
+    }
+
+    /// Exit 0 only for a requested stop with both threads clean.
+    #[test]
+    fn exit_codes() {
+        let exit = |cause, owner, io| Exit { cause, owner, io }.code();
+        assert_eq!(exit(Some(StopCause::Signal), Ended::Clean, Ended::Clean), 0);
+        assert_eq!(
+            exit(Some(StopCause::Requested), Ended::Clean, Ended::Clean),
+            0
+        );
+        assert_eq!(
+            exit(Some(StopCause::Requested), Ended::Panicked, Ended::Clean),
+            1
+        );
+        assert_eq!(
+            exit(Some(StopCause::Requested), Ended::Clean, Ended::Panicked),
+            1
+        );
+        assert_eq!(
+            exit(Some(StopCause::OwnerFailed), Ended::Clean, Ended::Clean),
+            1
+        );
+        assert_eq!(
+            exit(Some(StopCause::IoFailed), Ended::Clean, Ended::Clean),
+            1
+        );
+        assert_eq!(
+            exit(Some(StopCause::StoreFailed), Ended::Clean, Ended::Clean),
+            1
+        );
+        assert_eq!(exit(None, Ended::Clean, Ended::Clean), 1);
     }
 }

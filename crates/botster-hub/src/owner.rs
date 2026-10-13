@@ -5,7 +5,7 @@
 //! [`run`] is the thread's loop over `mio`; it runs only on the real Core (the fake's wake has no descriptor).
 
 use crate::bridge::{Answer, Bridge, Effect, FailKind, Failure, Item, ReplyTo, Request};
-use crate::phase::{request_stop, Lifecycle, SharedPhase, StopCause};
+use crate::phase::{request_stop, Ended, Lifecycle, SharedPhase, StopCause};
 use botster_core::contract::prelude::{
     CoreApi, CoreError, Event, Now, Op, OpId, OpResult, SessionId, SessionState,
 };
@@ -220,6 +220,15 @@ impl<C: CoreApi> Owner<C> {
     /// Ends the owner: returns `Core`, so that the caller drops it on this thread.
     pub fn into_core(self) -> C {
         self.core
+    }
+}
+
+/// Runs `body` on the owner under `catch_unwind`. The owner state lives outside the closure, so after a panic the caller
+/// still drains it: every lane token and waiter is answered (design section 5, "Owner panic").
+pub fn guarded<C: CoreApi>(owner: &mut Owner<C>, body: impl FnOnce(&mut Owner<C>)) -> Ended {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(owner))) {
+        Ok(()) => Ended::Clean,
+        Err(_) => Ended::Panicked,
     }
 }
 
@@ -508,6 +517,37 @@ mod tests {
         assert_eq!(answers[4].1, shutdown(Effect::None));
         assert_eq!(rig.outbox.reserved(), 0);
         assert!(rig.lifecycle.try_recv().is_err());
+    }
+
+    /// Owner panic: a panic in the loop body leaves the owner state intact, and the drain still answers every token once.
+    #[test]
+    fn panic_in_the_loop_still_answers_every_token() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.submit(2, Request::List);
+        let ended = guarded(&mut rig.owner, |owner| {
+            let item = owner.bridge.take_turn(1, 1, 1).into_iter().next().unwrap();
+            owner.dispatch(item);
+            panic!("injected");
+        });
+        assert_eq!(ended, Ended::Panicked);
+        rig.phase.advance(Phase::Running, Phase::Stopping);
+        rig.owner.drain();
+        let mut answers = rig.answers();
+        answers.sort_by_key(|(id, _)| *id);
+        let shutdown = |effect| {
+            Answer::Failed(Failure {
+                kind: FailKind::HubShutdown,
+                effect,
+            })
+        };
+        assert_eq!(
+            answers,
+            vec![(1, shutdown(Effect::Unknown)), (2, shutdown(Effect::None))]
+        );
+        assert_eq!(guarded(&mut rig.owner, |_| {}), Ended::Clean);
     }
 
     /// A waiter whose `Completed` arrives after the drain finds no waiter: no second answer.
