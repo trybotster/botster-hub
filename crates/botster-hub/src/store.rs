@@ -34,13 +34,15 @@ pub enum SpawnState {
     Cancelled,
 }
 
-/// The `failed` reasons that the Hub writes (A.7b; R-120 adds `interrupted` and `internal`).
+/// The `failed` reasons that the Hub writes (A.7b; R-120 adds `interrupted` and `internal`; R-121 adds `start_failed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailReason {
     ExecFailed,
     CwdMissing,
     WorkerFailed,
+    /// A start failure whose Core reason this Hub does not know (R-121, S2-HD-12). Not a Hub fault.
+    StartFailed,
     Interrupted,
     Internal,
 }
