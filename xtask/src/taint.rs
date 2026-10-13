@@ -4,7 +4,7 @@
 
 use crate::contracts;
 use anyhow::{bail, Context, Result};
-use botster_gate_kit::files::tracked_files;
+use botster_gate_kit::files::{lossy, read_tracked};
 use botster_gate_kit::taint::{parse_denylist, scan_files};
 use std::path::Path;
 
@@ -21,12 +21,8 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         &std::fs::read_to_string(&denylist)
             .with_context(|| format!("read {}", denylist.display()))?,
     );
-    let mut files = Vec::new();
-    for file in tracked_files(root)? {
-        if let Ok(bytes) = std::fs::read(root.join(&file)) {
-            files.push((file, String::from_utf8_lossy(&bytes).into_owned()));
-        }
-    }
+    // Every tracked file, each byte; a file that cannot be read fails the step (HUBB-3).
+    let files = lossy(read_tracked(root, |_| true)?);
     let (scanned, hits) = scan_files(&files, &tokens);
     let (lines, verdict) = report(scanned, tokens.len(), &hits);
     for line in lines {

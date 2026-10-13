@@ -22,14 +22,21 @@ exclude_re = [
     # forbid_unsafe::command -> Ok(()): reads the tracked manifests and sources. Decisions: botster_gate_kit::unsafe_exception
     # (its tests in Core); the Hub's policy: the_workspace_forbids_unsafe_code_with_no_exception.
     'xtask/src/forbid_unsafe\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
-    # budget::command: runs cargo metadata and nextest under the tier's deadline. Decisions: parse_tier, slow_members,
-    # over_limit, slowest, nextest_args (budget::tests). This entry is still the broad form: H212-I3 replaces the shell
-    # with the bounded run of botster-gate-kit (Core PR "gate-kit: shared verdicts"), and that change narrows it.
-    'xtask/src/budget\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
-    # mutants::command: runs git diff and cargo mutants. Decisions: pathspecs, changes_rust, run_args, verdict
-    # (mutants::tests). This entry is still the broad form: H212-I1 replaces the verdict with the outcome verdict of
-    # botster-gate-kit (Core PR "gate-kit: shared verdicts"), and that change narrows it.
-    'xtask/src/mutants\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # budget::command -> Ok(()): runs cargo metadata, builds the tests, and runs nextest with the bounded run of
+    # botster-gate-kit (its own process group, the kill at the deadline, the report and kill of every leftover; its tests
+    # and real-process tests in Core). Decisions: parse_tier (the_tier_is_default_or_slow), slow_members
+    # (the_slow_members_are_those_with_a_slow_feature), tier (the_default_tier_has_60_s_and_the_slow_tier_600_s_or_no_test),
+    # nextest_args (each_tier_has_its_profile_and_the_slow_tier_its_features), junit_times
+    # (a_missing_junit_file_fails_unless_the_run_passed_its_deadline), tier_failures
+    # (a_leftover_the_exit_a_missing_report_and_a_slow_test_each_fail_the_tier), over_limit and slowest (budget::tests).
+    'xtask/src/budget\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
+    # mutants::command -> Ok(()): runs git diff, cargo mutants --list and cargo mutants. Decisions: pathspecs,
+    # changes_rust, run_args, list_args, no_run (no_run_starts_without_rust_source_or_without_a_mutant), removed
+    # (only_an_absent_earlier_output_or_a_removed_one_is_fine) and decision
+    # (the_step_passes_only_with_every_listed_outcome_a_valid_report_and_exit_0,
+    # a_run_that_tests_another_set_than_the_listing_is_a_selection_error), over botster_gate_kit::mutant_outcomes (its tests
+    # in Core).
+    'xtask/src/mutants\.rs:\d+:\d+: replace command -> Result<\(\)> with Ok\(\(\)\)$',
     # ci::command -> Ok(()): runs the steps and prints the summary. Decisions: STEPS
     # (the_steps_are_the_minimal_gate_in_order), summary (the_summary_names_each_result_and_time) and verdict
     # (the_gate_fails_when_any_step_failed_and_names_each).

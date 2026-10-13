@@ -27,4 +27,4 @@ botster-plugin-contract = { git = "https://github.com/trybotster/botster-contrac
 
 # The gate code that Core shares (repo plan section 5): a reference by git rev of Core v1, never a copy.
 # Moves with the Core rev, not with the Hub contracts pin.
-botster-gate-kit = { git = "https://github.com/trybotster/botster-core", rev = "28a29d32d191604221eb4cbeeb02e47371fa3daf" }
+botster-gate-kit = { git = "https://github.com/trybotster/botster-core", rev = "5ee8c82ed0e5bb15205782eaf81e33b07245aa72" }
