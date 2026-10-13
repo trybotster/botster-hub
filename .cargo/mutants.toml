@@ -1,0 +1,33 @@
+# cargo-mutants settings of the mutants step (`cargo xtask mutants`, xtask/src/mutants.rs). The step tests the HIGH-path
+# code of the diff (ci/high-tier-paths.txt).
+#
+# Excluded: only the I/O shells of the xtask, each whole function. A shell reads files, starts git, cargo or nextest, and
+# prints; a test cannot run the gate inside the gate's own test run. Each shell's decisions are pure functions with tests,
+# named after each entry.
+
+exclude_globs = ["**/tests/**", "tests/**"]
+
+exclude_re = [
+    # lists::command: reads the three lists and the pinned ledger. Decisions: parse_rows, parse_ids, parse_ledger,
+    # same_contract, verdict (lists::tests).
+    'xtask/src/lists\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # contracts::root: runs cargo metadata. Decision: root_from_metadata (contracts::tests).
+    'xtask/src/contracts\.rs:\d+:\d+: (replace root( ->| with)|.* in root$)',
+    # taint::command: reads the denylist and the tracked files. Decisions: botster_gate_kit::taint (its tests in Core).
+    'xtask/src/taint\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # forbid_unsafe::command: reads the tracked manifests and sources. Decisions: botster_gate_kit::unsafe_exception (its
+    # tests in Core); the Hub's policy: the_workspace_forbids_unsafe_code_with_no_exception.
+    'xtask/src/forbid_unsafe\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # budget::command: runs cargo metadata and nextest under the tier's deadline. Decisions: parse_tier, slow_members,
+    # over_limit, slowest, nextest_args (budget::tests).
+    'xtask/src/budget\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # mutants::command: runs git diff and cargo mutants. Decisions: pathspecs, changes_rust, run_args, verdict
+    # (mutants::tests).
+    'xtask/src/mutants\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    # ci::command and ci::cargo: run the steps. Decisions: STEPS, summary (ci::tests).
+    'xtask/src/ci\.rs:\d+:\d+: (replace command( ->| with)|.* in command$)',
+    'xtask/src/ci\.rs:\d+:\d+: (replace cargo( ->| with)|.* in cargo$)',
+    # main and repo_root: the process entry. Decision: choose (tests in main.rs).
+    'xtask/src/main\.rs:\d+:\d+: (replace main( ->| with)|.* in main$)',
+    'xtask/src/main\.rs:\d+:\d+: (replace repo_root( ->| with)|.* in repo_root$)',
+]

@@ -1,0 +1,18 @@
+[package]
+name = "botster-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The v1 Hub daemon (repo plan section 3): data dir and flock singleton, one owner of the embedded Core behind a bounded
+# bridge, the client protocol server, plugin management through Core's managed-process ops. The bin `botster-hub` comes
+# with the daemon. HIGH paths (ci/high-tier-paths.txt): process control, identity and the durable store.
+
+[lints]
+workspace = true
+
+[dependencies]
+botster-hub-contract.workspace = true
+botster-plugin-contract.workspace = true

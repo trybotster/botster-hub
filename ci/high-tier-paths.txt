@@ -1,0 +1,13 @@
+# The HIGH-path list of botster-hub (botster-contracts docs/BUILD.md "Risk tiers", rule 5; the Stage 2 brief's trusted
+# parts: permissions, identity, secrets, process control, plugin isolation, gate code).
+#
+# A PR that changes a path below is HIGH, and the mutants step of the gate tests the Rust code of these paths only. One
+# path or `<dir>/**` per line, then `#` and the reason. A change to this file is gate code, so it is HIGH too.
+
+xtask/**                     # gate code (rule 1)
+ci/**                        # gate code and pool plumbing (rule 1); this list
+.cargo/**                    # gate code: the cargo alias and the mutants configuration (rule 1)
+.config/**                   # gate code: the nextest budgets and profiles (rule 1)
+Cargo.toml                   # gate code: the workspace lints, unsafe_code = "forbid", and the pins (rule 1)
+rust-toolchain.toml          # gate code: the toolchain of every step (rule 1)
+crates/botster-hub/**        # process control, identity and the durable store of the daemon (lead, 2026-10-12)

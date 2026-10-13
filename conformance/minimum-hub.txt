@@ -1,0 +1,132 @@
+# The minimum Hub: the conformance ids that stories 0 to 2 need (Stage 2 brief). Tab-separated columns: contract, id,
+# clause, story, mark, reason. Source: the pinned list ~/botster-sessions/pins/minimum-hub.26c2c795.md (125 rows, verbatim)
+# and its additions in ~/botster-sessions/shared/stage2/minimum-hub-additions.md (2 HC rows, rulings S2-D4 and R-120).
+# Marks: A26 waits for Core Amendment 26; W waits for a contract amendment. Every id is pending
+# (conformance/hub-pending.txt) until a Hub subject runs it. HC rows include ids of the route codec (the HC extract).
+HP	conf::md_2_oversize_frame_refused	MD-2	0	-	a stuck or hostile plugin cannot grow a Hub buffer
+HP	conf::md_3_full_lane_is_typed	MD-3	1	-	demo: a stuck plugin never blocks the Hub; a full lane is Backpressured
+HP	conf::md_4_stale_epoch_dropped	MD-4	2	A26	re-adopted service reconnects with a higher epoch; old frames are dropped
+HP	conf::wf_1_len_checked_before_alloc	WF-1	0	-	frame length is checked before allocation (stuck or hostile plugin)
+HP	conf::wf_2_invalid_utf8_ends_epoch	WF-2	0	-	a malformed frame ends the epoch, not the Hub
+HP	conf::hs_1_hello_first	HS-1	0	W	handshake: Hello first; renamed conf::hs_1_hub_hello_first by HP A11
+HP	conf::hs_2_ready_then_activated	HS-2	0	-	registration: Ready proposes, Activated confirms
+HP	conf::hs_2_rejected_registration_tears_down	HS-2	0	-	a bad registration leaves no running service
+HP	conf::hs_5_ready_deadline	HS-5	0	-	a plugin stuck before Ready cannot hang enable
+HP	conf::hs_6_resumed_hello	HS-6	2	A26	re-adopted plugin gets Hello{resumed=true} and answers a full Ready
+HP	conf::ld_1_load_then_register	LD-1	0	A26	enable: Hub asks Core for the service, then handshake, then Loaded
+HP	conf::ld_1_failed_load_leaves_nothing	LD-1	0	A26	failed enable leaves no service and no registration
+HP	conf::ld_4_shutdown_drains_then_kills	LD-4	0	A26	disable drains, then Core stops the service
+HP	conf::ld_5_survival_table	LD-5	2	-	story 2: plugin memory survives adoption
+HP	conf::ld_6_unload_removes_everything	LD-6	0	-	disable removes handlers and subscriptions
+HP	conf::cp_1_grants_come_from_manifest	CP-1	0	-	grants come only from the manifest
+HP	conf::cp_3_every_call_checked	CP-3	1	-	every host call is checked against the admitted set
+HP	conf::cp_4_own_scope_vs_any	CP-4	1	-	plain scope = own sessions; the plugin sees only what its grant allows
+HP	conf::vc_1_caller_from_proof	VC-1	0	-	enable and disable carry the verified operator caller
+HP	conf::iv_1_invoke_shape	IV-1	1	-	Invoke shape for event handlers
+HP	conf::iv_3_deadline_cancels	IV-3	1	-	demo: the stuck handler's request ends at its deadline; its caller is answered
+HP	conf::iv_4_one_active_handler	IV-4	1	-	brief fact 3: one active handler per plugin
+HP	conf::iv_4_control_traffic_flows_while_suspended	IV-4	1	-	brief fact 3: control traffic flows while a handler is stuck
+HP	conf::iv_4_queue_full_is_typed	IV-4	1	-	brief fact 3: bounded queue, typed backpressured refusal
+HP	conf::ca_4_no_reentrancy	CA-4	1	-	demo: the Hub never waits on plugin code to answer a host call
+HP	conf::ca_9_sink_never_blocks	CA-9	1	-	story-1 API: a log sink never blocks the Hub
+HP	conf::cf_1_own_config_only	CF-1	1	-	story-1 API: config.get returns own configuration
+HP	conf::a2_38_hub_identity_unavailable_condition	A2-38	1	-	story-1 API: hub.identity (the only hub.identity id)
+HP	conf::ss_1_list_page_and_cursor	SS-1	1	W	sessions.list; the metadata_namespace filter waits for the HP SS-1 amendment
+HP	conf::ss_2_get_row_or_not_found	SS-2	1	-	story-1 API: sessions.get
+HP	conf::ss_3_unready_is_unavailable	SS-3	2	-	after a Hub restart, a read before the baseline is unavailable
+HP	conf::ss_5_adoption_keeps_id	SS-5	2	-	re-adopted agent session keeps its id
+HP	conf::sa_1_stop_orderly	SA-1	1	-	story-1 API: sessions.stop
+HP	conf::ev_2_source_permission_checked	EV-2	1	-	lifecycle events need the events_hub grant
+HP	conf::ev_5_drop_consumer_copy_with_marker	EV-5	1	-	demo: a stuck plugin's queue overflows with a marker
+HP	conf::ev_5_emitter_not_blocked	EV-5	1	-	demo: the Hub is not blocked by a stuck subscriber
+HP	conf::ev_6_session_family_baseline_then_deltas	EV-6	1	-	story-1 API: lifecycle events (hub/session_family)
+HP	conf::ev_10_slow_subscriber_does_not_stall_the_hub	EV-10	1	-	demo: stuck plugin does not stall the Hub
+HP	conf::ev_10_core_ingest_independent_of_plugins	EV-10	1	-	demo: Core ingest (output) does not wait for plugins
+HP	conf::lm_1_limits_in_hello	LM-1	0	-	limits come from Hello; the demo sets small test limits
+HP	conf::lm_4_runaway_handler_is_failed_not_fatal	LM-4	1	-	demo: the stuck handler fails; the plugin and Hub live on
+HP	conf::lm_5_limits_overridable_for_tests	LM-5	1	-	demo needs small test limits
+HP	conf::cr_1_crash_seen_by_event	CR-1	0	A26	plugin service exit is seen through the Core exit event
+HP	conf::cr_2_crash_fails_inflight	CR-2	0	A26	a plugin service exit answers its in-flight requests
+HP	conf::cr_5_adopt_resumed_fences_old_epoch	CR-5	2	A26	story 2: re-adopted service, old epoch fenced
+HP	conf::cr_5_adoption_keeps_memory_reload_does_not	CR-5	2	A26	story 2: plugin memory survives (named in the brief)
+HP	conf::cr_5_lost_is_fresh_start	CR-5	2	A26	a service lost during restart starts fresh, not silently
+HP	conf::cr_6_guardian_enforces_orphan_grace	CR-6	2	A26	guardian keeps the service for orphan_grace while no Hub runs
+HP	conf::tr_1_host_allowlist	TR-1	0	A26	Hub starts only the shipped Lua host as the service
+HP	conf::mn_1_ready_matches_manifest_or_fails_load	MN-1	0	-	Ready must match the manifest
+HP	conf::pd_9_no_code_runs_at_install_or_staging	PD-9	0	-	install of the local package runs no plugin code
+HP	conf::pm_5_install_order	PM-5	0	-	the package must be installed before enable
+HP	conf::pm_5_staged_until_grants_approved	PM-5	0	-	session_create_command needs operator approval
+HP	conf::pm_8_new_grants_need_approve_grants	PM-8	0	-	first install grants need approve_grants
+HC	conf::rt_2_layout_created_with_modes	RT-2	0	-	Hub data root layout
+HC	conf::rt_3_siblings_only_no_path_fallback	RT-3	0	-	Hub finds the worker and plugin host beside itself
+HC	conf::rt_4_second_hub_same_root_refused	RT-4	2	-	restart: no second Hub on one data root
+HC	conf::rt_4_lock_before_socket	RT-4	2	-	restart: the new Hub takes the lock before the socket
+HC	conf::rt_5_foreign_runtime_dir_refused	RT-5	1	-	runtime directory safety
+HC	conf::rt_5_client_checks_socket_owner	RT-5	1	-	TUI checks the socket owner
+HC	conf::hs_0_ready_line_after_listen_and_adoption	HS-0	2	A26	Hub reports ready only after it adopts workers and the service
+HC	conf::hs_1_hello_first	HS-1	1	-	TUI handshake
+HC	conf::hs_3_terminal_format_selected	HS-3	1	-	TUI and worker agree a terminal format
+HC	conf::hs_5_new_incarnation_invalidates_cursors	HS-5	2	-	TUI reconnect after restart starts fresh watches
+HC	conf::hs_5_routes_survive_new_incarnation	HS-5	2	-	TUI route survives the new incarnation
+HC	conf::hs_7_each_binding_authenticates_to_operator	HS-7	1	-	local-stream caller is the operator
+HC	conf::hs_9_control_disconnect_keeps_route_open	HS-9	2	-	control loss at restart keeps the route
+HC	conf::en_7_accepted_returns_operation	EN-7	1	-	create(session) and enable answer an operation
+HC	conf::vb_1_pages_from_one_cut	VB-1	1	W	TUI session list; the describe-declared metadata_namespace filter waits for HC
+HC	conf::vb_3_create_follows_effect	VB-3	1	-	Q3 ruling: the TUI spawns the agent (create(session, {command}))
+HC	conf::wt_1_baseline_is_one_cut	WT-1	1	-	TUI watches the session list
+HC	conf::wt_7_reconnect_baseline	WT-7	2	-	TUI reconnect gets one new baseline
+HC	conf::bp_1_hub_stopped_bytes_still_flow	A8-5 (BP-1)	1	-	demo: typing and output do not pass through the Hub
+HC	conf::bp_2_output_bytes_identical_to_pty	BP-2	1	-	output bytes are the PTY's bytes
+HC	conf::bp_5_detach_via_hub_closes_route_at_worker	BP-5	1	-	detach ends the route at the worker
+HC	conf::bp_7_routes_survive_hub_restart	A8-5 (BP-7)	2	-	story 2: the route survives a Hub restart
+HC	conf::ts_1_multi_attach	TS-1	1	-	attach reserves a route (Q6 accepted: the only TS-1 id)
+HC	conf::ts_2_connect_once_in_time	TS-2	1	-	route connect
+HC	conf::ts_3_framing	TS-3	1	-	route framing
+HC	conf::ts_4_state_equivalence	TS-4	1	-	attach shows the session (libghostty baseline)
+HC	conf::ts_4b_live_after_baseline	TS-4b	1	-	live is the input-ready point
+HC	conf::ts_4b_early_input_not_ready	TS-4b	1	-	input before live is refused
+HC	conf::ts_4d_modes_effective_size	TS-4d	1	-	resize: effective size in modes
+HC	conf::ts_5_order_is_receive_order	TS-5	1	-	typing order
+HC	conf::ts_5_backpressure_not_drop	TS-5	1	-	typing is never dropped
+HC	conf::ts_5d_abort_before_commit	TS-5d	1	-	paste operation
+HC	conf::ts_5d_contiguous	TS-5d	1	-	paste is written contiguously
+HC	conf::ts_5e_precondition_zero_effect	TS-5e	1	-	unsafe multi-line paste is refused with zero effect
+HC	conf::ts_7_progressing_lossless	TS-7	1	-	demo: output is lossless for a reading TUI
+HC	conf::ts_10_detach	TS-10	1	-	quit detaches; session keeps running
+HC	conf::tb_l1_discovery_order	TB-L1	1	-	TUI finds the Hub socket
+HC	conf::tb_l1_directory_and_socket_modes	TB-L1	1	-	socket modes
+HC	conf::tr_1_unix_framing	TR-1	1	-	local-stream control framing
+HC	conf::tb_l2_token_single_use_bound_to_route_and_uid	TB-L2	1	-	local-stream route handoff token
+HC	conf::tb_l2_no_terminal_frame_read_by_hub	TB-L2	1	-	Hub reads no terminal frame (brief fact 3)
+HC	conf::tb_l3_peer_uid	TB-L3	1	-	peer uid authentication
+LB	conf::lb_2_unknown_argument_key_is_invalid_request	LB-2	1	-	Lua argument table
+LB	conf::lb_3_helpers_return_envelopes_never_raise	LB-3	1	-	Lua result envelope
+LB	conf::lb_4_handler_arguments	LB-4	1	-	event handler arguments
+LB	conf::lb_6_session_family_frames	LB-6	1	-	lifecycle events in Lua
+LB	conf::lb_10_register_builds_ready_and_refuses_after_ready	LB-10	0	-	botster.register builds Ready
+LB	conf::lb_12_session_calls_and_scopes	LB-12	1	-	create_command, stop scopes in Lua
+LB	conf::lb_17b_entry_relative_to_the_package_root	LB-17b	0	-	entrypoint path
+LB	conf::lb_17b_require_name_to_file_rule	LB-17b	0	-	require rule
+CLI	conf::cli_rt3_discovery_order	CLI-RT3	1	-	socket discovery
+CLI	conf::cli_rt4b_foreign_owner_refused	CLI-RT4b	1	-	socket ownership
+CLI	conf::cli_st1_running_hub	CLI-ST1	1	-	botster start with a running Hub attaches
+CLI	conf::cli_st2_spawn_background_ready	CLI-ST2	2	-	start (and restart) the Hub, wait for ready
+CLI	conf::cli_st2_second_instance_refused	CLI-ST2	2	-	restart: no second Hub
+CLI	conf::cli_at2_launch_contract	CLI-AT2	1	-	Q5 ruling: `botster attach` launches botster-tui
+CLI	conf::cli_at3_quit_keeps_hub	CLI-AT3	1	-	quitting the TUI keeps the Hub and the session
+CLI	conf::cli_pl3_install_sources	CLI-PL3	0	-	install the one local plugin
+CLI	conf::cli_pl9_enable_disable_waits_for_terminal	CLI-PL9	0	-	story 0: enable and disable
+CLI	conf::cli_pl9_activation_failure_not_success	CLI-PL9	0	-	failed enable is not success
+CLI	conf::cli_pl11_approve_shows_grants	CLI-PL11	0	-	approve the create_command grant
+HP	conf::sa_1_update_own_metadata_only	SA-1	1	-	labels: a plugin writes only its own namespace (one writer per namespace)
+HP	conf::a2_21_metadata_replaces_and_is_durable	A2-21	1	-	labels: whole-namespace write, durable before the answer (stays)
+HP	conf::cp_3_no_cross_plugin_namespace	CP-3	1	-	labels: no write into another plugin's namespace
+HC	conf::wt_2_filter_entry_exit	WT-2	1	W	session watch filtered by namespace presence; waits for the HC filter
+LB	conf::lb_16b_metadata_replaces_namespace_and_null_removes	LB-16b	1	-	labels in Lua: write own namespace; null removes it (ownership ends)
+LB	conf::lb_16b_update_and_spawn_arguments_match_the_hp_rows	LB-16b	1	-	sessions.update arguments in Lua
+UI	conf::ui_bd_6_owner_needs_allowlist	UI-BD-6	1	W	views filter sessions by owner today; namespace presence after UI-BD-6 amendment
+UI	conf::ui_bd_6_owner_filter_realizes	UI-BD-6	1	W	views exclude sessions without the namespace after the UI-BD-6 amendment
+HP	conf::cp_4_any_needs_approval	CP-4	1	-	labels: the plugin labels a TUI-spawned session; session_update:any needs operator approval
+HP	conf::cr_8_failure_isolation	CR-8	1	A26	isolation claim: one process per plugin; its own lanes, queues and Core limits
+HC	conf::en_7_durable_operation_survives_restart	EN-7	2	-	spawn operation records survive a restart (S2-D4, R-120)
+HC	conf::a_7b_every_kind_states_closed	A.7b	2	-	the reasons interrupted and internal (S2-D4, R-120)
