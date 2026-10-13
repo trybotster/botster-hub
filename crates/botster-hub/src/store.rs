@@ -56,6 +56,10 @@ pub struct Record {
     pub state: SpawnState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<FailReason>,
+    /// R-122 U3: the row is the Hub's to remove. It stays `true` until the row is proved gone (Sol S2-HD-11), and the
+    /// record is not swept while it is `true`.
+    #[serde(default)]
+    pub remove_row: bool,
     pub admitted_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at_ms: Option<u64>,
@@ -94,12 +98,14 @@ enum JobKind {
     Create,
     Finish,
     Delete,
+    /// R-122 U1, U2: the delete of a `starting` record before the answer.
+    Forget,
 }
 
 #[derive(Debug)]
 enum Job {
     Write { kind: JobKind, record: Record },
-    Delete { key: String },
+    Delete { kind: JobKind, key: String },
 }
 
 #[derive(Debug)]
@@ -119,6 +125,8 @@ pub enum StoreEvent {
     CreateDurable { operation_id: String },
     /// The `starting` record was proved not written: the request gets `internal`, `effect: none`.
     CreateNotWritten { operation_id: String },
+    /// The `starting` record is durably deleted (R-122 U1, U2): the owner answers now.
+    Forgotten { operation_id: String },
     /// A fault (design section 5, "Store fault"): the Hub stops with cause `store_failed`.
     Fault(String),
 }
@@ -151,6 +159,17 @@ struct Entry {
     pending: Option<Record>,
     /// A job for this record is in flight.
     busy: bool,
+    /// A forget (R-122 U1, U2) waits for a job slot, or is in flight.
+    forget: bool,
+    /// The marker clear came while a write of the marker was in flight: write the record again after it.
+    clear_after: bool,
+}
+
+impl Entry {
+    /// A terminal write or a forget waits for a job slot.
+    fn waits(&self) -> bool {
+        (self.pending.is_some() || self.forget) && !self.busy
+    }
 }
 
 /// The owner side of the store.
@@ -167,6 +186,8 @@ pub struct SpawnStore {
     thread: Option<JoinHandle<()>>,
     recovering: bool,
     admitting: bool,
+    /// A fault was seen: no job is sent again (the Hub stops with cause `store_failed`).
+    faulted: bool,
     gone: Option<Ended>,
     /// Files that are not the Hub's, counted for `diagnostics()`.
     pub foreign_files: usize,
@@ -262,7 +283,7 @@ impl SpawnStore {
                     format!("more than {} records", config.max_records),
                 ));
             }
-            if let Some(at) = record.terminal_at_ms {
+            if let (Some(at), false) = (record.terminal_at_ms, record.remove_row) {
                 expiry.insert((at, record.operation_id.clone()));
             }
             keys.insert(record.record_key.clone(), record.operation_id.clone());
@@ -273,6 +294,8 @@ impl SpawnStore {
                     written: true,
                     pending: None,
                     busy: false,
+                    forget: false,
+                    clear_after: false,
                 },
             );
         }
@@ -295,6 +318,7 @@ impl SpawnStore {
             thread: Some(thread),
             recovering: true,
             admitting: true,
+            faulted: false,
             gone: None,
             foreign_files,
         })
@@ -328,10 +352,13 @@ impl SpawnStore {
     }
 
     fn pending_terminals(&self) -> bool {
-        self.index.values().any(|e| e.pending.is_some() && !e.busy)
+        self.index.values().any(Entry::waits)
     }
 
     fn send(&mut self, job: Job) -> bool {
+        if self.faulted {
+            return false;
+        }
         match &self.jobs {
             Some(jobs) if self.in_flight < self.config.store_queue => match jobs.try_send(job) {
                 Ok(()) => {
@@ -370,6 +397,7 @@ impl SpawnStore {
             session_id: session_id.to_owned(),
             state: SpawnState::Starting,
             reason: None,
+            remove_row: false,
             admitted_at_ms: now_ms,
             terminal_at_ms: None,
         };
@@ -387,6 +415,8 @@ impl SpawnStore {
                 written: false,
                 pending: None,
                 busy: true,
+                forget: false,
+                clear_after: false,
             },
         );
         Ok(operation_id)
@@ -403,12 +433,35 @@ impl SpawnStore {
         terminal: Terminal,
         now_ms: u64,
     ) -> Result<(), String> {
+        self.finish_with(operation_id, terminal, now_ms, false)
+    }
+
+    /// R-122 U3: `failed { internal }` with the cleanup obligation (`remove_row: true`).
+    ///
+    /// # Errors
+    /// As [`SpawnStore::finish_spawn`].
+    pub fn finish_with_cleanup(&mut self, operation_id: &str, now_ms: u64) -> Result<(), String> {
+        self.finish_with(
+            operation_id,
+            Terminal::Failed(FailReason::Internal),
+            now_ms,
+            true,
+        )
+    }
+
+    fn finish_with(
+        &mut self,
+        operation_id: &str,
+        terminal: Terminal,
+        now_ms: u64,
+        remove_row: bool,
+    ) -> Result<(), String> {
         let Some(entry) = self.index.get_mut(operation_id) else {
             return Err(format!("no spawn operation {operation_id}"));
         };
-        if !entry.written {
+        if !entry.written || entry.forget {
             return Err(format!(
-                "the spawn operation {operation_id} is not durable yet"
+                "the spawn operation {operation_id} is not durable yet, or is forgotten"
             ));
         }
         let (state, reason) = match terminal {
@@ -419,9 +472,67 @@ impl SpawnStore {
         entry.pending = Some(Record {
             state,
             reason,
+            remove_row,
             terminal_at_ms: Some(now_ms),
             ..entry.record.clone()
         });
+        Ok(())
+    }
+
+    /// The row of a U3 record is proved gone (Sol S2-HD-11): the record is written again with `remove_row: false`, by the
+    /// rules of `finish_spawn` (never refused). After that write, the record is swept after its retention.
+    ///
+    /// # Errors
+    /// The operation is unknown.
+    pub fn clear_remove_row(&mut self, operation_id: &str) -> Result<(), String> {
+        let Some(entry) = self.index.get_mut(operation_id) else {
+            return Err(format!("no spawn operation {operation_id}"));
+        };
+        let latest = entry.pending.as_ref().unwrap_or(&entry.record);
+        if !latest.remove_row {
+            return Ok(());
+        }
+        if entry.busy && entry.pending.is_some() {
+            // The write of the marker is in flight: its completion queues the clear.
+            entry.clear_after = true;
+        } else {
+            entry.pending = Some(Record {
+                remove_row: false,
+                ..latest.clone()
+            });
+        }
+        Ok(())
+    }
+
+    /// The U3 records whose rows the Hub must still remove: `(operation_id, session_id)`.
+    pub fn remove_rows(&self) -> Vec<(String, String)> {
+        self.index
+            .iter()
+            .filter(|(_, e)| !e.clear_after && e.pending.as_ref().unwrap_or(&e.record).remove_row)
+            .map(|(id, e)| (id.clone(), e.record.session_id.clone()))
+            .collect()
+    }
+
+    /// R-122 U1, U2: deletes a durable `starting` record. [`StoreEvent::Forgotten`] follows; a delete error is a fault.
+    /// It is queued like a terminal state: never refused, and it goes before new `create_spawn` jobs.
+    ///
+    /// # Errors
+    /// The operation is unknown, not durable, or not a plain `starting` record.
+    pub fn forget_spawn(&mut self, operation_id: &str) -> Result<(), String> {
+        let Some(entry) = self.index.get_mut(operation_id) else {
+            return Err(format!("no spawn operation {operation_id}"));
+        };
+        if !entry.written
+            || entry.busy
+            || entry.forget
+            || entry.pending.is_some()
+            || entry.record.state != SpawnState::Starting
+        {
+            return Err(format!(
+                "the spawn operation {operation_id} cannot be forgotten"
+            ));
+        }
+        entry.forget = true;
         Ok(())
     }
 
@@ -431,7 +542,7 @@ impl SpawnStore {
             return Lookup::Busy;
         }
         match self.index.get(operation_id) {
-            Some(entry) if entry.written => Lookup::Found(entry.record.clone()),
+            Some(entry) if entry.written && !entry.forget => Lookup::Found(entry.record.clone()),
             _ => Lookup::NotFound,
         }
     }
@@ -442,17 +553,27 @@ impl SpawnStore {
         let ready: Vec<String> = self
             .index
             .iter()
-            .filter(|(_, e)| e.pending.is_some() && !e.busy)
+            .filter(|(_, e)| e.waits())
             .map(|(id, _)| id.clone())
             .collect();
         for id in ready {
-            let Some(record) = self.index.get(&id).and_then(|e| e.pending.clone()) else {
+            let Some(entry) = self.index.get(&id) else {
                 continue;
             };
-            if !self.send(Job::Write {
-                kind: JobKind::Finish,
-                record,
-            }) {
+            let job = if entry.forget {
+                Job::Delete {
+                    kind: JobKind::Forget,
+                    key: entry.record.record_key.clone(),
+                }
+            } else if let Some(record) = entry.pending.clone() {
+                Job::Write {
+                    kind: JobKind::Finish,
+                    record,
+                }
+            } else {
+                continue;
+            };
+            if !self.send(job) {
                 return;
             }
             if let Some(entry) = self.index.get_mut(&id) {
@@ -471,11 +592,14 @@ impl SpawnStore {
                 self.expiry.remove(&(at, id));
                 continue;
             };
-            if entry.busy || entry.pending.is_some() {
+            if entry.busy || entry.pending.is_some() || entry.forget || entry.record.remove_row {
                 break;
             }
             let key = entry.record.record_key.clone();
-            if !self.send(Job::Delete { key }) {
+            if !self.send(Job::Delete {
+                kind: JobKind::Delete,
+                key,
+            }) {
                 break;
             }
             self.expiry.remove(&(at, id.clone()));
@@ -510,6 +634,7 @@ impl SpawnStore {
                 self.gone = Some(ended);
                 self.in_flight = 0;
                 if ended == Ended::Panicked {
+                    self.fault();
                     events.push(StoreEvent::Fault("the store thread panicked".into()));
                 }
             }
@@ -535,10 +660,18 @@ impl SpawnStore {
                         if let Some(entry) = self.index.get_mut(&id) {
                             entry.busy = false;
                             if let Some(record) = entry.pending.take() {
-                                if let Some(at) = record.terminal_at_ms {
+                                if let (Some(at), false) =
+                                    (record.terminal_at_ms, record.remove_row)
+                                {
                                     self.expiry.insert((at, id.clone()));
                                 }
                                 entry.record = record;
+                            }
+                            if std::mem::take(&mut entry.clear_after) {
+                                entry.pending = Some(Record {
+                                    remove_row: false,
+                                    ..entry.record.clone()
+                                });
                             }
                         }
                     }
@@ -546,10 +679,16 @@ impl SpawnStore {
                         self.index.remove(&id);
                         self.keys.remove(&key);
                     }
+                    (JobKind::Forget, JobResult::Done) => {
+                        self.index.remove(&id);
+                        self.keys.remove(&key);
+                        events.push(StoreEvent::Forgotten { operation_id: id });
+                    }
                     (kind, _) => {
                         if let Some(entry) = self.index.get_mut(&id) {
                             entry.busy = false;
                         }
+                        self.fault();
                         events.push(StoreEvent::Fault(format!(
                             "a {kind:?} write of spawn operation {id} failed"
                         )));
@@ -557,6 +696,12 @@ impl SpawnStore {
                 }
             }
         }
+    }
+
+    /// A fault: no new spawn is admitted and no job is sent again. The jobs in flight complete.
+    fn fault(&mut self) {
+        self.faulted = true;
+        self.admitting = false;
     }
 
     /// Stop step 2 (design section 5): no new `create_spawn`; every pending terminal state is written as slots free; then
@@ -567,6 +712,10 @@ impl SpawnStore {
         let mut events = Vec::new();
         while self.gone.is_none() && self.pending_terminals() {
             self.pump(0);
+            // After a fault no job goes; with no job in flight, no completion can come.
+            if self.in_flight == 0 {
+                break;
+            }
             match self.done.recv() {
                 Ok(message) => self.apply(message, &mut events),
                 Err(_) => self.apply(StoreMsg::Gone(Ended::Panicked), &mut events),
@@ -601,6 +750,26 @@ impl SpawnStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// Why the live flow did not write `installed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallBlocked {
+    /// `installed` needs the row's `ready_reached` (A26 candidate 5). There is no interim rule for Core `v1` (lead ruling
+    /// 2026-10-12): the spawn stays `starting` until the A26 pin.
+    NeedsA26,
+}
+
+/// Spawn flow step 4 (design section 4a; R-122): `installed` when the row's `ready_reached` becomes `true`. Marked A26: a
+/// typed stub until the Core pin carries A26. It changes nothing.
+///
+/// # Errors
+/// Always [`InstallBlocked::NeedsA26`].
+pub fn install_on_ready(
+    _store: &mut SpawnStore,
+    _operation_id: &str,
+) -> Result<(), InstallBlocked> {
+    Err(InstallBlocked::NeedsA26)
 }
 
 /// Why step 6b did not run.
@@ -661,11 +830,11 @@ fn run_job(dir: &Path, job: Job) -> StoreMsg {
             };
             StoreMsg::Done { kind, key, result }
         }
-        Job::Delete { key } => {
+        Job::Delete { kind, key } => {
             let removed: io::Result<()> =
                 fs::remove_file(record_path(dir, &key)).and_then(|()| fsutil::sync_dir(dir));
             StoreMsg::Done {
-                kind: JobKind::Delete,
+                kind,
                 key,
                 result: if removed.is_ok() {
                     JobResult::Done
@@ -897,6 +1066,7 @@ mod tests {
                 session_id: "s".into(),
                 state: SpawnState::Starting,
                 reason: None,
+                remove_row: false,
                 admitted_at_ms: 0,
                 terminal_at_ms: None,
             })
@@ -991,6 +1161,100 @@ mod tests {
         fs::write(record_path(&ops, &key).join("x"), b"").unwrap();
         let faults = settle_until_fault(&mut store);
         assert!(matches!(&faults[..], [StoreEvent::Fault(_)]), "{faults:?}");
+        // After a fault no job goes again: the failed write is not resent, and no spawn is admitted.
+        store.pump(2);
+        assert_eq!(store.in_flight(), 0);
+        assert_eq!(store.create_spawn("c", 0), Err(CreateRefused::Closed));
+        assert!(
+            store.quiesce().is_empty(),
+            "the quiesce does not wait for a job"
+        );
+    }
+
+    /// Design section 4a, API 3 (R-122 U1, U2): `forget_spawn` deletes a durable `starting` record, then reports
+    /// `Forgotten`. Only a plain durable `starting` record can be forgotten.
+    #[test]
+    fn forget_deletes_a_starting_record() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        store.end_recovery();
+        let a = store.create_spawn("a", 0).unwrap();
+        assert!(store.forget_spawn(&a).is_err(), "not durable yet");
+        events(&mut store, 1);
+        store.forget_spawn(&a).unwrap();
+        assert!(store.forget_spawn(&a).is_err(), "a forget waits already");
+        assert_eq!(store.get_spawn(&a), Lookup::NotFound);
+        assert!(store.finish_spawn(&a, Terminal::Installed, 1).is_err());
+        assert_eq!(
+            settle(&mut store, 0),
+            vec![StoreEvent::Forgotten {
+                operation_id: a.clone()
+            }]
+        );
+        assert!(files(tmp.path()).is_empty());
+        assert_eq!(store.len(), 0);
+        let b = store.create_spawn("b", 0).unwrap();
+        events(&mut store, 1);
+        store.finish_spawn(&b, Terminal::Cancelled, 1).unwrap();
+        assert!(store.forget_spawn(&b).is_err(), "a terminal state waits");
+        settle(&mut store, 0);
+        assert!(store.forget_spawn(&b).is_err(), "not starting");
+        assert!(store.forget_spawn("nope").is_err());
+        store.close();
+    }
+
+    /// Sol S2-HD-11: a record with `remove_row: true` is not swept and survives a restart; after `clear_remove_row` it is
+    /// written again with `false`, and the sweep then deletes it after its retention.
+    #[test]
+    fn remove_row_blocks_the_sweep_until_cleared() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        store.end_recovery();
+        let a = store.create_spawn("a", 0).unwrap();
+        events(&mut store, 1);
+        store.finish_with_cleanup(&a, 100).unwrap();
+        settle(&mut store, u64::MAX);
+        settle(&mut store, u64::MAX);
+        assert!(
+            matches!(store.get_spawn(&a), Lookup::Found(r) if r.remove_row && r.reason == Some(FailReason::Internal))
+        );
+        assert_eq!(store.remove_rows(), vec![(a.clone(), "a".to_string())]);
+        store.close();
+        let mut store = open(tmp.path());
+        store.end_recovery();
+        assert_eq!(store.remove_rows(), vec![(a.clone(), "a".to_string())]);
+        settle(&mut store, u64::MAX);
+        assert!(matches!(store.get_spawn(&a), Lookup::Found(_)));
+        store.clear_remove_row(&a).unwrap();
+        assert!(store.remove_rows().is_empty());
+        settle(&mut store, 0);
+        assert!(matches!(store.get_spawn(&a), Lookup::Found(r) if !r.remove_row));
+        settle(&mut store, 1099);
+        assert!(matches!(store.get_spawn(&a), Lookup::Found(_)));
+        settle(&mut store, 1100);
+        assert_eq!(store.get_spawn(&a), Lookup::NotFound);
+        store.close();
+    }
+
+    /// A marker clear while the marker's own write is in flight is written after it, so the last durable state is
+    /// `remove_row: false`.
+    #[test]
+    fn clear_during_the_marker_write_is_kept() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        store.end_recovery();
+        let a = store.create_spawn("a", 0).unwrap();
+        events(&mut store, 1);
+        store.finish_with_cleanup(&a, 100).unwrap();
+        store.pump(0);
+        assert_eq!(store.in_flight(), 1);
+        store.clear_remove_row(&a).unwrap();
+        assert!(store.remove_rows().is_empty());
+        settle(&mut store, 0);
+        assert!(matches!(store.get_spawn(&a), Lookup::Found(r) if !r.remove_row));
+        store.close();
+        let mut store = open(tmp.path());
+        assert!(store.remove_rows().is_empty());
         store.close();
     }
 
