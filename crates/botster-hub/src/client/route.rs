@@ -9,9 +9,8 @@
 //! The owner calls every method in one turn with the `now` it read for that turn. Core is not called here: the owner
 //! calls `attach` after [`RouteTables::connect`] returns [`Connect::Consumed`], in the same step.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use botster_hub_contract::prelude::{BusyData, Close, CloseReason, HubShutdownData, ServerFrame};
+use data_encoding::BASE64URL_NOPAD;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -84,7 +83,7 @@ impl std::error::Error for EntropyError {}
 fn random_text(entropy: &mut impl Entropy, len: usize) -> Result<String, EntropyError> {
     let mut bytes = vec![0u8; len];
     entropy.fill(&mut bytes)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    Ok(BASE64URL_NOPAD.encode(&bytes))
 }
 
 /// A reservation that a valid connect consumed. The owner uses it for the Core `attach` of the same step.
@@ -377,8 +376,17 @@ mod tests {
         let b = t
             .reserve(Instant::now(), "op", 1, "s", &mut OsEntropy)
             .unwrap();
-        assert_eq!(URL_SAFE_NO_PAD.decode(&a.route_id).unwrap().len(), 16);
-        assert_eq!(URL_SAFE_NO_PAD.decode(&a.route_token).unwrap().len(), 32);
+        assert_eq!(
+            BASE64URL_NOPAD.decode(a.route_id.as_bytes()).unwrap().len(),
+            16
+        );
+        assert_eq!(
+            BASE64URL_NOPAD
+                .decode(a.route_token.as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
         assert_eq!(a.route_token.len(), 43);
         assert_ne!(a, b);
     }

@@ -14,8 +14,8 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 anyhow = "1"
-# Route ids and tokens on the wire: base64url with no padding (the same major as Core v1).
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# Route ids and tokens on the wire: base64url with no padding (the same crate as Core v1 and the daemon).
+data-encoding = "2"
 # The OS CSPRNG for route ids and tokens (the same major as Core v1).
 getrandom = "0.4"
 # getpeereid on macOS (TB-L3); rustix has SO_PEERCRED for Linux only, and std's peer_cred is unstable.

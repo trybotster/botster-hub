@@ -14,10 +14,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-base64.workspace = true
 botster-hub-contract.workspace = true
 botster-plugin-contract.workspace = true
 botster-route-codec.workspace = true
+data-encoding.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 serde.workspace = true
