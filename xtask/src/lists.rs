@@ -319,14 +319,9 @@ mod tests {
         ];
         let waits = [row(5, "HP", "conf::w")];
         assert_eq!(
-            verdict(
-                &minimum,
-                &pending(&[("HP", "conf::a"), ("HP", "conf::w")]),
-                &waits,
-                &ledger()
-            ),
+            verdict(&minimum, &pending(&[("HP", "conf::w")]), &waits, &ledger()),
             Ok(vec![
-                "lists: minimum 4, pending 2, running 2, waiting for an amendment 1".to_string(),
+                "lists: minimum 4, pending 1, running 3, waiting for an amendment 1".to_string(),
                 format!("lists: waits: HP conf::w ({WAITS}:5)"),
             ])
         );
