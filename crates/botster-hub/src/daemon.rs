@@ -4,13 +4,14 @@
 //! writes the ready line (HC HS-0). [`Daemon::wait`] is `main`'s wait on the lifecycle channel; it returns when the stop
 //! order has run to the end.
 
-use crate::bridge::{Bridge, LaneCaps};
+use crate::bridge::{Bridge, LaneCaps, OutboxCaps};
 use crate::client::handoff::{RouteConfig, RouteParams};
+use crate::client::server::{ProtocolConfig, Server, ServerConfig, SharedLimits, FIRST_CLIENT};
 use crate::failure::{FailCode, StartFailure};
 use crate::fsutil::ensure_dir;
 use crate::owner::{guarded, Adoption, Owner, TurnCounts};
 use crate::phase::{
-    request_stop, Ended, Lifecycle, Phase, SharedPhase, StopCause, LIFECYCLE_CAPACITY,
+    request_stop, Ended, Lifecycle, Phase, SharedPhase, StopCause, Wake, LIFECYCLE_CAPACITY,
 };
 use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
@@ -47,6 +48,12 @@ pub struct DaemonConfig {
     pub watches: WatchLimits,
     /// The route reservations (client protocol design, section 2.1).
     pub routes: RouteConfig,
+    /// A control connection's outbox. `replies` is `welcome.limits.max_outstanding` (HC EN-4).
+    pub outbox: OutboxCaps,
+    /// The client protocol's own numbers (PC's layer).
+    pub protocol: ProtocolConfig,
+    /// Stop step 3: the longest time `io` writes the outboxes before it removes the socket (design section 5).
+    pub stop_flush: Duration,
 }
 
 impl DaemonConfig {
@@ -89,7 +96,37 @@ impl DaemonConfig {
                 query_deadline: Duration::from_millis(200),
                 pending_ends: 1024,
             },
+            // The Hub's defaults: HC CF-2 lists `max_outstanding` with no number, and neither the HC nor the design sets
+            // the flush bound.
+            outbox: OutboxCaps {
+                replies: 64,
+                frames: 1024,
+                watch_queue: 256,
+            },
+            protocol: ProtocolConfig::production(),
+            stop_flush: Duration::from_millis(500),
         }
+    }
+
+    /// The server's parameters. Each `welcome.limits` number comes from the one part that enforces it.
+    fn server(&self, identity: &Identity, uid: u32) -> ServerConfig {
+        let shared = SharedLimits {
+            max_watches: self.watches.max_watches as u64,
+            max_outstanding: self.outbox.replies as u64,
+            operation_retention_seconds: self.store.retention_ms / 1000,
+            route_connect_seconds: self.routes.connect_window.as_secs(),
+            query_client_deadline_ms: self.routes.query_deadline.as_millis() as u64,
+            max_paste_bytes: self.core_limits.max_paste_bytes,
+            max_file_bytes: self.core_limits.max_file_bytes,
+        };
+        ServerConfig::compose(
+            &self.protocol,
+            shared,
+            identity.hub_id.clone(),
+            identity.incarnation.clone(),
+            uid,
+            self.outbox,
+        )
     }
 }
 
@@ -184,7 +221,7 @@ impl Daemon {
         let (adopted_tx, adopted) = sync_channel(1);
         // The store index is loaded strictly before the owner starts: a record that cannot be resolved fails the start
         // `data_root_unusable` before anything is bound (design section 4a, "Load at start").
-        let store = SpawnStore::open(&roots.data_root, config.store, owner_waker)?;
+        let store = SpawnStore::open(&roots.data_root, config.store, owner_waker.clone())?;
         let owner = Owner::new(
             core,
             bridge.clone(),
@@ -198,6 +235,10 @@ impl Daemon {
             &config.routes,
             roots.data_root.join("sessions"),
         ));
+        // `welcome.terminal_format`'s common set: the owner keeps it (R-124), and the server reads it.
+        let formats = owner.routes().map(|routes| routes.formats());
+        let server_config = config.server(&identity, uid);
+        let owner_wake: Arc<dyn Wake> = owner_waker.clone();
         let owner = {
             let phase = phase.clone();
             let lifecycle_tx = lifecycle_tx.clone();
@@ -241,12 +282,20 @@ impl Daemon {
                 return Err(unavailable(error));
             }
         };
+        let client = Client {
+            bridge: bridge.clone(),
+            owner_wake,
+            formats: formats.expect("the owner has its route tables"),
+            config: server_config,
+            stop_flush: config.stop_flush,
+        };
         let io = match spawn_io(
             listener,
             &roots.socket,
             &phase,
             &lifecycle_tx,
             config.handle_signals,
+            client,
         ) {
             Ok(io) => io,
             Err(error) => {
@@ -459,15 +508,35 @@ fn owner_loop(
     }
 }
 
+/// What `io` needs for the client protocol server.
+struct Client {
+    bridge: Arc<Bridge>,
+    owner_wake: Arc<dyn Wake>,
+    formats: Arc<crate::client::formats::CommonFormats>,
+    config: ServerConfig,
+    stop_flush: Duration,
+}
+
 fn spawn_io(
     mut listener: UnixListener,
     socket: &std::path::Path,
     phase: &Arc<SharedPhase>,
     lifecycle: &SyncSender<Lifecycle>,
     handle_signals: bool,
+    client: Client,
 ) -> std::io::Result<JoinHandle<()>> {
     let poll = Poll::new()?;
     let waker = Arc::new(Waker::new(poll.registry(), IO_WAKE)?);
+    let io_wake: Arc<dyn Wake> = waker.clone();
+    let server = Server::new(
+        poll.registry().try_clone()?,
+        client.bridge,
+        phase.clone(),
+        io_wake,
+        client.owner_wake,
+        client.formats,
+        client.config,
+    );
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     let signals = if handle_signals {
@@ -495,6 +564,9 @@ fn spawn_io(
                 socket,
                 phase,
                 lifecycle,
+                server,
+                stop_flush: client.stop_flush,
+                flush_until: None,
             };
             let ended = match catch_unwind(AssertUnwindSafe(|| io.run())) {
                 Ok(()) => Ended::Clean,
@@ -504,8 +576,8 @@ fn spawn_io(
         })
 }
 
-/// The `io` thread: the listener and the signal pipe. The client protocol server plugs in at the next step; until then a
-/// connection is accepted and closed at once.
+/// The `io` thread: the listener, the signal pipe and the client protocol server (PC's `client::Server`). `io` keeps the
+/// poll and the stop order; the server keeps the connections.
 struct Io {
     poll: Poll,
     listener: Option<UnixListener>,
@@ -513,20 +585,40 @@ struct Io {
     socket: PathBuf,
     phase: Arc<SharedPhase>,
     lifecycle: SyncSender<Lifecycle>,
+    server: Server,
+    stop_flush: Duration,
+    /// Stop step 3: the end of the flush, set when `io` first sees `OwnerDone`.
+    flush_until: Option<Instant>,
 }
 
 impl Io {
     fn run(&mut self) {
-        let mut events = Events::with_capacity(16);
+        let mut events = Events::with_capacity(64);
         loop {
             match self.phase.get() {
                 Phase::Running | Phase::Stopping => {}
-                Phase::OwnerDone => self.remove_socket(),
+                // Step 3: write the outboxes for at most `stop_flush`, so a client that never reads cannot hold the stop.
+                Phase::OwnerDone => {
+                    let now = Instant::now();
+                    let until = *self.flush_until.get_or_insert(now + self.stop_flush);
+                    if self.server.flush() || now >= until {
+                        self.remove_socket();
+                    }
+                }
                 Phase::SocketRemoved => {}
-                // Step 5: `close { hub_shutdown, lock_released: true }` goes to each connection here (protocol step).
-                Phase::LockReleased => return,
+                // Step 5: `close { hub_shutdown, lock_released: true }` where `io` can still write, then the end.
+                Phase::LockReleased => {
+                    self.server.close_all();
+                    return;
+                }
             }
-            if let Err(error) = self.poll.poll(&mut events, None) {
+            let flush = self.flush_until.filter(|_| self.listener.is_some());
+            let deadline = match (self.server.next_deadline(), flush) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            if let Err(error) = self.poll.poll(&mut events, timeout) {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -534,10 +626,17 @@ impl Io {
             }
             for event in events.iter() {
                 match event.token() {
+                    // The outboxes and the phase share the wake: drain at each one.
+                    IO_WAKE => self.server.drain_outboxes(),
                     LISTENER => self.accept(),
                     SIGNALS => self.signals(),
+                    token if token.0 >= FIRST_CLIENT => self.server.ready(token, event),
                     _ => {}
                 }
+            }
+            let now = Instant::now();
+            if self.server.next_deadline().is_some_and(|d| d <= now) {
+                self.server.expire(now);
             }
         }
     }
@@ -546,8 +645,9 @@ impl Io {
         let Some(listener) = &self.listener else {
             return;
         };
-        // No protocol yet: each connection is closed at once (dropped).
-        while let Ok((_stream, _)) = listener.accept() {}
+        while let Ok((stream, _)) = listener.accept() {
+            self.server.accept(stream, Instant::now());
+        }
     }
 
     fn signals(&mut self) {

@@ -251,3 +251,68 @@ fn undecodable_record_fails_start_before_bind() {
     );
     assert_eq!(daemon.wait().code(), 0);
 }
+
+fn send_frame(client: &mut std::os::unix::net::UnixStream, value: &serde_json::Value) {
+    use std::io::Write;
+    let body = serde_json::to_vec(value).unwrap();
+    let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    client.write_all(&bytes).unwrap();
+}
+
+fn read_frame(client: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    use std::io::Read;
+    let mut prefix = [0u8; 4];
+    client.read_exact(&mut prefix).unwrap();
+    let mut body = vec![0u8; u32::from_be_bytes(prefix) as usize];
+    client.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The `io` loop with the client protocol server on the real Core: `hello` gets `welcome` with the composed limits (each
+/// number from the part that enforces it), and the stop ends a control connection with `close { hub_shutdown,
+/// lock_released: true }` (HC HS-9, stop step 5), then end of file.
+#[test]
+fn a_control_connection_gets_welcome_then_the_stop_close() {
+    use std::io::Read;
+    let tmp = short_root();
+    let roots = roots_in(tmp.path());
+    let daemon = Daemon::start(&roots, uid(), config()).unwrap();
+    let mut client = std::os::unix::net::UnixStream::connect(&roots.socket).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    send_frame(
+        &mut client,
+        &serde_json::json!({"type": "hello", "protocol": "botster-hub", "versions": {"min": 1, "max": 1},
+            "client": {"name": "t", "version": "0"}, "features": [], "terminal_formats": []}),
+    );
+    let welcome = read_frame(&mut client);
+    assert_eq!(welcome["type"], "welcome", "{welcome}");
+    assert_eq!(welcome["hub_id"], daemon.identity.hub_id.as_str());
+    assert_eq!(welcome["incarnation"], daemon.identity.incarnation.as_str());
+    let limits = &welcome["limits"];
+    assert_eq!(limits["max_outstanding"], 64);
+    assert_eq!(limits["max_watches"], 32);
+    assert_eq!(limits["operation_retention_seconds"], 86_400);
+    assert_eq!(limits["route_connect_seconds"], 10);
+    let replies = outbox();
+    assert_eq!(
+        ask(&daemon, &replies, 1, Request::Shutdown),
+        Answer::Stopping
+    );
+    assert_eq!(daemon.wait().code(), 0);
+    let close = read_frame(&mut client);
+    assert_eq!(close["type"], "close", "{close}");
+    assert_eq!(
+        close["reason"]["hub_shutdown"]["lock_released"], true,
+        "{close}"
+    );
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        client.read(&mut byte).unwrap(),
+        0,
+        "end of file after the close"
+    );
+    assert!(!roots.socket.exists());
+}
