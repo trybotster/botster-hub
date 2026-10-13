@@ -5,6 +5,7 @@
 //! order has run to the end.
 
 use crate::bridge::{Bridge, LaneCaps};
+use crate::client::handoff::{RouteConfig, RouteParams};
 use crate::failure::{FailCode, StartFailure};
 use crate::fsutil::ensure_dir;
 use crate::owner::{guarded, Adoption, Owner, TurnCounts};
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The parameters of a daemon (small test values; HP LM-5 rule).
 #[derive(Debug, Clone)]
@@ -44,6 +45,8 @@ pub struct DaemonConfig {
     pub store: StoreConfig,
     /// The watch table (design section 4; HC BD-1 `max_watches` at least 32).
     pub watches: WatchLimits,
+    /// The route reservations (client protocol design, section 2.1).
+    pub routes: RouteConfig,
 }
 
 impl DaemonConfig {
@@ -77,6 +80,14 @@ impl DaemonConfig {
                 retention_ms: 86_400_000,
                 max_record_bytes: 4096,
                 turn_sweeps: 8,
+            },
+            // The Hub's defaults (HC CF-2 `[limits] route_connect_seconds` and `[routes] query_client_deadline_ms`, reported
+            // in `welcome.limits` and `route_limits`); the HC sets no number for either.
+            routes: RouteConfig {
+                max_reservations: 256,
+                connect_window: Duration::from_secs(10),
+                query_deadline: Duration::from_millis(200),
+                pending_ends: 1024,
             },
         }
     }
@@ -182,7 +193,11 @@ impl Daemon {
             config.counts,
             config.watches,
         )
-        .with_store(store);
+        .with_store(store)
+        .with_routes(RouteParams::new(
+            &config.routes,
+            roots.data_root.join("sessions"),
+        ));
         let owner = {
             let phase = phase.clone();
             let lifecycle_tx = lifecycle_tx.clone();
@@ -434,7 +449,6 @@ fn owner_loop(
             continue;
         }
         let timeout = owner
-            .core()
             .next_deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if let Err(error) = poll.poll(&mut events, timeout) {
