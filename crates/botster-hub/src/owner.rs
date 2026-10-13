@@ -2273,6 +2273,30 @@ mod tests {
         }
     }
 
+    /// R-124: the owner refreshes the common formats on each session change; a row's formats leave with it. The fake
+    /// Core announces `GHOSTSNP/1` for every session it knows, so the starting-session rule (an empty
+    /// `snapshot_formats` is left out) is proved in `client::formats` tests, not here.
+    #[test]
+    fn the_owner_refreshes_the_welcome_format_as_sessions_come_and_go() {
+        let wanted = vec!["ghostsnp/2+raw".to_string(), "ghostsnp/1+raw".to_string()];
+        let store = FakeStore::new();
+        let mut rig = with_routes(rig(open(&store)));
+        rig.adopt();
+        let formats = rig.owner.routes().unwrap().formats();
+        assert_eq!(formats.pick(&wanted), None, "no session, no format");
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        assert_eq!(formats.pick(&wanted), Some("ghostsnp/1+raw".into()));
+        rig.submit(2, Request::Op(Box::new(Op::Remove { id: sid("a") })));
+        rig.settle(64);
+        assert!(rig.owner.view().is_empty());
+        assert_eq!(
+            formats.pick(&wanted),
+            None,
+            "the removed row's formats left"
+        );
+    }
+
     #[test]
     fn a_route_is_reserved_and_connected_through_the_bridge() {
         let mut rig = route_rig();
