@@ -114,7 +114,7 @@ limits=(--cpus "$cpus" --cpu-shares "$shares" --memory "$(( cpus * 2 + 4 + tmp_g
 #
 # User: under rootless Docker, container uid 0 is the host user and every other uid maps into a subordinate range that cannot
 # write the host user's bind mounts, so a rootless daemon runs the containers as 0:0. Otherwise the containers run as the
-# host user. `run_user=... online ...` overrides it for one call.
+# host user.
 run_user="$(id -u):$(id -g)"
 if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then run_user=0:0; fi
 run_container() {
@@ -263,8 +263,9 @@ if (( private_git_deps )); then
     echo "no GitHub token: $token_file does not exist, and only a Mac node falls back to 'gh auth token'" >&2
     exit 3
   fi
-  # The fetch runs as container root: under rootless Docker only uid 0 reads the pool user's 0600 token file.
-  run_user=0:0 online --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" "${token_mount[@]}" -w /work \
+  # The fetch runs as run_user, like the gate that reuses its cargo volume. Under rootless Docker that is container root,
+  # the only uid that reads the pool user's 0600 token file; under rootful Docker (a Mac node) it is the host user.
+  online --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" "${token_mount[@]}" -w /work \
     -e GIT_TERMINAL_PROMPT=0 -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=credential.https://github.com.helper \
     -e 'GIT_CONFIG_VALUE_0=!f() { cat >/dev/null; [ "$1" = get ] || exit 0; echo username=x-access-token; printf "password=%s\n" "$(cat /run/testq-secrets/github-token)"; }; f' \
