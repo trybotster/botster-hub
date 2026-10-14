@@ -2,8 +2,9 @@
 //! lean"; the values of Core's xtask).
 //!
 //! The default tier: nextest's `ci` profile terminates a test at 2 s and fails it (`.config/nextest.toml`), and the tier
-//! as a whole must finish in 60 s. The slow tier runs the `slow` features of the members that have one, with no per-test
-//! limit and a 600 s deadline; with no such member it has no test and passes. The slowest tests are printed from nextest's
+//! as a whole must finish in 60 s. The slow tier runs the `slow` features of the members that have one; nextest terminates
+//! a test of it after 600 s. nextest ends each terminated test's process group, so the xtask has no deadline of its own;
+//! with no such member the slow tier has no test and passes. The slowest tests are printed from nextest's
 //! JUnit file.
 
 use anyhow::{bail, Context, Result};
@@ -17,8 +18,6 @@ use std::time::{Duration, Instant};
 pub const TEST_LIMIT_SECS: f64 = 2.0;
 /// The default tier as a whole must finish within this.
 pub const TIER_LIMIT: Duration = Duration::from_secs(60);
-/// The slow tier's deadline.
-pub const SLOW_DEADLINE: Duration = Duration::from_secs(600);
 
 /// The tier that the arguments name: `false` the default tier, `true` the slow tier.
 ///
@@ -104,10 +103,10 @@ pub fn nextest_args(slow: bool, members: &[String]) -> Vec<String> {
     args
 }
 
-/// The tier's run: nextest under the tier's deadline, then the JUnit report.
+/// The tier's run: nextest, then the JUnit report.
 ///
 /// # Errors
-/// nextest fails, the tier passes its deadline, or a test passes its limit.
+/// nextest fails, the default tier takes over its limit, or a test passes its limit.
 pub fn command(root: &Path, args: &[String]) -> Result<()> {
     let slow = parse_tier(args).map_err(anyhow::Error::msg)?;
     let members = if slow {
@@ -134,11 +133,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let (profile, deadline) = if slow {
-        ("slow", SLOW_DEADLINE)
-    } else {
-        ("ci", TIER_LIMIT)
-    };
+    let profile = if slow { "slow" } else { "ci" };
     // The build is not part of the tier's time: build first, then start the clock.
     let built = Command::new("cargo")
         .current_dir(root)
@@ -150,25 +145,11 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         bail!("the tests did not build ({built})");
     }
     let start = Instant::now();
-    let mut child = Command::new("cargo")
+    let status = Command::new("cargo")
         .current_dir(root)
         .args(nextest_args(slow, &members))
-        .spawn()
+        .status()
         .context("run cargo nextest")?;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("wait for cargo nextest")? {
-            break status;
-        }
-        if start.elapsed() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "the {profile} tier passed its deadline of {} s",
-                deadline.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
     let junit = root.join(format!("target/nextest/{profile}/junit.xml"));
     let times = parse_junit(
         &std::fs::read_to_string(&junit).with_context(|| format!("read {}", junit.display()))?,
@@ -183,6 +164,12 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     }
     if !status.success() {
         bail!("cargo nextest failed ({status})");
+    }
+    if !slow && start.elapsed() > TIER_LIMIT {
+        bail!(
+            "the {profile} tier took over its limit of {} s",
+            TIER_LIMIT.as_secs()
+        );
     }
     let over = if slow {
         Vec::new()

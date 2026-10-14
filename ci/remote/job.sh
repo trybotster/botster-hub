@@ -37,8 +37,8 @@ image_inputs=(rust-toolchain.toml)
 extra_volumes=()
 # Environment of the fetch and gate containers. None.
 extra_env=()
-# The mutation reports that a failed job keeps, as paths in the tree (target/ is the target volume).
-artifact_paths=(target/mutants.out)
+# The reports that a failed job keeps, as paths in the tree (target/ is the target volume). None.
+artifact_paths=()
 # --------------------------------------------------------------------------------------------------------------------------
 
 . "$(dirname "$0")/job-common.sh"

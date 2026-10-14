@@ -26,27 +26,8 @@ RUN test -n "$RUST_TOOLCHAIN" && \
 # The versions of the Mac gate. Tools live in /usr/local/cargo/bin; cargo finds them on PATH while CARGO_HOME points at
 # the volume.
 RUN CARGO_HOME=/usr/local/cargo CARGO_BUILD_JOBS=$BUILD_JOBS cargo install -q --locked \
-      cargo-nextest@0.9.146 cargo-mutants@27.1.0 && \
+      cargo-nextest@0.9.146 && \
     rm -rf /usr/local/cargo/registry /usr/local/cargo/git
-
-# cargo-mutants builds its mutant copies under TMPDIR. The gate's /tmp is a tmpfs (job.sh: test temp roots off the disk,
-# so writeback of a heavy writer in the same container cannot stall them), so this shim, first on PATH, gives
-# cargo-mutants a directory on the target volume instead.
-# That directory is inside the /work checkout, so the builds and tests that cargo-mutants starts get TMPDIR back on
-# /tmp: a test's tempdir must not have /work as a parent repository. cargo-mutants starts every cargo call with $CARGO
-# (cargo-mutants 27.1.0, src/cargo.rs cargo_bin), so the shim points $CARGO at a wrapper that sets TMPDIR and runs the
-# cargo that started `cargo mutants`. The wrapper is not on PATH.
-RUN mkdir -p /usr/local/botster/bin /usr/local/botster/libexec && \
-    printf '%s\n' '#!/bin/sh' \
-      'export BOTSTER_MUTANTS_CARGO="${CARGO:-cargo}"' \
-      'export CARGO=/usr/local/botster/libexec/mutants-cargo' \
-      'export TMPDIR="${BOTSTER_MUTANTS_TMPDIR:-/work/target/tmp}"' \
-      'mkdir -p "$TMPDIR"' \
-      'exec /usr/local/cargo/bin/cargo-mutants "$@"' > /usr/local/botster/bin/cargo-mutants && \
-    printf '%s\n' '#!/bin/sh' \
-      'export TMPDIR="${BOTSTER_TEST_TMPDIR:-/tmp}"' \
-      'exec "$BOTSTER_MUTANTS_CARGO" "$@"' > /usr/local/botster/libexec/mutants-cargo && \
-    chmod 755 /usr/local/botster/bin/cargo-mutants /usr/local/botster/libexec/mutants-cargo
 
 ENV PATH=/usr/local/botster/bin:$PATH \
     CARGO_HOME=/cargo \

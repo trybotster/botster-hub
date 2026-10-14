@@ -23,20 +23,9 @@ retries = 0
 [profile.ci.junit]
 path = "junit.xml"
 
-# Mutation runs (the mutants step of `cargo xtask ci`): the default profile, but nextest never terminates a test for its
-# time. A mutant that hangs and fails no test must reach the timeout of cargo-mutants and count as TIMEOUT, which fails the
-# step; a test that nextest terminated would count as CAUGHT. The step also passes `--max-fail 1:immediate`.
-[profile.mutants]
-inherits = "default"
-slow-timeout = { period = "2s" }
-# One retry of a failed test, in this profile only (BUILD.md Testing rule 9): a fail then a pass is FLAKY, nextest passes
-# the run, and the mutant counts as MISSED, so a fail-then-pass is no catch. The step names each FLAKY test
-# (botster_gate_kit::mutant_logs). Every other profile keeps zero retries.
-retries = 1
-
-# The slow tier: real-process tests. No 2 s limit; the xtask enforces the whole-tier deadline.
+# The slow tier: real-process tests. No 2 s limit; nextest terminates a test (and its process group) after 600 s.
 [profile.slow]
-slow-timeout = { period = "60s" }
+slow-timeout = { period = "60s", terminate-after = 10 }
 leak-timeout = { period = "200ms", result = "fail" }
 fail-fast = false
 

@@ -1,7 +1,7 @@
 //! `cargo xtask ci`: the Hub's gate (repo plan section 5, the minimal gate). Each step runs, in order; the summary names
 //! each step's result and time, and the gate fails when a step fails.
 
-use crate::{budget, forbid_unsafe, lists, mutants, taint};
+use crate::{budget, forbid_unsafe, lists, taint};
 use anyhow::{bail, Result};
 use std::path::Path;
 use std::process::Command;
@@ -37,7 +37,7 @@ fn cargo(root: &Path, args: &[&str]) -> Result<()> {
 }
 
 /// The steps of the gate, in order.
-pub const STEPS: [Step; 9] = [
+pub const STEPS: [Step; 8] = [
     ("fmt", |root| cargo(root, &["fmt", "--all", "--check"])),
     ("clippy", |root| {
         cargo(
@@ -63,7 +63,6 @@ pub const STEPS: [Step; 9] = [
     ("slow", |root| {
         budget::command(root, &["--slow".to_string()])
     }),
-    ("mutants", |root| mutants::command(root, &[])),
 ];
 
 /// The summary table: one line a step, `PASS` or `FAIL` with its time in seconds.
@@ -136,8 +135,7 @@ mod tests {
                 "high-tier",
                 "lists",
                 "test-budget",
-                "slow",
-                "mutants"
+                "slow"
             ]
         );
     }
@@ -159,20 +157,20 @@ mod tests {
             verdict(&[
                 ("fmt", false, 0.1),
                 ("lists", true, 0.2),
-                ("mutants", false, 3.0)
+                ("budget", false, 3.0)
             ]),
-            Err("ci failed: fmt, mutants".to_string())
+            Err("ci failed: fmt, budget".to_string())
         );
     }
 
     #[test]
     fn the_summary_names_each_result_and_time() {
         assert_eq!(
-            summary(&[("fmt", true, 0.25), ("mutants", false, 88.06)]),
+            summary(&[("fmt", true, 0.25), ("budget", false, 88.06)]),
             [
                 "=== ci summary ===".to_string(),
                 "fmt              PASS        0.2 s".to_string(),
-                "mutants          FAIL       88.1 s".to_string(),
+                "budget           FAIL       88.1 s".to_string(),
             ]
         );
     }

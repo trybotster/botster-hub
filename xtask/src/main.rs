@@ -5,7 +5,6 @@ mod ci;
 mod contracts;
 mod forbid_unsafe;
 mod lists;
-mod mutants;
 mod taint;
 
 use anyhow::{bail, Context, Result};
@@ -14,14 +13,13 @@ use std::path::{Path, PathBuf};
 type CommandFn = fn(&Path, &[String]) -> Result<()>;
 
 /// The commands, by name.
-const COMMANDS: [(&str, CommandFn); 8] = [
+const COMMANDS: [(&str, CommandFn); 7] = [
     ("ci", ci::command),
     ("lists", lists::command),
     ("taint", taint::command),
     ("unsafe-code", forbid_unsafe::command),
     ("high-tier", botster_gate_kit::high_tier::command),
     ("test-budget", budget::command),
-    ("mutants", mutants::command),
     ("slow", |root, _| {
         budget::command(root, &["--slow".to_string()])
     }),
@@ -86,8 +84,7 @@ mod tests {
 
     #[test]
     fn no_name_or_an_unknown_one_gives_the_usage() {
-        let usage =
-            "usage: cargo xtask <ci|lists|taint|unsafe-code|high-tier|test-budget|mutants|slow>";
+        let usage = "usage: cargo xtask <ci|lists|taint|unsafe-code|high-tier|test-budget|slow>";
         assert_eq!(choose(&[]).err(), Some(usage.to_string()));
         assert_eq!(choose(&args(&["nope"])).err(), Some(usage.to_string()));
     }

@@ -269,11 +269,10 @@ status=0
 # /tmp is a tmpfs: the kernel throttles every writer of a container whose dirty page cache is at its limit, so the tests'
 # temp roots (git repositories, small files) stalled for seconds while rustc or another test wrote gigabytes in the same
 # container (measured: git init/add/commit 6 ms quiet, 566 ms median and 1.8 s max under such a writer, 13 ms on tmpfs).
-# cargo-mutants keeps its large build copies on the target volume (the image's cargo-mutants shim).
 "$gate" --name "$name" "${offline[@]}" "${gate_env[@]}" "${mounts[@]}" --tmpfs "/tmp:rw,exec,mode=1777,size=${tmp_gb}g" \
   -w /work "$image" "$@" || status=$?
 
-# The mutation reports ($artifact_paths of the settings): botster-contracts writes them in the tree, botster-core in the
+# The failure reports ($artifact_paths of the settings): botster-contracts writes them in the tree, botster-core in the
 # target volume, which only a container sees.
 if (( status )); then
   remove_child "$artifacts" "$artifacts/$run"
