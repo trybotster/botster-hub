@@ -111,10 +111,16 @@ limits=(--cpus "$cpus" --cpu-shares "$shares" --memory "$(( cpus * 2 + 4 + tmp_g
 # host's browsers abort their requests in flight at each such network change (net::ERR_NETWORK_CHANGED in other projects'
 # suites on the pool hosts). `--network none` adds no veth. So `container` runs with no network, and only a step that
 # downloads runs through `online`.
+#
+# User: under rootless Docker, container uid 0 is the host user and every other uid maps into a subordinate range that cannot
+# write the host user's bind mounts, so a rootless daemon runs the containers as 0:0. Otherwise the containers run as the
+# host user. `run_user=... online ...` overrides it for one call.
+run_user="$(id -u):$(id -g)"
+if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then run_user=0:0; fi
 run_container() {
   local network=$1
   shift
-  docker run --rm --init --network "$network" --label "testq.job=$name" "${limits[@]}" --user "$(id -u):$(id -g)" \
+  docker run --rm --init --network "$network" --label "testq.job=$name" "${limits[@]}" --user "$run_user" \
     -e HOME=/tmp "$@" &
   wait $!
 }
@@ -240,19 +246,33 @@ gate_env=(-e TZ=UTC)
 for variable in "${extra_env[@]}"; do gate_env+=(-e "$variable"); done
 
 if (( private_git_deps )); then
-  # Fetch every dependency with the host's GitHub CLI token, in a container that runs no repo code but cargo's resolver.
-  # The token is a 0600 file mounted read-only and read by a git credential helper for github.com only: never in a process
-  # argument, a container's environment, the image, or a volume. The gate container then runs offline.
-  secrets=$(mktemp -d)
-  chmod 700 "$secrets"
-  (umask 077; printf '%s' "$(gh auth token)" > "$secrets/github-token")
-  online --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" -v "$secrets:/run/testq-secrets:ro" -w /work \
+  # Fetch every dependency with a GitHub token, in a container that runs no repo code but cargo's resolver. The token is a
+  # 0600 file mounted read-only and read by a git credential helper for github.com only: never in a process argument, a
+  # container's environment, the image, or a volume. The gate container then runs offline.
+  # On the pool the token is the file of the pool user (owner pooljob, mode 0600), mounted itself. Only a Mac node, which
+  # has no such file, copies the token of the host's GitHub CLI into a temporary file.
+  token_file=$HOME/.config/compute-pool/secrets/botster-github-token
+  if [ -f "$token_file" ]; then
+    token_mount=(--mount "type=bind,src=$token_file,dst=/run/testq-secrets/github-token,readonly")
+  elif [ "$(uname -s)" = Darwin ]; then
+    secrets=$(mktemp -d)
+    chmod 700 "$secrets"
+    (umask 077; printf '%s' "$(gh auth token)" > "$secrets/github-token")
+    token_mount=(-v "$secrets:/run/testq-secrets:ro")
+  else
+    echo "no GitHub token: $token_file does not exist, and only a Mac node falls back to 'gh auth token'" >&2
+    exit 3
+  fi
+  # The fetch runs as container root: under rootless Docker only uid 0 reads the pool user's 0600 token file.
+  run_user=0:0 online --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" "${token_mount[@]}" -w /work \
     -e GIT_TERMINAL_PROMPT=0 -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=credential.https://github.com.helper \
     -e 'GIT_CONFIG_VALUE_0=!f() { cat >/dev/null; [ "$1" = get ] || exit 0; echo username=x-access-token; printf "password=%s\n" "$(cat /run/testq-secrets/github-token)"; }; f' \
     "$image" bash ci/remote/fetch.sh
-  remove_child "${TMPDIR:-/tmp}" "$secrets"
-  secrets=
+  if [ -n "$secrets" ]; then
+    remove_child "${TMPDIR:-/tmp}" "$secrets"
+    secrets=
+  fi
   gate=container
 fi
 # Public sources come in a container with network and without the token (ci/remote/fetch-public.sh; botster-core: the
