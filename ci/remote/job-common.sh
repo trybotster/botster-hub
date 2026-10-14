@@ -8,6 +8,11 @@
 
 dir=$(realpath -- "${1:?job.sh: no snapshot directory}")
 name= secrets= watcher=
+# The GitHub token for private dependencies: the pool's secret BOTSTER_GITHUB_TOKEN (Nomad Variable pool-secrets/botster,
+# compute-pool DESIGN.md "Pool secrets") when the pool gives one, else the host's GitHub CLI login. Kept in a shell
+# variable, not exported, so no later process inherits it.
+export -n github_token 2>/dev/null; github_token=${BOTSTER_GITHUB_TOKEN:-}
+unset BOTSTER_GITHUB_TOKEN
 
 # Deletes <child> only when its real path is one directory directly inside <parent>.
 remove_child() {
@@ -95,9 +100,25 @@ name=testq-$project-$(basename "$dir" | sha1sum | cut -c1-10)
 hash=$(cd "$dir" && { cat ci/remote/Dockerfile "${image_inputs[@]}"; image_args; } | sha256sum | cut -c1-12)
 image=$project-gate:$hash
 toolchain=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$dir/rust-toolchain.toml")
-cargo_volume=$project-cargo
-target_volume=$project-target-$slug
-npm_volume=$project-npm
+# The containers' user: the owner of the job's files, so git accepts /work and the steps can write it. Rootful Docker:
+# this user's uid and gid. Rootless Docker (the compute pool's job user): container uid 0 is this user on the host, and
+# any other container uid is a subordinate uid that owns nothing here (git refuses /work: "dubious ownership"). There
+# the containers run as uid 0 with every capability dropped and no new privileges, so the permission bits still apply
+# to them as to an ordinary owner (no CAP_DAC_OVERRIDE). The tests' root checks (geteuid() == 0) still see root and
+# skip their permission-denied cases; the Mac tier and rootful Linux hosts run those cases.
+# The volumes of a rootless daemon have their own names ($project-rootless-*): volumes that an earlier container user
+# owns are never changed (a job of that user may still use them); they stay idle, and the compute pool removes idle job
+# volumes (pool-volumes). The first rootless job of a project starts with empty caches.
+security=$(docker info --format '{{range .SecurityOptions}}{{println .}}{{end}}') \
+  || { echo "job.sh: docker info failed; the containers' user cannot be chosen" >&2; exit 3; }
+if grep -qx 'name=rootless' <<< "$security"; then
+  ctr_uid=0 ctr_gid=0 ctr_user=(--user 0:0 --cap-drop ALL --security-opt no-new-privileges) vol=$project-rootless
+else
+  ctr_uid=$(id -u) ctr_gid=$(id -g) ctr_user=(--user "$ctr_uid:$ctr_gid") vol=$project
+fi
+cargo_volume=$vol-cargo
+target_volume=$vol-target-$slug
+npm_volume=$vol-npm
 
 # Priority jobs (CI) get more CPU weight when the host is busy. Memory: rustc and the linker need about 2 GB a CPU, plus the
 # gate container's tmpfs /tmp (tmp_gb).
@@ -111,21 +132,22 @@ limits=(--cpus "$cpus" --cpu-shares "$shares" --memory "$(( cpus * 2 + 4 + tmp_g
 # host's browsers abort their requests in flight at each such network change (net::ERR_NETWORK_CHANGED in other projects'
 # suites on the pool hosts). `--network none` adds no veth. So `container` runs with no network, and only a step that
 # downloads runs through `online`.
-#
-# User: under rootless Docker, container uid 0 is the host user and every other uid maps into a subordinate range that cannot
-# write the host user's bind mounts, so a rootless daemon runs the containers as 0:0. Otherwise the containers run as the
-# host user.
-run_user="$(id -u):$(id -g)"
-if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then run_user=0:0; fi
 run_container() {
   local network=$1
   shift
-  docker run --rm --init --network "$network" --label "testq.job=$name" "${limits[@]}" --user "$run_user" \
+  docker run --rm --init --network "$network" --label "testq.job=$name" "${limits[@]}" "${ctr_user[@]}" \
     -e HOME=/tmp "$@" &
   wait $!
 }
 container() { run_container none "$@"; }
 online() { run_container bridge "$@"; }
+# online_stdin: online, with this shell's stdin passed to the container (docker run -i). A background command's stdin is
+# /dev/null unless it is redirected, so run_container's docker gets it explicitly.
+online_stdin() {
+  docker run --rm --init -i --network bridge --label "testq.job=$name" "${limits[@]}" "${ctr_user[@]}" \
+    -e HOME=/tmp "$@" <&0 &
+  wait $!
+}
 
 echo "gate job: $project $(git -C "$dir" rev-parse HEAD) on $(hostname), $cpus CPUs, image $image, target $target_volume"
 
@@ -204,12 +226,12 @@ exec {in_use}>"$locks_dir/use-$target_volume.lock"
 flock -s "$in_use"
 while IFS= read -r stamp; do
   evict "$stamp" "no gate used it for 7 days" || true
-done < <(find "$stamps" -mindepth 1 -maxdepth 1 -type f -name "$project-target-*" -mtime +7)
-count=$(find "$stamps" -mindepth 1 -maxdepth 1 -type f -name "$project-target-*" | wc -l)
+done < <(find "$stamps" -mindepth 1 -maxdepth 1 -type f -name "$vol-target-*" -mtime +7)
+count=$(find "$stamps" -mindepth 1 -maxdepth 1 -type f -name "$vol-target-*" | wc -l)
 while IFS= read -r stamp; do
   (( count > max_targets )) || break
   evict "$stamp" "more than $max_targets target volumes of $project" && count=$(( count - 1 ))
-done < <(evictable "$stamps"/"$project"-target-*)
+done < <(evictable "$stamps"/"$vol"-target-*)
 if below "$floor_gb"; then
   while IFS= read -r stamp; do
     below "$floor_gb" || break
@@ -222,14 +244,33 @@ if (( free_now < fail_gb * 1024 * 1024 * 1024 )); then
   echo "job.sh: Docker's data root $docker_root has $free GiB free, below $fail_gb GiB, after trimming Botster target volumes; the gate does not start. Free space on the host (other projects' volumes, docker build cache)." >&2
   exit 75
 fi
-for volume in "$cargo_volume" "$target_volume" "$npm_volume" "${extra_volumes[@]/#/$project-}"; do
+# A new volume is given to the containers' user while it is empty; if that fails, the job removes the volume again.
+# Then one container checks that every volume's top directory belongs to the containers' user, so a volume whose
+# initialization failed (and whose removal failed too) is never used.
+for volume in "$cargo_volume" "$target_volume" "$npm_volume" "${extra_volumes[@]/#/$vol-}"; do
   volume=${volume%%:*}
   if ! docker volume inspect "$volume" >/dev/null 2>&1; then
     docker volume create "$volume" >/dev/null
-    docker run --rm --network none --label "testq.job=$name" -v "$volume:/v" "$image" chown "$(id -u):$(id -g)" /v &
-    wait $!
+    docker run --rm --network none --label "testq.job=$name" -v "$volume:/v" "$image" chown "$ctr_uid:$ctr_gid" /v &
+    if ! wait $!; then
+      if docker volume rm "$volume" >/dev/null 2>&1; then
+        echo "job.sh: cannot give the new volume $volume to the containers' user $ctr_uid:$ctr_gid; removed it" >&2
+      else
+        echo "job.sh: cannot give the new volume $volume to the containers' user $ctr_uid:$ctr_gid, and cannot remove it; remove it by hand (docker volume rm $volume)" >&2
+      fi
+      exit 3
+    fi
   fi
 done
+owner_mounts=() owner_names=() n=0
+for volume in "$cargo_volume" "$target_volume" "$npm_volume" "${extra_volumes[@]/#/$vol-}"; do
+  owner_mounts+=(-v "${volume%%:*}:/v/$n") owner_names+=("${volume%%:*}") n=$(( n + 1 ))
+done
+docker run --rm --network none --label "testq.job=$name" "${owner_mounts[@]}" "$image" sh -c \
+  'want=$1; shift; n=0; for name; do o=$(stat -c %u:%g "/v/$n") || exit 1
+     [ "$o" = "$want" ] || { echo "job.sh: volume $name is owned by $o, not by $want" >&2; exit 1; }; n=$((n + 1)); done' \
+  sh "$ctr_uid:$ctr_gid" "${owner_names[@]}" &
+wait $! || { echo "job.sh: a volume of this job does not belong to the containers' user $ctr_uid:$ctr_gid (remove it with docker volume rm; it is a cache)" >&2; exit 3; }
 exec {volumes_lock}>&-
 project_free=$(free_on "$projdir" 2>/dev/null) || project_free=
 project_free=${project_free//[[:space:]]/}
@@ -237,7 +278,7 @@ project_free=${project_free//[[:space:]]/}
 echo "gate job: $free GiB free on Docker's data root $docker_root (the target volumes); $project_free free on $projdir"
 
 mounts=(-v "$dir:/work" -v "$target_volume:/work/target" -v "$cargo_volume:/cargo" -v "$npm_volume:/npm")
-for volume in "${extra_volumes[@]}"; do mounts+=(-v "$project-${volume%%:*}:${volume#*:}"); done
+for volume in "${extra_volumes[@]}"; do mounts+=(-v "$vol-${volume%%:*}:${volume#*:}"); done
 # After a fetch step, the gate runs with no network; a project with no fetch step downloads in the gate itself, so its gate
 # runs online.
 gate=online offline=()
@@ -246,34 +287,20 @@ gate_env=(-e TZ=UTC)
 for variable in "${extra_env[@]}"; do gate_env+=(-e "$variable"); done
 
 if (( private_git_deps )); then
-  # Fetch every dependency with a GitHub token, in a container that runs no repo code but cargo's resolver. The token is a
-  # 0600 file mounted read-only and read by a git credential helper for github.com only: never in a process argument, a
-  # container's environment, the image, or a volume. The gate container then runs offline.
-  # On the pool the token is the file of the pool user (owner pooljob, mode 0600), mounted itself. Only a Mac node, which
-  # has no such file, copies the token of the host's GitHub CLI into a temporary file.
-  token_file=$HOME/.config/compute-pool/secrets/botster-github-token
-  if [ -f "$token_file" ]; then
-    token_mount=(--mount "type=bind,src=$token_file,dst=/run/testq-secrets/github-token,readonly")
-  elif [ "$(uname -s)" = Darwin ]; then
-    secrets=$(mktemp -d)
-    chmod 700 "$secrets"
-    (umask 077; printf '%s' "$(gh auth token)" > "$secrets/github-token")
-    token_mount=(-v "$secrets:/run/testq-secrets:ro")
-  else
-    echo "no GitHub token: $token_file does not exist, and only a Mac node falls back to 'gh auth token'" >&2
-    exit 3
-  fi
-  # The fetch runs as run_user, like the gate that reuses its cargo volume. Under rootless Docker that is container root,
-  # the only uid that reads the pool user's 0600 token file; under rootful Docker (a Mac node) it is the host user.
-  online --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" "${token_mount[@]}" -w /work \
+  # Fetch every dependency with the GitHub token (above), in a container that runs no repo code but cargo's resolver.
+  # The token reaches the container on its stdin and is written there to a 0600 file on a tmpfs that only the
+  # container's user owns, read by a git credential helper for github.com only: never in a process argument, a
+  # container's environment, the image, a volume, or a host file. (A host file does not work under rootless Docker: the
+  # container's user, --user, maps to a subordinate uid that cannot read the job user's 0600 file.)
+  if [ -n "$github_token" ]; then echo "job: private dependencies: GitHub token from the pool secret BOTSTER_GITHUB_TOKEN"
+  else echo "job: private dependencies: GitHub token from gh auth token"; github_token=$(gh auth token); fi
+  printf '%s' "$github_token" | online_stdin --name "$name-fetch" "${gate_env[@]}" "${mounts[@]}" -w /work \
+    --tmpfs "/run/testq-secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=$ctr_uid,gid=$ctr_gid" \
     -e GIT_TERMINAL_PROMPT=0 -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=credential.https://github.com.helper \
     -e 'GIT_CONFIG_VALUE_0=!f() { cat >/dev/null; [ "$1" = get ] || exit 0; echo username=x-access-token; printf "password=%s\n" "$(cat /run/testq-secrets/github-token)"; }; f' \
-    "$image" bash ci/remote/fetch.sh
-  if [ -n "$secrets" ]; then
-    remove_child "${TMPDIR:-/tmp}" "$secrets"
-    secrets=
-  fi
+    "$image" bash -c 'umask 077 && cat > /run/testq-secrets/github-token && exec bash ci/remote/fetch.sh </dev/null'
+  github_token=
   gate=container
 fi
 # Public sources come in a container with network and without the token (ci/remote/fetch-public.sh; botster-core: the
