@@ -841,6 +841,10 @@ impl<C: CoreApi> Owner<C> {
                         self.begin_remove(&id);
                     }
                 }
+                // R-124: a worker's formats appear with its state (`Launched`, adoption) and leave with its row.
+                if let Some(routes) = self.routes.as_ref() {
+                    routes.refresh_formats(&self.core, self.view.keys());
+                }
             }
             Event::RouteClosed { .. } | Event::RouteAdopted { .. } => {
                 if let Some(routes) = self.routes.as_mut() {

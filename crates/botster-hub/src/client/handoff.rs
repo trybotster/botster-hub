@@ -8,6 +8,7 @@
 //! - [`route_event`]: Core `RouteClosed` is the only removal from the route table; `RouteAdopted` rebuilds it after a
 //!   Hub restart (DP-8).
 
+use crate::client::formats::{common_formats, CommonFormats};
 use crate::client::route::{Connect, Entropy, NotConnected, OsEntropy, ReserveError, RouteTables};
 use botster_core::contract::prelude::{
     AttachOptions, ClientId, CoreApi, CoreError, CoreLimits, ErrorCode, Event, HistoryMode,
@@ -369,6 +370,8 @@ pub struct Routes {
     pub params: RouteParams,
     ends: VecDeque<RouteEnded>,
     lost: u64,
+    /// `welcome.terminal_format`'s common set (R-124), shared with `io`.
+    formats: Arc<CommonFormats>,
 }
 
 impl Routes {
@@ -378,7 +381,23 @@ impl Routes {
             params,
             ends: VecDeque::new(),
             lost: 0,
+            formats: Arc::new(CommonFormats::default()),
         }
+    }
+
+    /// The common format set that `io` reads at `hello`.
+    pub fn formats(&self) -> Arc<CommonFormats> {
+        self.formats.clone()
+    }
+
+    /// Recomputes the common set over `sessions` (R-124). The owner calls it after each session state change.
+    pub fn refresh_formats<'s, C: CoreApi>(
+        &self,
+        core: &C,
+        sessions: impl Iterator<Item = &'s SessionId>,
+    ) {
+        self.formats
+            .set(common_formats(sessions.map(|id| core.snapshot_formats(id))));
     }
 
     fn push_end(&mut self, end: Option<RouteEnded>) {
