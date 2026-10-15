@@ -6,6 +6,7 @@
 
 use crate::bridge::{Answer, Bridge, Effect, FailKind, Failure, Item, ReplyTo, Request};
 use crate::phase::{request_stop, Ended, Lifecycle, SharedPhase, StopCause};
+use crate::store::{SpawnStore, StoreEvent};
 use botster_core::contract::prelude::{
     CoreApi, CoreError, Event, Now, Op, OpId, OpResult, SessionId, SessionState,
 };
@@ -61,6 +62,12 @@ pub struct Owner<C: CoreApi> {
     adoption: Adoption,
     /// `Shutdown` tokens: answered `Stopping` by the stop drain.
     shutdowns: Vec<ReplyTo>,
+    /// The spawn operation store (design section 4a), when the daemon has one.
+    store: Option<SpawnStore>,
+    /// A store fault was seen: the stop closes the store at once instead of writing pending terminal states.
+    store_failed: bool,
+    /// Store events for the protocol layer (the spawn flow plugs in at the protocol step).
+    spawn_events: Vec<StoreEvent>,
 }
 
 impl<C: CoreApi> Owner<C> {
@@ -82,7 +89,29 @@ impl<C: CoreApi> Owner<C> {
             events_left: false,
             adoption: Adoption::NotStarted,
             shutdowns: Vec::new(),
+            store: None,
+            store_failed: false,
+            spawn_events: Vec::new(),
         }
+    }
+
+    /// Gives the owner the spawn operation store.
+    pub fn with_store(mut self, store: SpawnStore) -> Owner<C> {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn store(&self) -> Option<&SpawnStore> {
+        self.store.as_ref()
+    }
+
+    pub fn store_mut(&mut self) -> Option<&mut SpawnStore> {
+        self.store.as_mut()
+    }
+
+    /// The store events since the last call (`CreateDurable`, `CreateNotWritten`), for the protocol layer.
+    pub fn take_spawn_events(&mut self) -> Vec<StoreEvent> {
+        std::mem::take(&mut self.spawn_events)
     }
 
     pub fn core(&self) -> &C {
@@ -140,8 +169,27 @@ impl<C: CoreApi> Owner<C> {
         for event in events {
             self.apply(event);
         }
+        self.store_turn(now);
         TurnReport {
             runnable: pump.more || self.events_left || !self.bridge.is_empty(),
+        }
+    }
+
+    /// The store's part of a turn: queue pending terminal states and the sweep, then take the completions. A fault starts
+    /// the stop (cause `store_failed`). The wall clock for retention is `now.unix` (design section 4a).
+    fn store_turn(&mut self, now: Now) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        store.pump(now.unix.saturating_mul(1000));
+        for event in store.poll() {
+            match event {
+                StoreEvent::Fault(_) => {
+                    self.store_failed = true;
+                    request_stop(&self.phase, &self.lifecycle, StopCause::StoreFailed);
+                }
+                other => self.spawn_events.push(other),
+            }
         }
     }
 
@@ -225,6 +273,23 @@ impl<C: CoreApi> Owner<C> {
         for reply in self.shutdowns.drain(..) {
             reply.send(Answer::Stopping);
         }
+        // Quiesce the store (Sol finding 6): after a fault, close at once; else write the pending terminal states first.
+        // Either way the store thread has ended when this returns, so no store write follows `OwnerDone`.
+        if let Some(store) = self.store.as_mut() {
+            let events = if self.store_failed {
+                store.close()
+            } else {
+                store.quiesce()
+            };
+            if events.iter().any(|e| matches!(e, StoreEvent::Fault(_))) {
+                self.store_failed = true;
+            }
+        }
+    }
+
+    /// Whether a store fault was seen.
+    pub fn store_failed(&self) -> bool {
+        self.store_failed
     }
 
     /// Ends the owner: returns `Core`, so that the caller drops it on this thread.
@@ -588,6 +653,132 @@ mod tests {
             vec![(1, shutdown(Effect::Unknown)), (2, shutdown(Effect::None))]
         );
         assert_eq!(guarded(&mut rig.owner, |_| {}), Ended::Clean);
+    }
+
+    fn store_config() -> crate::store::StoreConfig {
+        crate::store::StoreConfig {
+            max_records: 4,
+            store_queue: 2,
+            retention_ms: 1000,
+            max_record_bytes: 4096,
+            turn_sweeps: 1,
+        }
+    }
+
+    fn short_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("bh-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    /// Turns until the store has nothing in flight (the store thread is real).
+    fn store_settle(rig: &mut Rig) {
+        for _ in 0..5000 {
+            rig.turn();
+            if rig.owner.store().unwrap().in_flight() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the store did not settle");
+    }
+
+    /// Store completions reach the owner's turn: `CreateDurable` goes to the protocol layer's events.
+    #[test]
+    fn store_completions_reach_the_turn() {
+        let tmp = short_root();
+        let store =
+            crate::store::SpawnStore::open(tmp.path(), store_config(), Arc::new(Count::default()))
+                .unwrap();
+        let store_rig = rig(open(&FakeStore::new()));
+        let mut rig = Rig {
+            owner: store_rig.owner.with_store(store),
+            ..store_rig
+        };
+        let id = rig.owner.store_mut().unwrap().create_spawn("s", 0).unwrap();
+        store_settle(&mut rig);
+        assert_eq!(
+            rig.owner.take_spawn_events(),
+            vec![crate::store::StoreEvent::CreateDurable { operation_id: id }]
+        );
+        rig.phase.advance(Phase::Running, Phase::Stopping);
+        rig.owner.drain();
+        assert!(!rig.owner.store_failed());
+    }
+
+    /// Store fault: a write with an unknown result starts the stop (cause `store_failed`), and the drain closes the store at
+    /// once.
+    #[test]
+    fn store_fault_starts_the_stop() {
+        let tmp = short_root();
+        let store =
+            crate::store::SpawnStore::open(tmp.path(), store_config(), Arc::new(Count::default()))
+                .unwrap();
+        let store_rig = rig(open(&FakeStore::new()));
+        let mut rig = Rig {
+            owner: store_rig.owner.with_store(store),
+            ..store_rig
+        };
+        let id = rig.owner.store_mut().unwrap().create_spawn("s", 0).unwrap();
+        store_settle(&mut rig);
+        rig.owner.take_spawn_events();
+        // A non-empty directory in the record's place makes the next `rename` fail: an unknown result.
+        let ops = tmp.path().join("store/ops");
+        let file = std::fs::read_dir(&ops)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("x"), b"").unwrap();
+        rig.owner
+            .store_mut()
+            .unwrap()
+            .finish_spawn(&id, crate::store::Terminal::Installed, 1)
+            .unwrap();
+        store_settle(&mut rig);
+        assert!(rig.owner.store_failed());
+        assert_eq!(rig.phase.get(), Phase::Stopping);
+        assert_eq!(
+            rig.lifecycle.try_recv(),
+            Ok(Lifecycle::StopRequested(StopCause::StoreFailed))
+        );
+        rig.owner.drain();
+    }
+
+    /// Stop step 2 with a store: the drain writes the pending terminal states, so the next start reads them.
+    #[test]
+    fn drain_writes_pending_terminal_states() {
+        let tmp = short_root();
+        let store =
+            crate::store::SpawnStore::open(tmp.path(), store_config(), Arc::new(Count::default()))
+                .unwrap();
+        let store_rig = rig(open(&FakeStore::new()));
+        let mut rig = Rig {
+            owner: store_rig.owner.with_store(store),
+            ..store_rig
+        };
+        let id = rig.owner.store_mut().unwrap().create_spawn("s", 0).unwrap();
+        store_settle(&mut rig);
+        rig.owner
+            .store_mut()
+            .unwrap()
+            .finish_spawn(&id, crate::store::Terminal::Cancelled, 1)
+            .unwrap();
+        rig.phase.advance(Phase::Running, Phase::Stopping);
+        rig.owner.drain();
+        let mut reopened =
+            crate::store::SpawnStore::open(tmp.path(), store_config(), Arc::new(Count::default()))
+                .unwrap();
+        reopened.end_recovery();
+        assert!(matches!(
+            reopened.get_spawn(&id),
+            crate::store::Lookup::Found(r) if r.state == crate::store::SpawnState::Cancelled
+        ));
+        reopened.close();
     }
 
     /// A waiter whose `Completed` arrives after the drain finds no waiter: no second answer.

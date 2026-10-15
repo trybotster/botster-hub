@@ -13,6 +13,7 @@ use crate::phase::{
 };
 use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
+use crate::store::{restore_spawns, SpawnStore, StoreConfig};
 use botster_core::contract::prelude::{CoreApi, CoreLimits, Now, OpenConfig, SessionId};
 use botster_core::Core;
 use mio::net::UnixListener;
@@ -38,6 +39,8 @@ pub struct DaemonConfig {
     pub worker_path: PathBuf,
     /// Whether `io` handles SIGTERM and SIGINT. A test daemon stops through `Shutdown` instead.
     pub handle_signals: bool,
+    /// The spawn operation store (design section 4a).
+    pub store: StoreConfig,
 }
 
 impl DaemonConfig {
@@ -58,6 +61,14 @@ impl DaemonConfig {
             core_limits: CoreLimits::default(),
             worker_path,
             handle_signals: true,
+            store: StoreConfig {
+                max_records: 4096,
+                store_queue: 64,
+                // `operation_retention_seconds` is the Hub's default (HC CF-2 `[limits]`, reported in `welcome.limits`).
+                retention_ms: 86_400_000,
+                max_record_bytes: 4096,
+                turn_sweeps: 8,
+            },
         }
     }
 }
@@ -144,16 +155,24 @@ impl Daemon {
         let owner_waker =
             Arc::new(Waker::new(owner_poll.registry(), OWNER_WAKE).map_err(internal)?);
         phase.set_owner_waker(owner_waker.clone());
-        let bridge = Arc::new(Bridge::new(config.lanes, phase.clone(), owner_waker));
+        let bridge = Arc::new(Bridge::new(
+            config.lanes,
+            phase.clone(),
+            owner_waker.clone(),
+        ));
         let (lifecycle_tx, lifecycle) = sync_channel(LIFECYCLE_CAPACITY);
         let (adopted_tx, adopted) = sync_channel(1);
+        // The store index is loaded strictly before the owner starts: a record that cannot be resolved fails the start
+        // `data_root_unusable` before anything is bound (design section 4a, "Load at start").
+        let store = SpawnStore::open(&roots.data_root, config.store, owner_waker)?;
         let owner = Owner::new(
             core,
             bridge.clone(),
             phase.clone(),
             lifecycle_tx.clone(),
             config.counts,
-        );
+        )
+        .with_store(store);
         let owner = {
             let phase = phase.clone();
             let lifecycle_tx = lifecycle_tx.clone();
@@ -343,6 +362,7 @@ fn run_owner(
     if ended == Ended::Panicked || !matches!(owner.adoption(), Adoption::Done) {
         request_stop(&phase, &lifecycle, StopCause::OwnerFailed);
     }
+    // The drain quiesces the store too, so no store write follows `OwnerDone` (the lock is released after it).
     owner.drain();
     drop(owner.into_core());
     phase.advance(Phase::Stopping, Phase::OwnerDone);
@@ -376,6 +396,11 @@ fn own_core_until_done(
             match owner.adoption() {
                 Adoption::Done => {
                     reported = true;
+                    // Step 6b: a typed A26 stub (R-121 forbids an interim rule for Core `v1`). `starting` records stay as
+                    // they are on disk; recovery ends, so `get_spawn` answers their durable state.
+                    if let Some(store) = owner.store_mut() {
+                        let _ = restore_spawns(store);
+                    }
                     let _ = adopted.try_send(Ok(owner.view().keys().cloned().collect()));
                 }
                 Adoption::Failed(message) => {
