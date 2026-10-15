@@ -1,4 +1,5 @@
-//! The `session` and `session_type` read kinds of the control envelope (HC sections 5 and 6; design section 7a).
+//! The `session` and `session_type` kinds of the control envelope (HC sections 5 and 6; design sections 7 and 7a): the
+//! reads, and the writes of `session` (`create`, `update{label}`, `delete`).
 //!
 //! One [`ConnKinds`] lives with each control connection on the `io` thread. It never calls Core:
 //! - [`ConnKinds::begin`] turns a `req` into a [`Step`]: an answer now, a request for the owner, or a local watch;
@@ -9,14 +10,30 @@
 //! (one pointer per row), builds and filters them, and a cursor holds the rest (VB-1). A `filter` is an equality map over
 //! the kind's core fields. A watch with a filter keeps the ids that it has shown, so that a row which stops matching gets
 //! `remove` and a row which starts to match gets `upsert` (WT-2).
+//!
+//! The writes:
+//! - `create` mints the session id (128 random bits, HC section 6), builds the `SpawnRequest` with the Hub's labels
+//!   (`create_labels`), and asks the owner for the spawn operation. The answer is the receipt (A.9).
+//! - `update` sets or removes `h/label` through the owner's one label writer (`SetLabels`); the answer is the row.
+//! - `delete` asks the owner for `Remove` of an `ended` or `lost` row (VB-5, A.2c).
+//!
+//! `idempotency_key` and `operation_id` (EN-8, EN-7b) are not served in Stage 2: a mutation that carries one is
+//! `unsupported`, never run twice by a retry.
 
+use crate::bridge::SpawnAnswer;
 use crate::bridge::{Answer, Effect, FailKind, Failure, Outbox, Request};
-use crate::client::rows::{session_row, RowFacts, SessionTypes};
+use crate::client::rows::{
+    create_labels, session_row, RowFacts, SessionTypes, TypeRefused, COMMAND_TYPE, LABEL_KEY,
+};
 use crate::watch::{Row, WatchFilter, WatchFrame as ViewFrame, WatchKey};
-use botster_core::contract::prelude::{CoreError, ErrorCode as CoreCode, SessionId};
+use botster_core::contract::prelude::{
+    CoreError, ErrorCategory, ErrorCode as CoreCode, OpResult, SessionId, Size, SpawnRequest,
+    Timing,
+};
 use botster_hub_contract::prelude::{
     kind_spec, Category, Error, ErrorCode, ErrorEffect, ListArgs, ListResult, OpenObject, Outcome,
-    Req, RequestId, Res, ServerFrame, SnapshotReason, Verb, WatchArgs, WatchClosedReason,
+    Req, RequestId, Res, ServerFrame, SessionCreate, SessionCreateCommand, SessionCreateReceipt,
+    SessionRef, SnapshotReason, StartingTag, UpdateArgs, Verb, WatchArgs, WatchClosedReason,
     WatchFrame, WatchOpened,
 };
 use serde::de::DeserializeOwned;
@@ -42,6 +59,8 @@ pub struct Ctx<'a> {
     pub cursor_idle: Duration,
     pub max_watches: usize,
     pub busy_retry_ms: u64,
+    /// The working directory of a command that names none.
+    pub default_cwd: &'a str,
 }
 
 /// The two kinds that this module serves.
@@ -132,6 +151,11 @@ pub enum Pending {
     Unwatch {
         watch: u64,
     },
+    Create {
+        session: String,
+    },
+    Update,
+    Delete,
 }
 
 /// A watch of this connection.
@@ -306,32 +330,133 @@ pub fn failure_error(ctx: &Ctx, failure: Failure) -> Error {
     }
 }
 
-/// The error of a Core refusal. A read that Core refuses never changed anything: `effect: none`.
-pub fn core_error(error_: &CoreError) -> Error {
-    let none = Some(ErrorEffect::None);
-    match error_.code {
-        CoreCode::UnknownSession => error(
+/// The error of a Core error, from its code and category (HC section 11). `effect` is what the caller knows about the
+/// request: a refusal at `begin` or a read changed nothing; an error of a finished op may have.
+pub fn core_error_with(error_: &CoreError, effect: ErrorEffect) -> Error {
+    let effect = Some(effect);
+    let (code, category, retryable, message) = match error_.code {
+        CoreCode::UnknownSession
+        | CoreCode::UnknownRoute
+        | CoreCode::UnknownService
+        | CoreCode::UnknownCapture => (
             ErrorCode::NotFound,
             Category::Caller,
             false,
-            none,
-            "no such session",
+            "no such resource",
         ),
-        CoreCode::WrongState => error(
-            ErrorCode::WrongState,
-            Category::State,
-            false,
-            none,
-            "the session is in a state that forbids the request",
-        ),
-        _ => error(
+        CoreCode::Cancelled => (ErrorCode::Cancelled, Category::State, false, "cancelled"),
+        // The Hub mints the id, so a used id is a Hub fault.
+        CoreCode::IdInUse => (
             ErrorCode::Internal,
             Category::Fault,
             false,
-            none,
-            "Core refused the request",
+            "the Hub failed to serve the request",
         ),
+        _ => match error_.code.category() {
+            ErrorCategory::Caller => (
+                ErrorCode::InvalidArguments,
+                Category::Caller,
+                false,
+                "Core refused the arguments",
+            ),
+            ErrorCategory::State => (
+                ErrorCode::WrongState,
+                Category::State,
+                false,
+                "the session is in a state that forbids the request",
+            ),
+            ErrorCategory::Capacity => (
+                ErrorCode::Busy,
+                Category::Capacity,
+                true,
+                "Core is at a capacity limit",
+            ),
+            _ => (
+                ErrorCode::Internal,
+                Category::Fault,
+                false,
+                "the Hub failed to serve the request",
+            ),
+        },
+    };
+    error(code, category, retryable, effect, message)
+}
+
+/// The error of a Core refusal at `begin` or of a read: nothing changed.
+pub fn core_error(error_: &CoreError) -> Error {
+    core_error_with(error_, ErrorEffect::None)
+}
+
+/// The error of an op that finished with an error: a synchronous kind of error proves no change; any other may have changed
+/// something (HC section 11.1).
+fn op_error(error_: &CoreError) -> Error {
+    let effect = if matches!(error_.code.timing(), Timing::Sync) {
+        ErrorEffect::None
+    } else {
+        ErrorEffect::Unknown
+    };
+    core_error_with(error_, effect)
+}
+
+/// `idempotency_key` and `operation_id` are not served in Stage 2 (EN-8, EN-7b), so a retry cannot be made safe: the
+/// mutation does not run.
+fn not_served_with(req: &Req) -> Option<Res> {
+    if req.idempotency_key.is_none() && req.operation_id.is_none() {
+        return None;
     }
+    let mut err = error(
+        ErrorCode::Unsupported,
+        Category::Caller,
+        false,
+        Some(ErrorEffect::None),
+        "idempotency_key and operation_id are not served by this Hub",
+    );
+    err.reason = Some("idempotency_not_served".into());
+    Some(res_err(req.id.0, err))
+}
+
+/// The spawn request of a command create (HC A.9). The label of the request travels in `labels` until the caller adds the
+/// Hub's keys.
+fn spawn_request(ctx: &Ctx, command: SessionCreateCommand) -> Result<SpawnRequest, String> {
+    if command.target_id.is_some() {
+        return Err("this Hub has no spawn targets".into());
+    }
+    if command.agent_scopes.is_some() {
+        return Err("agent_scopes is not served yet".into());
+    }
+    let spec = command.command;
+    if spec.argv.first().is_none_or(String::is_empty) {
+        return Err("argv names the program".into());
+    }
+    let (rows, cols) = command.size.map_or((24, 80), |size| (size.rows, size.cols));
+    if rows == 0 || cols == 0 || rows > u32::from(u16::MAX) || cols > u32::from(u16::MAX) {
+        return Err("size is rows and cols from 1 to 65535".into());
+    }
+    let mut labels = BTreeMap::new();
+    if let Some(label) = command.label {
+        labels.insert(LABEL_KEY.to_owned(), label);
+    }
+    Ok(SpawnRequest {
+        argv: spec.argv,
+        env: spec.env.unwrap_or_default(),
+        cwd: spec.cwd.unwrap_or_else(|| ctx.default_cwd.to_owned()),
+        size: Size {
+            rows,
+            cols,
+            cell_px: None,
+        },
+        labels,
+        color_profile: None,
+        notification_policy: None,
+        size_policy: None,
+    })
+}
+
+/// A session id: 128 random bits, hex (HC section 6). The Hub mints it and never reuses it.
+fn mint_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the system gives random bytes");
+    data_encoding::HEXLOWER.encode(&bytes)
 }
 
 fn args<T: DeserializeOwned + Default>(req: &Req) -> Result<T, String> {
@@ -435,6 +560,16 @@ impl ConnKinds {
             Verb::Get => Self::begin_get(kind, req, ctx),
             Verb::Watch => self.begin_watch(ctx, conn, outbox, kind, req),
             Verb::Unwatch => self.begin_unwatch(conn, req),
+            Verb::Create | Verb::Update | Verb::Delete if kind == Kind::Session => {
+                if let Some(refused) = not_served_with(req) {
+                    return Step::Reply(refused);
+                }
+                match req.verb {
+                    Verb::Create => Self::begin_create(ctx, req),
+                    Verb::Update => Self::begin_update(req),
+                    _ => Self::begin_delete(req),
+                }
+            }
             _ => Step::Reply(unsupported(id, "this verb is not served yet")),
         }
     }
@@ -677,6 +812,107 @@ impl ConnKinds {
         }
     }
 
+    fn begin_create(ctx: &Ctx, req: &Req) -> Step {
+        let id = req.id.0;
+        let Some(value) = req.args.clone() else {
+            return Step::Reply(invalid(id, "create needs args"));
+        };
+        let create: SessionCreate = match serde_json::from_value(value) {
+            Ok(create) => create,
+            Err(_) => {
+                return Step::Reply(invalid(
+                    id,
+                    "args are neither { command, .. } nor { session_type_id, .. }",
+                ))
+            }
+        };
+        let command = match create {
+            SessionCreate::Command(command) => command,
+            SessionCreate::Type(by_type) => {
+                // The registry check comes before `Spawn` (design section 7a).
+                return Step::Reply(match ctx.types.for_create(&by_type.session_type_id) {
+                    Err(TypeRefused::Unknown) => invalid(id, "no such session type"),
+                    Err(TypeRefused::NotByIdentifier) => {
+                        invalid(id, "this session type is created with a command")
+                    }
+                    // A type with a definition to run comes with the plugin kinds.
+                    Ok(_) => unsupported(id, "creating by session type is not served yet"),
+                });
+            }
+        };
+        let mut request = match spawn_request(ctx, command) {
+            Ok(request) => request,
+            Err(message) => return Step::Reply(invalid(id, &message)),
+        };
+        let session = mint_session_id();
+        request.labels = create_labels(
+            &SessionId(session.clone()),
+            request.labels.get(LABEL_KEY).map(String::as_str),
+            COMMAND_TYPE,
+        );
+        Step::Owner(
+            Request::Spawn {
+                session: SessionId(session.clone()),
+                request: Box::new(request),
+            },
+            Pending::Create { session },
+        )
+    }
+
+    fn begin_update(req: &Req) -> Step {
+        let id = req.id.0;
+        let Some(target) = req.target.as_deref() else {
+            return Step::Reply(invalid(id, "update needs a target"));
+        };
+        let update: UpdateArgs = match req
+            .args
+            .clone()
+            .ok_or_else(|| "update needs args".to_owned())
+            .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        {
+            Ok(update) => update,
+            Err(message) => return Step::Reply(invalid(id, &message)),
+        };
+        if update.if_rev.is_some() {
+            return Step::Reply(unsupported(
+                id,
+                "if_rev is not served: the row has no rev yet",
+            ));
+        }
+        let (mut set, mut remove) = (BTreeMap::new(), Vec::new());
+        for (key, value) in update.patch {
+            match (key.as_str(), value) {
+                ("label", Value::String(label)) => {
+                    set.insert(LABEL_KEY.to_owned(), label);
+                }
+                // RFC 7396: `null` deletes the member, and the label falls back to the session id.
+                ("label", Value::Null) => remove.push(LABEL_KEY.to_owned()),
+                ("label", _) => return Step::Reply(invalid(id, "label is a string or null")),
+                ("task", _) => return Step::Reply(unsupported(id, "task is not served yet")),
+                ("id" | "hub_id" | "kind", _) => {
+                    return Step::Reply(invalid(id, "identity fields are immutable"))
+                }
+                _ => return Step::Reply(invalid(id, "the patch holds label and task only")),
+            }
+        }
+        Step::Owner(
+            Request::SetLabels {
+                session: SessionId(target.into()),
+                set,
+                remove,
+            },
+            Pending::Update,
+        )
+    }
+
+    fn begin_delete(req: &Req) -> Step {
+        let id = req.id.0;
+        let Some(target) = req.target.as_deref() else {
+            return Step::Reply(invalid(id, "delete needs a target"));
+        };
+        Step::Owner(Request::Delete(SessionId(target.into())), Pending::Delete)
+    }
+
     fn begin_unwatch(&mut self, conn: u64, req: &Req) -> Step {
         let id = req.id.0;
         let Some(number) = req.target.as_deref().and_then(|t| t.parse::<u64>().ok()) else {
@@ -728,6 +964,10 @@ impl ConnKinds {
         let refusal = match &answer {
             Answer::Failed(failure) => Some(failure_error(ctx, *failure)),
             Answer::CoreRefused(refused) => Some(core_error(refused)),
+            Answer::Op(OpResult::Err(refused)) => Some(op_error(refused)),
+            Answer::Spawn(SpawnAnswer::Refused { error, effect: at }) => {
+                Some(core_error_with(error, self::effect(*at)))
+            }
             _ => None,
         };
         if let Some(err) = refusal {
@@ -769,6 +1009,32 @@ impl ConnKinds {
                     reason: None,
                 }),
             ],
+            (
+                Pending::Create { session },
+                Answer::Spawn(SpawnAnswer::Accepted { operation_id }),
+            ) => {
+                let receipt = SessionCreateReceipt {
+                    operation_id,
+                    session: SessionRef {
+                        hub_id: ctx.hub_id.to_owned(),
+                        session_id: session,
+                    },
+                    state: StartingTag::Starting,
+                };
+                vec![ServerFrame::Res(res_ok(
+                    id,
+                    serde_json::to_value(receipt).expect("a receipt always encodes"),
+                ))]
+            }
+            (Pending::Update, Answer::Row(row)) => {
+                vec![ServerFrame::Res(match session_value(ctx, &row) {
+                    Some(value) => res_ok(id, value),
+                    None => not_found(id, "no such session"),
+                })]
+            }
+            (Pending::Delete, Answer::Op(OpResult::Ok(_))) => {
+                vec![ServerFrame::Res(res_ok(id, json!({})))]
+            }
             (Pending::Unwatch { watch }, Answer::Unwatched) => {
                 self.watches.remove(&watch);
                 vec![ServerFrame::Res(res_ok(id, json!({})))]
@@ -980,6 +1246,7 @@ mod tests {
             cursor_idle: Duration::from_secs(60),
             max_watches: 2,
             busy_retry_ms: 50,
+            default_cwd: "/home/u",
         }
     }
 

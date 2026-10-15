@@ -62,6 +62,9 @@ pub enum Request {
         set: BTreeMap<String, String>,
         remove: Vec<String>,
     },
+    /// `delete(session)` (HC VB-5, A.2c): `Remove` of a row whose HC state is `ended` or `lost`. The answer is the op's
+    /// `Completed`; any other state is refused `wrong_state`.
+    Delete(SessionId),
     /// `invoke(session, attach)`: reserves a route (TS-1). Boxed like `Op`.
     ReserveRoute(Box<ReserveRequest>),
     /// A `route_connect` with the client's stream (TB-L2). On a refused `submit`, `Rejected` returns the stream to `io`.

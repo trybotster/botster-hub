@@ -125,14 +125,17 @@ impl DaemonConfig {
             max_paste_bytes: self.core_limits.max_paste_bytes,
             max_file_bytes: self.core_limits.max_file_bytes,
         };
-        ServerConfig::compose(
+        let mut config = ServerConfig::compose(
             &self.protocol,
             shared,
             identity.hub_id.clone(),
             identity.incarnation.clone(),
             uid,
             self.outbox,
-        )
+        );
+        // A created command with no `cwd` starts in the operator's home directory (HC A.9 names no default).
+        config.default_cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        config
     }
 }
 

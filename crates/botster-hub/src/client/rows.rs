@@ -173,13 +173,16 @@ impl<'a> RowFacts<'a> {
     }
 }
 
-/// The one builder of an HC `SessionRow` (design section 7a). `None` for a `Released` session.
-pub fn session_row(facts: RowFacts<'_>, hub_id: &str, types: &SessionTypes) -> Option<SessionRow> {
-    let mut state = hc_state(facts.state)?;
+/// The HC state and `failure_reason` of a row (HC A.2c; R-122): the one place that derives them. `None` for `Released`.
+pub fn derive_state(
+    state: &CoreState,
+    spawn_end: Option<&SpawnEnd>,
+) -> Option<(SessionState, Option<String>)> {
+    let mut hc = hc_state(state)?;
     // A Core `Created` row whose spawn failed or was cancelled shows as `ended` (R-122; section 7, item 4).
-    let failure_reason = match (facts.state, facts.spawn_end) {
+    let failure_reason = match (state, spawn_end) {
         (CoreState::Created, Some(end)) => {
-            state = SessionState::Ended;
+            hc = SessionState::Ended;
             match end {
                 SpawnEnd::Failed { reason } => Some(reason.clone()),
                 SpawnEnd::Cancelled => None,
@@ -193,6 +196,20 @@ pub fn session_row(facts: RowFacts<'_>, hub_id: &str, types: &SessionTypes) -> O
         }
         _ => None,
     };
+    Some((hc, failure_reason))
+}
+
+/// Whether `delete(session)` may run: the HC state is `ended` or `lost` (HC section 6, A.2c, VB-5).
+pub fn deletable(row: &Row) -> bool {
+    matches!(
+        derive_state(&row.state, row.spawn_end.as_ref()),
+        Some((SessionState::Ended | SessionState::Lost, _))
+    )
+}
+
+/// The one builder of an HC `SessionRow` (design section 7a). `None` for a `Released` session.
+pub fn session_row(facts: RowFacts<'_>, hub_id: &str, types: &SessionTypes) -> Option<SessionRow> {
+    let (state, failure_reason) = derive_state(facts.state, facts.spawn_end)?;
     let type_id = facts
         .labels
         .get(TYPE_KEY)
@@ -484,5 +501,27 @@ mod tests {
         let row = serde_json::to_value(session_row(f, "h", &types).unwrap()).unwrap();
         assert_eq!(row["exit"], json!({"signal": 9}));
         assert_eq!(row["state"], "ended");
+    }
+
+    /// HC A.2c: only an `ended` or `lost` session is deletable; a failed or cancelled spawn row is `ended`.
+    #[test]
+    fn only_an_ended_or_lost_row_is_deletable() {
+        let row = |state: CoreState| crate::watch::Row {
+            id: sid("s1"),
+            state,
+            size: size(),
+            exit: None,
+            labels: BTreeMap::new(),
+            activity: crate::watch::Activity::Idle,
+            spawn_end: None,
+        };
+        assert!(!deletable(&row(CoreState::Created)));
+        assert!(!deletable(&row(CoreState::Starting)));
+        assert!(!deletable(&row(CoreState::Running)));
+        assert!(!deletable(&row(CoreState::Stopping)));
+        assert!(deletable(&row(CoreState::Lost(LostReason::WorkerGone))));
+        let mut failed = row(CoreState::Created);
+        failed.spawn_end = Some(SpawnEnd::Cancelled);
+        assert!(deletable(&failed));
     }
 }

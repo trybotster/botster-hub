@@ -361,6 +361,16 @@ impl<C: CoreApi> Owner<C> {
         self.store.as_mut()
     }
 
+    /// Whether the spawn flow has nothing in flight: the store, the admissions, the forgets and the ops.
+    pub fn spawn_idle(&self) -> bool {
+        self.store
+            .as_ref()
+            .is_none_or(|store| store.in_flight() == 0)
+            && self.admitting.is_empty()
+            && self.forgetting.is_empty()
+            && self.waiters.is_empty()
+    }
+
     /// The Hub faults that the spawn flow logged.
     pub fn spawn_faults(&self) -> usize {
         self.spawn_faults
@@ -903,6 +913,27 @@ impl<C: CoreApi> Owner<C> {
                 ))),
             },
             Request::List => reply.send(Answer::Rows(self.view.values().cloned().collect())),
+            Request::Delete(id) => match self.view.get(&id) {
+                None => reply.send(Answer::CoreRefused(CoreError::new(
+                    ErrorCode::UnknownSession,
+                    "no such session",
+                ))),
+                Some(row) if !crate::client::rows::deletable(row) => {
+                    reply.send(Answer::CoreRefused(CoreError::new(
+                        ErrorCode::WrongState,
+                        "only an ended or lost session is deleted",
+                    )))
+                }
+                Some(_) => {
+                    reply.mark_dispatched();
+                    match self.core.begin(Op::Remove { id }) {
+                        Ok(op) => {
+                            self.waiters.insert(op, Waiter::Reply(reply));
+                        }
+                        Err(error) => reply.send(Answer::CoreRefused(error)),
+                    }
+                }
+            },
             Request::Cancel(op) => {
                 reply.mark_dispatched();
                 reply.send(Answer::Cancel(self.core.cancel(op)));
@@ -984,7 +1015,12 @@ impl<C: CoreApi> Owner<C> {
                     } else {
                         None
                     };
-                    reply.send(Answer::Op(result));
+                    // The answer is the row the write made (HC WT-9: a committed `update` returns the resulting value).
+                    let answer = match (&result, self.view.get(&session)) {
+                        (OpResult::Ok(_), Some(row)) => Answer::Row(Arc::clone(row)),
+                        _ => Answer::Op(result),
+                    };
+                    reply.send(answer);
                     self.next_labels(&session);
                     change
                 }
@@ -1410,9 +1446,13 @@ mod tests {
         rig.settle(64);
         let answers = rig.answers();
         assert_eq!(answers.len(), 2, "{answers:?}");
-        assert!(answers
-            .iter()
-            .all(|(_, a)| matches!(a, Answer::Op(OpResult::Ok(_)))));
+        // The answer is the row that the write made (HC WT-9): the second one holds both keys.
+        assert!(
+            answers.iter().all(|(_, a)| matches!(a, Answer::Row(_))),
+            "{answers:?}"
+        );
+        assert!(matches!(&answers[1].1, Answer::Row(row)
+            if row.labels.contains_key("h/x") && row.labels.contains_key("h/y")));
         let labels = &rig.owner.view()[&sid("a")].labels;
         assert_eq!(labels.get("h/x").map(String::as_str), Some("1"));
         assert_eq!(labels.get("h/y").map(String::as_str), Some("2"));
