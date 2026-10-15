@@ -454,6 +454,18 @@ impl SpawnStore {
             .collect()
     }
 
+    /// The written records that ended without the session running (`failed`, `cancelled`): `(session_id, state, reason)`.
+    /// The owner shows them on the rows (R-122); `installed` is not an end.
+    pub fn terminal_ends(&self) -> Vec<(String, SpawnState, Option<FailReason>)> {
+        self.index
+            .values()
+            .filter(|e| {
+                e.written && matches!(e.record.state, SpawnState::Failed | SpawnState::Cancelled)
+            })
+            .map(|e| (e.record.session_id.clone(), e.record.state, e.record.reason))
+            .collect()
+    }
+
     /// Step 6b ended: `get_spawn` answers from the index from now on.
     pub fn end_recovery(&mut self) {
         self.recovering = false;

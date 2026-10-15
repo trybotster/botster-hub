@@ -12,8 +12,8 @@ use crate::client::handoff::{
 };
 use crate::phase::{request_stop, Ended, Lifecycle, SharedPhase, StopCause};
 use crate::store::{
-    install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnStore, StoreEvent,
-    Terminal,
+    install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnState, SpawnStore,
+    StoreEvent, Terminal,
 };
 use crate::watch::{Activity, Row, SpawnEnd, WatchFrame, WatchKey, WatchLimits, Watches};
 use botster_core::contract::prelude::{
@@ -334,6 +334,21 @@ impl<C: CoreApi> Owner<C> {
             .into_iter()
             .map(|(operation_id, session)| (SessionId(session), operation_id))
             .collect();
+        // R-122: a failed or cancelled spawn of an earlier run shows on its adopted row.
+        self.spawn_ends = store
+            .terminal_ends()
+            .into_iter()
+            .filter_map(|(session, state, reason)| {
+                let end = match state {
+                    SpawnState::Failed => SpawnEnd::Failed {
+                        reason: reason?.as_str().to_owned(),
+                    },
+                    SpawnState::Cancelled => SpawnEnd::Cancelled,
+                    _ => return None,
+                };
+                Some((SessionId(session), end))
+            })
+            .collect();
         self.store = Some(store);
         self
     }
@@ -390,7 +405,11 @@ impl<C: CoreApi> Owner<C> {
             .core
             .list()
             .into_iter()
-            .map(|record| (record.id.clone(), Arc::new(Row::from_record(record))))
+            .map(|record| {
+                let mut row = Row::from_record(record);
+                row.spawn_end = self.spawn_ends.get(&row.id).cloned();
+                (row.id.clone(), Arc::new(row))
+            })
             .collect();
         match self.core.begin(Op::AdoptAll) {
             Ok(op) => {
@@ -977,6 +996,9 @@ impl<C: CoreApi> Owner<C> {
                     match result {
                         OpResult::Ok(_) => {
                             self.adoption = Adoption::Done;
+                            // A record of a session that adoption did not find has no row to show it.
+                            let view = &self.view;
+                            self.spawn_ends.retain(|id, _| view.contains_key(id));
                             self.adoption_sighting();
                             self.bridge.set_ready();
                         }
@@ -2579,6 +2601,56 @@ mod tests {
             );
             stop(rig);
         }
+    }
+
+    /// R-122: after a restart, the adopted rows of a `failed` or `cancelled` spawn show their end; a `starting` or
+    /// `installed` record shows none.
+    #[test]
+    fn a_restart_restores_the_spawn_ends_onto_the_adopted_rows() {
+        let tmp = short_root();
+        let core = FakeStore::new();
+        let mut first = store_rig(tmp.path(), &core);
+        first.adopt();
+        first.owner.store_mut().unwrap().end_recovery();
+        fail_next(first.owner.core(), "Start", ErrorCode::WorkerLinkFailed);
+        first.submit(1, spawn("a"));
+        flow_settle(&mut first);
+        for (n, name) in [(2, "b"), (3, "c"), (4, "d")] {
+            first.submit(n, spawn(name));
+            flow_settle(&mut first);
+        }
+        let answers = first.answers();
+        let id_of = |n: u64| {
+            let (_, answer) = answers.iter().find(|(id, _)| *id == n).unwrap();
+            accepted(answer)
+        };
+        // A terminal time near now: the sweep at open deletes a record older than the retention.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = first.owner.store_mut().unwrap();
+        store
+            .finish_spawn(&id_of(3), crate::store::Terminal::Cancelled, now_ms)
+            .unwrap();
+        store
+            .finish_spawn(&id_of(4), crate::store::Terminal::Installed, now_ms)
+            .unwrap();
+        store_settle(&mut first);
+        stop(first);
+        let mut second = store_rig(tmp.path(), &core);
+        second.adopt();
+        let end = |name: &str| second.owner.view()[&sid(name)].spawn_end.clone();
+        assert_eq!(
+            end("a"),
+            Some(SpawnEnd::Failed {
+                reason: "internal".into()
+            })
+        );
+        assert_eq!(end("b"), None, "a starting record");
+        assert_eq!(end("c"), Some(SpawnEnd::Cancelled));
+        assert_eq!(end("d"), None, "an installed record");
+        stop(second);
     }
 
     /// R-122 U4: another `Start` error with the row still `Created` gives `failed { internal }`, and the row is kept.
