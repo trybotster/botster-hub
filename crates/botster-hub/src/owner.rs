@@ -697,7 +697,8 @@ fn failed(kind: FailKind, effect: Effect) -> Answer {
 }
 
 /// The `StartFailed` reason to the record's reason (design section 4a). `GuardianFailed` and an unknown reason have no
-/// ruled mapping: `internal`.
+/// ruled mapping: `internal` until the steward answers S2-HD-12 (open; lead 2026-10-12). Change it only if the ruling
+/// differs.
 fn start_fail_reason(reason: StartFailReason) -> FailReason {
     match reason {
         StartFailReason::ExecFailed { .. } => FailReason::ExecFailed,
