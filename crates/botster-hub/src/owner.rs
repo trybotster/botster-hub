@@ -1198,8 +1198,8 @@ mod tests {
         chunk_rows: 1,
     };
 
-    struct Rig {
-        owner: Owner<FakeCore>,
+    struct Rig<C: CoreApi = FakeCore> {
+        owner: Owner<C>,
         bridge: Arc<Bridge>,
         phase: Arc<SharedPhase>,
         outbox: Arc<Outbox>,
@@ -1216,7 +1216,7 @@ mod tests {
         FakeCore::open(store, config, 7).unwrap()
     }
 
-    fn rig(core: FakeCore) -> Rig {
+    fn rig<C: CoreApi>(core: C) -> Rig<C> {
         let phase = SharedPhase::new();
         let bridge = Arc::new(Bridge::new(
             LaneCaps {
@@ -1249,7 +1249,7 @@ mod tests {
         }
     }
 
-    impl Rig {
+    impl<C: CoreApi> Rig<C> {
         fn now(&mut self) -> Now {
             self.clock += Duration::from_millis(1);
             Now {
@@ -1476,27 +1476,189 @@ mod tests {
         assert_eq!(rig.owner.view()[&id].size, size);
     }
 
-    /// The threshold is set once per session at its first non-`Released` state, and a live change sets it again.
+    type ThresholdCalls = Arc<std::sync::Mutex<Vec<(SessionId, Option<Duration>)>>>;
+
+    /// A [`FakeCore`] that records every `set_silence_threshold` call (the pinned fake keeps no threshold).
+    struct Recording {
+        inner: FakeCore,
+        calls: ThresholdCalls,
+    }
+
+    impl CoreApi for Recording {
+        fn begin(&mut self, op: Op) -> Result<OpId, CoreError> {
+            self.inner.begin(op)
+        }
+        fn pump(&mut self, now: Now) -> PumpReport {
+            self.inner.pump(now)
+        }
+        fn poll_events(&mut self, max: usize) -> Vec<Event> {
+            self.inner.poll_events(max)
+        }
+        fn wake_handle(&self) -> Arc<dyn WakeHandle> {
+            self.inner.wake_handle()
+        }
+        fn next_deadline(&self) -> Option<Instant> {
+            self.inner.next_deadline()
+        }
+        fn cancel(&mut self, op: OpId) -> CancelResult {
+            self.inner.cancel(op)
+        }
+        fn get(&self, id: &SessionId) -> Result<SessionRecord, CoreError> {
+            self.inner.get(id)
+        }
+        fn list(&self) -> Vec<SessionRecord> {
+            self.inner.list()
+        }
+        fn status(&self) -> Status {
+            self.inner.status()
+        }
+        fn diagnostics(&self) -> serde_json::Value {
+            self.inner.diagnostics()
+        }
+        fn terminal_state(&self, id: &SessionId) -> Result<TerminalState, CoreError> {
+            self.inner.terminal_state(id)
+        }
+        fn read_page(&self, capture: CaptureId, page: u32) -> Result<Page, CoreError> {
+            self.inner.read_page(capture, page)
+        }
+        fn release(&mut self, capture: CaptureId) {
+            self.inner.release(capture)
+        }
+        fn release_owner(&mut self, client: &ClientId) {
+            self.inner.release_owner(client)
+        }
+        fn snapshot_formats(&self, session: &SessionId) -> Result<Vec<SnapshotFormat>, CoreError> {
+            self.inner.snapshot_formats(session)
+        }
+        fn shadow_answerable_kinds(&self) -> Vec<botster_core_route_codec::prelude::QueryKind> {
+            self.inner.shadow_answerable_kinds()
+        }
+        fn attach(
+            &mut self,
+            client: ClientId,
+            session: SessionId,
+            transport: RouteTransport,
+            options: AttachOptions,
+        ) -> Result<AttachResult, AttachRefused> {
+            self.inner.attach(client, session, transport, options)
+        }
+        fn tap_read(&mut self, session: &SessionId, max: usize) -> Result<TapChunk, CoreError> {
+            self.inner.tap_read(session, max)
+        }
+        fn set_silence_threshold(
+            &mut self,
+            session: &SessionId,
+            threshold: Option<Duration>,
+        ) -> Result<(), CoreError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((session.clone(), threshold));
+            self.inner.set_silence_threshold(session, threshold)
+        }
+        fn service_send(
+            &mut self,
+            id: &ServiceId,
+            lane: u8,
+            frame: &OutboundFrame,
+        ) -> Result<(), SendError> {
+            self.inner.service_send(id, lane, frame)
+        }
+        fn service_recv(&mut self, id: &ServiceId, lane: u8) -> Result<Option<Frame>, RecvError> {
+            self.inner.service_recv(id, lane)
+        }
+        fn service_report(&self, id: &ServiceId) -> Result<SpawnReport, CoreError> {
+            self.inner.service_report(id)
+        }
+        fn service_log_tail(&self, id: &ServiceId, max: usize) -> Result<Vec<u8>, CoreError> {
+            self.inner.service_log_tail(id, max)
+        }
+        fn features(&self) -> Features {
+            self.inner.features()
+        }
+        fn limits(&self) -> CoreLimits {
+            self.inner.limits()
+        }
+        fn worker_protocol(&self) -> u8 {
+            self.inner.worker_protocol()
+        }
+        fn adoptable_worker_protocols(&self) -> BTreeSet<u8> {
+            self.inner.adoptable_worker_protocols()
+        }
+        fn worker_protocol_compatibility(&self, protocol: Option<u8>) -> WorkerCompatibility {
+            self.inner.worker_protocol_compatibility(protocol)
+        }
+        fn terminal_identity(&self) -> TerminalIdentity {
+            self.inner.terminal_identity()
+        }
+    }
+
+    /// TM-4: the threshold call carries `activity_idle`, it is made once per session (a second state event makes no
+    /// call), a changed value reaches every tracked session, and an adoption sighting sets it for a recovered row.
     #[test]
     fn the_silence_threshold_is_set_once_per_session() {
         let store = FakeStore::new();
-        let mut rig = rig(open(&store));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // A session that exists before the owner adopts: the sighting of `AdoptAll`.
+        let mut seed = rig(open(&store));
+        seed.adopt();
+        seed.submit(1, create("old"));
+        seed.settle(64);
+        seed.answers();
+        drop(seed);
+        let mut rig = rig(Recording {
+            inner: open(&store),
+            calls: calls.clone(),
+        });
+        let seen = |calls: &Arc<std::sync::Mutex<Vec<_>>>| calls.lock().unwrap().clone();
+        let idle = Some(ACTIVITY_IDLE);
         rig.adopt();
-        rig.submit(1, create("a"));
+        let sightings = seen(&calls);
+        assert!(sightings.iter().all(|(_, t)| *t == idle), "{sightings:?}");
+        // The recovered row `old` got its threshold at the sighting of `AdoptAll`.
+        assert_eq!(
+            sightings
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
+            vec![sid("old")]
+        );
+        rig.submit(2, create("a"));
         rig.settle(64);
         rig.answers();
-        assert!(rig.owner.thresholds.contains(&sid("a")));
-        rig.owner.set_activity_idle(Duration::from_millis(500));
-        assert_eq!(rig.owner.activity_idle, Duration::from_millis(500));
-        assert!(rig.owner.thresholds.contains(&sid("a")));
-        let id = sid("a");
+        let after_create = seen(&calls);
+        let for_a = |calls: &[(SessionId, Option<Duration>)]| {
+            calls.iter().filter(|(id, _)| *id == sid("a")).count()
+        };
+        assert_eq!(for_a(&after_create), 1, "{after_create:?}");
+        // Another state event of the same session makes no second call.
         rig.owner.apply(Event::SessionState {
-            id: id.clone(),
+            id: sid("a"),
+            instance: InstanceId("i".into()),
+            state: SessionState::Starting,
+        });
+        assert_eq!(for_a(&seen(&calls)), 1);
+        // A live change sets the new value for every tracked session, and an unchanged value sets nothing.
+        let before = seen(&calls).len();
+        let tracked = rig.owner.thresholds.len();
+        rig.owner.set_activity_idle(ACTIVITY_IDLE);
+        assert_eq!(seen(&calls).len(), before);
+        let new = Duration::from_millis(500);
+        rig.owner.set_activity_idle(new);
+        let all = seen(&calls);
+        let fresh = &all[before..];
+        assert_eq!(fresh.len(), tracked, "{fresh:?}");
+        assert!(fresh.iter().all(|(_, t)| *t == Some(new)));
+        assert_eq!(tracked, 2);
+        // `Released` forgets the session: a later change does not touch it.
+        rig.owner.apply(Event::SessionState {
+            id: sid("a"),
             instance: InstanceId("i".into()),
             state: SessionState::Released,
         });
-        assert!(rig.owner.thresholds.is_empty());
-        assert!(rig.owner.view().is_empty());
+        let before = seen(&calls).len();
+        rig.owner.set_activity_idle(Duration::from_millis(900));
+        assert!(seen(&calls)[before..].iter().all(|(id, _)| *id != sid("a")));
     }
 
     /// Start step 6: `AdoptAll` completes, the bridge becomes ready, and requests before it were refused `NotReady`.
