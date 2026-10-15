@@ -12,10 +12,10 @@ use crate::client::handoff::{
 };
 use crate::phase::{request_stop, Ended, Lifecycle, SharedPhase, StopCause};
 use crate::store::{
-    install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnStore, StoreEvent,
-    Terminal,
+    install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnState, SpawnStore,
+    StoreEvent, Terminal,
 };
-use crate::watch::{Activity, Row, WatchFrame, WatchKey, WatchLimits, Watches};
+use crate::watch::{Activity, Row, SpawnEnd, WatchFrame, WatchKey, WatchLimits, Watches};
 use botster_core::contract::prelude::{
     ActivitySource, CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult,
     SessionId, SessionState, SpawnRequest, StartFailReason,
@@ -163,6 +163,8 @@ pub struct Owner<C: CoreApi> {
     /// The label writer: the queued writes of each session, and the sessions with an `UpdateMetadata` in flight.
     label_queues: BTreeMap<SessionId, VecDeque<LabelEdit>>,
     labels_busy: BTreeSet<SessionId>,
+    /// The spawn ends of sessions whose spawn ended without the session running (R-122). An entry goes with its row.
+    spawn_ends: BTreeMap<SessionId, SpawnEnd>,
 }
 
 impl<C: CoreApi> Owner<C> {
@@ -201,6 +203,7 @@ impl<C: CoreApi> Owner<C> {
             thresholds: BTreeSet::new(),
             label_queues: BTreeMap::new(),
             labels_busy: BTreeSet::new(),
+            spawn_ends: BTreeMap::new(),
         }
     }
 
@@ -331,6 +334,21 @@ impl<C: CoreApi> Owner<C> {
             .into_iter()
             .map(|(operation_id, session)| (SessionId(session), operation_id))
             .collect();
+        // R-122: a failed or cancelled spawn of an earlier run shows on its adopted row.
+        self.spawn_ends = store
+            .terminal_ends()
+            .into_iter()
+            .filter_map(|(session, state, reason)| {
+                let end = match state {
+                    SpawnState::Failed => SpawnEnd::Failed {
+                        reason: reason?.as_str().to_owned(),
+                    },
+                    SpawnState::Cancelled => SpawnEnd::Cancelled,
+                    _ => return None,
+                };
+                Some((SessionId(session), end))
+            })
+            .collect();
         self.store = Some(store);
         self
     }
@@ -387,7 +405,11 @@ impl<C: CoreApi> Owner<C> {
             .core
             .list()
             .into_iter()
-            .map(|record| (record.id.clone(), Arc::new(Row::from_record(record))))
+            .map(|record| {
+                let mut row = Row::from_record(record);
+                row.spawn_end = self.spawn_ends.get(&row.id).cloned();
+                (row.id.clone(), Arc::new(row))
+            })
             .collect();
         match self.core.begin(Op::AdoptAll) {
             Ok(op) => {
@@ -639,7 +661,7 @@ impl<C: CoreApi> Owner<C> {
         session: SessionId,
         reply: ReplyTo,
         result: OpResult,
-    ) {
+    ) -> Option<ViewChange> {
         let error = match result {
             OpResult::Ok(_) => {
                 reply.send(Answer::Spawn(SpawnAnswer::Accepted {
@@ -656,11 +678,12 @@ impl<C: CoreApi> Owner<C> {
             if matches!(get.code, ErrorCode::UnknownSession) {
                 // U2: Core proves no row.
                 let answer = self.refused_none(error.clone());
-                return self.forget(operation_id, reply, answer);
+                self.forget(operation_id, reply, answer);
+                return None;
             }
         }
         // U3: a row exists or may exist. The record ends `failed { internal }` with the cleanup obligation.
-        self.finish(&operation_id, None);
+        let change = self.finish(&operation_id, &session, None);
         reply.send(match error {
             Some(error) => Answer::Spawn(SpawnAnswer::Refused {
                 error,
@@ -672,11 +695,12 @@ impl<C: CoreApi> Owner<C> {
         if matches!(&row, Ok(row) if row.state == SessionState::Created) {
             self.begin_remove(&session);
         }
+        change
     }
 
     /// Spawn flow step 3: `begin(Start)` after admission. A sync refusal is a Hub fault: `failed { internal }`, and the
     /// row is kept (R-122 corrects R-120 item 2).
-    fn begin_start(&mut self, operation_id: String, session: SessionId) {
+    fn begin_start(&mut self, operation_id: String, session: SessionId) -> Option<ViewChange> {
         match self.core.begin(Op::Start {
             id: session.clone(),
         }) {
@@ -688,6 +712,7 @@ impl<C: CoreApi> Owner<C> {
                         session,
                     },
                 );
+                None
             }
             Err(error) => {
                 self.spawn_fault(format!(
@@ -695,13 +720,18 @@ impl<C: CoreApi> Owner<C> {
                     session.0,
                     error_text(&error)
                 ));
-                self.finish(&operation_id, Some(FailReason::Internal));
+                self.finish(&operation_id, &session, Some(FailReason::Internal))
             }
         }
     }
 
     /// Spawn flow step 4: `Completed{Start}`.
-    fn start_completed(&mut self, operation_id: String, session: SessionId, result: OpResult) {
+    fn start_completed(
+        &mut self,
+        operation_id: String,
+        session: SessionId,
+        result: OpResult,
+    ) -> Option<ViewChange> {
         match result {
             OpResult::Ok(_) => {
                 // `installed` needs the row's `ready_reached` (A26). Marked A26: a typed stub, so the spawn stays
@@ -711,6 +741,7 @@ impl<C: CoreApi> Owner<C> {
                         Ok(()) | Err(InstallBlocked::NeedsA26) => {}
                     }
                 }
+                None
             }
             OpResult::Err(CoreError {
                 code: ErrorCode::StartFailed(reason),
@@ -723,7 +754,7 @@ impl<C: CoreApi> Owner<C> {
                         session.0
                     );
                 }
-                self.finish(&operation_id, Some(mapped));
+                self.finish(&operation_id, &session, Some(mapped))
             }
             // U4: another error, or an unknown result.
             _ => self.start_undecided(&operation_id, &session),
@@ -732,7 +763,7 @@ impl<C: CoreApi> Owner<C> {
 
     /// U4: the R-121 tests on the row as it is then. Tests 1 (`start_failure`) and 3 (`ready_reached`) read A26 fields,
     /// so on Core `v1` they never match. A row that is still `Created` gives `failed { internal }`, and the row is kept.
-    fn start_undecided(&mut self, operation_id: &str, session: &SessionId) {
+    fn start_undecided(&mut self, operation_id: &str, session: &SessionId) -> Option<ViewChange> {
         let reason = match self.core.get(session) {
             Err(error) if matches!(error.code, ErrorCode::UnknownSession) => {
                 Some(FailReason::Interrupted)
@@ -744,13 +775,18 @@ impl<C: CoreApi> Owner<C> {
             },
             Err(_) => None,
         };
-        if let Some(reason) = reason {
-            self.finish(operation_id, Some(reason));
-        }
+        reason.and_then(|reason| self.finish(operation_id, session, Some(reason)))
     }
 
-    /// Writes `failed { reason }`. `None` is U3: `failed { internal }` with `remove_row: true`.
-    fn finish(&mut self, operation_id: &str, reason: Option<FailReason>) {
+    /// Writes `failed { reason }`. `None` is U3: `failed { internal }` with `remove_row: true`. After the record is
+    /// written, the session's view row carries the end (R-122: a `Created` row shows `ended` with the reason); the
+    /// returned change is for the watches.
+    fn finish(
+        &mut self,
+        operation_id: &str,
+        session: &SessionId,
+        reason: Option<FailReason>,
+    ) -> Option<ViewChange> {
         let now_ms = self.now_ms;
         let finished = match (self.store.as_mut(), reason) {
             (Some(store), Some(reason)) => {
@@ -761,7 +797,14 @@ impl<C: CoreApi> Owner<C> {
         };
         if let Err(error) = finished {
             self.spawn_fault(error);
+            return None;
         }
+        let end = SpawnEnd::Failed {
+            reason: reason.unwrap_or(FailReason::Internal).as_str().to_owned(),
+        };
+        // The row may not be in the view yet (its `SessionState` can follow the `Completed`), so the end waits in the map.
+        self.spawn_ends.insert(session.clone(), end.clone());
+        self.update_row(session, |row| row.spawn_end = Some(end))
     }
 
     /// The cleanup obligation (Sol S2-HD-11): one `Remove` for each sighting of a U3 row as `Created`. A refusal leaves
@@ -851,11 +894,15 @@ impl<C: CoreApi> Owner<C> {
                     Err(error) => reply.send(Answer::CoreRefused(error)),
                 }
             }
-            Request::Get(id) => match self.core.get(&id) {
-                Ok(row) => reply.send(Answer::Session(row)),
-                Err(error) => reply.send(Answer::CoreRefused(error)),
+            // The reads answer from the view, which has the fields that Core's row lacks (activity, the spawn end).
+            Request::Get(id) => match self.view.get(&id) {
+                Some(row) => reply.send(Answer::Row(Arc::clone(row))),
+                None => reply.send(Answer::CoreRefused(CoreError::new(
+                    ErrorCode::UnknownSession,
+                    "no such session",
+                ))),
             },
-            Request::List => reply.send(Answer::Sessions(self.core.list())),
+            Request::List => reply.send(Answer::Rows(self.view.values().cloned().collect())),
             Request::Cancel(op) => {
                 reply.mark_dispatched();
                 reply.send(Answer::Cancel(self.core.cancel(op)));
@@ -949,6 +996,9 @@ impl<C: CoreApi> Owner<C> {
                     match result {
                         OpResult::Ok(_) => {
                             self.adoption = Adoption::Done;
+                            // A record of a session that adoption did not find has no row to show it.
+                            let view = &self.view;
+                            self.spawn_ends.retain(|id, _| view.contains_key(id));
                             self.adoption_sighting();
                             self.bridge.set_ready();
                         }
@@ -964,17 +1014,11 @@ impl<C: CoreApi> Owner<C> {
                     operation_id,
                     session,
                     reply,
-                }) => {
-                    self.create_completed(operation_id, session, reply, result);
-                    None
-                }
+                }) => self.create_completed(operation_id, session, reply, result),
                 Some(Waiter::SpawnStart {
                     operation_id,
                     session,
-                }) => {
-                    self.start_completed(operation_id, session, result);
-                    None
-                }
+                }) => self.start_completed(operation_id, session, result),
                 Some(Waiter::SpawnRemove { session }) => {
                     self.removing.remove(&session);
                     // An error leaves the marker: the next `Created` sighting begins `Remove` again.
@@ -991,6 +1035,7 @@ impl<C: CoreApi> Owner<C> {
                     self.view.remove(&id);
                     self.row_gone(&id);
                     self.thresholds.remove(&id);
+                    self.spawn_ends.remove(&id);
                     // Queued label writes of a gone row get the op's own answer.
                     for edit in self.label_queues.remove(&id).into_iter().flatten() {
                         edit.reply.send(Answer::CoreRefused(CoreError::new(
@@ -1019,6 +1064,7 @@ impl<C: CoreApi> Owner<C> {
                         // A new row: Core's record gives the other fields. A row that is gone has its `Released` next.
                         self.core.get(&id).ok().map(|record| {
                             let mut row = Row::from_record(record);
+                            row.spawn_end = self.spawn_ends.get(&id).cloned();
                             set_exit(&mut row);
                             self.view.insert(id.clone(), Arc::new(row));
                             ViewChange::Row(id.clone())
@@ -1661,6 +1707,70 @@ mod tests {
         assert!(seen(&calls)[before..].iter().all(|(id, _)| *id != sid("a")));
     }
 
+    /// `Get` and `List` answer the view rows (id-ordered), so the answer carries the activity that Core's row lacks.
+    #[test]
+    fn get_and_list_answer_view_rows() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("b"));
+        rig.submit(2, create("a"));
+        rig.settle(64);
+        rig.answers();
+        rig.owner.apply(Event::Activity {
+            id: sid("a"),
+            instance: InstanceId("i".into()),
+            source: ActivitySource::Output,
+            at: 1,
+        });
+        rig.submit(3, Request::Get(sid("a")));
+        rig.submit(4, Request::List);
+        rig.submit(5, Request::Get(sid("nope")));
+        rig.settle(64);
+        let answers = rig.answers();
+        assert!(
+            matches!(&answers[0], (3, Answer::Row(row)) if row.activity == Activity::Active),
+            "{answers:?}"
+        );
+        assert!(
+            matches!(&answers[1], (4, Answer::Rows(rows))
+                if rows.iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>() == ["a", "b"]),
+            "{answers:?}"
+        );
+        assert!(
+            matches!(&answers[2], (5, Answer::CoreRefused(e)) if matches!(e.code, ErrorCode::UnknownSession)),
+            "{answers:?}"
+        );
+    }
+
+    /// A spawn end that is written before the row's `SessionState` arrives is on the row when it appears.
+    #[test]
+    fn a_spawn_end_waits_for_its_row() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.owner.spawn_ends.insert(
+            sid("a"),
+            SpawnEnd::Failed {
+                reason: "internal".into(),
+            },
+        );
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        assert_eq!(
+            rig.owner.view()[&sid("a")].spawn_end,
+            Some(SpawnEnd::Failed {
+                reason: "internal".into()
+            })
+        );
+        rig.owner.apply(Event::SessionState {
+            id: sid("a"),
+            instance: InstanceId("i".into()),
+            state: SessionState::Released,
+        });
+        assert!(rig.owner.spawn_ends.is_empty());
+    }
+
     /// Start step 6: `AdoptAll` completes, the bridge becomes ready, and requests before it were refused `NotReady`.
     #[test]
     fn adoption_makes_the_bridge_ready() {
@@ -1708,11 +1818,11 @@ mod tests {
         // The request count is 2 per turn: two turns answer the three reads.
         rig.settle(8);
         let answers = rig.answers();
-        assert!(matches!(&answers[0], (2, Answer::Session(row)) if row.id == sid("a")));
+        assert!(matches!(&answers[0], (2, Answer::Row(row)) if row.id == sid("a")));
         assert!(
             matches!(&answers[1], (3, Answer::CoreRefused(e)) if e.code == ErrorCode::UnknownSession)
         );
-        assert!(matches!(&answers[2], (4, Answer::Sessions(rows)) if rows.len() == 1));
+        assert!(matches!(&answers[2], (4, Answer::Rows(rows)) if rows.len() == 1));
         rig.submit(5, Request::Op(Box::new(Op::Remove { id: sid("a") })));
         rig.settle(64);
         assert!(matches!(
@@ -2482,8 +2592,65 @@ mod tests {
             assert_eq!(record.reason, Some(mapped), "{reason:?}");
             assert!(!record.remove_row);
             assert!(rig.owner.core().get(&sid("a")).is_ok(), "the row is kept");
+            assert_eq!(
+                rig.owner.view()[&sid("a")].spawn_end,
+                Some(SpawnEnd::Failed {
+                    reason: mapped.as_str().into()
+                }),
+                "{reason:?}"
+            );
             stop(rig);
         }
+    }
+
+    /// R-122: after a restart, the adopted rows of a `failed` or `cancelled` spawn show their end; a `starting` or
+    /// `installed` record shows none.
+    #[test]
+    fn a_restart_restores_the_spawn_ends_onto_the_adopted_rows() {
+        let tmp = short_root();
+        let core = FakeStore::new();
+        let mut first = store_rig(tmp.path(), &core);
+        first.adopt();
+        first.owner.store_mut().unwrap().end_recovery();
+        fail_next(first.owner.core(), "Start", ErrorCode::WorkerLinkFailed);
+        first.submit(1, spawn("a"));
+        flow_settle(&mut first);
+        for (n, name) in [(2, "b"), (3, "c"), (4, "d")] {
+            first.submit(n, spawn(name));
+            flow_settle(&mut first);
+        }
+        let answers = first.answers();
+        let id_of = |n: u64| {
+            let (_, answer) = answers.iter().find(|(id, _)| *id == n).unwrap();
+            accepted(answer)
+        };
+        // A terminal time near now: the sweep at open deletes a record older than the retention.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = first.owner.store_mut().unwrap();
+        store
+            .finish_spawn(&id_of(3), crate::store::Terminal::Cancelled, now_ms)
+            .unwrap();
+        store
+            .finish_spawn(&id_of(4), crate::store::Terminal::Installed, now_ms)
+            .unwrap();
+        store_settle(&mut first);
+        stop(first);
+        let mut second = store_rig(tmp.path(), &core);
+        second.adopt();
+        let end = |name: &str| second.owner.view()[&sid(name)].spawn_end.clone();
+        assert_eq!(
+            end("a"),
+            Some(SpawnEnd::Failed {
+                reason: "internal".into()
+            })
+        );
+        assert_eq!(end("b"), None, "a starting record");
+        assert_eq!(end("c"), Some(SpawnEnd::Cancelled));
+        assert_eq!(end("d"), None, "an installed record");
+        stop(second);
     }
 
     /// R-122 U4: another `Start` error with the row still `Created` gives `failed { internal }`, and the row is kept.
@@ -2510,6 +2677,14 @@ mod tests {
             rig.owner.cleanup().is_empty(),
             "no Hub Remove after admission"
         );
+        // R-122: the `Created` row shows as `ended` with `failure_reason: internal`.
+        let built = crate::client::rows::session_row(
+            crate::client::rows::RowFacts::of(&rig.owner.view()[&sid("a")]),
+            "h",
+            &crate::client::rows::SessionTypes::device(),
+        )
+        .unwrap();
+        assert_eq!(built.failure_reason.as_deref(), Some("internal"));
         stop(rig);
     }
 

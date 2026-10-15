@@ -141,12 +141,7 @@ pub fn hc_state(state: &CoreState) -> Option<SessionState> {
 /// The `failure_reason` of a session whose worker was lost with a known termination (HC A.2c).
 const WORKER_LOST: &str = "worker_lost";
 
-/// How the session's spawn operation ended, when it ended without the session running (design section 7, item 4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpawnEnd {
-    Failed { reason: String },
-    Cancelled,
-}
+pub use crate::watch::SpawnEnd;
 
 /// What the builder reads about one session: P5's view row and the spawn operation.
 #[derive(Debug, Clone, Copy)]
@@ -161,8 +156,8 @@ pub struct RowFacts<'a> {
 }
 
 impl<'a> RowFacts<'a> {
-    /// The facts of one owner view row (design section 4, "The view row"), with the spawn end of its operation, if any.
-    pub fn of(row: &'a Row, spawn_end: Option<&'a SpawnEnd>) -> RowFacts<'a> {
+    /// The facts of one owner view row (design section 4, "The view row").
+    pub fn of(row: &'a Row) -> RowFacts<'a> {
         RowFacts {
             id: &row.id,
             state: &row.state,
@@ -173,7 +168,7 @@ impl<'a> RowFacts<'a> {
                 ViewActivity::Active => Activity::Active,
                 ViewActivity::Idle => Activity::Idle,
             },
-            spawn_end,
+            spawn_end: row.spawn_end.as_ref(),
         }
     }
 }
@@ -458,13 +453,19 @@ mod tests {
             exit: None,
             labels: create_labels(&id, Some("build"), COMMAND_TYPE),
             activity: ViewActivity::Idle,
+            spawn_end: None,
         };
-        let built = session_row(RowFacts::of(&row, None), "h", &types).unwrap();
+        let built = session_row(RowFacts::of(&row), "h", &types).unwrap();
         assert_eq!(built.activity, Activity::Idle);
         assert_eq!(built.label, "build");
         row.activity = ViewActivity::Active;
-        let built = session_row(RowFacts::of(&row, None), "h", &types).unwrap();
+        let built = session_row(RowFacts::of(&row), "h", &types).unwrap();
         assert_eq!(built.activity, Activity::Active);
+        row.spawn_end = Some(SpawnEnd::Failed {
+            reason: "exec_failed".into(),
+        });
+        let built = session_row(RowFacts::of(&row), "h", &types).unwrap();
+        assert_eq!(built.failure_reason.as_deref(), Some("exec_failed"));
     }
 
     #[test]

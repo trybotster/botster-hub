@@ -102,7 +102,7 @@ fn start_adopt_listen_and_stop() {
     // The bridge reaches the real Core.
     let replies = outbox();
     assert!(
-        matches!(ask(&daemon, &replies, 1, Request::List), Answer::Sessions(rows) if rows.is_empty())
+        matches!(ask(&daemon, &replies, 1, Request::List), Answer::Rows(rows) if rows.is_empty())
     );
     assert_eq!(
         ask(&daemon, &replies, 2, Request::Shutdown),
