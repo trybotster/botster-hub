@@ -63,8 +63,9 @@ pub struct RouteEntry {
     pub core_route: RouteId,
     pub session: SessionId,
     pub owner: Caller,
-    /// Unix milliseconds when this Hub put the route in the table: the connect, or the adoption after a restart (the
-    /// worker keeps no attach time, so `since` of an adopted route is the adoption).
+    /// Unix milliseconds when this Hub put the route in the table (steward R-127). A new route: the connect time. A
+    /// route adopted after a Hub restart: the Hub's adoption time, because the worker keeps no attach time and the Hub
+    /// persists no new field.
     pub since: u64,
 }
 
@@ -867,6 +868,7 @@ mod tests {
         assert_eq!((answer, ended), (RouteConnectAnswer::Handed, None));
         let entry = tables.route(&r.route_id).expect("in the route table");
         assert_eq!((entry.session.clone(), entry.owner), (sid("a"), me()));
+        assert_eq!(entry.since, SINCE, "a new route: the connect time (R-127)");
         let (again, _peer) = stream_pair();
         let (answer, ended) = connect(
             &mut core,
@@ -1001,6 +1003,14 @@ mod tests {
     }
 
     /// HC A.3: a route belongs to its caller. Another caller does not list it and does not find it to detach.
+    /// R-127: a route adopted after a restart has the adoption time as `since`.
+    #[test]
+    fn an_adopted_route_since_is_the_adoption_time() {
+        let mut tables = HubRouteTables::with_params(&params());
+        route_event(&mut tables, &adopted("r1", "operator/501"), SINCE + 7);
+        assert_eq!(tables.route("r1").unwrap().since, SINCE + 7);
+    }
+
     #[test]
     fn a_route_is_visible_to_its_caller_only() {
         let mut routes = Routes::new(params());
