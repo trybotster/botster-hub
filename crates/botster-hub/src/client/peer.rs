@@ -37,6 +37,10 @@ mod tests {
         assert_eq!(peer_uid(&accepted).unwrap(), me());
     }
 
+    /// macOS only: `getpeereid` of a listening socket is `ENOTCONN`. Linux's `SO_PEERCRED` of a listening socket is the
+    /// credentials of the process that called `listen` (not an error), so there the result of an unconnected socket is not
+    /// a refusal; the server reads the uid of accepted connections only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_socket_that_is_not_connected_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
