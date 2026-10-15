@@ -654,6 +654,11 @@ impl Server {
             }
             self.write(token);
         }
+        // A drain takes `TAKE` items from each outbox. What is left needs another turn of the `io` loop: no wake arrives
+        // for items that were already queued. The work of one turn stays bounded.
+        if self.conns.values().any(|c| c.outbox.has_items()) {
+            self.io_wake.wake();
+        }
     }
 
     /// Design 2.3, item 4: a refused connect gets its close; a handed one is Core's. Either way the entry goes.
@@ -820,6 +825,10 @@ mod tests {
         /// the route and handshake tests read the bridge themselves.
         owner: Option<crate::owner::Owner<botster_fake_core::FakeCore>>,
         _lifecycle: Option<std::sync::mpsc::Receiver<crate::phase::Lifecycle>>,
+        /// The wakes of the `io` loop that the server and the outboxes made.
+        io_wakes: Arc<Count>,
+        /// The wake count the last drain answered.
+        drained_at: usize,
         clock: Instant,
     }
 
@@ -854,6 +863,7 @@ mod tests {
             Arc::new(Count::default()),
         ));
         let formats = Arc::new(CommonFormats::default());
+        let io_wakes = Arc::new(Count::default());
         let (lifecycle_tx, lifecycle) =
             std::sync::mpsc::sync_channel(crate::phase::LIFECYCLE_CAPACITY);
         let core = {
@@ -882,7 +892,7 @@ mod tests {
                 },
                 crate::watch::WatchLimits {
                     max_watches: 32,
-                    chunk_rows: 2,
+                    chunk_rows: 1,
                 },
             )
         });
@@ -893,7 +903,7 @@ mod tests {
             poll.registry().try_clone().unwrap(),
             bridge.clone(),
             phase.clone(),
-            Arc::new(Count::default()),
+            io_wakes.clone(),
             Arc::new(Count::default()),
             formats.clone(),
             config,
@@ -910,6 +920,8 @@ mod tests {
             owner,
             _lifecycle: Some(lifecycle),
             clock: Instant::now(),
+            io_wakes,
+            drained_at: 0,
         };
         // Adoption ends before the first client: the bridge is ready.
         rig.owner_settle();
@@ -928,9 +940,6 @@ mod tests {
                 self.poll
                     .poll(&mut events, Some(Duration::from_millis(50)))
                     .unwrap();
-                if events.is_empty() {
-                    return;
-                }
                 for event in events.iter() {
                     if event.token() == LISTENER {
                         while let Ok((stream, _)) = self.listener.accept() {
@@ -941,7 +950,13 @@ mod tests {
                     }
                 }
                 self.owner_settle();
-                self.server.drain_outboxes();
+                // The `io` loop drains at its wake token, and only then: the owner's fills and the server's re-arm wake it.
+                if self.io_wakes.get() != self.drained_at {
+                    self.drained_at = self.io_wakes.get();
+                    self.server.drain_outboxes();
+                } else if events.is_empty() {
+                    return;
+                }
             }
         }
 
@@ -1710,5 +1725,145 @@ mod tests {
             close["reason"]["protocol_error"]["code"],
             "duplicate_request_id"
         );
+    }
+
+    fn body_len(value: &Value) -> usize {
+        serde_json::to_vec(value).unwrap().len()
+    }
+
+    /// KINDS-1: a drain takes at most `TAKE` items from a connection, and it asks the `io` loop for another turn while
+    /// items are left: no other wake comes for items that are already queued. `pump` follows the wakes as the loop does.
+    #[test]
+    fn a_drain_with_items_left_wakes_io_again() {
+        let mut config = config();
+        config.outbox = OutboxCaps {
+            replies: 8,
+            frames: 200,
+            watch_queue: 200,
+        };
+        config.out_bytes = 1 << 20;
+        let mut rig = owned(config);
+        for n in 0..70 {
+            rig.make_session(&format!("s{n:02}"));
+        }
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session", None, Value::Null);
+        // A reader thread keeps the socket empty while the test thread pumps: the baseline is larger than one drain and
+        // than the socket buffer.
+        let mut reader = client.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || loop {
+            let frame = receive(&mut reader);
+            let ended = frame["frame"] == "snapshot_end";
+            tx.send(frame).unwrap();
+            if ended {
+                return;
+            }
+        });
+        let mut frames = Vec::new();
+        for _ in 0..200 {
+            rig.pump();
+            frames.extend(rx.try_iter());
+            if frames.last().is_some_and(|f| f["frame"] == "snapshot_end") {
+                break;
+            }
+        }
+        thread.join().unwrap();
+        frames.extend(rx.try_iter());
+        // The `res`, `snapshot_begin`, 70 rows and `snapshot_end`.
+        assert_eq!(frames.len(), 1 + 1 + 70 + 1);
+    }
+
+    /// KINDS-2, EN-5: the Hub never sends a frame over `max_frame_bytes`. A `get` whose row is one byte over is
+    /// `response_too_large`; a row that fits exactly is sent.
+    #[test]
+    fn a_get_over_the_bound_is_response_too_large_and_an_exact_fit_is_sent() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        let max = 4096;
+        rig.set_label("a", &"x".repeat(100));
+        req(&mut client, 1, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let base = body_len(&receive(&mut client));
+        let fit = 100 + (max - base);
+        rig.set_label("a", &"x".repeat(fit));
+        req(&mut client, 2, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let exact = receive(&mut client);
+        assert_eq!(body_len(&exact), max, "the answer fits exactly");
+        assert_eq!(exact["ok"]["id"], "a");
+        rig.set_label("a", &"x".repeat(fit + 1));
+        req(&mut client, 3, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let over = receive(&mut client);
+        assert_eq!(over["err"]["code"], "response_too_large", "{over}");
+        // The connection is fine.
+        req(
+            &mut client,
+            4,
+            "get",
+            "session_type",
+            Some("command"),
+            Value::Null,
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["id"], "command");
+    }
+
+    /// KINDS-2, BD-2: a delta over the bound ends the watch with `watch_closed { item_too_large }`; nothing of the watch
+    /// follows it.
+    #[test]
+    fn a_delta_over_the_bound_closes_the_watch() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session", None, Value::Null);
+        rig.pump();
+        for _ in 0..4 {
+            receive(&mut client);
+        }
+        rig.set_label("a", &"x".repeat(5000));
+        let closed = receive(&mut client);
+        assert_eq!(
+            closed,
+            json!({"type": "watch", "frame": "watch_closed", "watch_id": "1", "reason": "item_too_large"})
+        );
+        rig.set_label("a", "small");
+        req(&mut client, 2, "list", "session", None, Value::Null);
+        rig.pump();
+        assert_eq!(
+            receive(&mut client)["id"],
+            "2",
+            "no frame of the closed watch follows"
+        );
+    }
+
+    /// KINDS-3, BD-1: the bound counts each watch once. Two watches in one write fill `max_watches` 2; the third is `busy`.
+    #[test]
+    fn pipelined_watches_count_once_against_the_bound() {
+        let mut config = config();
+        config.limits.max_watches = 2;
+        let mut rig = owned(config);
+        let mut client = rig.control();
+        for id in 1..=3 {
+            req(&mut client, id, "watch", "session", None, Value::Null);
+        }
+        rig.pump();
+        let mut oks = 0;
+        let mut busy = 0;
+        let mut seen = 0;
+        while seen < 3 {
+            let frame = receive(&mut client);
+            if frame["type"] == "res" {
+                seen += 1;
+                if frame.get("ok").is_some() {
+                    oks += 1;
+                } else if frame["err"]["code"] == "busy" {
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((oks, busy), (2, 1));
     }
 }

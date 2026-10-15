@@ -32,8 +32,6 @@ pub const MAX_PAGE: usize = 500;
 /// Cursors that one connection keeps. A new listing past the bound drops the oldest cursor (its next use is
 /// `expired_cursor`, which is retryable).
 pub const MAX_CURSORS: usize = 8;
-/// Bytes of a frame that are not items: the envelope, the ids and the cursor.
-const FRAME_HEADROOM: usize = 256;
 
 /// What the kinds read from the server (one source for each number).
 #[derive(Debug, Clone, Copy)]
@@ -356,23 +354,44 @@ fn type_values(ctx: &Ctx) -> Vec<Value> {
         .collect()
 }
 
-fn byte_len(value: &Value) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len() + 1)
+/// The encoded size of a frame body, which `max_frame_bytes` bounds (EN-5).
+fn encoded_len(frame: &ServerFrame) -> usize {
+    serde_json::to_vec(frame).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-/// Takes items from `items[from..]` while the frame stays within the bound. At most `limit` items.
-fn take_fitting(items: &[Value], from: usize, limit: usize, bound: usize) -> usize {
-    let budget = bound.saturating_sub(FRAME_HEADROOM);
-    let mut used: usize = 0;
-    let mut taken = 0;
-    for item in items[from..].iter().take(limit) {
-        used = used.saturating_add(byte_len(item));
-        if used > budget {
-            break;
+/// How many items of `items[from..]` go in one frame, at most `limit`, so that the whole encoded frame stays within `bound`.
+/// `overhead_last` is the encoded size of the frame with no items when it is the last page; `overhead_more` is the size
+/// when a cursor follows. Items are comma separated, so `k` items add their sizes and `k - 1` commas.
+fn take_fitting(
+    items: &[Value],
+    from: usize,
+    limit: usize,
+    bound: usize,
+    overhead_last: usize,
+    overhead_more: usize,
+) -> usize {
+    let greedy = |overhead: usize, limit: usize| {
+        let mut used = overhead;
+        let mut taken = 0;
+        for item in items[from..].iter().take(limit) {
+            let size = serde_json::to_vec(item).map_or(usize::MAX, |bytes| bytes.len());
+            let add = size.saturating_add(usize::from(taken > 0));
+            used = used.saturating_add(add);
+            if used > bound {
+                break;
+            }
+            taken += 1;
         }
-        taken += 1;
+        taken
+    };
+    let rest = items.len() - from;
+    if rest <= limit {
+        let all = greedy(overhead_last, rest);
+        if all == rest {
+            return all;
+        }
     }
-    taken
+    greedy(overhead_more, limit)
 }
 
 impl ConnKinds {
@@ -485,7 +504,14 @@ impl ConnKinds {
         limit: usize,
         now: Instant,
     ) -> Res {
-        let taken = take_fitting(&items, 0, limit, ctx.max_frame_bytes);
+        let taken = take_fitting(
+            &items,
+            0,
+            limit,
+            ctx.max_frame_bytes,
+            list_overhead(id, None),
+            list_overhead(id, Some(&cursor_name(self.next_cursor + 1))),
+        );
         if taken == 0 && !items.is_empty() {
             return too_large(id);
         }
@@ -542,7 +568,14 @@ impl ConnKinds {
             return expired();
         }
         let held = &mut self.cursors[at];
-        let taken = take_fitting(&held.items, held.next, limit, ctx.max_frame_bytes);
+        let taken = take_fitting(
+            &held.items,
+            held.next,
+            limit,
+            ctx.max_frame_bytes,
+            list_overhead(id, None),
+            list_overhead(id, Some(&cursor_name(n))),
+        );
         if taken == 0 {
             return too_large(id);
         }
@@ -574,7 +607,8 @@ impl ConnKinds {
             Ok(filter) => filter,
             Err(message) => return Step::Reply(invalid(id, &message)),
         };
-        if self.watches.len() + self.opening() >= ctx.max_watches {
+        // A session watch is in the table from `expect`, which comes before the next request, so each counts once.
+        if self.watches.len() >= ctx.max_watches {
             return Step::Reply(res_err(
                 id,
                 busy(ctx, "the connection has max_watches open"),
@@ -643,14 +677,6 @@ impl ConnKinds {
         }
     }
 
-    /// Watches whose request is open: they hold a place before the owner answers.
-    fn opening(&self) -> usize {
-        self.pending
-            .values()
-            .filter(|p| matches!(p, Pending::Watch { .. }))
-            .count()
-    }
-
     fn begin_unwatch(&mut self, conn: u64, req: &Req) -> Step {
         let id = req.id.0;
         let Some(number) = req.target.as_deref().and_then(|t| t.parse::<u64>().ok()) else {
@@ -675,6 +701,22 @@ impl ConnKinds {
 
     /// The frames for the owner's answer to request `id`: the `res`, and the first frame of a new baseline.
     pub fn answer(&mut self, ctx: &Ctx, id: u64, answer: Answer) -> Vec<ServerFrame> {
+        let frames = self.answer_unbounded(ctx, id, answer);
+        // The Hub never sends a frame over `max_frame_bytes` (EN-5): the answer becomes `response_too_large`.
+        frames
+            .into_iter()
+            .map(|frame| match frame {
+                ServerFrame::Res(res)
+                    if encoded_len(&ServerFrame::Res(res.clone())) > ctx.max_frame_bytes =>
+                {
+                    ServerFrame::Res(too_large(res.id.0))
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    fn answer_unbounded(&mut self, ctx: &Ctx, id: u64, answer: Answer) -> Vec<ServerFrame> {
         let Some(pending) = self.pending.remove(&id) else {
             return Vec::new();
         };
@@ -747,6 +789,26 @@ impl ConnKinds {
 
     /// The frames for one frame of the watch `number`. A watch that is gone or closed gets none (WT-5, WT-6).
     pub fn frame(&mut self, ctx: &Ctx, number: u64, frame: ViewFrame) -> Vec<ServerFrame> {
+        let frames = self.frame_unbounded(ctx, number, frame);
+        // A frame over `max_frame_bytes` is never sent (EN-5, BD-2): the watch ends with `watch_closed { item_too_large }`.
+        let mut out = Vec::with_capacity(frames.len());
+        for frame in frames {
+            if encoded_len(&frame) > ctx.max_frame_bytes {
+                if let Some(state) = self.watches.get_mut(&number) {
+                    state.closed = true;
+                }
+                out.push(ServerFrame::Watch(WatchFrame::WatchClosed {
+                    watch_id: number.to_string(),
+                    reason: WatchClosedReason::ItemTooLarge,
+                }));
+                break;
+            }
+            out.push(frame);
+        }
+        out
+    }
+
+    fn frame_unbounded(&mut self, ctx: &Ctx, number: u64, frame: ViewFrame) -> Vec<ServerFrame> {
         let Some(state) = self.watches.get_mut(&number) else {
             return Vec::new();
         };
@@ -872,11 +934,14 @@ fn too_large(id: u64) -> Res {
 /// The `snapshot_items` frames for `items`, each within the bound (WT-1). `Err` when one item alone does not fit
 /// (BD-2: `watch_closed { item_too_large }`).
 fn snapshot_items(watch_id: &str, items: Vec<Value>, bound: usize) -> Result<Vec<ServerFrame>, ()> {
+    let overhead = encoded_len(&ServerFrame::Watch(WatchFrame::SnapshotItems {
+        watch_id: watch_id.to_owned(),
+        items: Vec::new(),
+    }));
     let mut frames = Vec::new();
     let mut from = 0;
-    let bound = bound.saturating_sub(watch_id.len());
     while from < items.len() {
-        let taken = take_fitting(&items, from, usize::MAX, bound);
+        let taken = take_fitting(&items, from, usize::MAX, bound, overhead, overhead);
         if taken == 0 {
             return Err(());
         }
@@ -887,6 +952,15 @@ fn snapshot_items(watch_id: &str, items: Vec<Value>, bound: usize) -> Result<Vec
         from += taken;
     }
     Ok(frames)
+}
+
+/// The encoded size of a `list` answer with no items, for the cursor it will carry (or none).
+fn list_overhead(id: u64, cursor: Option<&str>) -> usize {
+    encoded_len(&ServerFrame::Res(list_res(
+        id,
+        Vec::new(),
+        cursor.map(str::to_owned),
+    )))
 }
 
 #[cfg(test)]
@@ -935,16 +1009,58 @@ mod tests {
         assert_eq!(filter.session(), Some(SessionId("a".into())));
     }
 
+    /// KINDS-4: the bound is on the whole encoded `list` answer. A page that fits exactly is sent; one byte less takes
+    /// fewer items, or none (`response_too_large`).
     #[test]
-    fn a_page_stops_at_the_limit_and_at_the_frame_bound() {
+    fn a_page_is_bound_by_the_whole_encoded_answer() {
+        let types = types();
+        let mut ctx = ctx(&types);
+        let all = items(3);
+        // The last page: all three items, no cursor.
+        let last = encoded_len(&ServerFrame::Res(list_res(7, all.clone(), None)));
+        ctx.max_frame_bytes = last;
+        let mut kinds = ConnKinds::default();
+        let res = kinds.first_page(&ctx, 7, "q".into(), all.clone(), 10, Instant::now());
+        let Outcome::Ok { ok } = res.outcome else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ok["items"].as_array().unwrap().len(), 3);
+        assert!(ok.get("next_cursor").is_none());
+        // One byte less: two items and a cursor, whose frame is no bigger than the bound.
+        ctx.max_frame_bytes = last - 1;
+        let mut kinds = ConnKinds::default();
+        let res = kinds.first_page(&ctx, 7, "q".into(), all.clone(), 10, Instant::now());
+        let Outcome::Ok { ok } = res.outcome.clone() else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ok["items"].as_array().unwrap().len(), 2);
+        assert!(encoded_len(&ServerFrame::Res(res)) < last);
+        // A page with a cursor: the cursor name is part of the answer.
+        let with_cursor = encoded_len(&ServerFrame::Res(list_res(
+            7,
+            all[..1].to_vec(),
+            Some("c1".into()),
+        )));
+        ctx.max_frame_bytes = with_cursor;
+        let mut kinds = ConnKinds::default();
+        let res = kinds.first_page(&ctx, 7, "q".into(), all.clone(), 1, Instant::now());
+        let Outcome::Ok { ok } = res.outcome else {
+            panic!("{res:?}")
+        };
+        assert_eq!(ok["items"].as_array().unwrap().len(), 1);
+        ctx.max_frame_bytes = with_cursor - 1;
+        let mut kinds = ConnKinds::default();
+        let res = kinds.first_page(&ctx, 7, "q".into(), all.clone(), 1, Instant::now());
+        assert!(
+            matches!(&res.outcome, Outcome::Err { err } if err.code == ErrorCode::ResponseTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_page_stops_at_the_limit() {
         let all = items(10);
-        assert_eq!(take_fitting(&all, 0, 3, 4096), 3);
-        assert_eq!(take_fitting(&all, 8, 5, 4096), 2);
-        let one = byte_len(&all[0]);
-        // A bound that holds two items plus the headroom.
-        assert_eq!(take_fitting(&all, 0, 10, FRAME_HEADROOM + 2 * one), 2);
-        // A bound under one item takes none.
-        assert_eq!(take_fitting(&all, 0, 10, FRAME_HEADROOM + one - 1), 0);
+        assert_eq!(take_fitting(&all, 0, 3, 4096, 20, 40), 3);
+        assert_eq!(take_fitting(&all, 8, 5, 4096, 20, 40), 2);
     }
 
     #[test]
@@ -1026,18 +1142,27 @@ mod tests {
         assert_eq!(kinds.cursors.len(), MAX_CURSORS);
     }
 
+    /// BD-2: one item over the bound is `response_too_large`; the snapshot frames are bound by their whole size, exactly.
     #[test]
     fn an_item_over_the_bound_is_response_too_large() {
         let types = types();
         let mut ctx = ctx(&types);
-        ctx.max_frame_bytes = FRAME_HEADROOM + 4;
+        ctx.max_frame_bytes = 40;
         let mut kinds = ConnKinds::default();
         let res = kinds.first_page(&ctx, 1, "q".into(), items(1), 10, Instant::now());
         assert!(
             matches!(&res.outcome, Outcome::Err { err } if err.code == ErrorCode::ResponseTooLarge)
         );
-        assert!(snapshot_items("1", items(1), FRAME_HEADROOM + 4).is_err());
-        assert!(snapshot_items("1", items(40), 600).unwrap().len() > 1);
+        assert!(snapshot_items("1", items(1), 40).is_err());
+        let one = encoded_len(&ServerFrame::Watch(WatchFrame::SnapshotItems {
+            watch_id: "1".into(),
+            items: items(1),
+        }));
+        assert_eq!(snapshot_items("1", items(1), one).unwrap().len(), 1);
+        assert!(snapshot_items("1", items(1), one - 1).is_err());
+        let frames = snapshot_items("1", items(40), 600).unwrap();
+        assert!(frames.len() > 1);
+        assert!(frames.iter().all(|f| encoded_len(f) <= 600));
     }
 
     #[test]
