@@ -303,14 +303,23 @@ fn stop_owner(phase: &SharedPhase, lifecycle: &SyncSender<Lifecycle>, owner: Joi
     let _ = owner.join();
 }
 
-/// RT-2: a session directory is deleted with its row, so a directory with no row after adoption is an orphan.
+/// RT-2: a session directory is deleted with its row, so a real directory with no row after adoption is an orphan.
+/// Nothing is followed: a sessions root that is not a real directory is left alone, and so is every entry that is not a
+/// real directory (a file, a symlink), so data outside the data root and unrelated files survive.
 fn delete_orphan_session_dirs(roots: &Roots, rows: &BTreeSet<SessionId>) {
-    let Ok(entries) = fs::read_dir(roots.data_root.join("sessions")) else {
+    let root = roots.data_root.join("sessions");
+    if !fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let known = name
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let known = entry
+            .file_name()
             .to_str()
             .is_some_and(|n| rows.contains(&SessionId(n.into())));
         if !known {
