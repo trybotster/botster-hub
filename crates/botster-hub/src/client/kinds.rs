@@ -158,6 +158,16 @@ pub enum Pending {
     Delete,
 }
 
+impl Pending {
+    /// Whether the request changes state: an answer to it cannot claim `effect: none` for a failure after dispatch.
+    fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Pending::Create { .. } | Pending::Update | Pending::Delete
+        )
+    }
+}
+
 /// A watch of this connection.
 #[derive(Debug)]
 pub struct WatchState {
@@ -388,13 +398,15 @@ pub fn core_error(error_: &CoreError) -> Error {
 }
 
 /// The error of an op that finished with an error: a synchronous kind of error proves no change; any other may have changed
-/// something (HC section 11.1).
+/// something (HC section 11.1). `Cancelled` is the exception: Core sends it only when the op was cancelled before any
+/// effect (EN-3b).
 fn op_error(error_: &CoreError) -> Error {
-    let effect = if matches!(error_.code.timing(), Timing::Sync) {
-        ErrorEffect::None
-    } else {
-        ErrorEffect::Unknown
-    };
+    let effect =
+        if matches!(error_.code.timing(), Timing::Sync) || error_.code == CoreCode::Cancelled {
+            ErrorEffect::None
+        } else {
+            ErrorEffect::Unknown
+        };
     core_error_with(error_, effect)
 }
 
@@ -937,15 +949,24 @@ impl ConnKinds {
 
     /// The frames for the owner's answer to request `id`: the `res`, and the first frame of a new baseline.
     pub fn answer(&mut self, ctx: &Ctx, id: u64, answer: Answer) -> Vec<ServerFrame> {
+        let mutated = self.pending.get(&id).is_some_and(Pending::mutates);
         let frames = self.answer_unbounded(ctx, id, answer);
-        // The Hub never sends a frame over `max_frame_bytes` (EN-5): the answer becomes `response_too_large`.
+        // The Hub never sends a frame over `max_frame_bytes` (EN-5): the answer becomes `response_too_large`. A mutation
+        // already ran, so its effect is `unknown` (HC section 11.1).
         frames
             .into_iter()
             .map(|frame| match frame {
                 ServerFrame::Res(res)
                     if encoded_len(&ServerFrame::Res(res.clone())) > ctx.max_frame_bytes =>
                 {
-                    ServerFrame::Res(too_large(res.id.0))
+                    ServerFrame::Res(too_large_with(
+                        res.id.0,
+                        if mutated {
+                            ErrorEffect::Unknown
+                        } else {
+                            ErrorEffect::None
+                        },
+                    ))
                 }
                 other => other,
             })
@@ -1185,13 +1206,18 @@ fn list_res(id: u64, items: Vec<Value>, next_cursor: Option<String>) -> Res {
 }
 
 fn too_large(id: u64) -> Res {
+    too_large_with(id, ErrorEffect::None)
+}
+
+/// `response_too_large` with the effect of the request: `none` before dispatch, `unknown` after a mutation ran.
+fn too_large_with(id: u64, effect: ErrorEffect) -> Res {
     res_err(
         id,
         error(
             ErrorCode::ResponseTooLarge,
             Category::Capacity,
             false,
-            Some(ErrorEffect::None),
+            Some(effect),
             "one item is larger than max_frame_bytes",
         ),
     )
@@ -1430,6 +1456,65 @@ mod tests {
         let frames = snapshot_items("1", items(40), 600).unwrap();
         assert!(frames.len() > 1);
         assert!(frames.iter().all(|f| encoded_len(f) <= 600));
+    }
+
+    fn effect_of(frames: &[ServerFrame]) -> (ErrorCode, Option<ErrorEffect>) {
+        match frames {
+            [ServerFrame::Res(Res {
+                outcome: Outcome::Err { err },
+                ..
+            })] => (err.code, err.effect),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// WRITE-1: a mutation that ran cannot say `effect: none` when its answer is too large; a read can.
+    #[test]
+    fn a_too_large_answer_keeps_the_effect_of_the_request() {
+        let types = types();
+        let mut ctx = ctx(&types);
+        ctx.max_frame_bytes = 40;
+        let mut kinds = ConnKinds::default();
+        kinds.pending.insert(1, Pending::Update);
+        let row = Arc::new(Row {
+            id: SessionId("a".into()),
+            state: botster_core::contract::prelude::SessionState::Running,
+            size: botster_core::contract::prelude::Size {
+                rows: 24,
+                cols: 80,
+                cell_px: None,
+            },
+            exit: None,
+            labels: BTreeMap::new(),
+            activity: crate::watch::Activity::Idle,
+            spawn_end: None,
+        });
+        let frames = kinds.answer(&ctx, 1, Answer::Row(row.clone()));
+        assert_eq!(
+            effect_of(&frames),
+            (ErrorCode::ResponseTooLarge, Some(ErrorEffect::Unknown))
+        );
+        kinds.pending.insert(2, Pending::Get);
+        let frames = kinds.answer(&ctx, 2, Answer::Row(row));
+        assert_eq!(
+            effect_of(&frames),
+            (ErrorCode::ResponseTooLarge, Some(ErrorEffect::None))
+        );
+    }
+
+    /// WRITE-2, EN-3b: a completion with `Cancelled` proves no effect; another asynchronous error does not.
+    #[test]
+    fn a_cancelled_completion_has_no_effect() {
+        let types = types();
+        let ctx = ctx(&types);
+        let mut kinds = ConnKinds::default();
+        kinds.pending.insert(1, Pending::Delete);
+        let cancelled = CoreError::new(CoreCode::Cancelled, "cancelled");
+        let frames = kinds.answer(&ctx, 1, Answer::Op(OpResult::Err(cancelled)));
+        assert_eq!(
+            effect_of(&frames),
+            (ErrorCode::Cancelled, Some(ErrorEffect::None))
+        );
     }
 
     #[test]

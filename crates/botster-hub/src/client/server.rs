@@ -2027,6 +2027,39 @@ mod tests {
 
     /// KR-1 `kr_1_session_update_label_and_task` (the label part), VB-4: the answer is the row; `null` deletes the label,
     /// which falls back to the id; `task`, `if_rev` and a stranger are refused; an unknown session is `not_found`.
+    /// WRITE-1, EN-5: an update whose row answer is over the bound ran. The label is stored, and the error says
+    /// `effect: unknown`, not `none`.
+    #[test]
+    fn an_update_with_an_answer_over_the_bound_says_its_effect_is_unknown() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        let max = 4096;
+        rig.set_label("a", &"x".repeat(100));
+        req(&mut client, 1, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let base = body_len(&receive(&mut client));
+        let over = 100 + (max - base) + 1;
+        req(
+            &mut client,
+            2,
+            "update",
+            "session",
+            Some("a"),
+            json!({"patch": {"label": "y".repeat(over)}}),
+        );
+        rig.pump();
+        let answer = receive(&mut client);
+        assert_eq!(answer["err"]["code"], "response_too_large", "{answer}");
+        assert_eq!(answer["err"]["effect"], "unknown", "{answer}");
+        let stored = rig.owner.as_ref().unwrap().view()
+            [&botster_core::contract::prelude::SessionId("a".into())]
+            .labels
+            .get(crate::client::rows::LABEL_KEY)
+            .cloned();
+        assert_eq!(stored, Some("y".repeat(over)), "the label was written");
+    }
+
     #[test]
     fn update_sets_the_label_and_answers_the_row() {
         let mut rig = owned(config());
