@@ -3,9 +3,12 @@
 //! - Bounded lanes: `Control`, `Request`, `Bulk`. A full lane refuses at once (`Backpressured`); nothing blocks.
 //! - Only `Bulk` coalesces, by key. No client request is coalesced: every client request gets its own answer (HC EN-3).
 //! - `submit` returns admission only. The real answer reaches the [`ReplyTo`] token later, exactly once.
-//! - No domain verbs: [`Request`] mirrors Core's ops and reads, plus `Shutdown` and the spawn operation (design section
-//!   4a, "Spawn flow").
+//! - No domain verbs: [`Request`] mirrors Core's ops and reads, plus `Shutdown`, the spawn operation (design section
+//!   4a, "Spawn flow") and the route handoff (client protocol design, sections 2.2 and 2.3).
 
+use crate::client::handoff::{
+    Reservation, ReserveRequest, RouteConnectAnswer, RouteConnectRequest,
+};
 use crate::phase::{SharedPhase, Wake};
 use crate::store::Lookup;
 use crate::watch::{WatchFilter, WatchFrame, WatchKey};
@@ -52,6 +55,10 @@ pub enum Request {
     },
     /// Ends a watch (HC WT-6): every frame of it is ahead of the reply.
     Unwatch(WatchKey),
+    /// `invoke(session, attach)`: reserves a route (TS-1). Boxed like `Op`.
+    ReserveRoute(Box<ReserveRequest>),
+    /// A `route_connect` with the client's stream (TB-L2). On a refused `submit`, `Rejected` returns the stream to `io`.
+    RouteConnect(Box<RouteConnectRequest>),
 }
 
 impl Request {
@@ -157,6 +164,10 @@ pub enum Answer {
     Watching,
     /// The watch is gone (or never existed).
     Unwatched,
+    /// The route is reserved; `io` adds the transport's `socket_path` (TS-1).
+    RouteReserved(Reservation),
+    /// The owner's step for a `route_connect`.
+    RouteConnect(RouteConnectAnswer),
     /// A failure that the Hub answers itself.
     Failed(Failure),
 }
