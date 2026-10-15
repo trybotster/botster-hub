@@ -329,7 +329,7 @@ fn run_owner(
     adopted: SyncSender<Result<BTreeSet<SessionId>, String>>,
 ) {
     let ended = guarded(&mut owner, |owner| {
-        owner_loop(owner, &mut poll, &phase, &adopted)
+        own_core_until_done(owner, &mut poll, &phase, &adopted)
     });
     if ended == Ended::Panicked || !matches!(owner.adoption(), Adoption::Done) {
         request_stop(&phase, &lifecycle, StopCause::OwnerFailed);
@@ -340,7 +340,7 @@ fn run_owner(
     let _ = lifecycle.try_send(Lifecycle::OwnerGone(ended));
 }
 
-fn owner_loop(
+fn own_core_until_done(
     owner: &mut Owner<Core>,
     poll: &mut Poll,
     phase: &SharedPhase,
