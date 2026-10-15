@@ -317,6 +317,13 @@ impl<C: CoreApi> Owner<C> {
         }
     }
 
+    /// Sets `activity_idle_ms` at construction (the first `SessionState` of each session sets the threshold, so nothing is
+    /// set yet); a live change after the start is [`Owner::set_activity_idle`].
+    pub fn with_activity_idle(mut self, idle: Duration) -> Owner<C> {
+        self.activity_idle = idle;
+        self
+    }
+
     /// Gives the owner the spawn operation store. The records with `remove_row: true` give the cleanup obligations.
     pub fn with_store(mut self, store: SpawnStore) -> Owner<C> {
         self.cleanup = store
@@ -1332,6 +1339,164 @@ mod tests {
 
     fn session_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
         root.join("sessions").join(name)
+    }
+
+    fn set_label(key: &str, value: &str) -> Request {
+        Request::SetLabels {
+            session: sid("a"),
+            set: [(key.to_string(), value.to_string())].into(),
+            remove: Vec::new(),
+        }
+    }
+
+    /// R-125: two edits of different keys, queued together, both survive; the writer sends one `UpdateMetadata` at a time
+    /// and the second edit starts from the map that the first one wrote.
+    #[test]
+    fn two_interleaved_label_edits_both_survive() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        rig.answers();
+        rig.submit(2, set_label("h/x", "1"));
+        rig.submit(3, set_label("h/y", "2"));
+        rig.settle(64);
+        let answers = rig.answers();
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        assert!(answers
+            .iter()
+            .all(|(_, a)| matches!(a, Answer::Op(OpResult::Ok(_)))));
+        let labels = &rig.owner.view()[&sid("a")].labels;
+        assert_eq!(labels.get("h/x").map(String::as_str), Some("1"));
+        assert_eq!(labels.get("h/y").map(String::as_str), Some("2"));
+        assert_eq!(rig.owner.core.get(&sid("a")).unwrap().labels, *labels);
+        // A remove applies to the latest map.
+        rig.submit(
+            4,
+            Request::SetLabels {
+                session: sid("a"),
+                set: Default::default(),
+                remove: vec!["h/x".into()],
+            },
+        );
+        rig.settle(64);
+        rig.answers();
+        let labels = &rig.owner.view()[&sid("a")].labels;
+        assert!(!labels.contains_key("h/x") && labels.contains_key("h/y"));
+    }
+
+    /// A label edit of a session with no row is refused `UnknownSession`.
+    #[test]
+    fn a_label_edit_of_an_unknown_session_is_refused() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, set_label("h/x", "1"));
+        rig.settle(64);
+        let answers = rig.answers();
+        assert!(
+            matches!(&answers[..], [(1, Answer::CoreRefused(e))] if matches!(e.code, ErrorCode::UnknownSession)),
+            "{answers:?}"
+        );
+    }
+
+    /// R-125: the raw `UpdateMetadata` op is not for clients; the label writer is the only writer.
+    #[test]
+    fn a_raw_update_metadata_is_refused_internal_with_no_effect() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        rig.answers();
+        rig.submit(
+            2,
+            Request::Op(Box::new(Op::UpdateMetadata {
+                id: sid("a"),
+                labels: [("k".to_string(), "v".to_string())].into(),
+            })),
+        );
+        rig.settle(64);
+        let answers = rig.answers();
+        assert!(
+            matches!(&answers[..], [(2, Answer::Failed(f))]
+                if f.kind == FailKind::Internal && f.effect == Effect::None),
+            "{answers:?}"
+        );
+        assert!(rig.owner.view()[&sid("a")].labels.is_empty());
+    }
+
+    /// The row follows `Activity{Output}` (active), `Silent` (idle) and `SizeChanged`; other sources change nothing.
+    #[test]
+    fn the_row_follows_activity_silence_and_size() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        rig.answers();
+        let id = sid("a");
+        let instance = InstanceId("i".into());
+        assert_eq!(rig.owner.view()[&id].activity, Activity::Idle);
+        let change = rig.owner.apply(Event::Activity {
+            id: id.clone(),
+            instance: instance.clone(),
+            source: ActivitySource::Output,
+            at: 1,
+        });
+        assert!(matches!(change, Some(ViewChange::Row(_))));
+        assert_eq!(rig.owner.view()[&id].activity, Activity::Active);
+        let again = rig.owner.apply(Event::Activity {
+            id: id.clone(),
+            instance: instance.clone(),
+            source: ActivitySource::Output,
+            at: 2,
+        });
+        assert!(again.is_none(), "an unchanged row is no delta");
+        let change = rig.owner.apply(Event::Silent {
+            id: id.clone(),
+            instance,
+            since: 3,
+        });
+        assert!(matches!(change, Some(ViewChange::Row(_))));
+        assert_eq!(rig.owner.view()[&id].activity, Activity::Idle);
+        let size = Size {
+            rows: 30,
+            cols: 100,
+            cell_px: None,
+        };
+        // The fake posts `SizeChanged` only for a started session (SZ-3), so the event is applied directly.
+        let change = rig.owner.apply(Event::SizeChanged {
+            id: id.clone(),
+            instance: InstanceId("i".into()),
+            size,
+        });
+        assert!(matches!(change, Some(ViewChange::Row(_))));
+        assert_eq!(rig.owner.view()[&id].size, size);
+    }
+
+    /// The threshold is set once per session at its first non-`Released` state, and a live change sets it again.
+    #[test]
+    fn the_silence_threshold_is_set_once_per_session() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        rig.answers();
+        assert!(rig.owner.thresholds.contains(&sid("a")));
+        rig.owner.set_activity_idle(Duration::from_millis(500));
+        assert_eq!(rig.owner.activity_idle, Duration::from_millis(500));
+        assert!(rig.owner.thresholds.contains(&sid("a")));
+        let id = sid("a");
+        rig.owner.apply(Event::SessionState {
+            id: id.clone(),
+            instance: InstanceId("i".into()),
+            state: SessionState::Released,
+        });
+        assert!(rig.owner.thresholds.is_empty());
+        assert!(rig.owner.view().is_empty());
     }
 
     /// Start step 6: `AdoptAll` completes, the bridge becomes ready, and requests before it were refused `NotReady`.

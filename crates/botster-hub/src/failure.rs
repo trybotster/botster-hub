@@ -13,6 +13,8 @@ pub enum FailCode {
     SocketUnavailable,
     AdoptionFailed,
     DataRootUnusable,
+    /// Core lacks a feature that the Hub requires (R-118 makes the set of codes open); the message names it.
+    CoreFeatureMissing,
     Internal,
 }
 
@@ -28,6 +30,7 @@ impl FailCode {
             FailCode::SocketUnavailable => "socket_unavailable",
             FailCode::AdoptionFailed => "adoption_failed",
             FailCode::DataRootUnusable => "data_root_unusable",
+            FailCode::CoreFeatureMissing => "core_feature_missing",
             FailCode::Internal => "internal",
         }
     }
@@ -91,6 +94,7 @@ mod tests {
             (FailCode::SocketUnavailable, "socket_unavailable"),
             (FailCode::AdoptionFailed, "adoption_failed"),
             (FailCode::DataRootUnusable, "data_root_unusable"),
+            (FailCode::CoreFeatureMissing, "core_feature_missing"),
             (FailCode::Internal, "internal"),
         ];
         for (code, text) in all {
