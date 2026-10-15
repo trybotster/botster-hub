@@ -47,6 +47,20 @@ pub enum FailReason {
     Internal,
 }
 
+impl FailReason {
+    /// The word of the reason in the record and on the wire (A.7b).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailReason::ExecFailed => "exec_failed",
+            FailReason::CwdMissing => "cwd_missing",
+            FailReason::WorkerFailed => "worker_failed",
+            FailReason::StartFailed => "start_failed",
+            FailReason::Interrupted => "interrupted",
+            FailReason::Internal => "internal",
+        }
+    }
+}
+
 /// One spawn operation record (design section 4a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,6 +451,18 @@ impl SpawnStore {
             .values()
             .filter(|e| e.written && e.record.state == SpawnState::Starting)
             .map(|e| e.record.clone())
+            .collect()
+    }
+
+    /// The written records that ended without the session running (`failed`, `cancelled`): `(session_id, state, reason)`.
+    /// The owner shows them on the rows (R-122); `installed` is not an end.
+    pub fn terminal_ends(&self) -> Vec<(String, SpawnState, Option<FailReason>)> {
+        self.index
+            .values()
+            .filter(|e| {
+                e.written && matches!(e.record.state, SpawnState::Failed | SpawnState::Cancelled)
+            })
+            .map(|e| (e.record.session_id.clone(), e.record.state, e.record.reason))
             .collect()
     }
 

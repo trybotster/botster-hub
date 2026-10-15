@@ -11,9 +11,9 @@ use crate::client::handoff::{
 };
 use crate::phase::{SharedPhase, Wake};
 use crate::store::Lookup;
-use crate::watch::{WatchFilter, WatchFrame, WatchKey};
+use crate::watch::{Row, WatchFilter, WatchFrame, WatchKey};
 use botster_core::contract::prelude::{
-    CancelResult, CoreError, Op, OpId, OpResult, SessionId, SessionRecord, SpawnRequest,
+    CancelResult, CoreError, Op, OpId, OpResult, SessionId, SpawnRequest,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,9 +39,9 @@ pub enum Request {
     GetSpawn(String),
     /// A Core op (`begin`). Boxed: an `Op` is large, and a request moves through the lanes and back in `Rejected`.
     Op(Box<Op>),
-    /// A sync read of one row.
+    /// A read of one view row.
     Get(SessionId),
-    /// A sync read of every row.
+    /// A read of every view row.
     List,
     /// `cancel(op)`.
     Cancel(OpId),
@@ -162,8 +162,10 @@ pub enum Answer {
     Op(OpResult),
     /// A sync refusal by Core (`begin` or a read returned an error).
     CoreRefused(CoreError),
-    Session(SessionRecord),
-    Sessions(Vec<SessionRecord>),
+    /// The answer to [`Request::Get`]: the view row.
+    Row(Arc<Row>),
+    /// The answer to [`Request::List`]: every view row, id-ordered, one cut.
+    Rows(Vec<Arc<Row>>),
     Cancel(CancelResult),
     /// The answer to `Shutdown`: the stop runs.
     Stopping,

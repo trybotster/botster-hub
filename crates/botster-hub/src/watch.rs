@@ -16,6 +16,13 @@ pub enum Activity {
     Idle,
 }
 
+/// How a session's spawn operation ended without the session running (design section 7, item 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnEnd {
+    Failed { reason: String },
+    Cancelled,
+}
+
 /// One row of the session view. Rows are immutable and shared: a cut copies one pointer per row. Every field has one
 /// source (design section 4, "The view row"); PC's layer builds the HC `session` row from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +34,9 @@ pub struct Row {
     /// Core's session labels; the Hub's fields are under `h/` (R-125).
     pub labels: BTreeMap<String, String>,
     pub activity: Activity,
+    /// How the session's spawn operation ended without the session running (R-122; design section 7, item 4). The owner
+    /// sets it where it writes the terminal record; the protocol layer reads it for `failure_reason`.
+    pub spawn_end: Option<SpawnEnd>,
 }
 
 impl Row {
@@ -39,6 +49,7 @@ impl Row {
             exit: record.exit,
             labels: record.labels,
             activity: Activity::Idle,
+            spawn_end: None,
         }
     }
 }
