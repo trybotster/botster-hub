@@ -1,3 +1,13 @@
-//! The v1 Hub: a clean interface to Core, primitives and plugin management, with no product logic (Stage 2 brief,
-//! architecture facts 1 and 2). Its client protocol types are those of `botster-hub-contract`; its plugin protocol types
-//! are those of `botster-plugin-contract`. The daemon, the Core bridge and the plugin supervisor come in later PRs.
+//! The Botster Hub daemon (repo-plan section 3): the data root and the `flock` singleton, ONE owner of the embedded Core
+//! behind a small bounded bridge, start and stop, and restore through the live admission path. No product logic.
+//!
+//! Design: `shared/stage2/design-hub-daemon.md`, sha256 0d39345f (Sol CLEAN, round 4).
+
+pub mod bridge;
+pub mod daemon;
+pub mod failure;
+pub mod fsutil;
+pub mod owner;
+pub mod phase;
+pub mod roots;
+pub mod start;
