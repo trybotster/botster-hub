@@ -68,6 +68,8 @@ pub struct ServerConfig {
     pub uid: u32,
     /// The working directory of a created command that names none (HC A.9 sets no default; the operator's home).
     pub default_cwd: String,
+    /// The Hub's socket path, which `attach` answers as `transport.socket_path` (TS-1, TB-L2).
+    pub socket_path: String,
 }
 
 /// The numbers that this layer owns (HC CF-2 `[limits]`; the Hub's defaults, no HC number).
@@ -175,6 +177,7 @@ impl ServerConfig {
             busy_retry_ms: protocol.busy_retry_ms,
             uid,
             default_cwd: "/".into(),
+            socket_path: String::new(),
         }
     }
 }
@@ -494,7 +497,8 @@ impl Server {
         if control.kinds.outstanding(id) {
             return self.close(token, protocol_error(ProtocolErrorCode::DuplicateRequestId));
         }
-        let ctx = kind_ctx(&self.config, &self.types);
+        let formats = control.hello.terminal_formats.clone();
+        let ctx = kind_ctx(&self.config, &self.types, &formats);
         let step = control
             .kinds
             .begin(&ctx, token.0 as u64, &conn.outbox, &req, now);
@@ -687,7 +691,7 @@ impl Server {
         let State::Control(control) = &mut conn.state else {
             return;
         };
-        let ctx = kind_ctx(&self.config, &self.types);
+        let ctx = kind_ctx(&self.config, &self.types, &[]);
         let frames = match item {
             OutItem::Reply { request_id, answer } => control.kinds.answer(&ctx, request_id, answer),
             OutItem::Frame { watch, frame } => control.kinds.frame(&ctx, watch, frame),
@@ -752,8 +756,15 @@ impl Server {
     }
 }
 
-fn kind_ctx<'a>(config: &'a ServerConfig, types: &'a SessionTypes) -> Ctx<'a> {
+fn kind_ctx<'a>(
+    config: &'a ServerConfig,
+    types: &'a SessionTypes,
+    terminal_formats: &'a [String],
+) -> Ctx<'a> {
     Ctx {
+        caller: Caller { uid: config.uid },
+        terminal_formats,
+        socket_path: &config.socket_path,
         hub_id: &config.hub_id,
         types,
         max_frame_bytes: usize::try_from(config.limits.max_frame_bytes).unwrap_or(usize::MAX),
@@ -814,6 +825,7 @@ mod tests {
             busy_retry_ms: 50,
             uid: me(),
             default_cwd: "/tmp".into(),
+            socket_path: "/tmp/hub.sock".into(),
         }
     }
 
@@ -846,12 +858,13 @@ mod tests {
         build_rig(config, true)
     }
 
-    fn build_rig(config: ServerConfig, with_owner: bool) -> Rig {
+    fn build_rig(mut config: ServerConfig, with_owner: bool) -> Rig {
         let dir = tempfile::Builder::new()
             .prefix("bh-")
             .tempdir_in("/tmp")
             .unwrap();
         let path = dir.path().join("hub.sock");
+        config.socket_path = path.to_string_lossy().into_owned();
         let poll = Poll::new().unwrap();
         let mut listener = UnixListener::bind(&path).unwrap();
         poll.registry()
@@ -913,6 +926,13 @@ mod tests {
                     chunk_rows: 1,
                 },
             )
+            .with_routes(crate::client::handoff::RouteParams {
+                max_reservations: 4,
+                connect_window: Duration::from_secs(10),
+                query_deadline: Duration::from_millis(200),
+                sessions_root: "/data/sessions".into(),
+                pending_ends: 4,
+            })
             .with_store(store);
             owner.store_mut().unwrap().end_recovery();
             owner.begin_adoption();
@@ -1033,6 +1053,27 @@ mod tests {
             let op = Request::Op(Box::new(Op::Create {
                 session: SessionId(name.into()),
                 request,
+            }));
+            self.bridge.submit(op, outbox.reserve(1).unwrap()).unwrap();
+            self.owner_settle();
+            self.server.drain_outboxes();
+        }
+
+        /// Starts a created session, as `Spawn` does after the create: a route attaches to a running session.
+        fn start_session(&mut self, name: &str) {
+            use botster_core::contract::prelude::{Op, SessionId};
+            let outbox = Outbox::new(
+                OutboxCaps {
+                    replies: 2,
+                    frames: 2,
+                    watch_queue: 2,
+                },
+                self.phase.clone(),
+                Arc::new(Count::default()),
+                Arc::new(Count::default()),
+            );
+            let op = Request::Op(Box::new(Op::Start {
+                id: SessionId(name.into()),
             }));
             self.bridge.submit(op, outbox.reserve(1).unwrap()).unwrap();
             self.owner_settle();
@@ -2164,5 +2205,209 @@ mod tests {
         res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
         assert_eq!(res[0]["err"]["code"], "not_found");
         assert_eq!(res[1]["err"]["code"], "not_found");
+    }
+
+    fn invoke(client: &mut StdStream, id: u64, target: &str, action: &str, args: Value) {
+        let mut frame = json!({"type": "req", "id": id.to_string(), "verb": "invoke",
+            "kind": "session", "target": target, "action": action});
+        if !args.is_null() {
+            frame["args"] = args;
+        }
+        send(client, &frame);
+    }
+
+    /// `attach` on `session` through `client`, then the route connection with the answer's token. It returns the route id
+    /// and the route's client end, which the test keeps open.
+    fn attach_and_connect(
+        rig: &mut Rig,
+        client: &mut StdStream,
+        id: u64,
+        session: &str,
+    ) -> (String, StdStream) {
+        invoke(client, id, session, "attach", json!({"history": "none"}));
+        rig.pump();
+        let attached = receive(client);
+        let route_id = attached["ok"]["route_id"]
+            .as_str()
+            .expect("{attached}")
+            .to_owned();
+        let token = attached["ok"]["transport"]["route_token"].as_str().unwrap();
+        let mut route = rig.connect();
+        send(
+            &mut route,
+            &json!({"frame": "route_connect", "route_id": route_id, "route_token": token}),
+        );
+        rig.pump();
+        (route_id, route)
+    }
+
+    /// TS-1: `attach` answers the reservation and the transport; the route is in `list(route)` only after the connect
+    /// (HS-5, A.3).
+    #[test]
+    fn attach_reserves_and_the_connect_makes_the_route_visible() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        rig.start_session("a");
+        let mut client = rig.control();
+        invoke(&mut client, 1, "a", "attach", json!({"history": "none"}));
+        rig.pump();
+        let attached = receive(&mut client);
+        let ok = &attached["ok"];
+        assert_eq!(ok["transport"]["binding"], "local-stream", "{attached}");
+        assert_eq!(
+            ok["transport"]["socket_path"],
+            rig.path.to_string_lossy().as_ref()
+        );
+        assert!(ok["transport"]["route_token"].as_str().unwrap().len() >= 32);
+        assert!(ok["route_limits"]["max_frame_bytes"].as_u64().unwrap() > 0);
+        req(&mut client, 2, "list", "route", None, Value::Null);
+        rig.pump();
+        assert_eq!(
+            receive(&mut client)["ok"]["items"],
+            json!([]),
+            "reserved only"
+        );
+        let (route_id, _route) = attach_and_connect(&mut rig, &mut client, 3, "a");
+        req(&mut client, 4, "list", "route", None, Value::Null);
+        rig.pump();
+        let listed = receive(&mut client);
+        let items = listed["ok"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{listed}");
+        assert_eq!(items[0]["id"], route_id.as_str());
+        assert_eq!(
+            items[0]["session"],
+            json!({"hub_id": "h", "session_id": "a"})
+        );
+        assert_eq!(items[0]["binding"], "local-stream");
+        assert!(items[0]["since"].as_u64().unwrap() > 0);
+        req(&mut client, 5, "get", "route", Some(&route_id), Value::Null);
+        req(&mut client, 6, "get", "route", Some("nope"), Value::Null);
+        rig.pump();
+        let mut got = [receive(&mut client), receive(&mut client)];
+        got.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(got[0]["ok"]["id"], route_id.as_str());
+        assert_eq!(got[1]["err"]["code"], "not_found");
+        // A filter keeps to the core fields.
+        req(
+            &mut client,
+            7,
+            "list",
+            "route",
+            None,
+            json!({"filter": {"session": {"hub_id": "h", "session_id": "b"}}}),
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["items"], json!([]));
+    }
+
+    /// TS-10, BP-5: `detach` ends the route at Core, and Core's `RouteClosed` removes it from the table.
+    #[test]
+    fn detach_and_delete_end_a_route_of_the_caller_only() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        rig.start_session("a");
+        rig.make_session("b");
+        let mut client = rig.control();
+        let (first, _r1) = attach_and_connect(&mut rig, &mut client, 1, "a");
+        // A route on another session is not found, and the route stays.
+        invoke(&mut client, 2, "b", "detach", json!({"route_id": first}));
+        rig.pump();
+        let wrong = receive(&mut client);
+        assert_eq!(wrong["err"]["code"], "not_found", "{wrong}");
+        assert_eq!(wrong["err"]["effect"], "none");
+        invoke(&mut client, 3, "a", "detach", json!({"route_id": first}));
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"], json!({}));
+        req(&mut client, 4, "list", "route", None, Value::Null);
+        rig.pump();
+        assert_eq!(
+            receive(&mut client)["ok"]["items"],
+            json!([]),
+            "RouteClosed removed it"
+        );
+        let (second, _r2) = attach_and_connect(&mut rig, &mut client, 5, "a");
+        req(
+            &mut client,
+            6,
+            "delete",
+            "route",
+            Some(&second),
+            Value::Null,
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"], json!({}));
+        req(&mut client, 7, "list", "route", None, Value::Null);
+        req(
+            &mut client,
+            8,
+            "delete",
+            "route",
+            Some(&second),
+            Value::Null,
+        );
+        rig.pump();
+        let mut res = [receive(&mut client), receive(&mut client)];
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(res[0]["ok"]["items"], json!([]));
+        assert_eq!(res[1]["err"]["code"], "not_found", "already gone");
+    }
+
+    /// TS-1: the refusals before a route is reserved, and the parts that this Hub does not serve yet.
+    #[test]
+    fn attach_refusals_and_unserved_parts() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        let cases = [
+            (
+                json!({"history": "none", "replace_route": "r"}),
+                "unsupported",
+                None,
+            ),
+            (
+                json!({"history": "none", "binding": "webrtc"}),
+                "unsupported",
+                Some("binding_auth_unavailable"),
+            ),
+            (
+                json!({"history": "none", "writable": false}),
+                "unsupported",
+                None,
+            ),
+            (json!({"history": "some"}), "invalid_arguments", None),
+            (json!({}), "invalid_arguments", None),
+        ];
+        for (n, (args, code, reason)) in cases.into_iter().enumerate() {
+            invoke(&mut client, 10 + n as u64, "a", "attach", args);
+            rig.pump();
+            let res = receive(&mut client);
+            assert_eq!(res["err"]["code"], code, "{res}");
+            assert_eq!(res["err"]["effect"], "none", "{res}");
+            assert_eq!(res["err"]["reason"].as_str(), reason, "{res}");
+        }
+        invoke(
+            &mut client,
+            30,
+            "nope",
+            "attach",
+            json!({"history": "none"}),
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["err"]["code"], "not_found");
+        req(&mut client, 31, "watch", "route", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["err"]["code"], "unsupported");
+        // No terminal format in common with the session's worker: `unsupported { terminal_format }`.
+        let mut odd = rig.connect();
+        let mut hello = hello(1, 1);
+        hello["terminal_formats"] = json!(["nope/1"]);
+        send(&mut odd, &hello);
+        rig.pump();
+        receive(&mut odd);
+        invoke(&mut odd, 1, "a", "attach", json!({"history": "none"}));
+        rig.pump();
+        let res = receive(&mut odd);
+        assert_eq!(res["err"]["code"], "unsupported", "{res}");
+        assert_eq!(res["err"]["reason"], "terminal_format");
     }
 }

@@ -250,7 +250,8 @@ impl Daemon {
         ));
         // `welcome.terminal_format`'s common set: the owner keeps it (R-124), and the server reads it.
         let formats = owner.routes().map(|routes| routes.formats());
-        let server_config = config.server(&identity, uid);
+        let mut server_config = config.server(&identity, uid);
+        server_config.socket_path = roots.socket.to_string_lossy().into_owned();
         let owner_wake: Arc<dyn Wake> = owner_waker.clone();
         let owner = {
             let phase = phase.clone();

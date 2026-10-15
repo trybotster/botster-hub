@@ -22,18 +22,20 @@
 
 use crate::bridge::SpawnAnswer;
 use crate::bridge::{Answer, Effect, FailKind, Failure, Outbox, Request};
+use crate::client::handoff::{Caller, Reservation, ReserveRequest, RouteInfo};
 use crate::client::rows::{
     create_labels, session_row, RowFacts, SessionTypes, TypeRefused, COMMAND_TYPE, LABEL_KEY,
 };
 use crate::watch::{Row, WatchFilter, WatchFrame as ViewFrame, WatchKey};
 use botster_core::contract::prelude::{
-    CoreError, ErrorCategory, ErrorCode as CoreCode, OpResult, SessionId, Size, SpawnRequest,
-    Timing,
+    CoreError, ErrorCategory, ErrorCode as CoreCode, HistoryMode, OpResult, SessionId, Size,
+    SpawnRequest, Timing,
 };
 use botster_hub_contract::prelude::{
-    kind_spec, Category, Error, ErrorCode, ErrorEffect, ListArgs, ListResult, OpenObject, Outcome,
-    Req, RequestId, Res, ServerFrame, SessionCreate, SessionCreateCommand, SessionCreateReceipt,
-    SessionRef, SnapshotReason, StartingTag, UpdateArgs, Verb, WatchArgs, WatchClosedReason,
+    kind_spec, AttachArgs, AttachHistory, AttachResult, Category, DetachArgs, Error, ErrorCode,
+    ErrorEffect, ListArgs, ListResult, OpenObject, Outcome, Req, RequestId, Res, RouteRow,
+    ServerFrame, SessionCreate, SessionCreateCommand, SessionCreateReceipt, SessionRef,
+    SnapshotReason, StartingTag, Transport, UpdateArgs, Verb, WatchArgs, WatchClosedReason,
     WatchFrame, WatchOpened,
 };
 use serde::de::DeserializeOwned;
@@ -61,13 +63,23 @@ pub struct Ctx<'a> {
     pub busy_retry_ms: u64,
     /// The working directory of a command that names none.
     pub default_cwd: &'a str,
+    /// The caller of the connection: `operator` with the peer uid (HS-7). A route belongs to its caller (A.3).
+    pub caller: Caller,
+    /// `hello.terminal_formats`, in preference order: the formats that an `attach` chooses from (TS-1).
+    pub terminal_formats: &'a [String],
+    /// The Hub's socket, which an `attach` answers as `transport.socket_path`.
+    pub socket_path: &'a str,
 }
 
-/// The two kinds that this module serves.
+/// The binding of this transport (HC section 9.1; TB-0).
+const BINDING: &str = "local-stream";
+
+/// The kinds that this module serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Session,
     SessionType,
+    Route,
 }
 
 impl Kind {
@@ -75,6 +87,7 @@ impl Kind {
         match name {
             "session" => Some(Kind::Session),
             "session_type" => Some(Kind::SessionType),
+            "route" => Some(Kind::Route),
             _ => None,
         }
     }
@@ -83,6 +96,7 @@ impl Kind {
         match self {
             Kind::Session => "session",
             Kind::SessionType => "session_type",
+            Kind::Route => "route",
         }
     }
 }
@@ -155,7 +169,17 @@ pub enum Pending {
         session: String,
     },
     Update,
+    /// `delete(session)`, and the detach of `invoke(session, detach)` and `delete(route)`: the op's `Completed` is `{}`.
     Delete,
+    Attach,
+    RouteList {
+        query: String,
+        filter: Filter,
+        limit: usize,
+    },
+    RouteGet {
+        id: String,
+    },
 }
 
 impl Pending {
@@ -267,6 +291,15 @@ fn not_found(id: u64, message: &str) -> Res {
             message,
         ),
     )
+}
+
+/// `unsupported` with a typed reason (HC TS-1).
+fn unsupported_with(id: u64, reason: &str, message: &str) -> Res {
+    let mut res = unsupported(id, message);
+    if let Outcome::Err { err } = &mut res.outcome {
+        err.reason = Some(reason.to_owned());
+    }
+    res
 }
 
 /// An unknown kind or verb, or a verb that a kind does not declare (EN-6, VB-7).
@@ -389,7 +422,18 @@ pub fn core_error_with(error_: &CoreError, effect: ErrorEffect) -> Error {
             ),
         },
     };
-    error(code, category, retryable, effect, message)
+    let mut err = error(code, category, retryable, effect, message);
+    // An `attach` that Core cannot serve names its reason (HC TS-1): `terminal_format` or `binding_auth_unavailable`.
+    if let CoreCode::Unsupported { what } = &error_.code {
+        err.code = ErrorCode::Unsupported;
+        err.category = Category::Caller;
+        err.message = "Core does not support the request".into();
+        err.reason = what
+            .as_ref()
+            .and_then(|reason| serde_json::to_value(reason).ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+    }
+    err
 }
 
 /// The error of a Core refusal at `begin` or of a read: nothing changed.
@@ -483,6 +527,35 @@ fn session_value(ctx: &Ctx, row: &Row) -> Option<Value> {
     Some(serde_json::to_value(built).expect("a session row always encodes"))
 }
 
+/// The HC `route` row (section 6). The route is the caller's own, so the row names no caller.
+fn route_value(ctx: &Ctx, route: &RouteInfo) -> Value {
+    serde_json::to_value(RouteRow {
+        id: route.route_id.clone(),
+        session: SessionRef {
+            hub_id: ctx.hub_id.to_owned(),
+            session_id: route.session.0.clone(),
+        },
+        binding: BINDING.to_owned(),
+        since: route.since,
+    })
+    .expect("a route row always encodes")
+}
+
+/// The `attach` result (TS-1): the owner's reservation, and the transport that only `io` knows.
+fn attach_value(ctx: &Ctx, reservation: Reservation) -> Value {
+    serde_json::to_value(AttachResult {
+        route_id: reservation.route_id,
+        transport: Transport {
+            binding: BINDING.to_owned(),
+            socket_path: Some(ctx.socket_path.to_owned()),
+            route_token: Some(reservation.route_token),
+            extra: Default::default(),
+        },
+        route_limits: reservation.route_limits,
+    })
+    .expect("an attach result always encodes")
+}
+
 fn type_values(ctx: &Ctx) -> Vec<Value> {
     ctx.types
         .list()
@@ -572,6 +645,8 @@ impl ConnKinds {
             Verb::Get => Self::begin_get(kind, req, ctx),
             Verb::Watch => self.begin_watch(ctx, conn, outbox, kind, req),
             Verb::Unwatch => self.begin_unwatch(conn, req),
+            Verb::Invoke if kind == Kind::Session => Self::begin_invoke(ctx, req),
+            Verb::Delete if kind == Kind::Route => Self::begin_detach(ctx, req, None),
             Verb::Create | Verb::Update | Verb::Delete if kind == Kind::Session => {
                 if let Some(refused) = not_served_with(req) {
                     return Step::Reply(refused);
@@ -600,7 +675,111 @@ impl ConnKinds {
                 ),
                 None => not_found(id, "no such session type"),
             }),
+            Kind::Route => Step::Owner(
+                Request::Routes(ctx.caller),
+                Pending::RouteGet {
+                    id: target.to_owned(),
+                },
+            ),
         }
+    }
+
+    /// `invoke` on a session (HC A.9): `attach` and `detach`. Both change state, so a retry key is refused (EN-8).
+    fn begin_invoke(ctx: &Ctx, req: &Req) -> Step {
+        let id = req.id.0;
+        if let Some(refused) = not_served_with(req) {
+            return Step::Reply(refused);
+        }
+        let Some(target) = req.target.as_deref() else {
+            return Step::Reply(invalid(id, "invoke needs a target"));
+        };
+        match req.action.as_deref() {
+            Some("attach") => Self::begin_attach(ctx, req, target),
+            Some("detach") => {
+                let detach: DetachArgs = match req
+                    .args
+                    .clone()
+                    .ok_or_else(|| "detach needs args".to_owned())
+                    .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+                {
+                    Ok(detach) => detach,
+                    Err(message) => return Step::Reply(invalid(id, &message)),
+                };
+                Self::begin_detach(ctx, req, Some((target, detach.route_id)))
+            }
+            _ => Step::Reply(unsupported(id, "this action is not served yet")),
+        }
+    }
+
+    /// `attach` (TS-1): the owner reserves a route; the connect comes on the route connection (TB-L2).
+    fn begin_attach(ctx: &Ctx, req: &Req, target: &str) -> Step {
+        let id = req.id.0;
+        let attach: AttachArgs = match req
+            .args
+            .clone()
+            .ok_or_else(|| "attach needs args".to_owned())
+            .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        {
+            Ok(attach) => attach,
+            Err(message) => return Step::Reply(invalid(id, &message)),
+        };
+        if attach.replace_route.is_some() {
+            return Step::Reply(unsupported(
+                id,
+                "replace_route is not served: a session has one route at a time in this Hub",
+            ));
+        }
+        if attach.binding.as_deref().is_some_and(|b| b != BINDING) {
+            return Step::Reply(unsupported_with(
+                id,
+                "binding_auth_unavailable",
+                "this connection offers the local-stream binding only",
+            ));
+        }
+        if attach.writable == Some(false) {
+            return Step::Reply(unsupported(id, "a read-only route is not served yet"));
+        }
+        let history = match attach.history {
+            AttachHistory::None => HistoryMode::None,
+            AttachHistory::Screen => HistoryMode::Screen,
+            AttachHistory::Full => HistoryMode::Full,
+            _ => return Step::Reply(invalid(id, "history is none, screen or full")),
+        };
+        Step::Owner(
+            Request::ReserveRoute(Box::new(ReserveRequest {
+                caller: ctx.caller,
+                session: SessionId(target.into()),
+                terminal_formats: ctx.terminal_formats.to_vec(),
+                history: Some(history),
+                answers_queries: attach.answers_queries.unwrap_or(true),
+                route_features: attach.route_features.unwrap_or_default(),
+            })),
+            Pending::Attach,
+        )
+    }
+
+    /// `invoke(session, detach)` with the session and the route, or `delete(route)` with the route as the target
+    /// (HC TS-10, A.7). Only the owning caller's route is found.
+    fn begin_detach(ctx: &Ctx, req: &Req, on_session: Option<(&str, String)>) -> Step {
+        let id = req.id.0;
+        if let Some(refused) = not_served_with(req) {
+            return Step::Reply(refused);
+        }
+        let (route_id, session) = match on_session {
+            Some((session, route_id)) => (route_id, Some(SessionId(session.into()))),
+            None => match req.target.clone() {
+                Some(route_id) => (route_id, None),
+                None => return Step::Reply(invalid(id, "delete needs a target")),
+            },
+        };
+        Step::Owner(
+            Request::DetachRoute {
+                caller: ctx.caller,
+                route_id,
+                session,
+            },
+            Pending::Delete,
+        )
     }
 
     fn begin_list(&mut self, ctx: &Ctx, kind: Kind, req: &Req, now: Instant) -> Step {
@@ -638,6 +817,14 @@ impl ConnKinds {
                     .collect();
                 Step::Reply(self.first_page(ctx, id, query, items, limit, now))
             }
+            Kind::Route => Step::Owner(
+                Request::Routes(ctx.caller),
+                Pending::RouteList {
+                    query,
+                    filter,
+                    limit,
+                },
+            ),
         }
     }
 
@@ -789,6 +976,8 @@ impl ConnKinds {
                     },
                 )
             }
+            // A route watch needs the route table's changes in the watch fan-out: a later PR.
+            Kind::Route => Step::Reply(unsupported(id, "watching routes is not served yet")),
             Kind::SessionType => {
                 // The registry does not change while the Hub runs, so the baseline is the whole watch (WT-1).
                 let watch_id = number.to_string();
@@ -933,7 +1122,7 @@ impl ConnKinds {
         match self.watches.get(&number).map(|w| w.kind) {
             None => Step::Reply(not_found(id, "no such watch")),
             // A local watch has nothing at the owner.
-            Some(Kind::SessionType) => {
+            Some(Kind::SessionType | Kind::Route) => {
                 self.watches.remove(&number);
                 Step::Reply(res_ok(id, json!({})))
             }
@@ -1022,6 +1211,39 @@ impl ConnKinds {
                     limit,
                     Instant::now(),
                 ))]
+            }
+            (
+                Pending::RouteList {
+                    query,
+                    filter,
+                    limit,
+                },
+                Answer::Routes(routes),
+            ) => {
+                let items: Vec<Value> = routes
+                    .iter()
+                    .map(|route| route_value(ctx, route))
+                    .filter(|value| filter.matches(value))
+                    .collect();
+                vec![ServerFrame::Res(self.first_page(
+                    ctx,
+                    id,
+                    query,
+                    items,
+                    limit,
+                    Instant::now(),
+                ))]
+            }
+            (Pending::RouteGet { id: route_id }, Answer::Routes(routes)) => {
+                vec![ServerFrame::Res(
+                    match routes.iter().find(|route| route.route_id == route_id) {
+                        Some(route) => res_ok(id, route_value(ctx, route)),
+                        None => not_found(id, "no such route"),
+                    },
+                )]
+            }
+            (Pending::Attach, Answer::RouteReserved(reservation)) => {
+                vec![ServerFrame::Res(res_ok(id, attach_value(ctx, reservation)))]
             }
             (Pending::Watch { watch, .. }, Answer::Watching) => vec![
                 ServerFrame::Res(watch_opened(id, watch)),
@@ -1273,6 +1495,9 @@ mod tests {
             max_watches: 2,
             busy_retry_ms: 50,
             default_cwd: "/home/u",
+            caller: Caller { uid: 501 },
+            terminal_formats: &[],
+            socket_path: "/run/hub.sock",
         }
     }
 
