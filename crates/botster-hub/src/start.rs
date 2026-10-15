@@ -52,7 +52,8 @@ pub fn take_lock(roots: &Roots) -> Result<HubLock, StartFailure> {
             ),
         ));
     }
-    ensure_dir(&roots.data_root).map_err(|e| unusable(&roots.data_root, &e))?;
+    ensure_durable_dir(&roots.data_root, fsutil::sync_dir)
+        .map_err(|e| unusable(&roots.data_root, &e))?;
     let lock_path = roots.lock_path();
     let mut file = OpenOptions::new()
         .read(true)
@@ -88,6 +89,17 @@ pub fn take_lock(roots: &Roots) -> Result<HubLock, StartFailure> {
         .and_then(|()| file.write_all(holder.as_bytes()));
     named.map_err(|e| unusable(&lock_path, &e))?;
     Ok(HubLock { file })
+}
+
+/// Creates `dir` (0700) if it is missing, then syncs its parent through `sync`, so that the entry of the data root itself is
+/// durable before the Hub reports ready: Core and the Hub sync everything below the root, and neither syncs its ancestors. It
+/// runs at every start, so a retry after a crash between the creation and the sync also syncs. A failed sync fails the start.
+fn ensure_durable_dir(dir: &Path, sync: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+    ensure_dir(dir)?;
+    match dir.parent() {
+        Some(parent) => sync(parent),
+        None => Ok(()),
+    }
 }
 
 fn unusable(path: &Path, error: &io::Error) -> StartFailure {
@@ -257,6 +269,27 @@ mod tests {
     use super::*;
     use crate::roots::{Env, Platform};
     use std::os::unix::fs::PermissionsExt;
+
+    /// The parent of a new data root is synced; so is the parent of an existing one (a retry); a sync error fails.
+    #[test]
+    fn the_data_root_parent_is_synced_and_a_sync_error_fails() {
+        let tmp = short_root();
+        let dir = tmp.path().join("d");
+        let synced = std::cell::RefCell::new(Vec::new());
+        let record = |parent: &Path| {
+            synced.borrow_mut().push(parent.to_path_buf());
+            Ok(())
+        };
+        ensure_durable_dir(&dir, record).unwrap();
+        ensure_durable_dir(&dir, record).unwrap();
+        assert_eq!(
+            *synced.borrow(),
+            vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()]
+        );
+        let failing = |_: &Path| Err(io::Error::other("injected"));
+        let error = ensure_durable_dir(&dir, failing).unwrap_err();
+        assert_eq!(error.to_string(), "injected");
+    }
 
     /// A short test root under `/tmp` (design section 5a: the macOS `TMPDIR` is too long for a data root).
     pub(crate) fn short_root() -> tempfile::TempDir {

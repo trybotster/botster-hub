@@ -152,6 +152,46 @@ fn data_root_bound_matches_core() {
     assert!(!roots.data_root.exists());
 }
 
+/// The sweep follows nothing: a symlinked sessions root, and a symlink or a file inside it, leave outside data intact.
+#[test]
+fn the_orphan_sweep_follows_no_symlink_and_keeps_non_directories() {
+    let tmp = short_root();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(outside.join("keep")).unwrap();
+    fs::write(outside.join("keep/data"), "x").unwrap();
+    let roots = roots_in(tmp.path());
+    fs::create_dir_all(&roots.data_root).unwrap();
+    std::os::unix::fs::symlink(&outside, roots.data_root.join("sessions")).unwrap();
+    let daemon = Daemon::start(&roots, uid(), config()).unwrap();
+    assert!(outside.join("keep/data").exists());
+    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    assert_eq!(
+        ask(&daemon, &outbox, 1, Request::Shutdown),
+        Answer::Stopping
+    );
+    assert_eq!(daemon.wait().code(), 0);
+
+    let tmp = short_root();
+    let roots = roots_in(tmp.path());
+    let sessions = roots.data_root.join("sessions");
+    fs::create_dir_all(sessions.join("gone")).unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, sessions.join("link")).unwrap();
+    fs::write(sessions.join("file"), "x").unwrap();
+    let daemon = Daemon::start(&roots, uid(), config()).unwrap();
+    assert!(!sessions.join("gone").exists());
+    assert!(fs::symlink_metadata(sessions.join("link")).is_ok());
+    assert!(outside.exists());
+    assert!(sessions.join("file").exists());
+    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    assert_eq!(
+        ask(&daemon, &outbox, 1, Request::Shutdown),
+        Answer::Stopping
+    );
+    assert_eq!(daemon.wait().code(), 0);
+}
+
 /// HC RT-2: a session directory with no row after adoption is deleted.
 #[test]
 fn rt_2_orphan_session_dir_deleted() {

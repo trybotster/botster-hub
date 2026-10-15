@@ -129,6 +129,10 @@ impl<C: CoreApi> Owner<C> {
         for item in items {
             self.dispatch(item);
         }
+        // Once the stop has begun, Core does no more work: no pump, no event poll (the stop drain answers what is left).
+        if self.phase.stopping() {
+            return TurnReport { runnable: false };
+        }
         let pump = self.core.pump(now);
         let events = self.core.poll_events(self.counts.events.max(1));
         // A non-empty poll sets `events_left`; only an empty poll clears it (Core `poll_events` promises "at most max").
@@ -143,6 +147,12 @@ impl<C: CoreApi> Owner<C> {
 
     fn dispatch(&mut self, item: Item) {
         let Item { request, mut reply } = item;
+        // After a `Shutdown` (or any stop cause) no later request of the turn reaches Core: it is answered `hub_shutdown`,
+        // effect none. A repeated `Shutdown` is still answered `Stopping`.
+        if self.phase.stopping() && !matches!(request, Request::Shutdown) {
+            reply.send(shutdown(Effect::None));
+            return;
+        }
         match request {
             Request::Op(op) => {
                 reply.mark_dispatched();
@@ -512,11 +522,41 @@ mod tests {
             answers[0]
         );
         assert_eq!(answers[1].1, Answer::Stopping);
-        assert!(matches!(&answers[2].1, Answer::Sessions(_)));
-        assert!(matches!(&answers[3].1, Answer::Sessions(_)));
-        assert_eq!(answers[4].1, shutdown(Effect::None));
+        // The requests behind the Shutdown never reach Core (even a read): all are answered `hub_shutdown`, effect none.
+        for later in &answers[2..] {
+            assert_eq!(later.1, shutdown(Effect::None), "{later:?}");
+        }
         assert_eq!(rig.outbox.reserved(), 0);
         assert!(rig.lifecycle.try_recv().is_err());
+    }
+
+    /// A mutation queued behind the `Shutdown` in the same turn is not admitted to Core: no waiter, no pump, and the answer is
+    /// `hub_shutdown` with `effect: none`.
+    #[test]
+    fn a_mutation_behind_the_shutdown_is_not_admitted() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, Request::Shutdown);
+        rig.submit(2, create("a"));
+        let report = rig.turn();
+        assert_eq!(rig.phase.get(), Phase::Stopping);
+        assert_eq!(rig.owner.waiters(), 0, "the mutation reached Core");
+        assert!(!report.runnable, "Core is pumped no more after the stop");
+        assert!(rig.owner.view().is_empty());
+        let answers = rig.answers();
+        assert_eq!(
+            answers,
+            vec![(
+                2,
+                Answer::Failed(Failure {
+                    kind: FailKind::HubShutdown,
+                    effect: Effect::None,
+                })
+            )]
+        );
+        rig.owner.drain();
+        assert_eq!(rig.answers(), vec![(1, Answer::Stopping)]);
     }
 
     /// Owner panic: a panic in the loop body leaves the owner state intact, and the drain still answers every token once.
