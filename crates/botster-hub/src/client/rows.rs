@@ -137,6 +137,9 @@ pub fn hc_state(state: &CoreState) -> Option<SessionState> {
     })
 }
 
+/// The `failure_reason` of a session whose worker was lost with a known termination (HC A.2c).
+const WORKER_LOST: &str = "worker_lost";
+
 /// How the session's spawn operation ended, when it ended without the session running (design section 7, item 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnEnd {
@@ -169,6 +172,11 @@ pub fn session_row(facts: RowFacts<'_>, hub_id: &str, types: &SessionTypes) -> O
             }
         }
         (_, Some(SpawnEnd::Failed { reason })) => Some(reason.clone()),
+        // A worker lost with a known termination (A.2c; Core AD-2 `WorkerGone`, `StartInterrupted`): `worker_lost`, when
+        // no more specific spawn failure applies. An unresolved adoption (`lost`) names no failure.
+        (CoreState::Lost(LostReason::WorkerGone | LostReason::StartInterrupted), _) => {
+            Some(WORKER_LOST.to_owned())
+        }
         _ => None,
     };
     let type_id = facts
@@ -380,6 +388,43 @@ mod tests {
         let row = session_row(f, "h", &types).unwrap();
         assert_eq!(row.state, SessionState::Ended);
         assert_eq!(row.failure_reason, None);
+    }
+
+    /// A.2c: a worker lost with a known termination is `ended` with `failure_reason: worker_lost`, with no spawn record; an
+    /// unresolved adoption is `lost` with no reason; a more specific spawn failure keeps its own reason.
+    #[test]
+    fn a_known_termination_names_worker_lost_and_an_unresolved_adoption_does_not() {
+        let types = SessionTypes::device();
+        let id = sid("s1");
+        let labels = BTreeMap::new();
+        for reason in [LostReason::WorkerGone, LostReason::StartInterrupted] {
+            let state = CoreState::Lost(reason);
+            let row = session_row(facts(&id, &state, &labels), "h", &types).unwrap();
+            assert_eq!(row.state, SessionState::Ended, "{state:?}");
+            assert_eq!(
+                row.failure_reason.as_deref(),
+                Some("worker_lost"),
+                "{state:?}"
+            );
+        }
+        for reason in [
+            LostReason::WorkerUnreachable,
+            LostReason::WorkerVersion,
+            LostReason::RegistryCorrupt,
+        ] {
+            let state = CoreState::Lost(reason);
+            let row = session_row(facts(&id, &state, &labels), "h", &types).unwrap();
+            assert_eq!(row.state, SessionState::Lost, "{state:?}");
+            assert_eq!(row.failure_reason, None, "{state:?}");
+        }
+        let state = CoreState::Lost(LostReason::WorkerGone);
+        let end = SpawnEnd::Failed {
+            reason: "exec_failed".into(),
+        };
+        let mut f = facts(&id, &state, &labels);
+        f.spawn_end = Some(&end);
+        let row = session_row(f, "h", &types).unwrap();
+        assert_eq!(row.failure_reason.as_deref(), Some("exec_failed"));
     }
 
     #[test]
