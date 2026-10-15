@@ -7,6 +7,12 @@
 # gate never reads a partial archive. An archive that fails `gzip -t` counts as missing.
 set -euo pipefail
 
+# Stage 2 gates of botster-hub run on the Linux pool only: this step needs flock and the cargo volume that fetch.sh filled.
+if [ "$(uname -s)" = Darwin ]; then
+  echo "botster-hub: Mac gates are not supported in Stage 2; use botster-gate --on linux" >&2
+  exit 64
+fi
+
 : "${CARGO_HOME:=$HOME/.cargo}"
 store=${BOTSTER_ZIG_PACKAGES:-$HOME/.cache/botster/zig-packages}
 
