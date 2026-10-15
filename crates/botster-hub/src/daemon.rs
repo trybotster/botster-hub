@@ -367,9 +367,20 @@ fn run_owner(
     }
     // The drain quiesces the store too, so no store write follows `OwnerDone` (the lock is released after it).
     owner.drain();
+    let ended = owner_end(ended, owner.store_failed());
     drop(owner.into_core());
     phase.advance(Phase::Stopping, Phase::OwnerDone);
     let _ = lifecycle.try_send(Lifecycle::OwnerGone(ended));
+}
+
+/// How the owner ended, once the drain has run: a store failure found during the drain (the quiesce writes the pending
+/// terminal states) makes a clean end a failed one, so a requested stop does not exit 0 over a lost write.
+fn owner_end(ended: Ended, store_failed: bool) -> Ended {
+    if ended == Ended::Clean && store_failed {
+        Ended::StoreFailed
+    } else {
+        ended
+    }
 }
 
 fn own_core_until_done(
@@ -659,5 +670,18 @@ mod tests {
             1
         );
         assert_eq!(exit(None, Ended::Clean, Ended::Clean), 1);
+        // A store failure found while the requested stop quiesces: exit 1 though the cause is `Requested`.
+        assert_eq!(
+            exit(Some(StopCause::Requested), Ended::StoreFailed, Ended::Clean),
+            1
+        );
+    }
+
+    /// A clean owner end with a store failure is `StoreFailed`; nothing else changes.
+    #[test]
+    fn a_store_failure_makes_a_clean_owner_end_a_failed_one() {
+        assert_eq!(owner_end(Ended::Clean, true), Ended::StoreFailed);
+        assert_eq!(owner_end(Ended::Clean, false), Ended::Clean);
+        assert_eq!(owner_end(Ended::Panicked, true), Ended::Panicked);
     }
 }
