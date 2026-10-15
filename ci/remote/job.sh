@@ -33,10 +33,12 @@ private_git_deps=1
 image_args() { :; }
 # Files whose content picks the image tag, besides the Dockerfile.
 image_inputs=(rust-toolchain.toml)
-# Volumes besides cargo, target and npm: "<suffix>:<mount>". None.
-extra_volumes=()
-# Environment of the fetch and gate containers. None.
-extra_env=()
+# Volumes besides cargo, target and npm: "<suffix>:<mount>". zig: Zig's global cache and the libghostty package store.
+extra_volumes=(zig:/zig)
+# Environment of the fetch and gate containers. libghostty's build.rs (botster-core, a dependency) reads its Zig packages
+# from the store that fetch-public.sh fills, and runs Zig under a network denial: the gate container has no network at all
+# (--network none), so it declares that with BOTSTER_ZIG_NETWORK_DENIED=1.
+extra_env=(BOTSTER_ZIG_PACKAGES=/zig/packages BOTSTER_ZIG_NETWORK_DENIED=1)
 # The reports that a failed job keeps, as paths in the tree (target/ is the target volume). None.
 artifact_paths=()
 # --------------------------------------------------------------------------------------------------------------------------
