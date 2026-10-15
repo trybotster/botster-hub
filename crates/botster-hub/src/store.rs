@@ -11,7 +11,7 @@
 use crate::failure::{FailCode, StartFailure};
 use crate::fsutil::{self, ensure_dir, WriteError};
 use crate::phase::{Ended, Wake};
-use crate::start::random_id;
+use crate::start::{ensure_durable_dir, random_id};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -176,8 +176,11 @@ struct Entry {
     record: Record,
     /// The `starting` write is durable.
     written: bool,
-    /// The terminal record that waits for its job, or whose job is in flight.
+    /// The terminal record that waits for its job. A later terminal state replaces it until the job is sent.
     pending: Option<Record>,
+    /// The terminal record whose job is in flight: exactly the payload that the job writes. A terminal state that comes
+    /// meanwhile goes to `pending`, and is written by a job of its own after this one completes.
+    sent: Option<Record>,
     /// A job for this record is in flight.
     busy: bool,
     /// A forget (R-122 U1, U2) waits for a job slot, or is in flight.
@@ -207,6 +210,8 @@ pub struct SpawnStore {
     thread: Option<JoinHandle<()>>,
     recovering: bool,
     admitting: bool,
+    /// The stop's quiesce began: only pending terminal states are still written (no directory deletion, no sweep).
+    stopping: bool,
     /// A fault was seen: no job is sent again (the Hub stops with cause `store_failed`).
     faulted: bool,
     /// The session directories of `Released` rows that wait for a job slot.
@@ -261,6 +266,18 @@ fn make_session_dir(sessions: &Path, session_id: &str) -> io::Result<()> {
 
 /// Deletes `sessions/<id>/` with no-follow: a missing entry is done, a symlink or a file is an error and is kept.
 pub fn remove_session_dir(sessions: &Path, session_id: &str) -> io::Result<()> {
+    // The sessions root is not followed either: a symlinked root would lead the deletion out of the data root.
+    match fs::symlink_metadata(sessions) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                sessions.display()
+            )))
+        }
+        Ok(_) => {}
+    }
     let session = sessions.join(session_id);
     match fs::symlink_metadata(&session) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -300,9 +317,21 @@ impl SpawnStore {
         config: StoreConfig,
         owner: Arc<dyn Wake>,
     ) -> Result<SpawnStore, StartFailure> {
+        Self::open_with(data_root, config, owner, fsutil::sync_dir)
+    }
+
+    /// [`SpawnStore::open`] with the directory sync as a parameter, so that a sync failure can be tested.
+    fn open_with(
+        data_root: &Path,
+        config: StoreConfig,
+        owner: Arc<dyn Wake>,
+        sync: impl Fn(&Path) -> io::Result<()>,
+    ) -> Result<SpawnStore, StartFailure> {
         let dir = data_root.join("store").join("ops");
-        ensure_dir(&data_root.join("store")).map_err(|e| unusable(&dir, e))?;
-        ensure_dir(&dir).map_err(|e| unusable(&dir, e))?;
+        // Each directory entry is made durable through the sync of its parent, at every open (a retry included): the data root
+        // holds `store/`, `store/` holds `ops/`, and a record write syncs `ops/` itself.
+        ensure_durable_dir(&data_root.join("store"), &sync).map_err(|e| unusable(&dir, e))?;
+        ensure_durable_dir(&dir, &sync).map_err(|e| unusable(&dir, e))?;
         let mut index = HashMap::new();
         let mut keys = HashMap::new();
         let mut expiry = BTreeSet::new();
@@ -365,6 +394,7 @@ impl SpawnStore {
                     record,
                     written: true,
                     pending: None,
+                    sent: None,
                     busy: false,
                     forget: false,
                     clear_after: false,
@@ -393,6 +423,7 @@ impl SpawnStore {
             thread: Some(thread),
             recovering: true,
             admitting: true,
+            stopping: false,
             faulted: false,
             dir_deletes: VecDeque::new(),
             gone: None,
@@ -493,6 +524,7 @@ impl SpawnStore {
                 record,
                 written: false,
                 pending: None,
+                sent: None,
                 busy: true,
                 forget: false,
                 clear_after: false,
@@ -567,11 +599,15 @@ impl SpawnStore {
         let Some(entry) = self.index.get_mut(operation_id) else {
             return Err(format!("no spawn operation {operation_id}"));
         };
-        let latest = entry.pending.as_ref().unwrap_or(&entry.record);
+        let latest = entry
+            .pending
+            .as_ref()
+            .or(entry.sent.as_ref())
+            .unwrap_or(&entry.record);
         if !latest.remove_row {
             return Ok(());
         }
-        if entry.busy && entry.pending.is_some() {
+        if entry.pending.is_none() && entry.sent.is_some() {
             // The write of the marker is in flight: its completion queues the clear.
             entry.clear_after = true;
         } else {
@@ -587,7 +623,14 @@ impl SpawnStore {
     pub fn remove_rows(&self) -> Vec<(String, String)> {
         self.index
             .iter()
-            .filter(|(_, e)| !e.clear_after && e.pending.as_ref().unwrap_or(&e.record).remove_row)
+            .filter(|(_, e)| {
+                !e.clear_after
+                    && e.pending
+                        .as_ref()
+                        .or(e.sent.as_ref())
+                        .unwrap_or(&e.record)
+                        .remove_row
+            })
             .map(|(id, e)| (id.clone(), e.record.session_id.clone()))
             .collect()
     }
@@ -653,12 +696,24 @@ impl SpawnStore {
             } else {
                 continue;
             };
+            let sent = match &job {
+                Job::Write { record, .. } => Some(record.clone()),
+                _ => None,
+            };
             if !self.send(job) {
                 return;
             }
             if let Some(entry) = self.index.get_mut(&id) {
                 entry.busy = true;
+                if sent.is_some() {
+                    // The payload now belongs to the job; a later terminal state goes to a new `pending`.
+                    entry.pending = None;
+                    entry.sent = sent;
+                }
             }
+        }
+        if self.stopping {
+            return;
         }
         while let Some(session) = self.dir_deletes.front().cloned() {
             if !self.send(Job::DeleteDir { session }) {
@@ -747,7 +802,8 @@ impl SpawnStore {
                     (JobKind::Finish, JobResult::Done) => {
                         if let Some(entry) = self.index.get_mut(&id) {
                             entry.busy = false;
-                            if let Some(record) = entry.pending.take() {
+                            // The record is the payload that the job wrote, not a terminal state queued meanwhile.
+                            if let Some(record) = entry.sent.take() {
                                 if let (Some(at), false) =
                                     (record.terminal_at_ms, record.remove_row)
                                 {
@@ -756,9 +812,11 @@ impl SpawnStore {
                                 entry.record = record;
                             }
                             if std::mem::take(&mut entry.clear_after) {
+                                let base =
+                                    entry.pending.take().unwrap_or_else(|| entry.record.clone());
                                 entry.pending = Some(Record {
                                     remove_row: false,
-                                    ..entry.record.clone()
+                                    ..base
                                 });
                             }
                         }
@@ -775,6 +833,7 @@ impl SpawnStore {
                     (kind, _) => {
                         if let Some(entry) = self.index.get_mut(&id) {
                             entry.busy = false;
+                            entry.sent = None;
                         }
                         self.fault();
                         events.push(StoreEvent::Fault(format!(
@@ -815,8 +874,10 @@ impl SpawnStore {
     /// write after the lock release could break RT-4. Returns the faults seen meanwhile.
     pub fn quiesce(&mut self) -> Vec<StoreEvent> {
         self.admitting = false;
+        self.stopping = true;
         let mut events = Vec::new();
-        while self.gone.is_none() && self.pending_terminals() {
+        // A job in flight can queue a later terminal state when it completes: wait for it too.
+        while self.gone.is_none() && (self.pending_terminals() || self.in_flight > 0) {
             self.pump(0);
             // After a fault no job goes; with no job in flight, no completion can come.
             if self.in_flight == 0 {
@@ -1263,6 +1324,97 @@ mod tests {
             matches!(reopened.get_spawn(&b), Lookup::Found(r) if r.state == SpawnState::Cancelled)
         );
         reopened.close();
+    }
+
+    /// A terminal state that comes while an older one is in flight is written by a job of its own: memory, the file and a
+    /// reopen all agree with what was written (SPAWN-3).
+    #[test]
+    fn a_terminal_state_queued_during_a_write_does_not_pass_for_the_one_written() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        let a = store.create_spawn("a", 0).unwrap();
+        events(&mut store, 1);
+        store.end_recovery();
+        store.finish_spawn(&a, Terminal::Cancelled, 1).unwrap();
+        store.pump(1);
+        assert_eq!(store.in_flight(), 1);
+        // Before the completion is taken, a later terminal state arrives.
+        store.finish_spawn(&a, Terminal::Installed, 2).unwrap();
+        let mut waited = 0;
+        while store.in_flight() > 0 && waited < 5000 {
+            store.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += 1;
+        }
+        let key = store.index[&a].record.record_key.clone();
+        let on_disk: Record = serde_json::from_slice(
+            &fs::read(record_path(&tmp.path().join("store/ops"), &key)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.state, SpawnState::Cancelled);
+        assert!(
+            matches!(store.get_spawn(&a), Lookup::Found(r) if r.state == SpawnState::Cancelled),
+            "memory says what the file says"
+        );
+        // The later state is still pending, and the quiesce writes it.
+        assert!(store.quiesce().is_empty());
+        let mut reopened = open(tmp.path());
+        reopened.end_recovery();
+        assert!(
+            matches!(reopened.get_spawn(&a), Lookup::Found(r) if r.state == SpawnState::Installed)
+        );
+        reopened.close();
+    }
+
+    /// The deletion of a session directory follows no symlink, the sessions root included (SPAWN-1).
+    #[test]
+    fn a_symlinked_sessions_root_is_not_followed() {
+        let tmp = root();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("s1")).unwrap();
+        fs::write(outside.join("s1/data"), "x").unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::os::unix::fs::symlink(&outside, &sessions).unwrap();
+        assert!(remove_session_dir(&sessions, "s1").is_err());
+        assert!(outside.join("s1/data").exists());
+        // A real root still works, and a missing one is done.
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("s1/uploads")).unwrap();
+        remove_session_dir(&real, "s1").unwrap();
+        assert!(!real.join("s1").exists());
+        remove_session_dir(&tmp.path().join("none"), "s1").unwrap();
+    }
+
+    /// Opening the store syncs `store/`'s parent (the data root) and `ops/`'s parent (`store/`), at every open; a sync
+    /// failure fails the open (SPAWN-2).
+    #[test]
+    fn open_syncs_the_parents_of_the_store_directories_and_a_sync_failure_fails() {
+        let tmp = root();
+        let synced = std::cell::RefCell::new(Vec::new());
+        let record = |dir: &Path| {
+            synced.borrow_mut().push(dir.to_path_buf());
+            Ok(())
+        };
+        for _ in 0..2 {
+            let mut store =
+                SpawnStore::open_with(tmp.path(), CONFIG, Arc::new(Count::default()), record)
+                    .unwrap();
+            store.close();
+        }
+        let root = tmp.path().to_path_buf();
+        let store_dir = root.join("store");
+        assert_eq!(
+            *synced.borrow(),
+            vec![root.clone(), store_dir.clone(), root, store_dir]
+        );
+        let other = self::root();
+        let failure =
+            SpawnStore::open_with(other.path(), CONFIG, Arc::new(Count::default()), |_| {
+                Err(io::Error::other("injected"))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, FailCode::DataRootUnusable);
     }
 
     /// A write that fails before the `rename` is `NotWritten`: the reservation is removed and nothing is on disk. A write

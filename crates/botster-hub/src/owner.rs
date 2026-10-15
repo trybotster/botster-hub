@@ -1586,6 +1586,43 @@ mod tests {
         rig.owner.drain();
     }
 
+    /// A write that fails while a requested stop quiesces the store is a store failure: the flag is set by the drain, which
+    /// `run_owner` carries into the owner's end (`daemon::owner_end`).
+    #[test]
+    fn a_write_failure_during_the_stop_quiesce_sets_store_failed() {
+        let tmp = short_root();
+        let store =
+            crate::store::SpawnStore::open(tmp.path(), store_config(), Arc::new(Count::default()))
+                .unwrap();
+        let store_rig = rig(open(&FakeStore::new()));
+        let mut rig = Rig {
+            owner: store_rig.owner.with_store(store),
+            ..store_rig
+        };
+        let id = rig.owner.store_mut().unwrap().create_spawn("s", 0).unwrap();
+        store_settle(&mut rig);
+        let ops = tmp.path().join("store/ops");
+        let file = std::fs::read_dir(&ops)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("x"), b"").unwrap();
+        rig.owner
+            .store_mut()
+            .unwrap()
+            .finish_spawn(&id, crate::store::Terminal::Installed, 1)
+            .unwrap();
+        // A requested stop: no fault has been seen yet.
+        rig.phase.advance(Phase::Running, Phase::Stopping);
+        assert!(!rig.owner.store_failed());
+        rig.owner.drain();
+        assert!(rig.owner.store_failed());
+    }
+
     /// Stop step 2 with a store: the drain writes the pending terminal states, so the next start reads them.
     #[test]
     fn drain_writes_pending_terminal_states() {
