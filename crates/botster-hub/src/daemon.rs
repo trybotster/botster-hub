@@ -13,6 +13,7 @@ use crate::phase::{
 };
 use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
+use crate::store::{remove_session_dir, restore_spawns, SpawnStore, StoreConfig};
 use botster_core::contract::prelude::{CoreApi, CoreLimits, Now, OpenConfig, SessionId};
 use botster_core::Core;
 use mio::net::UnixListener;
@@ -38,6 +39,8 @@ pub struct DaemonConfig {
     pub worker_path: PathBuf,
     /// Whether `io` handles SIGTERM and SIGINT. A test daemon stops through `Shutdown` instead.
     pub handle_signals: bool,
+    /// The spawn operation store (design section 4a).
+    pub store: StoreConfig,
 }
 
 impl DaemonConfig {
@@ -58,6 +61,14 @@ impl DaemonConfig {
             core_limits: CoreLimits::default(),
             worker_path,
             handle_signals: true,
+            store: StoreConfig {
+                max_records: 4096,
+                store_queue: 64,
+                // `operation_retention_seconds` is the Hub's default (HC CF-2 `[limits]`, reported in `welcome.limits`).
+                retention_ms: 86_400_000,
+                max_record_bytes: 4096,
+                turn_sweeps: 8,
+            },
         }
     }
 }
@@ -144,16 +155,24 @@ impl Daemon {
         let owner_waker =
             Arc::new(Waker::new(owner_poll.registry(), OWNER_WAKE).map_err(internal)?);
         phase.set_owner_waker(owner_waker.clone());
-        let bridge = Arc::new(Bridge::new(config.lanes, phase.clone(), owner_waker));
+        let bridge = Arc::new(Bridge::new(
+            config.lanes,
+            phase.clone(),
+            owner_waker.clone(),
+        ));
         let (lifecycle_tx, lifecycle) = sync_channel(LIFECYCLE_CAPACITY);
         let (adopted_tx, adopted) = sync_channel(1);
+        // The store index is loaded strictly before the owner starts: a record that cannot be resolved fails the start
+        // `data_root_unusable` before anything is bound (design section 4a, "Load at start").
+        let store = SpawnStore::open(&roots.data_root, config.store, owner_waker)?;
         let owner = Owner::new(
             core,
             bridge.clone(),
             phase.clone(),
             lifecycle_tx.clone(),
             config.counts,
-        );
+        )
+        .with_store(store);
         let owner = {
             let phase = phase.clone();
             let lifecycle_tx = lifecycle_tx.clone();
@@ -162,12 +181,13 @@ impl Daemon {
                 .spawn(move || run_owner(owner, owner_poll, phase, lifecycle_tx, adopted_tx))
                 .map_err(internal)?
         };
-        let rows = match adopted.recv() {
-            Ok(Ok(rows)) => rows,
+        // The rows after adoption and the sessions of the `starting` records: the session directories to keep.
+        let keep = match adopted.recv() {
+            Ok(Ok(keep)) => keep,
             Ok(Err(message)) => return Err(adoption_failed(owner, message)),
             Err(_) => return Err(adoption_failed(owner, "the owner ended first".into())),
         };
-        delete_orphan_session_dirs(roots, &rows);
+        delete_orphan_session_dirs(roots, &keep);
 
         // Step 7: bind `hub.sock` (HC TB-L1; 0600) after adoption (lead ruling Q4), then start `io`.
         let unavailable = |error: std::io::Error| {
@@ -303,27 +323,29 @@ fn stop_owner(phase: &SharedPhase, lifecycle: &SyncSender<Lifecycle>, owner: Joi
     let _ = owner.join();
 }
 
-/// RT-2: a session directory is deleted with its row, so a real directory with no row after adoption is an orphan.
-/// Nothing is followed: a sessions root that is not a real directory is left alone, and so is every entry that is not a
-/// real directory (a file, a symlink), so data outside the data root and unrelated files survive.
-fn delete_orphan_session_dirs(roots: &Roots, rows: &BTreeSet<SessionId>) {
-    let root = roots.data_root.join("sessions");
-    if !fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+/// RT-2: a session directory is deleted with its row, so a directory with no row and no `starting` record after
+/// adoption is an orphan (design section 4a, "The session directory"; step 6). Only directories are deleted, read with
+/// no-follow: a symlink is never followed and never deleted. This sweep is the one recovery path for every leftover
+/// directory. It runs before the bind, so no spawn runs during it.
+fn delete_orphan_session_dirs(roots: &Roots, keep: &BTreeSet<SessionId>) {
+    let sessions = roots.data_root.join("sessions");
+    // The sessions root itself is not followed either: a symlinked root is left alone (#213 H213-1).
+    if !fs::symlink_metadata(&sessions).is_ok_and(|m| m.is_dir()) {
         return;
     }
-    let Ok(entries) = fs::read_dir(&root) else {
+    let Ok(entries) = fs::read_dir(&sessions) else {
         return;
     };
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        // `DirEntry::file_type` does not follow a symlink.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let known = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| rows.contains(&SessionId(n.into())));
-        if !known {
-            let _ = fs::remove_dir_all(entry.path());
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !keep.contains(&SessionId(name.clone())) {
+            let _ = remove_session_dir(&sessions, &name);
         }
     }
 }
@@ -343,10 +365,22 @@ fn run_owner(
     if ended == Ended::Panicked || !matches!(owner.adoption(), Adoption::Done) {
         request_stop(&phase, &lifecycle, StopCause::OwnerFailed);
     }
+    // The drain quiesces the store too, so no store write follows `OwnerDone` (the lock is released after it).
     owner.drain();
+    let ended = owner_end(ended, owner.store_failed());
     drop(owner.into_core());
     phase.advance(Phase::Stopping, Phase::OwnerDone);
     let _ = lifecycle.try_send(Lifecycle::OwnerGone(ended));
+}
+
+/// How the owner ended, once the drain has run: a store failure found during the drain (the quiesce writes the pending
+/// terminal states) makes a clean end a failed one, so a requested stop does not exit 0 over a lost write.
+fn owner_end(ended: Ended, store_failed: bool) -> Ended {
+    if ended == Ended::Clean && store_failed {
+        Ended::StoreFailed
+    } else {
+        ended
+    }
 }
 
 fn own_core_until_done(
@@ -376,7 +410,23 @@ fn own_core_until_done(
             match owner.adoption() {
                 Adoption::Done => {
                     reported = true;
-                    let _ = adopted.try_send(Ok(owner.view().keys().cloned().collect()));
+                    // Step 6b: a typed A26 stub (R-121 forbids an interim rule for Core `v1`). `starting` records stay as
+                    // they are on disk; recovery ends, so `get_spawn` answers their durable state.
+                    if let Some(store) = owner.store_mut() {
+                        let _ = restore_spawns(store);
+                    }
+                    // The store index was loaded and checked before the owner started (`SpawnStore::open`), so the
+                    // `starting` records are known here (Sol S2-HD-13).
+                    let mut keep: BTreeSet<SessionId> = owner.view().keys().cloned().collect();
+                    if let Some(store) = owner.store() {
+                        keep.extend(
+                            store
+                                .starting()
+                                .into_iter()
+                                .map(|r| SessionId(r.session_id)),
+                        );
+                    }
+                    let _ = adopted.try_send(Ok(keep));
                 }
                 Adoption::Failed(message) => {
                     let _ = adopted.try_send(Err(message.clone()));
@@ -620,5 +670,18 @@ mod tests {
             1
         );
         assert_eq!(exit(None, Ended::Clean, Ended::Clean), 1);
+        // A store failure found while the requested stop quiesces: exit 1 though the cause is `Requested`.
+        assert_eq!(
+            exit(Some(StopCause::Requested), Ended::StoreFailed, Ended::Clean),
+            1
+        );
+    }
+
+    /// A clean owner end with a store failure is `StoreFailed`; nothing else changes.
+    #[test]
+    fn a_store_failure_makes_a_clean_owner_end_a_failed_one() {
+        assert_eq!(owner_end(Ended::Clean, true), Ended::StoreFailed);
+        assert_eq!(owner_end(Ended::Clean, false), Ended::Clean);
+        assert_eq!(owner_end(Ended::Panicked, true), Ended::Panicked);
     }
 }

@@ -125,6 +125,8 @@ pub enum StopCause {
 pub enum Ended {
     Clean,
     Panicked,
+    /// The owner ended without a panic, but its store failed (a write failed during the stop's quiesce, or before it).
+    StoreFailed,
 }
 
 /// The messages on the lifecycle channel (capacity 4, one slot per kind; each kind is sent at most once).

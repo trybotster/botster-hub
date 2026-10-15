@@ -94,7 +94,10 @@ pub fn take_lock(roots: &Roots) -> Result<HubLock, StartFailure> {
 /// Creates `dir` (0700) if it is missing, then syncs its parent through `sync`, so that the entry of the data root itself is
 /// durable before the Hub reports ready: Core and the Hub sync everything below the root, and neither syncs its ancestors. It
 /// runs at every start, so a retry after a crash between the creation and the sync also syncs. A failed sync fails the start.
-fn ensure_durable_dir(dir: &Path, sync: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn ensure_durable_dir(
+    dir: &Path,
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     ensure_dir(dir)?;
     match containing_dir(dir) {
         Some(parent) => sync(&parent),
