@@ -1,7 +1,7 @@
 //! The daemon on the real Core (lead condition: the bridge is proven against the real crate): start, adoption, the socket,
 //! the lock, and the stop order through `Shutdown`.
 
-use botster_hub::bridge::{Answer, OutItem, Outbox, Request};
+use botster_hub::bridge::{Answer, OutItem, Outbox, OutboxCaps, Request};
 use botster_hub::daemon::{Daemon, DaemonConfig};
 use botster_hub::failure::FailCode;
 use botster_hub::phase::{Ended, StopCause, Wake};
@@ -48,6 +48,20 @@ impl Wake for NoWake {
     fn wake(&self) {}
 }
 
+fn outbox() -> Arc<Outbox> {
+    let caps = OutboxCaps {
+        replies: 4,
+        frames: 4,
+        watch_queue: 4,
+    };
+    Outbox::new(
+        caps,
+        botster_hub::phase::SharedPhase::new(),
+        Arc::new(NoWake),
+        Arc::new(NoWake),
+    )
+}
+
 /// Submits `request` and waits for its answer.
 fn ask(daemon: &Daemon, outbox: &Arc<Outbox>, id: u64, request: Request) -> Answer {
     daemon
@@ -86,12 +100,12 @@ fn start_adopt_listen_and_stop() {
     let second = Daemon::start(&roots, uid(), config()).err().unwrap();
     assert_eq!(second.code, FailCode::LockHeld);
     // The bridge reaches the real Core.
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert!(
-        matches!(ask(&daemon, &outbox, 1, Request::List), Answer::Sessions(rows) if rows.is_empty())
+        matches!(ask(&daemon, &replies, 1, Request::List), Answer::Sessions(rows) if rows.is_empty())
     );
     assert_eq!(
-        ask(&daemon, &outbox, 2, Request::Shutdown),
+        ask(&daemon, &replies, 2, Request::Shutdown),
         Answer::Stopping
     );
     let exit = daemon.wait();
@@ -104,8 +118,11 @@ fn start_adopt_listen_and_stop() {
     );
     // The lock is released: a new Hub starts on the same root, and keeps the hub id.
     let again = Daemon::start(&roots, uid(), config()).unwrap();
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
-    assert_eq!(ask(&again, &outbox, 1, Request::Shutdown), Answer::Stopping);
+    let replies = outbox();
+    assert_eq!(
+        ask(&again, &replies, 1, Request::Shutdown),
+        Answer::Stopping
+    );
     assert_eq!(again.wait().code(), 0);
 }
 
@@ -121,9 +138,9 @@ fn core_open_error_is_data_root_unusable() {
     assert!(roots.lock_path().exists());
     assert!(!roots.socket.exists());
     let daemon = Daemon::start(&roots, uid(), config()).unwrap();
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert_eq!(
-        ask(&daemon, &outbox, 1, Request::Shutdown),
+        ask(&daemon, &replies, 1, Request::Shutdown),
         Answer::Stopping
     );
     assert_eq!(daemon.wait().code(), 0);
@@ -140,9 +157,9 @@ fn data_root_bound_matches_core() {
     roots.data_root = pad(roots::MAX_DATA_ROOT_BYTES);
     assert_eq!(roots::path_bytes(&roots.data_root), 54);
     let daemon = Daemon::start(&roots, uid(), config()).unwrap();
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert_eq!(
-        ask(&daemon, &outbox, 1, Request::Shutdown),
+        ask(&daemon, &replies, 1, Request::Shutdown),
         Answer::Stopping
     );
     assert_eq!(daemon.wait().code(), 0);
@@ -200,9 +217,9 @@ fn rt_2_orphan_session_dir_deleted() {
     fs::create_dir_all(roots.data_root.join("sessions/gone/uploads")).unwrap();
     let daemon = Daemon::start(&roots, uid(), config()).unwrap();
     assert!(!roots.data_root.join("sessions/gone").exists());
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert_eq!(
-        ask(&daemon, &outbox, 1, Request::Shutdown),
+        ask(&daemon, &replies, 1, Request::Shutdown),
         Answer::Stopping
     );
     assert_eq!(daemon.wait().code(), 0);
@@ -239,9 +256,9 @@ fn the_orphan_sweep_keeps_starting_records_and_symlinks() {
     assert!(sessions.join("pending/uploads").is_dir());
     assert!(fs::symlink_metadata(sessions.join("link")).is_ok());
     assert!(target.join("keep").exists());
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert_eq!(
-        ask(&daemon, &outbox, 1, Request::Shutdown),
+        ask(&daemon, &replies, 1, Request::Shutdown),
         Answer::Stopping
     );
     assert_eq!(daemon.wait().code(), 0);
@@ -267,9 +284,9 @@ fn undecodable_record_fails_start_before_bind() {
     assert!(!roots.socket.exists());
     fs::remove_file(&bad).unwrap();
     let daemon = Daemon::start(&roots, uid(), config()).unwrap();
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let replies = outbox();
     assert_eq!(
-        ask(&daemon, &outbox, 1, Request::Shutdown),
+        ask(&daemon, &replies, 1, Request::Shutdown),
         Answer::Stopping
     );
     assert_eq!(daemon.wait().code(), 0);
