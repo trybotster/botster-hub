@@ -13,5 +13,6 @@ pub mod formats;
 pub mod handoff;
 pub mod peer;
 pub mod route;
+pub mod rows;
 pub mod server;
 pub mod wire;
