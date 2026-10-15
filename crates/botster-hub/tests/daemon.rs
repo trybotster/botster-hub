@@ -181,7 +181,7 @@ fn the_orphan_sweep_follows_no_symlink_and_keeps_non_directories() {
     std::os::unix::fs::symlink(&outside, roots.data_root.join("sessions")).unwrap();
     let daemon = Daemon::start(&roots, uid(), config()).unwrap();
     assert!(outside.join("keep/data").exists());
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let outbox = crate::outbox();
     assert_eq!(
         ask(&daemon, &outbox, 1, Request::Shutdown),
         Answer::Stopping
@@ -201,7 +201,7 @@ fn the_orphan_sweep_follows_no_symlink_and_keeps_non_directories() {
     assert!(fs::symlink_metadata(sessions.join("link")).is_ok());
     assert!(outside.exists());
     assert!(sessions.join("file").exists());
-    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    let outbox = crate::outbox();
     assert_eq!(
         ask(&daemon, &outbox, 1, Request::Shutdown),
         Answer::Stopping
