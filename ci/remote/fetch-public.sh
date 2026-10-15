@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# The public fetch step of a gate (ci/remote/job-common.sh runs it after fetch.sh, in its own container with network and
-# without any GitHub token). The Hub depends on botster-core, whose botster-terminal-ghostty crate builds libghostty with
+# The public fetch step of a gate (.pool.toml `fetch.public_command`: the pool runs it after the private cargo fetch, with
+# network and without any GitHub token). The Hub depends on botster-core, whose botster-terminal-ghostty crate builds libghostty with
 # Zig. Its build.rs fetches nothing, so the store of Zig packages that build_data.rs lists must be full before the gate runs
-# with no network. The crate is in cargo's checkout of botster-core (the volume), with its prefetch-zig.sh (a Zig build of
+# with no network. The crate is in cargo's checkout of botster-core (CARGO_HOME), with its prefetch-zig.sh (a Zig build of
 # the pinned Ghostty source). Each archive is published into the store with an atomic rename and never overwritten, so a
 # gate never reads a partial archive. An archive that fails `gzip -t` counts as missing.
 set -euo pipefail
 
-# Stage 2 gates of botster-hub run on the Linux pool only: this step needs flock and the cargo volume that fetch.sh filled.
+# Stage 2 gates of botster-hub run on the Linux pool only: this step needs flock and the cargo home that the private fetch
+# filled.
 if [ "$(uname -s)" = Darwin ]; then
   echo "botster-hub: Mac gates are not supported in Stage 2; use botster-gate --on linux" >&2
   exit 64

@@ -140,6 +140,32 @@ mod tests {
         );
     }
 
+    /// The value of `key = "..."` on a line of a TOML file that this test reads as text.
+    fn quoted(file: &str, key: &str) -> String {
+        let text =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(file))
+                .unwrap();
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(key)?
+                    .trim_start()
+                    .strip_prefix("= \"")?
+                    .split('"')
+                    .next()
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| panic!("{file} has no {key}"))
+    }
+
+    /// The pool installs the tools of mise.toml: its Rust is the channel of rust-toolchain.toml.
+    #[test]
+    fn the_pool_installs_the_rust_toolchain_of_the_repository() {
+        assert_eq!(
+            quoted("mise.toml", "rust"),
+            quoted("rust-toolchain.toml", "channel")
+        );
+    }
+
     #[test]
     fn a_failed_process_is_named_with_its_detail() {
         assert_eq!(succeeded("cargo fmt", true, "x"), Ok(()));

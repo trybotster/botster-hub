@@ -1,0 +1,8 @@
+# The tools of the Botster Hub gate for the pool's docker runtime (mise finds this file). They are the tools of the old
+# ci/remote/Dockerfile.
+[tools]
+# The stable channel of rust-toolchain.toml (with its rustfmt and clippy components). A test (xtask ci.rs) keeps both equal.
+rust = "1.97.0"
+# libghostty builds with Zig: the same version as botster-core's gate.
+zig = "0.16.0"
+"cargo:cargo-nextest" = "0.9.146"
