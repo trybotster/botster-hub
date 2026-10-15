@@ -16,8 +16,10 @@ use crate::bridge::{Answer, Bridge, OutItem, Outbox, OutboxCaps, Refused, Reques
 use crate::client::classify::{classify, First};
 use crate::client::formats::CommonFormats;
 use crate::client::handoff::{Caller, RouteConnectAnswer, RouteConnectRequest};
+use crate::client::kinds::{self, ConnKinds, Ctx, Step};
 use crate::client::peer::peer_uid;
 use crate::client::route::{close_frame, MAX_ROUTE_CONNECT_CLOSE};
+use crate::client::rows::SessionTypes;
 use crate::client::wire::{framed, FrameReader, OutBuf, ReadError};
 use crate::phase::{SharedPhase, Wake};
 use botster_hub_contract::prelude::{
@@ -183,17 +185,18 @@ enum State {
     /// The `route_connect` is with the owner, and the stream travels in the request.
     Route,
     /// After `welcome`.
-    Control(Control),
+    Control(Box<Control>),
     /// A close is queued: the connection ends when its bytes are written.
     Closing,
 }
 
 struct Control {
-    #[allow(dead_code)] // The kinds use the selected version and the hello (next step).
+    #[allow(dead_code)] // The kinds that follow use the selected version and the hello.
     version: u16,
     #[allow(dead_code)]
     hello: Hello,
     reader: FrameReader,
+    kinds: ConnKinds,
 }
 
 struct Conn {
@@ -215,6 +218,8 @@ pub struct Server {
     config: ServerConfig,
     /// `welcome.terminal_format`'s common set, which the owner keeps (R-124).
     formats: Arc<CommonFormats>,
+    /// The session_type registry (design section 7a). The protocol layer owns it; it is built here, at start.
+    types: Arc<SessionTypes>,
     conns: HashMap<Token, Conn>,
     next_token: usize,
 }
@@ -300,6 +305,7 @@ impl Server {
             owner_wake,
             config,
             formats,
+            types: Arc::new(SessionTypes::device()),
             conns: HashMap::new(),
             next_token: FIRST_CLIENT,
         }
@@ -445,18 +451,18 @@ impl Server {
         let Some(conn) = self.conns.get_mut(&token) else {
             return;
         };
-        conn.state = State::Control(Control {
+        conn.state = State::Control(Box::new(Control {
             version,
             hello,
             reader: FrameReader::default(),
-        });
+            kinds: ConnKinds::default(),
+        }));
         if conn.out.push(&frame).is_err() {
             self.drop_conn(token);
         }
     }
 
-    /// The control envelope after `welcome` (HC sections 3 and 5). The kinds come in the next step; until then every
-    /// request is answered `unsupported`.
+    /// The control envelope after `welcome` (HC sections 3 and 5).
     fn envelope(&mut self, token: Token, body: &[u8]) {
         let frame = match serde_json::from_slice::<ClientFrame>(body) {
             Ok(frame) => frame,
@@ -471,21 +477,57 @@ impl Server {
         }
     }
 
+    /// The kinds (design section 7a). An open request id is unique (EN-1). A request for the owner takes one reply slot;
+    /// without a slot the answer is `too_many_requests` and the connection stays open (EN-4).
     fn request(&mut self, token: Token, req: Req) {
-        let res = error_res(
-            req.id.0,
-            ErrorCode::Unsupported,
-            Category::Caller,
-            false,
-            "this kind is not served yet",
-        );
-        self.push_res(token, &res);
+        let now = Instant::now();
+        let Some(conn) = self.conns.get_mut(&token) else {
+            return;
+        };
+        let State::Control(control) = &mut conn.state else {
+            return;
+        };
+        let id = req.id.0;
+        if control.kinds.outstanding(id) {
+            return self.close(token, protocol_error(ProtocolErrorCode::DuplicateRequestId));
+        }
+        let ctx = kind_ctx(&self.config, &self.types);
+        let step = control
+            .kinds
+            .begin(&ctx, token.0 as u64, &conn.outbox, &req, now);
+        match step {
+            Step::Reply(res) => self.push_res(token, &res),
+            Step::Local(res, frames) => {
+                self.push_res(token, &res);
+                for frame in frames {
+                    self.push_frame(token, &frame);
+                }
+            }
+            Step::Owner(request, pending) => {
+                let Some(reply) = conn.outbox.reserve(id) else {
+                    let res = kinds::too_many_requests(id);
+                    return self.push_res(token, &res);
+                };
+                control.kinds.expect(id, pending);
+                if let Err(rejected) = self.bridge.submit(request, reply) {
+                    // The answer goes through the outbox like any other: one path from the reply to the `res`.
+                    rejected
+                        .reply
+                        .send(Answer::Failed(rejected.refused.failure()));
+                }
+            }
+        }
     }
 
     fn push_res(&mut self, token: Token, res: &Res) {
-        let frame = server_frame(&ServerFrame::Res(res.clone()));
+        self.push_frame(token, &ServerFrame::Res(res.clone()));
+    }
+
+    /// A frame that does not fit the connection's outgoing bound ends the connection: a slow reader never gets a gap.
+    fn push_frame(&mut self, token: Token, frame: &ServerFrame) {
+        let bytes = server_frame(frame);
         if let Some(conn) = self.conns.get_mut(&token) {
-            if conn.out.push(&frame).is_err() {
+            if conn.out.push(&bytes).is_err() {
                 self.drop_conn(token);
             }
         }
@@ -612,6 +654,11 @@ impl Server {
             }
             self.write(token);
         }
+        // A drain takes `TAKE` items from each outbox. What is left needs another turn of the `io` loop: no wake arrives
+        // for items that were already queued. The work of one turn stays bounded.
+        if self.conns.values().any(|c| c.outbox.has_items()) {
+            self.io_wake.wake();
+        }
     }
 
     /// Design 2.3, item 4: a refused connect gets its close; a handed one is Core's. Either way the entry goes.
@@ -631,15 +678,19 @@ impl Server {
     }
 
     fn control_item(&mut self, token: Token, item: OutItem) {
-        if let OutItem::Reply { request_id, .. } = item {
-            let res = error_res(
-                request_id,
-                ErrorCode::Internal,
-                Category::Fault,
-                false,
-                "no request of this connection reaches the owner yet",
-            );
-            self.push_res(token, &res);
+        let Some(conn) = self.conns.get_mut(&token) else {
+            return;
+        };
+        let State::Control(control) = &mut conn.state else {
+            return;
+        };
+        let ctx = kind_ctx(&self.config, &self.types);
+        let frames = match item {
+            OutItem::Reply { request_id, answer } => control.kinds.answer(&ctx, request_id, answer),
+            OutItem::Frame { watch, frame } => control.kinds.frame(&ctx, watch, frame),
+        };
+        for frame in frames {
+            self.push_frame(token, &frame);
         }
     }
 
@@ -695,6 +746,17 @@ impl Server {
             self.write(token);
             self.drop_conn(token);
         }
+    }
+}
+
+fn kind_ctx<'a>(config: &'a ServerConfig, types: &'a SessionTypes) -> Ctx<'a> {
+    Ctx {
+        hub_id: &config.hub_id,
+        types,
+        max_frame_bytes: usize::try_from(config.limits.max_frame_bytes).unwrap_or(usize::MAX),
+        cursor_idle: Duration::from_secs(config.limits.cursor_idle_seconds),
+        max_watches: usize::try_from(config.limits.max_watches).unwrap_or(usize::MAX),
+        busy_retry_ms: config.busy_retry_ms,
     }
 }
 
@@ -759,9 +821,27 @@ mod tests {
         bridge: Arc<Bridge>,
         formats: Arc<CommonFormats>,
         phase: Arc<SharedPhase>,
+        /// The real owner over the fake Core, driven by `pump` (the owner thread's job in a Hub). Only [`owned`] has one:
+        /// the route and handshake tests read the bridge themselves.
+        owner: Option<crate::owner::Owner<botster_fake_core::FakeCore>>,
+        _lifecycle: Option<std::sync::mpsc::Receiver<crate::phase::Lifecycle>>,
+        /// The wakes of the `io` loop that the server and the outboxes made.
+        io_wakes: Arc<Count>,
+        /// The wake count the last drain answered.
+        drained_at: usize,
+        clock: Instant,
     }
 
     fn rig_with(config: ServerConfig) -> Rig {
+        build_rig(config, false)
+    }
+
+    /// A rig with the real owner, which `pump` drives.
+    fn owned(config: ServerConfig) -> Rig {
+        build_rig(config, true)
+    }
+
+    fn build_rig(config: ServerConfig, with_owner: bool) -> Rig {
         let dir = tempfile::Builder::new()
             .prefix("bh-")
             .tempdir_in("/tmp")
@@ -783,16 +863,52 @@ mod tests {
             Arc::new(Count::default()),
         ));
         let formats = Arc::new(CommonFormats::default());
+        let io_wakes = Arc::new(Count::default());
+        let (lifecycle_tx, lifecycle) =
+            std::sync::mpsc::sync_channel(crate::phase::LIFECYCLE_CAPACITY);
+        let core = {
+            use botster_core::contract::prelude::{CoreLimits, OpenConfig};
+            let store = botster_fake_core::FakeStore::new();
+            let open = OpenConfig {
+                data_dir: "/fake".into(),
+                worker_path: Some("/fake/botster-worker".into()),
+                limits: CoreLimits::default(),
+            };
+            botster_fake_core::FakeCore::open(&store, open, 7).unwrap()
+        };
+        let mut owner = with_owner.then(|| {
+            crate::owner::Owner::new(
+                core,
+                bridge.clone(),
+                phase.clone(),
+                lifecycle_tx,
+                crate::owner::TurnCounts {
+                    control: 2,
+                    request: 4,
+                    bulk: 2,
+                    events: 16,
+                    fanout: 16,
+                    baseline_rows: 16,
+                },
+                crate::watch::WatchLimits {
+                    max_watches: 32,
+                    chunk_rows: 1,
+                },
+            )
+        });
+        if let Some(owner) = owner.as_mut() {
+            owner.begin_adoption();
+        }
         let server = Server::new(
             poll.registry().try_clone().unwrap(),
             bridge.clone(),
             phase.clone(),
-            Arc::new(Count::default()),
+            io_wakes.clone(),
             Arc::new(Count::default()),
             formats.clone(),
             config,
         );
-        Rig {
+        let mut rig = Rig {
             _dir: dir,
             path,
             poll,
@@ -801,7 +917,15 @@ mod tests {
             bridge,
             formats,
             phase,
-        }
+            owner,
+            _lifecycle: Some(lifecycle),
+            clock: Instant::now(),
+            io_wakes,
+            drained_at: 0,
+        };
+        // Adoption ends before the first client: the bridge is ready.
+        rig.owner_settle();
+        rig
     }
 
     fn rig() -> Rig {
@@ -816,9 +940,6 @@ mod tests {
                 self.poll
                     .poll(&mut events, Some(Duration::from_millis(50)))
                     .unwrap();
-                if events.is_empty() {
-                    return;
-                }
                 for event in events.iter() {
                     if event.token() == LISTENER {
                         while let Ok((stream, _)) = self.listener.accept() {
@@ -828,8 +949,110 @@ mod tests {
                         self.server.ready(event.token(), event);
                     }
                 }
-                self.server.drain_outboxes();
+                self.owner_settle();
+                // The `io` loop drains at its wake token, and only then: the owner's fills and the server's re-arm wake it.
+                if self.io_wakes.get() != self.drained_at {
+                    self.drained_at = self.io_wakes.get();
+                    self.server.drain_outboxes();
+                } else if events.is_empty() {
+                    return;
+                }
             }
+        }
+
+        /// Runs owner turns until no work is left.
+        fn owner_settle(&mut self) {
+            let Some(owner) = self.owner.as_mut() else {
+                return;
+            };
+            for _ in 0..200 {
+                self.clock += Duration::from_millis(1);
+                let now = botster_core::contract::prelude::Now {
+                    monotonic: self.clock,
+                    unix: 1_000_000,
+                };
+                if !owner.turn(now).runnable {
+                    return;
+                }
+            }
+            panic!("the owner is still runnable");
+        }
+
+        /// A session through the bridge, as a client's spawn would make one.
+        fn make_session(&mut self, name: &str) {
+            use botster_core::contract::prelude::{Op, SessionId, Size, SpawnRequest};
+            let outbox = Outbox::new(
+                OutboxCaps {
+                    replies: 2,
+                    frames: 2,
+                    watch_queue: 2,
+                },
+                self.phase.clone(),
+                Arc::new(Count::default()),
+                Arc::new(Count::default()),
+            );
+            let request = SpawnRequest {
+                argv: vec!["/bin/sh".into()],
+                env: Default::default(),
+                cwd: "/".into(),
+                size: Size {
+                    rows: 24,
+                    cols: 80,
+                    cell_px: None,
+                },
+                labels: crate::client::rows::create_labels(
+                    &SessionId(name.into()),
+                    None,
+                    crate::client::rows::COMMAND_TYPE,
+                ),
+                color_profile: None,
+                notification_policy: None,
+                size_policy: None,
+            };
+            let op = Request::Op(Box::new(Op::Create {
+                session: SessionId(name.into()),
+                request,
+            }));
+            self.bridge.submit(op, outbox.reserve(1).unwrap()).unwrap();
+            self.owner_settle();
+            self.server.drain_outboxes();
+        }
+
+        fn set_label(&mut self, name: &str, label: &str) {
+            use botster_core::contract::prelude::SessionId;
+            let outbox = Outbox::new(
+                OutboxCaps {
+                    replies: 2,
+                    frames: 2,
+                    watch_queue: 2,
+                },
+                self.phase.clone(),
+                Arc::new(Count::default()),
+                Arc::new(Count::default()),
+            );
+            let request = Request::SetLabels {
+                session: SessionId(name.into()),
+                set: [(
+                    crate::client::rows::LABEL_KEY.to_string(),
+                    label.to_string(),
+                )]
+                .into(),
+                remove: Vec::new(),
+            };
+            self.bridge
+                .submit(request, outbox.reserve(1).unwrap())
+                .unwrap();
+            self.owner_settle();
+            self.pump();
+        }
+
+        /// A connection past `welcome`.
+        fn control(&mut self) -> StdStream {
+            let mut client = self.connect();
+            send(&mut client, &hello(1, 1));
+            self.pump();
+            receive(&mut client);
+            client
         }
 
         fn connect(&mut self) -> StdStream {
@@ -1168,21 +1391,479 @@ mod tests {
         assert_eq!(rig.server.connections(), 0);
     }
 
+    fn req(
+        client: &mut StdStream,
+        id: u64,
+        verb: &str,
+        kind: &str,
+        target: Option<&str>,
+        args: Value,
+    ) {
+        let mut frame = json!({"type": "req", "id": id.to_string(), "verb": verb, "kind": kind});
+        if let Some(target) = target {
+            frame["target"] = json!(target);
+        }
+        if !args.is_null() {
+            frame["args"] = args;
+        }
+        send(client, &frame);
+    }
+
+    fn ids(items: &Value) -> Vec<String> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// An unknown kind or verb is `unsupported` and the connection stays open (EN-6, VB-7).
     #[test]
-    fn a_request_after_welcome_is_answered() {
-        let mut rig = rig();
-        let mut client = rig.connect();
-        send(&mut client, &hello(1, 1));
+    fn an_unknown_kind_or_verb_is_unsupported_and_the_connection_stays_open() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        req(&mut client, 1, "list", "nope", None, Value::Null);
+        req(&mut client, 2, "frobnicate", "session", None, Value::Null);
         rig.pump();
-        receive(&mut client);
-        send(
+        let mut codes = [receive(&mut client), receive(&mut client)];
+        codes.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(codes[0]["err"]["code"], "unsupported");
+        assert_eq!(codes[1]["err"]["code"], "unsupported");
+        req(&mut client, 3, "list", "session", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["items"], json!([]));
+    }
+
+    /// VB-1, VB-2: `list` and `get` of sessions; the row is the builder's (R-125); an unknown target is `not_found`.
+    #[test]
+    fn list_and_get_answer_session_rows() {
+        let mut rig = owned(config());
+        rig.make_session("b");
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(&mut client, 1, "list", "session", None, Value::Null);
+        req(&mut client, 2, "get", "session", Some("a"), Value::Null);
+        req(&mut client, 3, "get", "session", Some("nope"), Value::Null);
+        req(&mut client, 4, "get", "session", None, Value::Null);
+        rig.pump();
+        let mut res: Vec<Value> = (0..4).map(|_| receive(&mut client)).collect();
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(ids(&res[0]["ok"]["items"]), ["a", "b"]);
+        let row = &res[1]["ok"];
+        assert_eq!(row["id"], "a");
+        assert_eq!(row["hub_id"], "h");
+        assert_eq!(row["label"], "a");
+        assert_eq!(row["session_type"]["id"], "command");
+        assert_eq!(row["activity"], "idle");
+        assert_eq!(res[2]["err"]["code"], "not_found");
+        assert_eq!(res[3]["err"]["code"], "invalid_arguments");
+    }
+
+    /// VB-1, `vb_1_pages_from_one_cut`: the pages of a cursor come from the cut of the first call, so a session made
+    /// between two pages is not in them and none is skipped or repeated.
+    #[test]
+    fn pages_come_from_one_cut() {
+        let mut rig = owned(config());
+        for name in ["a", "b", "c"] {
+            rig.make_session(name);
+        }
+        let mut client = rig.control();
+        req(&mut client, 1, "list", "session", None, json!({"limit": 2}));
+        rig.pump();
+        let first = receive(&mut client);
+        assert_eq!(ids(&first["ok"]["items"]), ["a", "b"]);
+        let cursor = first["ok"]["next_cursor"].as_str().unwrap().to_owned();
+        rig.make_session("bb");
+        req(
             &mut client,
-            &json!({"type": "req", "id": "7", "verb": "list", "kind": "session"}),
+            2,
+            "list",
+            "session",
+            None,
+            json!({"limit": 2, "cursor": cursor}),
         );
         rig.pump();
+        let second = receive(&mut client);
+        assert_eq!(ids(&second["ok"]["items"]), ["c"]);
+        assert!(second["ok"].get("next_cursor").is_none());
+        // The cursor is gone after its last page; a new listing sees the new session.
+        req(
+            &mut client,
+            3,
+            "list",
+            "session",
+            None,
+            json!({"cursor": cursor}),
+        );
+        req(&mut client, 4, "list", "session", None, Value::Null);
+        rig.pump();
+        let mut res = [receive(&mut client), receive(&mut client)];
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(res[0]["err"]["code"], "expired_cursor");
+        assert_eq!(ids(&res[1]["ok"]["items"]), ["a", "b", "bb", "c"]);
+    }
+
+    /// VB-1: an equality filter over core fields; a field that is not a core field is `invalid_arguments`.
+    #[test]
+    fn list_filters_by_core_field() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        rig.make_session("b");
+        rig.set_label("b", "build");
+        let mut client = rig.control();
+        req(
+            &mut client,
+            1,
+            "list",
+            "session",
+            None,
+            json!({"filter": {"label": "build"}}),
+        );
+        req(
+            &mut client,
+            2,
+            "list",
+            "session",
+            None,
+            json!({"filter": {"colour": "red"}}),
+        );
+        rig.pump();
+        let mut res = [receive(&mut client), receive(&mut client)];
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(ids(&res[0]["ok"]["items"]), ["b"]);
+        assert_eq!(res[1]["err"]["code"], "invalid_arguments");
+    }
+
+    /// WT-1, WT-2, WT-6: `res` first, then one baseline; deltas after `snapshot_end`; `unwatch` ends the frames.
+    #[test]
+    fn a_session_watch_has_a_baseline_then_deltas_then_silence() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session", None, Value::Null);
+        rig.pump();
         let res = receive(&mut client);
-        assert_eq!(res["type"], "res");
-        assert_eq!(res["id"], "7");
-        assert_eq!(res["err"]["code"], "unsupported");
+        assert_eq!(res["id"], "1");
+        let watch = res["ok"]["watch_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            receive(&mut client),
+            json!({"type": "watch", "frame": "snapshot_begin", "watch_id": watch})
+        );
+        let items = receive(&mut client);
+        assert_eq!(items["frame"], "snapshot_items");
+        assert_eq!(ids(&items["items"]), ["a"]);
+        assert_eq!(
+            receive(&mut client),
+            json!({"type": "watch", "frame": "snapshot_end", "watch_id": watch})
+        );
+        rig.make_session("b");
+        rig.pump();
+        let upsert = receive(&mut client);
+        assert_eq!(
+            (upsert["frame"].as_str(), upsert["id"].as_str()),
+            (Some("upsert"), Some("b"))
+        );
+        assert_eq!(upsert["value"]["id"], "b");
+        req(
+            &mut client,
+            2,
+            "unwatch",
+            "session",
+            Some(&watch),
+            Value::Null,
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["id"], "2");
+        rig.make_session("c");
+        rig.pump();
+        req(&mut client, 3, "list", "session", None, Value::Null);
+        rig.pump();
+        // The next frame is the answer to the list: nothing of the watch follows the unwatch `res`.
+        let next = receive(&mut client);
+        assert_eq!(next["id"], "3");
+        assert_eq!(ids(&next["ok"]["items"]), ["a", "b", "c"]);
+        // The watch is gone: a second unwatch is `not_found`.
+        req(
+            &mut client,
+            4,
+            "unwatch",
+            "session",
+            Some(&watch),
+            Value::Null,
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["err"]["code"], "not_found");
+    }
+
+    /// WT-2 `wt_2_filter_entry_exit`: a row that starts to match gets `upsert`, and a row that stops matching gets `remove`.
+    #[test]
+    fn a_filtered_watch_sends_entry_and_exit() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(
+            &mut client,
+            1,
+            "watch",
+            "session",
+            None,
+            json!({"filter": {"label": "build"}}),
+        );
+        rig.pump();
+        receive(&mut client);
+        receive(&mut client);
+        let items = receive(&mut client);
+        assert_eq!(
+            items,
+            json!({"type": "watch", "frame": "snapshot_end", "watch_id": "1"}),
+            "no row matches"
+        );
+        rig.set_label("a", "build");
+        let entry = receive(&mut client);
+        assert_eq!(
+            (entry["frame"].as_str(), entry["id"].as_str()),
+            (Some("upsert"), Some("a"))
+        );
+        rig.set_label("a", "test");
+        let exit = receive(&mut client);
+        assert_eq!(
+            (exit["frame"].as_str(), exit["id"].as_str()),
+            (Some("remove"), Some("a"))
+        );
+    }
+
+    /// BD-1: a connection has at most `max_watches` watches; the next is `busy`, and the connection stays open.
+    #[test]
+    fn the_watch_bound_is_busy() {
+        let mut config = config();
+        config.limits.max_watches = 1;
+        let mut rig = owned(config);
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session_type", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["id"], "1");
+        for _ in 0..3 {
+            receive(&mut client);
+        }
+        req(&mut client, 2, "watch", "session", None, Value::Null);
+        rig.pump();
+        let res = receive(&mut client);
+        assert_eq!(res["err"]["code"], "busy");
+        assert_eq!(res["err"]["retryable"], true);
+    }
+
+    /// `session_type` reads come from the registry: `list`, `get`, `watch` (R-125, S2-HC-3: the `command` type).
+    #[test]
+    fn session_type_reads_come_from_the_registry() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        req(&mut client, 1, "list", "session_type", None, Value::Null);
+        req(
+            &mut client,
+            2,
+            "get",
+            "session_type",
+            Some("command"),
+            Value::Null,
+        );
+        req(
+            &mut client,
+            3,
+            "get",
+            "session_type",
+            Some("nope"),
+            Value::Null,
+        );
+        rig.pump();
+        let mut res: Vec<Value> = (0..3).map(|_| receive(&mut client)).collect();
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(ids(&res[0]["ok"]["items"]), ["command"]);
+        assert_eq!(res[1]["ok"]["source"], "device");
+        assert_eq!(res[1]["ok"]["editable"], false);
+        assert_eq!(res[2]["err"]["code"], "not_found");
+        req(&mut client, 4, "watch", "session_type", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["id"], "4");
+        assert_eq!(receive(&mut client)["frame"], "snapshot_begin");
+        assert_eq!(ids(&receive(&mut client)["items"]), ["command"]);
+        assert_eq!(receive(&mut client)["frame"], "snapshot_end");
+    }
+
+    /// EN-1: a request id that is open on the connection closes it `duplicate_request_id`. EN-4: past `max_outstanding`,
+    /// the answer is `too_many_requests` and the connection stays open.
+    #[test]
+    fn open_ids_are_unique_and_the_outstanding_bound_does_not_close() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        // Eight open requests fill the replies; the ninth is refused. The owner has not run, so none is answered yet.
+        for id in 1..=9 {
+            req(&mut client, id, "list", "session", None, Value::Null);
+        }
+        rig.pump();
+        let refused = receive(&mut client);
+        assert_eq!(refused["id"], "9");
+        assert_eq!(refused["err"]["code"], "too_many_requests");
+        let mut answered = 0;
+        for _ in 0..8 {
+            let res = receive(&mut client);
+            assert!(
+                res.get("ok").is_some() || res["err"]["code"] == "busy",
+                "{res}"
+            );
+            answered += 1;
+        }
+        assert_eq!(answered, 8);
+        // A duplicate of an open id.
+        for _ in 0..2 {
+            req(&mut client, 20, "get", "session", Some("x"), Value::Null);
+        }
+        rig.pump();
+        let close = receive(&mut client);
+        assert_eq!(close["type"], "close");
+        assert_eq!(
+            close["reason"]["protocol_error"]["code"],
+            "duplicate_request_id"
+        );
+    }
+
+    fn body_len(value: &Value) -> usize {
+        serde_json::to_vec(value).unwrap().len()
+    }
+
+    /// KINDS-1: a drain takes at most `TAKE` items from a connection, and it asks the `io` loop for another turn while
+    /// items are left: no other wake comes for items that are already queued. `pump` follows the wakes as the loop does.
+    #[test]
+    fn a_drain_with_items_left_wakes_io_again() {
+        let mut config = config();
+        config.outbox = OutboxCaps {
+            replies: 8,
+            frames: 200,
+            watch_queue: 200,
+        };
+        config.out_bytes = 1 << 20;
+        let mut rig = owned(config);
+        for n in 0..70 {
+            rig.make_session(&format!("s{n:02}"));
+        }
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session", None, Value::Null);
+        // A reader thread keeps the socket empty while the test thread pumps: the baseline is larger than one drain and
+        // than the socket buffer.
+        let mut reader = client.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || loop {
+            let frame = receive(&mut reader);
+            let ended = frame["frame"] == "snapshot_end";
+            tx.send(frame).unwrap();
+            if ended {
+                return;
+            }
+        });
+        let mut frames = Vec::new();
+        for _ in 0..200 {
+            rig.pump();
+            frames.extend(rx.try_iter());
+            if frames.last().is_some_and(|f| f["frame"] == "snapshot_end") {
+                break;
+            }
+        }
+        thread.join().unwrap();
+        frames.extend(rx.try_iter());
+        // The `res`, `snapshot_begin`, 70 rows and `snapshot_end`.
+        assert_eq!(frames.len(), 1 + 1 + 70 + 1);
+    }
+
+    /// KINDS-2, EN-5: the Hub never sends a frame over `max_frame_bytes`. A `get` whose row is one byte over is
+    /// `response_too_large`; a row that fits exactly is sent.
+    #[test]
+    fn a_get_over_the_bound_is_response_too_large_and_an_exact_fit_is_sent() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        let max = 4096;
+        rig.set_label("a", &"x".repeat(100));
+        req(&mut client, 1, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let base = body_len(&receive(&mut client));
+        let fit = 100 + (max - base);
+        rig.set_label("a", &"x".repeat(fit));
+        req(&mut client, 2, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let exact = receive(&mut client);
+        assert_eq!(body_len(&exact), max, "the answer fits exactly");
+        assert_eq!(exact["ok"]["id"], "a");
+        rig.set_label("a", &"x".repeat(fit + 1));
+        req(&mut client, 3, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let over = receive(&mut client);
+        assert_eq!(over["err"]["code"], "response_too_large", "{over}");
+        // The connection is fine.
+        req(
+            &mut client,
+            4,
+            "get",
+            "session_type",
+            Some("command"),
+            Value::Null,
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["id"], "command");
+    }
+
+    /// KINDS-2, BD-2: a delta over the bound ends the watch with `watch_closed { item_too_large }`; nothing of the watch
+    /// follows it.
+    #[test]
+    fn a_delta_over_the_bound_closes_the_watch() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(&mut client, 1, "watch", "session", None, Value::Null);
+        rig.pump();
+        for _ in 0..4 {
+            receive(&mut client);
+        }
+        rig.set_label("a", &"x".repeat(5000));
+        let closed = receive(&mut client);
+        assert_eq!(
+            closed,
+            json!({"type": "watch", "frame": "watch_closed", "watch_id": "1", "reason": "item_too_large"})
+        );
+        rig.set_label("a", "small");
+        req(&mut client, 2, "list", "session", None, Value::Null);
+        rig.pump();
+        assert_eq!(
+            receive(&mut client)["id"],
+            "2",
+            "no frame of the closed watch follows"
+        );
+    }
+
+    /// KINDS-3, BD-1: the bound counts each watch once. Two watches in one write fill `max_watches` 2; the third is `busy`.
+    #[test]
+    fn pipelined_watches_count_once_against_the_bound() {
+        let mut config = config();
+        config.limits.max_watches = 2;
+        let mut rig = owned(config);
+        let mut client = rig.control();
+        for id in 1..=3 {
+            req(&mut client, id, "watch", "session", None, Value::Null);
+        }
+        rig.pump();
+        let mut oks = 0;
+        let mut busy = 0;
+        let mut seen = 0;
+        while seen < 3 {
+            let frame = receive(&mut client);
+            if frame["type"] == "res" {
+                seen += 1;
+                if frame.get("ok").is_some() {
+                    oks += 1;
+                } else if frame["err"]["code"] == "busy" {
+                    busy += 1;
+                }
+            }
+        }
+        assert_eq!((oks, busy), (2, 1));
     }
 }
