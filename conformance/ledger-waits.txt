@@ -1,0 +1,4 @@
+# Minimum-Hub rows that the pinned contracts ledger does not hold with their contract yet, each with the amendment that
+# fixes it. The lists check reports each one as waiting, never as a pass; it refuses an entry that the ledger already
+# matches, so an entry goes when its amendment freezes. Columns (tab-separated): contract, id, amendment, reason.
+HP	conf::hs_1_hello_first	HP A11	the ledger keys by bare id and holds only the HC row of this id; HP A11 renames the HP id conf::hs_1_hub_hello_first

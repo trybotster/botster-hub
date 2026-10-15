@@ -1,0 +1,16 @@
+[package]
+name = "botster-plugin-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The Lua plugin runner (repo plan section 3): one process per plugin, started by Core as a service. Its plugin isolation
+# code joins the HIGH paths in the PR that adds it.
+
+[lints]
+workspace = true
+
+[dependencies]
+botster-plugin-contract.workspace = true

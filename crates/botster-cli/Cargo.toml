@@ -1,0 +1,20 @@
+[package]
+name = "botster-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The CLI (repo plan section 3): `botster hub ...` and `botster tui` (launches the TUI, which connects to the Hub;
+# CLI-AT2). STANDARD tier.
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "botster"
+path = "src/main.rs"
+
+[dependencies]
+botster-cli-contract.workspace = true
