@@ -442,7 +442,16 @@ impl<C: CoreApi> Owner<C> {
             OpResult::Err(CoreError {
                 code: ErrorCode::StartFailed(reason),
                 ..
-            }) => self.finish(&operation_id, Some(start_fail_reason(reason))),
+            }) => {
+                let mapped = start_fail_reason(reason);
+                if mapped == FailReason::StartFailed {
+                    eprintln!(
+                        "botster-hub: spawn flow: an unknown StartFailReason {reason:?} for {}",
+                        session.0
+                    );
+                }
+                self.finish(&operation_id, Some(mapped));
+            }
             // U4: another error, or an unknown result.
             _ => self.start_undecided(&operation_id, &session),
         }
@@ -696,15 +705,19 @@ fn failed(kind: FailKind, effect: Effect) -> Answer {
     Answer::Failed(Failure { kind, effect })
 }
 
-/// The `StartFailed` reason to the record's reason (design section 4a). `GuardianFailed` and an unknown reason have no
-/// ruled mapping: `internal` until the steward answers S2-HD-12 (open; lead 2026-10-12). Change it only if the ruling
-/// differs.
+/// The `StartFailed` reason to the record's reason (design section 4a; R-121 at contracts main 16721c1c, S2-HD-12). The
+/// same mapping serves a recorded `start_failure` (A26).
+/// - `GuardianFailed` is `worker_failed`: A26 renames it to `WorkerFailed`; the arm serves a Core built before A26.
+/// - An unknown reason (the set is non-exhaustive) is `start_failed`, not `internal` (`internal` names a Hub fault,
+///   R-120). The caller logs the raw Core value.
 fn start_fail_reason(reason: StartFailReason) -> FailReason {
     match reason {
         StartFailReason::ExecFailed { .. } => FailReason::ExecFailed,
         StartFailReason::CwdMissing => FailReason::CwdMissing,
-        StartFailReason::StartupTimeout | StartFailReason::WorkerFailed => FailReason::WorkerFailed,
-        _ => FailReason::Internal,
+        StartFailReason::StartupTimeout
+        | StartFailReason::WorkerFailed
+        | StartFailReason::GuardianFailed => FailReason::WorkerFailed,
+        _ => FailReason::StartFailed,
     }
 }
 
@@ -1251,7 +1264,8 @@ mod tests {
             (StartFailReason::CwdMissing, FailReason::CwdMissing),
             (StartFailReason::StartupTimeout, FailReason::WorkerFailed),
             (StartFailReason::WorkerFailed, FailReason::WorkerFailed),
-            (StartFailReason::GuardianFailed, FailReason::Internal),
+            (StartFailReason::GuardianFailed, FailReason::WorkerFailed),
+            (StartFailReason::Other, FailReason::StartFailed),
         ];
         for (reason, mapped) in cases {
             let tmp = short_root();
