@@ -47,6 +47,20 @@ pub enum FailReason {
     Internal,
 }
 
+impl FailReason {
+    /// The word of the reason in the record and on the wire (A.7b).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailReason::ExecFailed => "exec_failed",
+            FailReason::CwdMissing => "cwd_missing",
+            FailReason::WorkerFailed => "worker_failed",
+            FailReason::StartFailed => "start_failed",
+            FailReason::Interrupted => "interrupted",
+            FailReason::Internal => "internal",
+        }
+    }
+}
+
 /// One spawn operation record (design section 4a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
