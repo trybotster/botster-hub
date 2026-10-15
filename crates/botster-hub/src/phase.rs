@@ -116,6 +116,8 @@ pub enum StopCause {
     OwnerFailed,
     /// The store failed (design section 5, "Store fault").
     StoreFailed,
+    /// The `io` thread ended before the stop (a panic).
+    IoFailed,
 }
 
 /// How a thread ended.
