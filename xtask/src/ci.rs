@@ -1,7 +1,7 @@
 //! `cargo xtask ci`: the Hub's gate (repo plan section 5, the minimal gate). Each step runs, in order; the summary names
 //! each step's result and time, and the gate fails when a step fails.
 
-use crate::{budget, forbid_unsafe, lists, taint};
+use crate::{budget, forbid_unsafe, lists, taint, zig_packages};
 use anyhow::{bail, Result};
 use std::path::Path;
 use std::process::Command;
@@ -37,7 +37,7 @@ fn cargo(root: &Path, args: &[&str]) -> Result<()> {
 }
 
 /// The steps of the gate, in order.
-pub const STEPS: [Step; 8] = [
+pub const STEPS: [Step; 9] = [
     ("fmt", |root| cargo(root, &["fmt", "--all", "--check"])),
     ("clippy", |root| {
         cargo(
@@ -59,6 +59,7 @@ pub const STEPS: [Step; 8] = [
         botster_gate_kit::high_tier::command(root, &[])
     }),
     ("lists", |root| lists::command(root, &[])),
+    ("zig-packages", |root| zig_packages::command(root, &[])),
     ("test-budget", |root| budget::command(root, &[])),
     ("slow", |root| {
         budget::command(root, &["--slow".to_string()])
@@ -134,6 +135,7 @@ mod tests {
                 "unsafe-code",
                 "high-tier",
                 "lists",
+                "zig-packages",
                 "test-budget",
                 "slow"
             ]

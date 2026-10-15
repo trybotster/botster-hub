@@ -13,8 +13,10 @@ timeout_seconds = 3000
 # botster-core for botster-core and botster-gate-kit). The pool maps the profile to the project's credential.
 private = "cargo"
 # Run without secrets, with network. It fills the Zig package store that libghostty's build.rs reads (botster-core's
-# botster-terminal-ghostty, built with Zig). Its source is the checkout of botster-core in cargo's home that the private
-# fetch filled. The file is mode 644, so bash runs it.
+# botster-terminal-ghostty, built with Zig). It reads the list of packages in ci/zig-prefetch (data in this repository),
+# not botster-core's checkout: the private and the public fetch run independently, and the private cargo home is the
+# private profile's alone. `cargo xtask zig-packages` checks the list against botster-core's pin. The file is mode 644, so
+# bash runs it.
 public_command = ["bash", "ci/remote/fetch-public.sh"]
 
 [network]
@@ -22,12 +24,6 @@ fetch = "bridge"
 gate = "none"
 
 # Logical caches: the pool assigns the subdirectories. key = inputs that pick the cache; mode: rw or exclusive.
-[[caches]]
-name = "cargo"
-path = "/cache/cargo"
-key = ["rust-toolchain.toml"]
-mode = "rw"
-
 [[caches]]
 name = "target"
 path = "/cache/target"
@@ -46,7 +42,6 @@ mode = "rw"
 TZ = "UTC"
 # CI: a missing tool or a skipped step fails the gate, it does not pass as SKIPPED.
 CI = "1"
-CARGO_HOME = "/cache/cargo"
 CARGO_TARGET_DIR = "/cache/target"
 CARGO_TERM_COLOR = "never"
 CARGO_BUILD_JOBS = "4"

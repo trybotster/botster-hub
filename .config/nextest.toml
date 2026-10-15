@@ -7,6 +7,12 @@
 
 nextest-version = "0.9.100"
 
+# The store of every profile (and so its JUnit file) is in the workspace, whatever CARGO_TARGET_DIR is: the pool sets the
+# target directory to a cache volume, and `cargo xtask test-budget` reads <workspace>/target/nextest/<profile>/junit.xml
+# (xtask/src/budget.rs `junit_path`; a test keeps both equal).
+[store]
+dir = "target/nextest"
+
 [profile.default]
 slow-timeout = { period = "2s", terminate-after = 1 }
 leak-timeout = { period = "200ms", result = "fail" }
