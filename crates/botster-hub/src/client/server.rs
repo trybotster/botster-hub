@@ -66,6 +66,114 @@ pub struct ServerConfig {
     pub uid: u32,
 }
 
+/// The numbers that this layer owns (HC CF-2 `[limits]`; the Hub's defaults, no HC number).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolConfig {
+    /// `hub_current` (HS-2).
+    pub version: u16,
+    /// The features that the Hub offers (HS-3).
+    pub features: Vec<String>,
+    /// Every control frame, the handshake included (TR-1, EN-5).
+    pub max_frame_bytes: u64,
+    /// A chunked binding's chunk payload (TR-3); `local-stream` does not chunk.
+    pub max_chunk_bytes: u64,
+    pub idempotency_window_seconds: u64,
+    pub cursor_idle_seconds: u64,
+    pub max_connections: usize,
+    pub max_unclassified: usize,
+    pub handshake_deadline: Duration,
+    /// A connection's outgoing byte bound: at least `max_frame_bytes` and the longest route-connect close.
+    pub out_bytes: usize,
+    pub busy_retry_ms: u64,
+}
+
+impl ProtocolConfig {
+    pub fn production() -> ProtocolConfig {
+        ProtocolConfig {
+            version: 1,
+            features: Vec::new(),
+            max_frame_bytes: 1024 * 1024,
+            max_chunk_bytes: 16 * 1024,
+            idempotency_window_seconds: 600,
+            cursor_idle_seconds: 300,
+            max_connections: 256,
+            max_unclassified: 32,
+            handshake_deadline: Duration::from_secs(5),
+            out_bytes: 2 * 1024 * 1024,
+            busy_retry_ms: 100,
+        }
+    }
+}
+
+/// The `welcome.limits` numbers that other components enforce, so each has one source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedLimits {
+    /// The watch table.
+    pub max_watches: u64,
+    /// The outbox `replies` cap (EN-4).
+    pub max_outstanding: u64,
+    /// The spawn store's retention.
+    pub operation_retention_seconds: u64,
+    /// The route window (TS-2).
+    pub route_connect_seconds: u64,
+    /// The routes' query deadline (EV-8).
+    pub query_client_deadline_ms: u64,
+    /// Core's `max_paste_bytes` (R-119: Core enforces it per route).
+    pub max_paste_bytes: u64,
+    /// Core's `max_file_bytes`.
+    pub max_file_bytes: u64,
+}
+
+impl ServerConfig {
+    /// The server's configuration from this layer's numbers and the other components' numbers.
+    ///
+    /// # Panics
+    /// `max_outstanding` is not the outbox `replies` cap, or `out_bytes` cannot hold one frame of `max_frame_bytes`.
+    pub fn compose(
+        protocol: &ProtocolConfig,
+        shared: SharedLimits,
+        hub_id: String,
+        incarnation: String,
+        uid: u32,
+        outbox: OutboxCaps,
+    ) -> ServerConfig {
+        assert_eq!(
+            shared.max_outstanding, outbox.replies as u64,
+            "welcome.limits.max_outstanding is the outbox replies cap"
+        );
+        assert!(
+            protocol.out_bytes as u64 >= protocol.max_frame_bytes + 4,
+            "out_bytes holds one whole frame"
+        );
+        ServerConfig {
+            hub_id,
+            incarnation,
+            version: protocol.version,
+            features: protocol.features.clone(),
+            limits: Limits {
+                max_frame_bytes: protocol.max_frame_bytes,
+                max_chunk_bytes: protocol.max_chunk_bytes,
+                max_outstanding: shared.max_outstanding,
+                max_watches: shared.max_watches,
+                route_connect_seconds: shared.route_connect_seconds,
+                idempotency_window_seconds: protocol.idempotency_window_seconds,
+                cursor_idle_seconds: protocol.cursor_idle_seconds,
+                operation_retention_seconds: shared.operation_retention_seconds,
+                max_paste_bytes: shared.max_paste_bytes,
+                max_file_bytes: shared.max_file_bytes,
+                query_client_deadline_ms: shared.query_client_deadline_ms,
+            },
+            max_connections: protocol.max_connections,
+            max_unclassified: protocol.max_unclassified,
+            handshake_deadline: protocol.handshake_deadline,
+            out_bytes: protocol.out_bytes,
+            outbox,
+            busy_retry_ms: protocol.busy_retry_ms,
+            uid,
+        }
+    }
+}
+
 enum State {
     /// Waiting for the first frame.
     Unclassified {
@@ -757,6 +865,67 @@ mod tests {
         json!({"type": "hello", "protocol": "botster-hub", "versions": {"min": min, "max": max},
             "client": {"name": "t", "version": "0"}, "features": ["b", "c"],
             "terminal_formats": ["ghostsnp/2+raw", "ghostsnp/1+raw"]})
+    }
+
+    fn shared() -> SharedLimits {
+        SharedLimits {
+            max_watches: 32,
+            max_outstanding: 8,
+            operation_retention_seconds: 86_400,
+            route_connect_seconds: 10,
+            query_client_deadline_ms: 200,
+            max_paste_bytes: 65_536,
+            max_file_bytes: 1_048_576,
+        }
+    }
+
+    #[test]
+    fn compose_takes_each_number_from_its_one_source() {
+        let protocol = ProtocolConfig::production();
+        let outbox = OutboxCaps {
+            replies: 8,
+            frames: 4,
+            watch_queue: 4,
+        };
+        let config = ServerConfig::compose(&protocol, shared(), "h".into(), "i".into(), 7, outbox);
+        let l = config.limits;
+        assert_eq!(
+            (
+                l.max_watches,
+                l.max_outstanding,
+                l.operation_retention_seconds
+            ),
+            (32, 8, 86_400)
+        );
+        assert_eq!(
+            (
+                l.route_connect_seconds,
+                l.query_client_deadline_ms,
+                l.max_paste_bytes,
+                l.max_file_bytes
+            ),
+            (10, 200, 65_536, 1_048_576)
+        );
+        assert_eq!(l.max_frame_bytes, protocol.max_frame_bytes);
+        assert_eq!((config.uid, config.outbox), (7, outbox));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_outstanding")]
+    fn compose_refuses_a_max_outstanding_that_the_outbox_does_not_enforce() {
+        let outbox = OutboxCaps {
+            replies: 9,
+            frames: 4,
+            watch_queue: 4,
+        };
+        ServerConfig::compose(
+            &ProtocolConfig::production(),
+            shared(),
+            "h".into(),
+            "i".into(),
+            7,
+            outbox,
+        );
     }
 
     #[test]
