@@ -6,6 +6,7 @@
 pub mod bridge;
 pub mod failure;
 pub mod fsutil;
+pub mod owner;
 pub mod phase;
 pub mod roots;
 pub mod start;
