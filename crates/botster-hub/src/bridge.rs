@@ -55,6 +55,13 @@ pub enum Request {
     },
     /// Ends a watch (HC WT-6): every frame of it is ahead of the reply.
     Unwatch(WatchKey),
+    /// The one writer of a session's Core labels (design section 4, "The label writer"): `set` and `remove` apply to
+    /// the latest map, one `UpdateMetadata` at a time per session. The answer is the op's `Completed`.
+    SetLabels {
+        session: SessionId,
+        set: BTreeMap<String, String>,
+        remove: Vec<String>,
+    },
     /// `invoke(session, attach)`: reserves a route (TS-1). Boxed like `Op`.
     ReserveRoute(Box<ReserveRequest>),
     /// A `route_connect` with the client's stream (TB-L2). On a refused `submit`, `Rejected` returns the stream to `io`.
