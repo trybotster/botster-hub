@@ -12,3 +12,4 @@ pub mod phase;
 pub mod roots;
 pub mod start;
 pub mod store;
+pub mod watch;

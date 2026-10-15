@@ -12,6 +12,7 @@ use crate::store::{
     install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnStore, StoreEvent,
     Terminal,
 };
+use crate::watch::{Row, WatchFrame, WatchKey, WatchLimits, Watches};
 use botster_core::contract::prelude::{
     CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult, SessionId,
     SessionState, SpawnRequest, StartFailReason,
@@ -27,6 +28,22 @@ pub struct TurnCounts {
     pub request: usize,
     pub bulk: usize,
     pub events: usize,
+    /// Watch deliveries per turn (the fan-out continuation).
+    pub fanout: usize,
+    /// Baseline rows per turn, across all baselines.
+    pub baseline_rows: usize,
+}
+
+/// The fan-out continuation (design section 4): one poll's events, the next event, and the next watch. While it is
+/// pending, the owner polls no new event, so the events wait in Core's own bounded queue and the order per watch holds.
+#[derive(Debug)]
+struct FanOut {
+    batch: Vec<Event>,
+    next_event: usize,
+    /// The current event was applied to the view; its delta goes to the watches after `next_watch`.
+    started: bool,
+    next_watch: Option<WatchKey>,
+    delta: Option<(SessionId, WatchFrame)>,
 }
 
 /// A waiter: who gets an op's `Completed` (section 4).
@@ -84,7 +101,9 @@ pub struct Owner<C: CoreApi> {
     lifecycle: SyncSender<Lifecycle>,
     counts: TurnCounts,
     waiters: HashMap<OpId, Waiter>,
-    view: BTreeMap<SessionId, SessionState>,
+    view: BTreeMap<SessionId, Arc<Row>>,
+    watches: Watches,
+    fanout: Option<FanOut>,
     events_left: bool,
     adoption: Adoption,
     /// `Shutdown` tokens: answered `Stopping` by the stop drain.
@@ -114,6 +133,7 @@ impl<C: CoreApi> Owner<C> {
         phase: Arc<SharedPhase>,
         lifecycle: SyncSender<Lifecycle>,
         counts: TurnCounts,
+        limits: WatchLimits,
     ) -> Owner<C> {
         Owner {
             core,
@@ -123,6 +143,8 @@ impl<C: CoreApi> Owner<C> {
             counts,
             waiters: HashMap::new(),
             view: BTreeMap::new(),
+            watches: Watches::new(limits),
+            fanout: None,
             events_left: false,
             adoption: Adoption::NotStarted,
             shutdowns: Vec::new(),
@@ -176,8 +198,17 @@ impl<C: CoreApi> Owner<C> {
 
     /// The session view: built only from `list()` at start, the `SessionState` events of `AdoptAll`, and the events after
     /// it (Core LC-11). The Hub keeps no second registry of sessions.
-    pub fn view(&self) -> &BTreeMap<SessionId, SessionState> {
+    pub fn view(&self) -> &BTreeMap<SessionId, Arc<Row>> {
         &self.view
+    }
+
+    pub fn watches(&self) -> &Watches {
+        &self.watches
+    }
+
+    /// Whether a fan-out continuation is pending.
+    pub fn fanout_pending(&self) -> bool {
+        self.fanout.is_some()
     }
 
     /// The number of op waiters (bounded by Core's op limits and `max_outstanding` per connection).
@@ -191,7 +222,16 @@ impl<C: CoreApi> Owner<C> {
             .core
             .list()
             .into_iter()
-            .map(|row| (row.id, row.state))
+            .map(|row| {
+                let id = row.id.clone();
+                (
+                    id,
+                    Arc::new(Row {
+                        id: row.id,
+                        state: row.state,
+                    }),
+                )
+            })
             .collect();
         match self.core.begin(Op::AdoptAll) {
             Ok(op) => {
@@ -202,7 +242,8 @@ impl<C: CoreApi> Owner<C> {
         }
     }
 
-    /// One owner turn (section 2): admit, pump once, poll events and apply them, then report whether to run again.
+    /// One owner turn (section 2): admit; pump once; continue the fan-out; only with no fan-out pending, the baselines
+    /// and a new poll; then report whether to run again.
     pub fn turn(&mut self, now: Now) -> TurnReport {
         self.now_ms = now.unix.saturating_mul(1000);
         let items =
@@ -216,15 +257,87 @@ impl<C: CoreApi> Owner<C> {
             return TurnReport { runnable: false };
         }
         let pump = self.core.pump(now);
-        let events = self.core.poll_events(self.counts.events.max(1));
-        // A non-empty poll sets `events_left`; only an empty poll clears it (Core `poll_events` promises "at most max").
-        self.events_left = !events.is_empty();
-        for event in events {
-            self.apply(event);
+        self.watches.remove_closed();
+        self.fanout_step();
+        if self.fanout.is_none() {
+            self.watches
+                .baseline_turn(self.counts.baseline_rows, &self.view);
+            let events = self.core.poll_events(self.counts.events.max(1));
+            // A non-empty poll sets `events_left`; only an empty poll clears it (Core `poll_events` promises "at most
+            // max").
+            self.events_left = !events.is_empty();
+            if self.events_left {
+                self.fanout = Some(FanOut {
+                    batch: events,
+                    next_event: 0,
+                    started: false,
+                    next_watch: None,
+                    delta: None,
+                });
+            }
         }
         self.store_turn();
         TurnReport {
-            runnable: pump.more || self.events_left || !self.bridge.is_empty(),
+            runnable: pump.more
+                || self.events_left
+                || self.fanout.is_some()
+                || self.watches.runnable()
+                || !self.bridge.is_empty(),
+        }
+    }
+
+    /// Continues the fan-out for at most `fanout` units of work: applying one event to the view is one unit, and each
+    /// watch visited is one unit, so a turn's work is bounded whatever the number of watches (Sol finding 5). The view
+    /// advances one event at a time, as the event's fan-out starts (Sol finding 3, round 2).
+    fn fanout_step(&mut self) {
+        let Some(mut fan) = self.fanout.take() else {
+            return;
+        };
+        let mut budget = self.counts.fanout.max(1);
+        while budget > 0 {
+            if !fan.started {
+                let Some(event) = fan.batch.get(fan.next_event).cloned() else {
+                    return;
+                };
+                let session = match &event {
+                    Event::SessionState { id, state, .. } => {
+                        Some((id.clone(), *state == SessionState::Released))
+                    }
+                    _ => None,
+                };
+                self.apply(event);
+                fan.delta = session.and_then(|(id, released)| {
+                    if released {
+                        Some((id.clone(), WatchFrame::Removed(id)))
+                    } else {
+                        self.view
+                            .get(&id)
+                            .map(|row| (id, WatchFrame::Delta(row.clone())))
+                    }
+                });
+                fan.started = true;
+                fan.next_watch = None;
+                budget -= 1;
+                continue;
+            }
+            let next = match &fan.delta {
+                Some(_) => self.watches.next_after(fan.next_watch),
+                None => None,
+            };
+            match (next, &fan.delta) {
+                (Some(key), Some((id, frame))) => {
+                    self.watches.deliver(key, id, frame);
+                    fan.next_watch = Some(key);
+                    budget -= 1;
+                }
+                _ => {
+                    fan.next_event += 1;
+                    fan.started = false;
+                }
+            }
+        }
+        if fan.started || fan.next_event < fan.batch.len() {
+            self.fanout = Some(fan);
         }
     }
 
@@ -535,7 +648,7 @@ impl<C: CoreApi> Owner<C> {
     fn adoption_sighting(&mut self) {
         let sessions: Vec<SessionId> = self.cleanup.keys().cloned().collect();
         for session in sessions {
-            match self.view.get(&session) {
+            match self.view.get(&session).map(|row| row.state) {
                 None => self.row_gone(&session),
                 Some(SessionState::Created) => self.begin_remove(&session),
                 Some(_) => {}
@@ -587,6 +700,23 @@ impl<C: CoreApi> Owner<C> {
                 };
                 reply.send(Answer::SpawnRecord(lookup));
             }
+            Request::Watch {
+                key,
+                filter,
+                outbox,
+            } => match self.watches.add(key, filter, outbox) {
+                Ok(()) => reply.send(Answer::Watching),
+                Err(_) => reply.send(Answer::Failed(Failure {
+                    kind: FailKind::TooManyWatches,
+                    effect: Effect::None,
+                })),
+            },
+            // The watch, its baseline entry and its queue go in one step; then the reply, so every frame of the watch is
+            // ahead of it in the FIFO (HC WT-6).
+            Request::Unwatch(key) => {
+                self.watches.remove(key);
+                reply.send(Answer::Unwatched);
+            }
         }
     }
 
@@ -635,13 +765,17 @@ impl<C: CoreApi> Owner<C> {
                     // During adoption, the sighting waits for `Completed{AdoptAll}` (`adoption_sighting`).
                     let sighting =
                         state == SessionState::Created && self.adoption == Adoption::Done;
-                    self.view.insert(id.clone(), state);
+                    let row = Arc::new(Row {
+                        id: id.clone(),
+                        state,
+                    });
+                    self.view.insert(id.clone(), row);
                     if sighting {
                         self.begin_remove(&id);
                     }
                 }
             }
-            // The fan-out to watches is a later step (stacked PR C). Other events change no owner state.
+            // Other events change no owner state, and the session watches carry only rows.
             _ => {}
         }
     }
@@ -752,6 +886,13 @@ mod tests {
         request: 2,
         bulk: 1,
         events: 2,
+        fanout: 3,
+        baseline_rows: 2,
+    };
+
+    const LIMITS: WatchLimits = WatchLimits {
+        max_watches: 2,
+        chunk_rows: 1,
     };
 
     struct Rig {
@@ -784,9 +925,19 @@ mod tests {
             Arc::new(Count::default()),
         ));
         let (tx, rx) = std::sync::mpsc::sync_channel(LIFECYCLE_CAPACITY);
-        let outbox = Outbox::new(16, phase.clone(), Arc::new(Count::default()));
+        let caps = crate::bridge::OutboxCaps {
+            replies: 16,
+            frames: 4,
+            watch_queue: 2,
+        };
+        let outbox = Outbox::new(
+            caps,
+            phase.clone(),
+            Arc::new(Count::default()),
+            Arc::new(Count::default()),
+        );
         Rig {
-            owner: Owner::new(core, bridge.clone(), phase.clone(), tx, COUNTS),
+            owner: Owner::new(core, bridge.clone(), phase.clone(), tx, COUNTS, LIMITS),
             bridge,
             phase,
             outbox,
@@ -829,7 +980,10 @@ mod tests {
             self.outbox
                 .take(64)
                 .into_iter()
-                .map(|OutItem::Reply { request_id, answer }| (request_id, answer))
+                .filter_map(|item| match item {
+                    OutItem::Reply { request_id, answer } => Some((request_id, answer)),
+                    OutItem::Frame { .. } => None,
+                })
                 .collect()
         }
 
@@ -922,8 +1076,8 @@ mod tests {
         );
         assert_eq!(rig.owner.waiters(), 0);
         assert_eq!(
-            rig.owner.view().get(&sid("a")),
-            Some(&SessionState::Created)
+            rig.owner.view().get(&sid("a")).map(|row| row.state),
+            Some(SessionState::Created)
         );
         rig.submit(2, Request::Get(sid("a")));
         rig.submit(3, Request::Get(sid("none")));
@@ -1090,6 +1244,347 @@ mod tests {
             vec![(1, shutdown(Effect::Unknown)), (2, shutdown(Effect::None))]
         );
         assert_eq!(guarded(&mut rig.owner, |_| {}), Ended::Clean);
+    }
+
+    use crate::bridge::OutboxCaps;
+    use crate::watch::{Row, WatchFilter, WatchFrame, WatchKey};
+
+    /// Creates sessions through the owner, so that the view holds rows.
+    fn with_sessions(rig: &mut Rig, names: &[&str]) {
+        // One at a time: the rig's request lane holds 4.
+        for (n, name) in names.iter().enumerate() {
+            rig.submit(1000 + n as u64, create(name));
+            rig.settle(256);
+        }
+        rig.answers();
+        assert_eq!(rig.owner.view().len(), names.len());
+    }
+
+    fn conn(rig: &Rig, frames: usize, watch_queue: usize) -> (Arc<Outbox>, Arc<Count>) {
+        let owner_wakes = Arc::new(Count::default());
+        let caps = OutboxCaps {
+            replies: 8,
+            frames,
+            watch_queue,
+        };
+        let outbox = Outbox::new(
+            caps,
+            rig.phase.clone(),
+            Arc::new(Count::default()),
+            owner_wakes.clone(),
+        );
+        (outbox, owner_wakes)
+    }
+
+    fn watch(rig: &Rig, outbox: &Arc<Outbox>, id: u64, key: WatchKey, filter: WatchFilter) {
+        let reply = outbox.reserve(id).unwrap();
+        rig.bridge
+            .submit(
+                Request::Watch {
+                    key,
+                    filter,
+                    outbox: outbox.clone(),
+                },
+                reply,
+            )
+            .unwrap();
+    }
+
+    /// The frames of `watch` in `items`, in order, with the replies kept as `None`.
+    fn frames(items: &[OutItem]) -> Vec<Option<WatchFrame>> {
+        items
+            .iter()
+            .map(|item| match item {
+                OutItem::Frame { frame, .. } => Some(frame.clone()),
+                OutItem::Reply { .. } => None,
+            })
+            .collect()
+    }
+
+    fn ids(rows: &[Arc<Row>]) -> Vec<String> {
+        rows.iter().map(|r| r.id.0.clone()).collect()
+    }
+
+    const KEY: WatchKey = WatchKey { conn: 1, watch: 7 };
+
+    /// HC WT-1: the reply, then the baseline of the current rows in chunks, then `snapshot_end`; a later change arrives as a
+    /// delta after `snapshot_end`.
+    #[test]
+    fn wt_1_baseline_then_deltas() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        with_sessions(&mut rig, &["a", "b"]);
+        let (outbox, _) = conn(&rig, 8, 8);
+        watch(&rig, &outbox, 1, KEY, WatchFilter::default());
+        rig.settle(64);
+        let got = frames(&outbox.take(64));
+        assert_eq!(got[0], None, "the reply first");
+        let mut rows = Vec::new();
+        for frame in &got[1..got.len() - 1] {
+            match frame {
+                Some(WatchFrame::SnapshotChunk(chunk)) => rows.extend(ids(chunk)),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rows, vec!["a", "b"]);
+        assert_eq!(got.last().unwrap(), &Some(WatchFrame::SnapshotEnd));
+        rig.submit(5, create("c"));
+        rig.settle(64);
+        let got = frames(&outbox.take(64));
+        assert!(
+            got.iter()
+                .any(|f| matches!(f, Some(WatchFrame::Delta(row)) if row.id == sid("c"))),
+            "{got:?}"
+        );
+    }
+
+    /// A filter sees only its session.
+    #[test]
+    fn filter_limits_rows_and_deltas() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        with_sessions(&mut rig, &["a", "b"]);
+        let (outbox, _) = conn(&rig, 8, 8);
+        let filter = WatchFilter {
+            session: Some(sid("b")),
+        };
+        watch(&rig, &outbox, 1, KEY, filter);
+        rig.settle(64);
+        let got = frames(&outbox.take(64));
+        assert_eq!(
+            got[1],
+            Some(WatchFrame::SnapshotChunk(vec![
+                rig.owner.view()[&sid("b")].clone()
+            ]))
+        );
+        rig.submit(5, Request::Op(Box::new(Op::Remove { id: sid("a") })));
+        rig.settle(64);
+        assert!(frames(&outbox.take(64)).iter().all(Option::is_none));
+        rig.submit(6, Request::Op(Box::new(Op::Remove { id: sid("b") })));
+        rig.settle(64);
+        assert!(frames(&outbox.take(64)).contains(&Some(WatchFrame::Removed(sid("b")))));
+    }
+
+    /// The capacity wake: a full outbox blocks the baseline, the owner is not runnable on it (no spin), and the drain by
+    /// `io` wakes the owner once; then the baseline finishes.
+    #[test]
+    fn capacity_wake_resumes_a_blocked_baseline() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        with_sessions(&mut rig, &["a", "b", "c", "d", "e"]);
+        // Two frames of room; one row per chunk.
+        let (outbox, wakes) = conn(&rig, 2, 8);
+        watch(&rig, &outbox, 1, KEY, WatchFilter::default());
+        rig.settle(64);
+        assert!(outbox.wants_room());
+        assert!(
+            !rig.turn().runnable,
+            "a blocked baseline does not keep the owner running"
+        );
+        assert_eq!(wakes.get(), 0);
+        let mut rows = Vec::new();
+        let mut end = false;
+        for _ in 0..16 {
+            for frame in frames(&outbox.take(64)).into_iter().flatten() {
+                match frame {
+                    WatchFrame::SnapshotChunk(chunk) => rows.extend(ids(&chunk)),
+                    WatchFrame::SnapshotEnd => end = true,
+                    other => panic!("{other:?}"),
+                }
+            }
+            if end {
+                break;
+            }
+            rig.settle(64);
+        }
+        assert!(end);
+        assert_eq!(rows, vec!["a", "b", "c", "d", "e"]);
+        assert!(wakes.get() >= 1, "each drain below half woke the owner");
+    }
+
+    /// The arm-then-recheck under one lock: `io` drains while the owner sees no room; the owner's own recheck then finds
+    /// room, so no wake is lost.
+    #[test]
+    fn capacity_wake_is_not_lost() {
+        let rig = rig(open(&FakeStore::new()));
+        let (outbox, wakes) = conn(&rig, 4, 8);
+        for _ in 0..4 {
+            assert!(outbox.push_frame(1, WatchFrame::SnapshotEnd));
+        }
+        assert!(!outbox.push_frame(1, WatchFrame::SnapshotEnd));
+        assert!(outbox.wants_room());
+        outbox.take(1);
+        assert!(outbox.wants_room(), "3 frames is above half: no wake yet");
+        assert_eq!(wakes.get(), 0);
+        outbox.take(1);
+        assert!(!outbox.wants_room(), "2 frames is half: the wake");
+        assert_eq!(wakes.get(), 1);
+        outbox.take(1);
+        assert_eq!(wakes.get(), 1, "one wake per crossing");
+        assert!(outbox.push_frame(1, WatchFrame::SnapshotEnd));
+    }
+
+    /// HC WT-4: a watch queue overflow drops the queue, and a `Resync` and a new baseline follow.
+    #[test]
+    fn wt_4_overflow_resyncs() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        let (outbox, _) = conn(&rig, 8, 1);
+        watch(&rig, &outbox, 1, KEY, WatchFilter::default());
+        rig.settle(64);
+        outbox.take(64);
+        // Two sessions change before `io` takes anything: the queue of 1 overflows.
+        rig.submit(5, create("x"));
+        rig.submit(6, create("y"));
+        rig.settle(128);
+        let got: Vec<WatchFrame> = frames(&outbox.take(64)).into_iter().flatten().collect();
+        let resync = got
+            .iter()
+            .position(|f| *f == WatchFrame::Resync)
+            .expect("a resync");
+        let end = got
+            .iter()
+            .rposition(|f| *f == WatchFrame::SnapshotEnd)
+            .unwrap();
+        assert!(resync < end);
+        let rows: Vec<String> = got[resync..end]
+            .iter()
+            .filter_map(|f| match f {
+                WatchFrame::SnapshotChunk(chunk) => Some(ids(chunk)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(rows, vec!["x", "y"], "the new baseline holds both rows");
+    }
+
+    /// HC WT-6: after `unwatch`, every frame of the watch is ahead of the reply, and no frame follows it.
+    #[test]
+    fn wt_6_unwatch_reply_is_last() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        with_sessions(&mut rig, &["a", "b", "c"]);
+        let (outbox, _) = conn(&rig, 8, 8);
+        watch(&rig, &outbox, 1, KEY, WatchFilter::default());
+        rig.turn();
+        rig.bridge
+            .submit(Request::Unwatch(KEY), outbox.reserve(2).unwrap())
+            .unwrap();
+        rig.submit(9, create("d"));
+        rig.settle(64);
+        let items = outbox.take(64);
+        let unwatched = items
+            .iter()
+            .position(|i| matches!(i, OutItem::Reply { request_id: 2, .. }))
+            .unwrap();
+        assert!(items[unwatched + 1..]
+            .iter()
+            .all(|i| !matches!(i, OutItem::Frame { watch: 7, .. })));
+        assert!(rig.owner.watches().is_empty());
+    }
+
+    /// HC BD-1: the per-connection watch bound refuses typed, with `effect: none`.
+    #[test]
+    fn bd_1_watch_bound() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        let (outbox, _) = conn(&rig, 8, 8);
+        for w in 0..3 {
+            watch(
+                &rig,
+                &outbox,
+                w,
+                WatchKey { conn: 1, watch: w },
+                WatchFilter::default(),
+            );
+        }
+        rig.settle(64);
+        let replies: Vec<Answer> = outbox
+            .take(64)
+            .into_iter()
+            .filter_map(|i| match i {
+                OutItem::Reply { answer, .. } => Some(answer),
+                OutItem::Frame { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                Answer::Watching,
+                Answer::Watching,
+                Answer::Failed(Failure {
+                    kind: FailKind::TooManyWatches,
+                    effect: Effect::None
+                })
+            ]
+        );
+    }
+
+    /// HC HS-9: a closed connection's watches end with it.
+    #[test]
+    fn hs_9_disconnect_releases_watches() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        let (outbox, _) = conn(&rig, 8, 8);
+        watch(&rig, &outbox, 1, KEY, WatchFilter::default());
+        rig.settle(64);
+        assert_eq!(rig.owner.watches().len(), 1);
+        outbox.close();
+        rig.turn();
+        assert!(rig.owner.watches().is_empty());
+    }
+
+    /// Section 2: a turn's fan-out work is bounded by `fanout`, whatever the number of watches; the continuation finishes
+    /// the batch over later turns.
+    #[test]
+    fn fanout_is_counted() {
+        let mut rig = rig(open(&FakeStore::new()));
+        rig.adopt();
+        let (outbox, _) = conn(&rig, 64, 64);
+        for w in 0..2 {
+            watch(
+                &rig,
+                &outbox,
+                w,
+                WatchKey { conn: 1, watch: w },
+                WatchFilter::default(),
+            );
+        }
+        let (other, _) = conn(&rig, 64, 64);
+        for w in 0..2 {
+            watch(
+                &rig,
+                &other,
+                10 + w,
+                WatchKey { conn: 2, watch: w },
+                WatchFilter::default(),
+            );
+        }
+        rig.settle(64);
+        assert_eq!(rig.owner.watches().len(), 4);
+        rig.submit(5, create("a"));
+        // Turn until the fan-out of the batch with the `SessionState` event starts, then count turns until it ends.
+        let mut pending_turns = 0;
+        for _ in 0..64 {
+            rig.turn();
+            if rig.owner.fanout_pending() {
+                pending_turns += 1;
+            } else if pending_turns > 0 {
+                break;
+            }
+        }
+        // 3 units per turn: an event of 4 watches needs 5 units, so the fan-out spans more than one turn.
+        assert!(pending_turns >= 2, "{pending_turns}");
+        rig.settle(64);
+        let deltas = |o: &Arc<Outbox>| {
+            frames(&o.take(64))
+                .into_iter()
+                .flatten()
+                .filter(|f| matches!(f, WatchFrame::Delta(_)))
+                .count()
+        };
+        assert!(deltas(&outbox) >= 2);
+        assert!(deltas(&other) >= 2);
     }
 
     fn store_config() -> crate::store::StoreConfig {
