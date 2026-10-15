@@ -8,10 +8,11 @@
 
 use crate::phase::{SharedPhase, Wake};
 use crate::store::Lookup;
+use crate::watch::{WatchFilter, WatchFrame, WatchKey};
 use botster_core::contract::prelude::{
     CancelResult, CoreError, Op, OpId, OpResult, SessionId, SessionRecord, SpawnRequest,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -43,6 +44,14 @@ pub enum Request {
     Cancel(OpId),
     /// Starts the stop. No Core call.
     Shutdown,
+    /// Watches the session view (HC WT-1): a baseline, then deltas, through the connection's outbox.
+    Watch {
+        key: WatchKey,
+        filter: WatchFilter,
+        outbox: Arc<Outbox>,
+    },
+    /// Ends a watch (HC WT-6): every frame of it is ahead of the reply.
+    Unwatch(WatchKey),
 }
 
 impl Request {
@@ -110,6 +119,8 @@ pub enum FailKind {
     Internal,
     Busy,
     Unavailable,
+    /// The connection is at its watch bound (HC BD-1).
+    TooManyWatches,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +153,10 @@ pub enum Answer {
     Cancel(CancelResult),
     /// The answer to `Shutdown`: the stop runs.
     Stopping,
+    /// The watch exists; its baseline follows.
+    Watching,
+    /// The watch is gone (or never existed).
+    Unwatched,
     /// A failure that the Hub answers itself.
     Failed(Failure),
 }
@@ -150,43 +165,100 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutItem {
     Reply { request_id: u64, answer: Answer },
+    Frame { watch: u64, frame: WatchFrame },
+}
+
+/// How a delta push went (design section 4, "Overflow and resync").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaPush {
+    Queued,
+    /// The watch's queue was full: it is dropped, and the owner puts the watch in the baseline queue again.
+    Overflow,
+    /// No such watch queue (the watch ended): nothing to do.
+    NoWatch,
+}
+
+/// The bounded delta queue of one watch. Keyed rows coalesce to the newest value; `live` is false while a baseline is in
+/// progress, so `io` writes the deltas only after `snapshot_end` (HC WT-1, WT-4).
+#[derive(Debug, Default)]
+struct WatchQueue {
+    deltas: VecDeque<(SessionId, WatchFrame)>,
+    live: bool,
 }
 
 struct OutboxInner {
     /// Reserved reply slots: tokens that are still held, plus replies in `items` that `io` has not taken.
     reserved: usize,
+    /// Replies and baseline frames, FIFO.
     items: VecDeque<OutItem>,
+    /// The baseline frames in `items`.
+    frames: usize,
+    /// The owner waits for frame room (the capacity wake).
+    wants_room: bool,
+    queues: BTreeMap<u64, WatchQueue>,
     /// The connection ended: a send frees its slot with no write.
     closed: bool,
 }
 
-/// The FIFO outbox of one connection. A reply's reservation is a count, not a place; the reply is appended when it is
-/// sent (section 4, "Watch frames and `unwatch`"). A send never blocks and never fails.
+/// The sizes of an outbox (small test values; HP LM-5 rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxCaps {
+    /// Replies in flight (HC EN-4 `max_outstanding`).
+    pub replies: usize,
+    /// Baseline frames that wait for `io` (`outbox_frames`).
+    pub frames: usize,
+    /// Deltas per watch queue.
+    pub watch_queue: usize,
+}
+
+/// The FIFO outbox of one connection (design section 4). A reply's reservation is a count, not a place; the reply is
+/// appended when it is sent. Baseline frames need frame room; deltas go to their watch's bounded queue and never wait. A
+/// send never blocks and never fails.
+///
+/// The capacity wake: the owner arms `wants_room` and checks the room again under the same lock, and `io` lowers the frame
+/// count and checks the flag under that lock. This is one synchronized level check (Sol finding 1, round 4), so no wake is
+/// lost, and a blocked baseline does not spin.
 pub struct Outbox {
     inner: Mutex<OutboxInner>,
-    max_replies: usize,
+    caps: OutboxCaps,
     phase: Arc<SharedPhase>,
     /// Wakes `io` when an item is appended.
     io: Arc<dyn Wake>,
+    /// Wakes the owner when frame room returns (the capacity wake).
+    owner: Arc<dyn Wake>,
+}
+
+impl std::fmt::Debug for Outbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outbox").field("caps", &self.caps).finish()
+    }
 }
 
 impl Outbox {
-    /// A new outbox with room for `max_replies` replies in flight (HC EN-4 `max_outstanding`).
-    pub fn new(max_replies: usize, phase: Arc<SharedPhase>, io: Arc<dyn Wake>) -> Arc<Outbox> {
+    pub fn new(
+        caps: OutboxCaps,
+        phase: Arc<SharedPhase>,
+        io: Arc<dyn Wake>,
+        owner: Arc<dyn Wake>,
+    ) -> Arc<Outbox> {
         Arc::new(Outbox {
             inner: Mutex::new(OutboxInner {
                 reserved: 0,
                 items: VecDeque::new(),
+                frames: 0,
+                wants_room: false,
+                queues: BTreeMap::new(),
                 closed: false,
             }),
-            max_replies,
+            caps,
             phase,
             io,
+            owner,
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, OutboxInner> {
-        // A panic while the lock is held leaves only counts and a queue; the next user goes on with them.
+        // A panic while the lock is held leaves only counts and queues; the next user goes on with them.
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -196,7 +268,7 @@ impl Outbox {
     /// `too_many_requests` itself (HC EN-4) and calls nothing.
     pub fn reserve(self: &Arc<Self>, request_id: u64) -> Option<ReplyTo> {
         let mut inner = self.lock();
-        if inner.closed || inner.reserved >= self.max_replies {
+        if inner.closed || inner.reserved >= self.caps.replies {
             return None;
         }
         inner.reserved += 1;
@@ -220,23 +292,142 @@ impl Outbox {
         self.io.wake();
     }
 
-    /// `io` takes at most `max` items in FIFO order. Each taken reply frees its slot.
+    /// Appends a baseline frame if the outbox has frame room. Without room, it arms `wants_room` under the same lock and
+    /// returns `false`: the owner marks the baseline blocked, and `io` wakes the owner when room returns. A closed outbox
+    /// takes the frame and drops it.
+    pub fn push_frame(&self, watch: u64, frame: WatchFrame) -> bool {
+        let mut inner = self.lock();
+        if inner.closed {
+            return true;
+        }
+        if inner.frames >= self.caps.frames {
+            inner.wants_room = true;
+            return false;
+        }
+        inner.frames += 1;
+        inner.items.push_back(OutItem::Frame { watch, frame });
+        drop(inner);
+        self.io.wake();
+        true
+    }
+
+    /// Whether the owner still waits for frame room. `io` clears it with the capacity wake.
+    pub fn wants_room(&self) -> bool {
+        self.lock().wants_room
+    }
+
+    /// Opens the delta queue of a new watch (not live: its baseline comes first).
+    pub fn open_watch(&self, watch: u64) {
+        self.lock().queues.insert(watch, WatchQueue::default());
+    }
+
+    /// The baseline ended (`snapshot_end` is in `items`): `io` may write the watch's deltas after it.
+    pub fn set_live(&self, watch: u64) {
+        if let Some(queue) = self.lock().queues.get_mut(&watch) {
+            queue.live = true;
+        }
+        self.io.wake();
+    }
+
+    /// Drops the watch's deltas and makes it wait for a new baseline (overflow or resync).
+    pub fn reset_watch(&self, watch: u64) {
+        if let Some(queue) = self.lock().queues.get_mut(&watch) {
+            queue.deltas.clear();
+            queue.live = false;
+        }
+    }
+
+    /// `unwatch` and the connection's end: the watch's queue goes in this one step (HC WT-6).
+    pub fn remove_watch(&self, watch: u64) {
+        self.lock().queues.remove(&watch);
+    }
+
+    /// Queues a delta of `key` for the watch. A delta of a key that is already queued replaces it in place (keyed rows
+    /// coalesce to the newest value). A full queue overflows: its deltas are dropped.
+    pub fn push_delta(&self, watch: u64, key: &SessionId, frame: WatchFrame) -> DeltaPush {
+        let mut inner = self.lock();
+        let closed = inner.closed;
+        let Some(queue) = inner.queues.get_mut(&watch) else {
+            return DeltaPush::NoWatch;
+        };
+        if closed {
+            return DeltaPush::Queued;
+        }
+        if let Some(slot) = queue.deltas.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = frame;
+        } else if queue.deltas.len() >= self.caps.watch_queue {
+            queue.deltas.clear();
+            queue.live = false;
+            return DeltaPush::Overflow;
+        } else {
+            queue.deltas.push_back((key.clone(), frame));
+        }
+        let live = queue.live;
+        drop(inner);
+        if live {
+            self.io.wake();
+        }
+        DeltaPush::Queued
+    }
+
+    /// `io` takes at most `max` items: first `items` in FIFO order (replies and baseline frames), then the deltas of live
+    /// watches. Each taken reply frees its slot. When the frame count falls to `frames / 2` or less while the owner waits
+    /// for room, `io` clears `wants_room` and wakes the owner once (the capacity wake).
     pub fn take(&self, max: usize) -> Vec<OutItem> {
         let mut inner = self.lock();
         let n = max.min(inner.items.len());
-        let taken: Vec<OutItem> = inner.items.drain(..n).collect();
-        inner.reserved -= taken.len();
+        let mut taken: Vec<OutItem> = inner.items.drain(..n).collect();
+        for item in &taken {
+            match item {
+                OutItem::Reply { .. } => inner.reserved -= 1,
+                OutItem::Frame { .. } => inner.frames -= 1,
+            }
+        }
+        for (watch, queue) in inner.queues.iter_mut() {
+            while taken.len() < max && queue.live {
+                let Some((_, frame)) = queue.deltas.pop_front() else {
+                    break;
+                };
+                taken.push(OutItem::Frame {
+                    watch: *watch,
+                    frame,
+                });
+            }
+        }
+        let wake = inner.wants_room && inner.frames <= self.caps.frames / 2;
+        if wake {
+            inner.wants_room = false;
+        }
+        drop(inner);
+        if wake {
+            self.owner.wake();
+        }
         taken
     }
 
-    /// The connection ended: unwritten replies are dropped and their slots freed; later sends free their slots with no
-    /// write.
+    /// The connection ended: unwritten replies and frames are dropped and their slots freed; later sends free their slots
+    /// with no write. The owner drops the connection's watches when it sees `is_closed`.
     pub fn close(&self) {
         let mut inner = self.lock();
         inner.closed = true;
-        let unwritten = inner.items.len();
+        let replies = inner
+            .items
+            .iter()
+            .filter(|item| matches!(item, OutItem::Reply { .. }))
+            .count();
         inner.items.clear();
-        inner.reserved -= unwritten;
+        inner.frames = 0;
+        inner.queues.clear();
+        inner.reserved -= replies;
+        let waiting = std::mem::take(&mut inner.wants_room);
+        drop(inner);
+        if waiting {
+            self.owner.wake();
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
     }
 
     /// Reserved slots (held tokens plus unwritten replies).
@@ -244,9 +435,14 @@ impl Outbox {
         self.lock().reserved
     }
 
-    /// Whether replies wait for `io`.
+    /// Whether items wait for `io`.
     pub fn has_items(&self) -> bool {
-        !self.lock().items.is_empty()
+        let inner = self.lock();
+        !inner.items.is_empty()
+            || inner
+                .queues
+                .values()
+                .any(|q| q.live && !q.deltas.is_empty())
     }
 }
 
@@ -484,7 +680,12 @@ mod tests {
         let phase = SharedPhase::new();
         let io = Arc::new(Count::default());
         let owner = Arc::new(Count::default());
-        let outbox = Outbox::new(max_replies, phase.clone(), io.clone());
+        let sizes = OutboxCaps {
+            replies: max_replies,
+            frames: 4,
+            watch_queue: 4,
+        };
+        let outbox = Outbox::new(sizes, phase.clone(), io.clone(), owner.clone());
         let bridge = Bridge::new(caps, phase.clone(), owner.clone());
         Rig {
             phase,
@@ -505,7 +706,10 @@ mod tests {
         let _ = rig;
         items
             .into_iter()
-            .map(|OutItem::Reply { request_id, answer }| (request_id, answer))
+            .map(|item| match item {
+                OutItem::Reply { request_id, answer } => (request_id, answer),
+                OutItem::Frame { .. } => panic!("a frame in a reply test"),
+            })
             .collect()
     }
 
