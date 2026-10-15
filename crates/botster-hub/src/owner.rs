@@ -705,7 +705,11 @@ impl<C: CoreApi> Owner<C> {
         // After a `Shutdown` (or any stop cause) no later request of the turn reaches Core: it is answered `hub_shutdown`,
         // effect none. A repeated `Shutdown` is still answered `Stopping`.
         if self.phase.stopping() && !matches!(request, Request::Shutdown) {
-            reply.send(shutdown(Effect::None));
+            reply.send(match request {
+                // HS-9: a route connection still gets its typed close, as in the drain.
+                Request::RouteConnect(request) => route_connect_shutdown(*request),
+                _ => shutdown(Effect::None),
+            });
             return;
         }
         match request {
@@ -864,14 +868,7 @@ impl<C: CoreApi> Owner<C> {
             match request {
                 Request::Shutdown => reply.send(Answer::Stopping),
                 // HS-9: a typed close whenever the Hub can still write. The lock is still held here.
-                Request::RouteConnect(request) => {
-                    reply.send(Answer::RouteConnect(RouteConnectAnswer::Refused {
-                        reason: CloseReason::HubShutdown(HubShutdownData {
-                            lock_released: false,
-                        }),
-                        stream: ReturnedStream(Arc::new(request.stream)),
-                    }))
-                }
+                Request::RouteConnect(request) => reply.send(route_connect_shutdown(*request)),
                 _ => reply.send(shutdown(Effect::None)),
             }
         }
@@ -925,6 +922,17 @@ pub fn guarded<C: CoreApi>(owner: &mut Owner<C>, body: impl FnOnce(&mut Owner<C>
         Ok(()) => Ended::Clean,
         Err(_) => Ended::Panicked,
     }
+}
+
+/// The answer to a route connection that arrives once the stop has begun (HS-9): a typed close `hub_shutdown` with
+/// `lock_released: false`, on the returned stream, whenever the Hub can still write. The lock is still held.
+fn route_connect_shutdown(request: crate::client::handoff::RouteConnectRequest) -> Answer {
+    Answer::RouteConnect(RouteConnectAnswer::Refused {
+        reason: CloseReason::HubShutdown(HubShutdownData {
+            lock_released: false,
+        }),
+        stream: ReturnedStream(Arc::new(request.stream)),
+    })
 }
 
 fn shutdown(effect: Effect) -> Answer {
@@ -2405,6 +2413,61 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A route connection that is admitted in the same turn as a `Shutdown`, behind it, gets the typed close with
+    /// `lock_released: false` and keeps its stream, not a generic failure (HS-9).
+    #[test]
+    fn a_route_connect_behind_a_shutdown_gets_the_typed_close() {
+        let mut rig = route_rig();
+        rig.submit(5, Request::Shutdown);
+        let (request, _client) = route_connect("r", "t");
+        rig.submit(6, request);
+        rig.turn();
+        assert_eq!(rig.phase.get(), Phase::Stopping);
+        let answers = rig.answers();
+        assert!(
+            matches!(
+                answers.as_slice(),
+                [(
+                    6,
+                    Answer::RouteConnect(RouteConnectAnswer::Refused {
+                        reason: CloseReason::HubShutdown(HubShutdownData {
+                            lock_released: false
+                        }),
+                        ..
+                    })
+                )]
+            ),
+            "{answers:?}"
+        );
+    }
+
+    /// The stop can begin from another thread (a signal, an io failure) after a request left its lane and before it is
+    /// dispatched: the route connection still gets the typed close.
+    #[test]
+    fn a_route_connect_admitted_before_a_stop_from_elsewhere_gets_the_typed_close() {
+        let mut rig = route_rig();
+        let (request, _client) = route_connect("r", "t");
+        rig.submit(6, request);
+        rig.phase.advance(Phase::Running, Phase::Stopping);
+        rig.turn();
+        let answers = rig.answers();
+        assert!(
+            matches!(
+                answers.as_slice(),
+                [(
+                    6,
+                    Answer::RouteConnect(RouteConnectAnswer::Refused {
+                        reason: CloseReason::HubShutdown(HubShutdownData {
+                            lock_released: false
+                        }),
+                        ..
+                    })
+                )]
+            ),
+            "{answers:?}"
+        );
     }
 
     #[test]
