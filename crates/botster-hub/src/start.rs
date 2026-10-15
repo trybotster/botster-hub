@@ -96,10 +96,21 @@ pub fn take_lock(roots: &Roots) -> Result<HubLock, StartFailure> {
 /// runs at every start, so a retry after a crash between the creation and the sync also syncs. A failed sync fails the start.
 fn ensure_durable_dir(dir: &Path, sync: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
     ensure_dir(dir)?;
-    match dir.parent() {
-        Some(parent) => sync(parent),
+    match containing_dir(dir) {
+        Some(parent) => sync(&parent),
         None => Ok(()),
     }
+}
+
+/// The directory that holds `dir`: `Path::parent` gives the empty path for a single-component relative path (`d`), which
+/// is the current directory and cannot be opened, so that case gives `.`. The root has none.
+fn containing_dir(dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    Some(if parent.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        parent.to_path_buf()
+    })
 }
 
 fn unusable(path: &Path, error: &io::Error) -> StartFailure {
@@ -269,6 +280,16 @@ mod tests {
     use super::*;
     use crate::roots::{Env, Platform};
     use std::os::unix::fs::PermissionsExt;
+
+    /// A single-component relative data root (`BOTSTER_DATA_DIR=d`) is held by `.`, which can be opened and synced.
+    #[test]
+    fn a_relative_data_root_is_held_by_the_current_directory() {
+        assert_eq!(containing_dir(Path::new("d")), Some(PathBuf::from(".")));
+        assert_eq!(containing_dir(Path::new("a/d")), Some(PathBuf::from("a")));
+        assert_eq!(containing_dir(Path::new("/d")), Some(PathBuf::from("/")));
+        assert_eq!(containing_dir(Path::new("/")), None);
+        fsutil::sync_dir(&containing_dir(Path::new("d")).unwrap()).unwrap();
+    }
 
     /// The parent of a new data root is synced; so is the parent of an existing one (a retry); a sync error fails.
     #[test]
