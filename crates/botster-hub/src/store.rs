@@ -733,6 +733,11 @@ impl SpawnStore {
                 self.expiry.remove(&(at, id));
                 continue;
             };
+            // A key that is not the current durable record's expiry is stale: it never deletes the record.
+            if entry.record.terminal_at_ms != Some(at) {
+                self.expiry.remove(&(at, id));
+                continue;
+            }
             if entry.busy || entry.pending.is_some() || entry.forget || entry.record.remove_row {
                 break;
             }
@@ -804,6 +809,10 @@ impl SpawnStore {
                             entry.busy = false;
                             // The record is the payload that the job wrote, not a terminal state queued meanwhile.
                             if let Some(record) = entry.sent.take() {
+                                // The record's earlier expiry key is superseded by the one of the record just written.
+                                if let Some(old) = entry.record.terminal_at_ms {
+                                    self.expiry.remove(&(old, id.clone()));
+                                }
                                 if let (Some(at), false) =
                                     (record.terminal_at_ms, record.remove_row)
                                 {
@@ -1364,6 +1373,39 @@ mod tests {
             matches!(reopened.get_spawn(&a), Lookup::Found(r) if r.state == SpawnState::Installed)
         );
         reopened.close();
+    }
+
+    /// The retention of a record runs from its current durable terminal state: an older write's expiry key is gone, so it
+    /// cannot delete the record early (SPAWN-5).
+    #[test]
+    fn retention_follows_the_latest_durable_terminal_state() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        let a = store.create_spawn("a", 0).unwrap();
+        events(&mut store, 1);
+        store.end_recovery();
+        store.finish_spawn(&a, Terminal::Cancelled, 10).unwrap();
+        store.pump(10);
+        store.finish_spawn(&a, Terminal::Installed, 20).unwrap();
+        settle(&mut store, 20);
+        assert_eq!(
+            store.expiry.len(),
+            1,
+            "one key for one record: {:?}",
+            store.expiry
+        );
+        assert_eq!(
+            store.expiry.first().map(|(at, _)| *at),
+            Some(20),
+            "the key is the latest write's"
+        );
+        // Past the first write's retention but not the second's: the record stays.
+        let early = 10 + CONFIG.retention_ms;
+        settle(&mut store, early);
+        assert!(matches!(store.get_spawn(&a), Lookup::Found(_)));
+        // Past the second's: it goes.
+        settle(&mut store, 20 + CONFIG.retention_ms);
+        assert!(matches!(store.get_spawn(&a), Lookup::NotFound));
     }
 
     /// The deletion of a session directory follows no symlink, the sessions root included (SPAWN-1).
