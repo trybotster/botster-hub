@@ -3,11 +3,13 @@
 //! - Bounded lanes: `Control`, `Request`, `Bulk`. A full lane refuses at once (`Backpressured`); nothing blocks.
 //! - Only `Bulk` coalesces, by key. No client request is coalesced: every client request gets its own answer (HC EN-3).
 //! - `submit` returns admission only. The real answer reaches the [`ReplyTo`] token later, exactly once.
-//! - No domain verbs: [`Request`] mirrors Core's ops and reads, plus `Shutdown`.
+//! - No domain verbs: [`Request`] mirrors Core's ops and reads, plus `Shutdown` and the spawn operation (design section
+//!   4a, "Spawn flow").
 
 use crate::phase::{SharedPhase, Wake};
+use crate::store::Lookup;
 use botster_core::contract::prelude::{
-    CancelResult, CoreError, Op, OpId, OpResult, SessionId, SessionRecord,
+    CancelResult, CoreError, Op, OpId, OpResult, SessionId, SessionRecord, SpawnRequest,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +23,16 @@ pub enum Lane {
     Bulk,
 }
 
-/// A request: Core's ops and reads, plus `Shutdown`.
+/// A request: Core's ops and reads, plus `Shutdown` and the spawn operation.
 #[derive(Debug)]
 pub enum Request {
+    /// A spawn operation (R-122): a durable `starting` record, then `Create`, then `Start`. Boxed like `Op`.
+    Spawn {
+        session: SessionId,
+        request: Box<SpawnRequest>,
+    },
+    /// A read of a spawn operation record (design section 4a, API 4).
+    GetSpawn(String),
     /// A Core op (`begin`). Boxed: an `Op` is large, and a request moves through the lanes and back in `Rejected`.
     Op(Box<Op>),
     /// A sync read of one row.
@@ -109,9 +118,21 @@ pub struct Failure {
     pub effect: Effect,
 }
 
+/// The answer to [`Request::Spawn`] (R-122). A Hub failure goes as [`Answer::Failed`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpawnAnswer {
+    /// Admission: `Completed{Create}` was `Ok`. The owner begins `Start` next.
+    Accepted { operation_id: String },
+    /// A pre-admission Core error, with its effect: `none` when no row exists (U1, U2), `unknown` when one may (U3).
+    Refused { error: CoreError, effect: Effect },
+}
+
 /// What the owner sends through a token. The protocol layer maps it to the client protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Answer {
+    Spawn(SpawnAnswer),
+    /// The answer to [`Request::GetSpawn`]: the durable state.
+    SpawnRecord(Lookup),
     /// The `Completed` result of a Core op.
     Op(OpResult),
     /// A sync refusal by Core (`begin` or a read returned an error).
