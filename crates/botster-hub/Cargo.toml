@@ -10,8 +10,11 @@ publish.workspace = true
 # bridge, the client protocol server, plugin management through Core's managed-process ops. The bin `botster-hub` comes
 # with the daemon. HIGH paths (ci/high-tier-paths.txt): process control, identity and the durable store.
 
-[lints]
-workspace = true
+# The workspace's lint table, copied with exactly one difference (lead ruling 2026-10-12, HC HS-0 `--ready-fd`):
+# `unsafe_code` is "deny", not "forbid", so that exactly one item may allow it: `take_ready_fd` in src/main.rs (the gate-kit
+# Policy exceptions list it). The gate-kit rule refuses any other `unsafe_code` identifier, so no other item can allow it.
+[lints.rust]
+unsafe_code = "deny"
 
 [dependencies]
 botster-core.workspace = true

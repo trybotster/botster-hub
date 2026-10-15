@@ -4,6 +4,7 @@
 //! Design: `shared/stage2/design-hub-daemon.md`, sha256 0d39345f (Sol CLEAN, round 4).
 
 pub mod bridge;
+pub mod daemon;
 pub mod failure;
 pub mod fsutil;
 pub mod owner;
