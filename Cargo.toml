@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+anyhow = "1"
+regex = "1"
+serde_json = "1"
+toml = "0.9"
+
+# botster-contracts, by tag: the Hub's own contract crates (hub, plugin, cli, ui contracts and conformance) follow this tag.
+# Core-contract crates (botster-core-contract, botster-fake-core, Core-facing route-codec use) follow the Core rev's tag
+# instead, with no [patch] (lead, 2026-10-12): Cargo treats two tags as two crates.
+botster-cli-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
+botster-hub-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
+botster-plugin-contract = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.50" }
+
+# The gate code that Core shares (repo plan section 5): a reference by git rev of Core v1, never a copy.
+# Moves with the Core rev, not with the Hub contracts pin.
+botster-gate-kit = { git = "https://github.com/trybotster/botster-core", rev = "28a29d32d191604221eb4cbeeb02e47371fa3daf" }

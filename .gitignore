@@ -1,0 +1,6 @@
+target/
+.DS_Store
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/
