@@ -7,6 +7,9 @@
 use crate::bridge::{
     Answer, Bridge, Effect, FailKind, Failure, Item, ReplyTo, Request, SpawnAnswer,
 };
+use crate::client::handoff::{
+    ReserveRefused, ReturnedStream, RouteConnectAnswer, RouteParams, Routes,
+};
 use crate::phase::{request_stop, Ended, Lifecycle, SharedPhase, StopCause};
 use crate::store::{
     install_on_ready, CreateRefused, FailReason, InstallBlocked, Lookup, SpawnStore, StoreEvent,
@@ -17,9 +20,11 @@ use botster_core::contract::prelude::{
     CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult, SessionId,
     SessionState, SpawnRequest, StartFailReason,
 };
+use botster_hub_contract::prelude::{CloseReason, HubShutdownData};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The per-turn counts (section 2; parameters with small test values, HP LM-5 rule). Each is at least 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +129,10 @@ pub struct Owner<C: CoreApi> {
     spawn_faults: usize,
     /// The wall clock of this turn in milliseconds, for the store (design section 4a).
     now_ms: u64,
+    /// The monotonic clock of this turn, for the reservation deadlines (read once per turn, section 2).
+    now: Instant,
+    /// The route reservations and the route table (client protocol design, section 2), when the daemon serves clients.
+    routes: Option<Routes>,
 }
 
 impl<C: CoreApi> Owner<C> {
@@ -156,6 +165,31 @@ impl<C: CoreApi> Owner<C> {
             removing: BTreeSet::new(),
             spawn_faults: 0,
             now_ms: 0,
+            now: Instant::now(),
+            routes: None,
+        }
+    }
+
+    /// Gives the owner the route tables (client protocol design, section 2.1).
+    pub fn with_routes(mut self, params: RouteParams) -> Owner<C> {
+        self.routes = Some(Routes::new(params));
+        self
+    }
+
+    pub fn routes(&self) -> Option<&Routes> {
+        self.routes.as_ref()
+    }
+
+    pub fn routes_mut(&mut self) -> Option<&mut Routes> {
+        self.routes.as_mut()
+    }
+
+    /// The owner's wait timeout: the earlier of Core's next deadline and the earliest reservation deadline.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let routes = self.routes.as_ref().and_then(Routes::next_deadline);
+        match (self.core.next_deadline(), routes) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -246,6 +280,11 @@ impl<C: CoreApi> Owner<C> {
     /// and a new poll; then report whether to run again.
     pub fn turn(&mut self, now: Now) -> TurnReport {
         self.now_ms = now.unix.saturating_mul(1000);
+        self.now = now.monotonic;
+        // Due reservations end before this turn's connects, so a connect past its window finds no entry.
+        if let Some(routes) = self.routes.as_mut() {
+            routes.expire(self.now);
+        }
         let items =
             self.bridge
                 .take_turn(self.counts.control, self.counts.request, self.counts.bulk);
@@ -717,6 +756,34 @@ impl<C: CoreApi> Owner<C> {
                 self.watches.remove(key);
                 reply.send(Answer::Unwatched);
             }
+            Request::ReserveRoute(request) => {
+                let Some(routes) = self.routes.as_mut() else {
+                    reply.send(failed(FailKind::Internal, Effect::None));
+                    return;
+                };
+                let answer = match routes.reserve(&self.core, self.now, *request) {
+                    Ok(reservation) => Answer::RouteReserved(reservation),
+                    Err(ReserveRefused::Core(error)) => Answer::CoreRefused(error),
+                    Err(ReserveRefused::Busy) => failed(FailKind::Busy, Effect::None),
+                    Err(ReserveRefused::Internal(message)) => {
+                        eprintln!("botster-hub: route reservation: {message}");
+                        failed(FailKind::Internal, Effect::None)
+                    }
+                };
+                reply.send(answer);
+            }
+            Request::RouteConnect(request) => {
+                reply.mark_dispatched();
+                let answer = match self.routes.as_mut() {
+                    Some(routes) => routes.connect(&mut self.core, self.now, *request),
+                    // No route table: no token can be valid.
+                    None => RouteConnectAnswer::Refused {
+                        reason: CloseReason::RouteTokenInvalid,
+                        stream: ReturnedStream(Arc::new(request.stream)),
+                    },
+                };
+                reply.send(Answer::RouteConnect(answer));
+            }
         }
     }
 
@@ -775,6 +842,11 @@ impl<C: CoreApi> Owner<C> {
                     }
                 }
             }
+            Event::RouteClosed { .. } | Event::RouteAdopted { .. } => {
+                if let Some(routes) = self.routes.as_mut() {
+                    routes.event(&event);
+                }
+            }
             // Other events change no owner state, and the session watches carry only rows.
             _ => {}
         }
@@ -787,6 +859,15 @@ impl<C: CoreApi> Owner<C> {
         for Item { request, reply } in self.bridge.drain() {
             match request {
                 Request::Shutdown => reply.send(Answer::Stopping),
+                // HS-9: a typed close whenever the Hub can still write. The lock is still held here.
+                Request::RouteConnect(request) => {
+                    reply.send(Answer::RouteConnect(RouteConnectAnswer::Refused {
+                        reason: CloseReason::HubShutdown(HubShutdownData {
+                            lock_released: false,
+                        }),
+                        stream: ReturnedStream(Arc::new(request.stream)),
+                    }))
+                }
                 _ => reply.send(shutdown(Effect::None)),
             }
         }
@@ -2190,5 +2271,161 @@ mod tests {
         assert!(settled >= 1);
         assert_eq!(rig.answers().len(), 4);
         assert!(!rig.turn().runnable);
+    }
+
+    // The route handoff through the bridge (client protocol design, sections 2.2, 2.3 and 2.5).
+
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn route_params() -> RouteParams {
+        RouteParams {
+            max_reservations: 4,
+            connect_window: WINDOW,
+            query_deadline: Duration::from_millis(200),
+            sessions_root: "/data/sessions".into(),
+            pending_ends: 8,
+        }
+    }
+
+    fn with_routes(rig: Rig) -> Rig {
+        Rig {
+            owner: rig.owner.with_routes(route_params()),
+            ..rig
+        }
+    }
+
+    fn operator() -> crate::client::handoff::Caller {
+        crate::client::handoff::Caller { uid: 501 }
+    }
+
+    fn reserve_route(name: &str) -> Request {
+        Request::ReserveRoute(Box::new(crate::client::handoff::ReserveRequest {
+            caller: operator(),
+            session: sid(name),
+            terminal_formats: vec!["ghostsnp/1+raw".into()],
+            history: None,
+            answers_queries: true,
+            route_features: vec![],
+        }))
+    }
+
+    fn route_connect(
+        route_id: &str,
+        route_token: &str,
+    ) -> (Request, std::os::unix::net::UnixStream) {
+        let (hub_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let request =
+            Request::RouteConnect(Box::new(crate::client::handoff::RouteConnectRequest {
+                route_id: route_id.into(),
+                route_token: route_token.into(),
+                caller: operator(),
+                stream: hub_end,
+            }));
+        (request, client_end)
+    }
+
+    /// A rig with route tables, adopted, with session `a` started.
+    fn route_rig() -> Rig {
+        let store = FakeStore::new();
+        let mut rig = with_routes(rig(open(&store)));
+        rig.adopt();
+        rig.submit(1, create("a"));
+        rig.settle(64);
+        rig.submit(2, Request::Op(Box::new(Op::Start { id: sid("a") })));
+        rig.settle(64);
+        rig.answers();
+        rig
+    }
+
+    fn reserved(rig: &mut Rig, id: u64) -> crate::client::handoff::Reservation {
+        rig.submit(id, reserve_route("a"));
+        rig.settle(8);
+        match rig.answers().pop() {
+            Some((got, Answer::RouteReserved(r))) if got == id => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_route_is_reserved_and_connected_through_the_bridge() {
+        let mut rig = route_rig();
+        let r = reserved(&mut rig, 3);
+        let (request, _client) = route_connect(&r.route_id, &r.route_token);
+        rig.submit(4, request);
+        rig.settle(8);
+        assert_eq!(
+            rig.answers(),
+            vec![(4, Answer::RouteConnect(RouteConnectAnswer::Handed))]
+        );
+        let routes = rig.owner.routes().unwrap();
+        assert_eq!(routes.tables.route(&r.route_id).unwrap().session, sid("a"));
+    }
+
+    #[test]
+    fn a_reservation_bounds_the_wait_and_ends_not_connected_at_its_deadline() {
+        let mut rig = route_rig();
+        let before = rig.clock;
+        let r = reserved(&mut rig, 3);
+        let deadline = rig.owner.next_deadline().unwrap();
+        assert!(
+            deadline > before && deadline <= rig.clock + WINDOW,
+            "{deadline:?}"
+        );
+        rig.clock = deadline;
+        rig.turn();
+        let routes = rig.owner.routes_mut().unwrap();
+        let (ends, lost) = routes.take_ends();
+        assert_eq!(lost, 0);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].route_id, r.route_id);
+        assert_eq!(
+            ends[0].reason,
+            botster_route_codec::prelude::RouteEndReason::NotConnected
+        );
+        assert_eq!(routes.next_deadline(), None);
+    }
+
+    #[test]
+    fn the_stop_drain_answers_a_queued_connect_with_a_typed_hub_shutdown_close() {
+        let mut rig = route_rig();
+        let r = reserved(&mut rig, 3);
+        let (request, _client) = route_connect(&r.route_id, &r.route_token);
+        rig.submit(4, request);
+        rig.owner.drain();
+        match rig.answers().as_slice() {
+            [(4, Answer::RouteConnect(RouteConnectAnswer::Refused { reason, .. }))] => assert_eq!(
+                *reason,
+                CloseReason::HubShutdown(HubShutdownData {
+                    lock_released: false
+                })
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_owner_without_route_tables_refuses_routes() {
+        let store = FakeStore::new();
+        let mut rig = rig(open(&store));
+        rig.adopt();
+        rig.submit(1, reserve_route("a"));
+        rig.settle(8);
+        assert_eq!(
+            rig.answers(),
+            vec![(1, failed(FailKind::Internal, Effect::None))]
+        );
+        let (request, _client) = route_connect("r", "t");
+        rig.submit(2, request);
+        rig.settle(8);
+        assert!(matches!(
+            rig.answers().as_slice(),
+            [(
+                2,
+                Answer::RouteConnect(RouteConnectAnswer::Refused {
+                    reason: CloseReason::RouteTokenInvalid,
+                    ..
+                })
+            )]
+        ));
     }
 }
