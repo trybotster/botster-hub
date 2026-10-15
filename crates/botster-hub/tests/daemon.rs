@@ -207,3 +207,31 @@ fn rt_2_orphan_session_dir_deleted() {
     );
     assert_eq!(daemon.wait().code(), 0);
 }
+
+/// Design section 4a, "Load at start": a record that cannot be resolved fails the start `data_root_unusable` before the
+/// socket is bound; after the operator removes it, the Hub starts.
+#[test]
+fn undecodable_record_fails_start_before_bind() {
+    let tmp = short_root();
+    let roots = roots_in(tmp.path());
+    let ops = roots.data_root.join("store/ops");
+    fs::create_dir_all(&ops).unwrap();
+    let bad = ops.join(format!("{}.json", "a".repeat(26)));
+    fs::write(&bad, b"{").unwrap();
+    let failure = Daemon::start(&roots, uid(), config()).err().unwrap();
+    assert_eq!(failure.code, FailCode::DataRootUnusable);
+    assert!(
+        failure.message.contains("store/ops/"),
+        "{}",
+        failure.message
+    );
+    assert!(!roots.socket.exists());
+    fs::remove_file(&bad).unwrap();
+    let daemon = Daemon::start(&roots, uid(), config()).unwrap();
+    let outbox = Outbox::new(4, botster_hub::phase::SharedPhase::new(), Arc::new(NoWake));
+    assert_eq!(
+        ask(&daemon, &outbox, 1, Request::Shutdown),
+        Answer::Stopping
+    );
+    assert_eq!(daemon.wait().code(), 0);
+}
