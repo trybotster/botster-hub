@@ -187,7 +187,7 @@ impl Pending {
     fn mutates(&self) -> bool {
         matches!(
             self,
-            Pending::Create { .. } | Pending::Update | Pending::Delete
+            Pending::Create { .. } | Pending::Update | Pending::Delete | Pending::Attach
         )
     }
 }
@@ -1724,6 +1724,36 @@ mod tests {
         assert_eq!(
             effect_of(&frames),
             (ErrorCode::ResponseTooLarge, Some(ErrorEffect::None))
+        );
+    }
+
+    /// ROUTE-1: the owner reserved the route before it answered, so an attach result over the bound cannot say `none`.
+    #[test]
+    fn an_attach_result_over_the_bound_says_its_effect_is_unknown() {
+        let types = types();
+        let mut ctx = ctx(&types);
+        ctx.max_frame_bytes = 40;
+        let mut kinds = ConnKinds::default();
+        kinds.pending.insert(1, Pending::Attach);
+        let reservation = Reservation {
+            route_id: "r".into(),
+            route_token: "t".into(),
+            route_limits: botster_hub_contract::prelude::RouteLimits {
+                max_frame_bytes: 1,
+                max_screen_frame_bytes: 1,
+                max_history_page_bytes: 1,
+                max_paste_bytes: 1,
+                max_file_bytes: 1,
+                max_query_reply_bytes: 1,
+                query_client_deadline_ms: 1,
+                stall_deadline_ms: 1,
+                stall_close_after_ms: 1,
+            },
+        };
+        let frames = kinds.answer(&ctx, 1, Answer::RouteReserved(reservation));
+        assert_eq!(
+            effect_of(&frames),
+            (ErrorCode::ResponseTooLarge, Some(ErrorEffect::Unknown))
         );
     }
 
