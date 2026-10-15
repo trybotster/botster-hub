@@ -39,6 +39,9 @@ botster-route-codec = { git = "https://github.com/trybotster/botster-contracts",
 # contracts tag: two tags are two crates, and the fake must implement the same `CoreApi` trait as `botster_core::Core`. It
 # moves with the Core pin. The Hub reads the Core contract types only through `botster_core::contract`.
 botster-fake-core = { git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.46" }
+# The route codec at the same tag as the fake Core: the test wrapper of `CoreApi` names `QueryKind` of that version (the
+# Hub's own `botster-route-codec` is another crate). Dev only.
+botster-core-route-codec = { package = "botster-route-codec", git = "https://github.com/trybotster/botster-contracts", tag = "contracts-v0.1.46" }
 
 data-encoding = "2"
 getrandom = "0.4"

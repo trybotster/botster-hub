@@ -7,6 +7,7 @@
 //!   collision is impossible by construction.
 //! - [`session_row`]: the one builder of an HC `SessionRow`. No other code writes a product field.
 
+use crate::watch::{Activity as ViewActivity, Row};
 use botster_core::contract::prelude::{
     Exit, LostReason, SessionId, SessionState as CoreState, Size,
 };
@@ -157,6 +158,24 @@ pub struct RowFacts<'a> {
     pub labels: &'a BTreeMap<String, String>,
     pub activity: Activity,
     pub spawn_end: Option<&'a SpawnEnd>,
+}
+
+impl<'a> RowFacts<'a> {
+    /// The facts of one owner view row (design section 4, "The view row"), with the spawn end of its operation, if any.
+    pub fn of(row: &'a Row, spawn_end: Option<&'a SpawnEnd>) -> RowFacts<'a> {
+        RowFacts {
+            id: &row.id,
+            state: &row.state,
+            size: row.size,
+            exit: row.exit.as_ref(),
+            labels: &row.labels,
+            activity: match row.activity {
+                ViewActivity::Active => Activity::Active,
+                ViewActivity::Idle => Activity::Idle,
+            },
+            spawn_end,
+        }
+    }
 }
 
 /// The one builder of an HC `SessionRow` (design section 7a). `None` for a `Released` session.
@@ -425,6 +444,27 @@ mod tests {
         f.spawn_end = Some(&end);
         let row = session_row(f, "h", &types).unwrap();
         assert_eq!(row.failure_reason.as_deref(), Some("exec_failed"));
+    }
+
+    /// The owner's view row gives the facts, and its activity maps to the contract's (R-125).
+    #[test]
+    fn a_view_row_gives_the_facts_of_the_builder() {
+        let types = SessionTypes::device();
+        let id = sid("s1");
+        let mut row = Row {
+            id: id.clone(),
+            state: CoreState::Running,
+            size: size(),
+            exit: None,
+            labels: create_labels(&id, Some("build"), COMMAND_TYPE),
+            activity: ViewActivity::Idle,
+        };
+        let built = session_row(RowFacts::of(&row, None), "h", &types).unwrap();
+        assert_eq!(built.activity, Activity::Idle);
+        assert_eq!(built.label, "build");
+        row.activity = ViewActivity::Active;
+        let built = session_row(RowFacts::of(&row, None), "h", &types).unwrap();
+        assert_eq!(built.activity, Activity::Active);
     }
 
     #[test]

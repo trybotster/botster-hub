@@ -17,7 +17,9 @@ use crate::roots::Roots;
 use crate::start::{self, HubLock, Identity};
 use crate::store::{remove_session_dir, restore_spawns, SpawnStore, StoreConfig};
 use crate::watch::WatchLimits;
-use botster_core::contract::prelude::{CoreApi, CoreLimits, Now, OpenConfig, SessionId};
+use botster_core::contract::prelude::{
+    CoreApi, CoreLimits, Feature, Features, Now, OpenConfig, SessionId,
+};
 use botster_core::Core;
 use mio::net::UnixListener;
 use mio::unix::SourceFd;
@@ -54,6 +56,9 @@ pub struct DaemonConfig {
     pub protocol: ProtocolConfig,
     /// Stop step 3: the longest time `io` writes the outboxes before it removes the socket (design section 5).
     pub stop_flush: Duration,
+    /// HC section 6 `activity_idle_ms`: a session is `idle` after this long with no output. It is Core's TM-4 silence
+    /// threshold of each session (design section 4, "The view row").
+    pub activity_idle: Duration,
 }
 
 impl DaemonConfig {
@@ -105,6 +110,7 @@ impl DaemonConfig {
             },
             protocol: ProtocolConfig::production(),
             stop_flush: Duration::from_millis(500),
+            activity_idle: Duration::from_millis(3000),
         }
     }
 
@@ -204,6 +210,9 @@ impl Daemon {
             )
         })?;
 
+        // Step 5, last check: the silence feature is required (it is optional in Core, A2-6). There is no fallback Hub timer.
+        require_silence(&core.features())?;
+
         // Step 6: the owner thread, then `AdoptAll`.
         let phase = SharedPhase::new();
         let internal =
@@ -231,6 +240,7 @@ impl Daemon {
             config.watches,
         )
         .with_store(store)
+        .with_activity_idle(config.activity_idle)
         .with_routes(RouteParams::new(
             &config.routes,
             roots.data_root.join("sessions"),
@@ -445,6 +455,19 @@ fn run_owner(
     drop(owner.into_core());
     phase.advance(Phase::Stopping, Phase::OwnerDone);
     let _ = lifecycle.try_send(Lifecycle::OwnerGone(ended));
+}
+
+/// Start step 5: Core must have the `silence` feature, because the Hub has no timer of its own for `activity`
+/// (design section 4, "The view row"; R-125).
+///
+/// # Errors
+/// `core_feature_missing silence`.
+fn require_silence(features: &Features) -> Result<(), StartFailure> {
+    if features.names.contains(&Feature::Silence) {
+        Ok(())
+    } else {
+        Err(StartFailure::new(FailCode::CoreFeatureMissing, "silence"))
+    }
 }
 
 /// How the owner ended, once the drain has run: a store failure found during the drain (the quiesce writes the pending
@@ -799,6 +822,17 @@ mod tests {
             exit(Some(StopCause::Requested), Ended::StoreFailed, Ended::Clean),
             1
         );
+    }
+
+    /// Start step 5: a Core without `silence` fails the start `core_feature_missing silence`.
+    #[test]
+    fn a_core_without_silence_fails_the_start() {
+        let mut features = Features::default();
+        let failure = require_silence(&features).unwrap_err();
+        assert_eq!(failure.code, FailCode::CoreFeatureMissing);
+        assert_eq!(failure.message, "silence");
+        features.names.insert(Feature::Silence);
+        assert!(require_silence(&features).is_ok());
     }
 
     /// A clean owner end with a store failure is `StoreFailed`; nothing else changes.

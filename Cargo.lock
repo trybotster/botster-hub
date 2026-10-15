@@ -202,6 +202,7 @@ dependencies = [
  "botster-fake-core",
  "botster-hub-contract",
  "botster-plugin-contract",
+ "botster-route-codec 0.1.0 (git+https://github.com/trybotster/botster-contracts?tag=contracts-v0.1.46)",
  "botster-route-codec 0.1.0 (git+https://github.com/trybotster/botster-contracts?tag=contracts-v0.1.50)",
  "data-encoding",
  "getrandom 0.4.3",

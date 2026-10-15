@@ -4,15 +4,43 @@
 //! session view one event at a time.
 
 use crate::bridge::{DeltaPush, Outbox};
-use botster_core::contract::prelude::{SessionId, SessionState};
+use botster_core::contract::prelude::{Exit, SessionId, SessionRecord, SessionState, Size};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-/// One row of the session view. Rows are immutable and shared: a cut copies one pointer per row.
+/// HC section 6 `activity` (steward R-125): `active` when the session had output within `activity_idle_ms`. Core's TM-4
+/// silence edge is the timer (design section 4, "The view row").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Active,
+    Idle,
+}
+
+/// One row of the session view. Rows are immutable and shared: a cut copies one pointer per row. Every field has one
+/// source (design section 4, "The view row"); PC's layer builds the HC `session` row from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: SessionId,
     pub state: SessionState,
+    pub size: Size,
+    pub exit: Option<Exit>,
+    /// Core's session labels; the Hub's fields are under `h/` (R-125).
+    pub labels: BTreeMap<String, String>,
+    pub activity: Activity,
+}
+
+impl Row {
+    /// A row from Core's record. The activity starts `idle`.
+    pub fn from_record(record: SessionRecord) -> Row {
+        Row {
+            id: record.id,
+            state: record.state,
+            size: record.size,
+            exit: record.exit,
+            labels: record.labels,
+            activity: Activity::Idle,
+        }
+    }
 }
 
 /// A frame of a watch (HC WT-1, WT-4).
