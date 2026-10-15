@@ -13,7 +13,7 @@ use crate::fsutil::{self, ensure_dir, WriteError};
 use crate::phase::{Ended, Wake};
 use crate::start::random_id;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -106,8 +106,16 @@ enum JobKind {
 
 #[derive(Debug)]
 enum Job {
+    /// A `Create` write first makes the session directory (design section 4a, "The session directory").
     Write { kind: JobKind, record: Record },
-    Delete { kind: JobKind, key: String },
+    /// A `Forget` delete names the session: its directory goes after the record.
+    Delete {
+        kind: JobKind,
+        key: String,
+        session: Option<String>,
+    },
+    /// The session directory of a `Released` row.
+    DeleteDir { session: String },
 }
 
 #[derive(Debug)]
@@ -117,7 +125,16 @@ enum StoreMsg {
         key: String,
         result: JobResult,
     },
+    DirDone,
     Gone(Ended),
+}
+
+/// The directories of the store thread.
+struct Dirs {
+    /// `<data root>/store/ops`.
+    ops: PathBuf,
+    /// `<data root>/sessions` (HC RT-2).
+    sessions: PathBuf,
 }
 
 /// What a turn's completions mean for the owner.
@@ -140,6 +157,8 @@ pub enum CreateRefused {
     Busy,
     /// The store no longer admits (the stop, or a fault).
     Closed,
+    /// The session id is not a safe path component (an owner bug: session ids are Hub-minted).
+    BadSession,
 }
 
 /// The answer of `get_spawn`.
@@ -190,6 +209,8 @@ pub struct SpawnStore {
     admitting: bool,
     /// A fault was seen: no job is sent again (the Hub stops with cause `store_failed`).
     faulted: bool,
+    /// The session directories of `Released` rows that wait for a job slot.
+    dir_deletes: VecDeque<String>,
     gone: Option<Ended>,
     /// Files that are not the Hub's, counted for `diagnostics()`.
     pub foreign_files: usize,
@@ -204,6 +225,55 @@ fn unusable(path: &Path, cause: impl std::fmt::Display) -> StartFailure {
 
 fn record_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("{key}.json"))
+}
+
+/// A session id that can name `sessions/<id>/`: not empty, not `.` or `..`, no `/` or NUL, at most 128 bytes (Core's
+/// default `max_session_id_bytes`). Session ids are Hub-minted, so a refusal is an owner bug.
+pub fn is_session_dir_name(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains(['/', '\0'])
+}
+
+/// Makes `sessions/`, `sessions/<id>/` and `sessions/<id>/uploads/` (0700) and syncs them. A path step that exists and is
+/// not a directory (a symlink included) is an error, so nothing is made through a symlink.
+fn make_session_dir(sessions: &Path, session_id: &str) -> io::Result<()> {
+    let session = sessions.join(session_id);
+    let uploads = session.join("uploads");
+    for dir in [sessions, session.as_path(), uploads.as_path()] {
+        ensure_dir(dir)?;
+        if !fs::symlink_metadata(dir)?.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+    }
+    fsutil::sync_dir(&session)?;
+    fsutil::sync_dir(sessions)?;
+    match sessions.parent() {
+        Some(root) => fsutil::sync_dir(root),
+        None => Ok(()),
+    }
+}
+
+/// Deletes `sessions/<id>/` with no-follow: a missing entry is done, a symlink or a file is an error and is kept.
+pub fn remove_session_dir(sessions: &Path, session_id: &str) -> io::Result<()> {
+    let session = sessions.join(session_id);
+    match fs::symlink_metadata(&session) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                session.display()
+            )))
+        }
+        Ok(_) => fs::remove_dir_all(&session)?,
+    }
+    fsutil::sync_dir(sessions)
 }
 
 fn tmp_path(dir: &Path, key: &str) -> PathBuf {
@@ -303,10 +373,13 @@ impl SpawnStore {
         }
         let (jobs, job_rx) = sync_channel(config.store_queue);
         let (done_tx, done) = sync_channel(config.store_queue + 1);
-        let thread_dir = dir.clone();
+        let thread_dirs = Dirs {
+            ops: dir.clone(),
+            sessions: data_root.join("sessions"),
+        };
         let thread = std::thread::Builder::new()
             .name("store".into())
-            .spawn(move || store_thread(&thread_dir, &job_rx, &done_tx, owner.as_ref()))
+            .spawn(move || store_thread(&thread_dirs, &job_rx, &done_tx, owner.as_ref()))
             .map_err(|e| StartFailure::new(FailCode::Internal, e.to_string()))?;
         Ok(SpawnStore {
             dir,
@@ -321,6 +394,7 @@ impl SpawnStore {
             recovering: true,
             admitting: true,
             faulted: false,
+            dir_deletes: VecDeque::new(),
             gone: None,
             foreign_files,
         })
@@ -382,6 +456,9 @@ impl SpawnStore {
     pub fn create_spawn(&mut self, session_id: &str, now_ms: u64) -> Result<String, CreateRefused> {
         if !self.admitting || self.jobs.is_none() {
             return Err(CreateRefused::Closed);
+        }
+        if !is_session_dir_name(session_id) {
+            return Err(CreateRefused::BadSession);
         }
         if self.index.len() >= self.config.max_records
             || self.in_flight >= self.config.store_queue
@@ -566,6 +643,7 @@ impl SpawnStore {
                 Job::Delete {
                     kind: JobKind::Forget,
                     key: entry.record.record_key.clone(),
+                    session: Some(entry.record.session_id.clone()),
                 }
             } else if let Some(record) = entry.pending.clone() {
                 Job::Write {
@@ -581,6 +659,12 @@ impl SpawnStore {
             if let Some(entry) = self.index.get_mut(&id) {
                 entry.busy = true;
             }
+        }
+        while let Some(session) = self.dir_deletes.front().cloned() {
+            if !self.send(Job::DeleteDir { session }) {
+                break;
+            }
+            self.dir_deletes.pop_front();
         }
         let mut swept = 0;
         while swept < self.config.turn_sweeps {
@@ -601,6 +685,7 @@ impl SpawnStore {
             if !self.send(Job::Delete {
                 kind: JobKind::Delete,
                 key,
+                session: None,
             }) {
                 break;
             }
@@ -640,6 +725,7 @@ impl SpawnStore {
                     events.push(StoreEvent::Fault("the store thread panicked".into()));
                 }
             }
+            StoreMsg::DirDone => self.in_flight -= 1,
             StoreMsg::Done { kind, key, result } => {
                 self.in_flight -= 1;
                 let Some(id) = self.keys.get(&key).cloned() else {
@@ -698,6 +784,24 @@ impl SpawnStore {
                 }
             }
         }
+    }
+
+    /// A `Released` row: its session directory is deleted by a store job, after the terminal states (design section 4a,
+    /// "The session directory"; Core A6-3; Sol S2-HD-14).
+    /// - Until a job slot is free, the deletion waits in this handle, at most `max_records` entries. Over the bound, it
+    ///   is dropped, and the orphan sweep at the next start removes the directory.
+    /// - A deletion that was sent is a store job like any other: it finishes before the store thread is joined. One that
+    ///   was not sent when the stop starts is dropped for the orphan sweep.
+    /// - An id that cannot name a directory has none.
+    pub fn release_session(&mut self, session_id: &str) {
+        if is_session_dir_name(session_id) && self.dir_deletes.len() < self.config.max_records {
+            self.dir_deletes.push_back(session_id.to_owned());
+        }
+    }
+
+    /// The deletions that wait for a job slot.
+    pub fn dir_deletes(&self) -> usize {
+        self.dir_deletes.len()
     }
 
     /// A fault: no new spawn is admitted and no job is sent again. The jobs in flight complete.
@@ -798,10 +902,10 @@ pub fn restore_spawns(store: &mut SpawnStore) -> Result<(), RestoreBlocked> {
     }
 }
 
-fn store_thread(dir: &Path, jobs: &Receiver<Job>, done: &SyncSender<StoreMsg>, owner: &dyn Wake) {
+fn store_thread(dirs: &Dirs, jobs: &Receiver<Job>, done: &SyncSender<StoreMsg>, owner: &dyn Wake) {
     let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         while let Ok(job) = jobs.recv() {
-            let message = run_job(dir, job);
+            let message = run_job(dirs, job);
             // The channel holds one slot per job in flight plus `Gone`, so this send never blocks.
             let _ = done.send(message);
             owner.wake();
@@ -814,10 +918,25 @@ fn store_thread(dir: &Path, jobs: &Receiver<Job>, done: &SyncSender<StoreMsg>, o
     owner.wake();
 }
 
-fn run_job(dir: &Path, job: Job) -> StoreMsg {
+fn run_job(dirs: &Dirs, job: Job) -> StoreMsg {
+    let dir = dirs.ops.as_path();
     match job {
         Job::Write { kind, record } => {
             let key = record.record_key.clone();
+            // The directory goes first, so a record never names a missing directory. An error here changed no record.
+            if kind == JobKind::Create {
+                if let Err(error) = make_session_dir(&dirs.sessions, &record.session_id) {
+                    eprintln!(
+                        "botster-hub: store: the session directory of {}: {error}",
+                        record.session_id
+                    );
+                    return StoreMsg::Done {
+                        kind,
+                        key,
+                        result: JobResult::NotWritten,
+                    };
+                }
+            }
             let result = match serde_json::to_vec(&record) {
                 Err(_) => JobResult::NotWritten,
                 Ok(bytes) => match fsutil::write_atomic(
@@ -832,9 +951,15 @@ fn run_job(dir: &Path, job: Job) -> StoreMsg {
             };
             StoreMsg::Done { kind, key, result }
         }
-        Job::Delete { kind, key } => {
+        Job::Delete { kind, key, session } => {
             let removed: io::Result<()> =
                 fs::remove_file(record_path(dir, &key)).and_then(|()| fsutil::sync_dir(dir));
+            // The directory goes after the record. Its error is logged only; the orphan sweep retries it.
+            if let (Ok(()), Some(session)) = (&removed, session) {
+                if let Err(error) = remove_session_dir(&dirs.sessions, &session) {
+                    eprintln!("botster-hub: store: the session directory of {session}: {error}");
+                }
+            }
             StoreMsg::Done {
                 kind,
                 key,
@@ -844,6 +969,12 @@ fn run_job(dir: &Path, job: Job) -> StoreMsg {
                     JobResult::Unknown
                 },
             }
+        }
+        Job::DeleteDir { session } => {
+            if let Err(error) = remove_session_dir(&dirs.sessions, &session) {
+                eprintln!("botster-hub: store: the session directory of {session}: {error}");
+            }
+            StoreMsg::DirDone
         }
     }
 }
@@ -1236,6 +1367,83 @@ mod tests {
         settle(&mut store, 1100);
         assert_eq!(store.get_spawn(&a), Lookup::NotFound);
         store.close();
+    }
+
+    /// The session directory: the `starting` job makes it (0700) before the record; a symlink in its place fails the job
+    /// as `NotWritten`, and nothing is made through the link.
+    #[test]
+    fn the_starting_job_makes_the_session_directory_first() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        let a = store.create_spawn("a", 0).unwrap();
+        assert_eq!(
+            events(&mut store, 1),
+            vec![StoreEvent::CreateDurable { operation_id: a }]
+        );
+        let uploads = tmp.path().join("sessions/a/uploads");
+        assert_eq!(
+            fs::symlink_metadata(&uploads).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let target = tmp.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("sessions/b")).unwrap();
+        let b = store.create_spawn("b", 0).unwrap();
+        assert_eq!(
+            events(&mut store, 1),
+            vec![StoreEvent::CreateNotWritten { operation_id: b }]
+        );
+        assert!(
+            !target.join("uploads").exists(),
+            "nothing made through the link"
+        );
+        assert_eq!(files(tmp.path()).len(), 1);
+        assert_eq!(
+            store.create_spawn("../c", 0),
+            Err(CreateRefused::BadSession)
+        );
+        store.close();
+    }
+
+    /// `remove_session_dir` deletes a directory, and keeps a symlink and its target.
+    #[test]
+    fn remove_session_dir_never_follows_a_symlink() {
+        let tmp = root();
+        let sessions = tmp.path().join("sessions");
+        fs::create_dir_all(sessions.join("a/uploads")).unwrap();
+        fs::write(sessions.join("a/uploads/f"), b"x").unwrap();
+        remove_session_dir(&sessions, "a").unwrap();
+        assert!(!sessions.join("a").exists());
+        remove_session_dir(&sessions, "a").unwrap();
+        let target = tmp.path().join("t");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join("l")).unwrap();
+        assert!(remove_session_dir(&sessions, "l").is_err());
+        assert!(target.join("keep").exists());
+        assert!(fs::symlink_metadata(sessions.join("l")).is_ok());
+    }
+
+    /// Sol S2-HD-14: release deletions wait in the handle, at most `max_records`; a sent one finishes before the join.
+    #[test]
+    fn release_deletions_are_bounded_and_finish_before_the_join() {
+        let tmp = root();
+        let mut store = open(tmp.path());
+        store.end_recovery();
+        let sessions = tmp.path().join("sessions");
+        for name in ["a", "b", "c", "d"] {
+            fs::create_dir_all(sessions.join(name)).unwrap();
+            store.release_session(name);
+        }
+        store.release_session("..");
+        assert_eq!(store.dir_deletes(), CONFIG.max_records);
+        // Two job slots: two deletions are sent; the stop joins them and drops the third.
+        store.pump(0);
+        assert_eq!(store.in_flight(), 2);
+        assert!(store.quiesce().is_empty());
+        assert!(!sessions.join("a").exists() && !sessions.join("b").exists());
+        assert!(sessions.join("c").exists(), "left for the orphan sweep");
+        assert!(sessions.join("d").exists(), "over the bound");
     }
 
     /// A marker clear while the marker's own write is in flight is written after it, so the last durable state is
