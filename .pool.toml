@@ -1,0 +1,60 @@
+# The settings of the Botster Hub gate for the pool's docker runtime (`jobq run --runtime docker`). The schema is section 11
+# of compute-pool docs/pool-contracts.md. Settings only: this file grants no secret, host mount, host network, privilege or
+# Docker socket.
+
+# The tools come from mise.toml: mise finds it in the checkout.
+
+# DRAFT: no measured docker gate of the Hub exists yet. The old gate took 14 to 23 s to run (queue time excluded) after a
+# warm fetch; a cold target cache builds libghostty with Zig. Keep a wide bound until a docker gate is measured.
+timeout_seconds = 3000
+
+[fetch]
+# The pool's private-fetch profile for cargo: Cargo.lock has private git dependencies (trybotster: botster-contracts, and
+# botster-core for botster-core and botster-gate-kit). The pool maps the profile to the project's credential.
+private = "cargo"
+# Run without secrets, with network. It fills the Zig package store that libghostty's build.rs reads (botster-core's
+# botster-terminal-ghostty, built with Zig). It reads the list of packages in ci/zig-prefetch (data in this repository),
+# not botster-core's checkout: the private and the public fetch run independently, and the private cargo home is the
+# private profile's alone. `cargo xtask zig-packages` checks the list against botster-core's pin. The file is mode 644, so
+# bash runs it.
+public_command = ["bash", "ci/remote/fetch-public.sh"]
+
+[network]
+fetch = "bridge"
+gate = "none"
+
+# Logical caches: the pool assigns the subdirectories. key = inputs that pick the cache; mode: rw or exclusive.
+[[caches]]
+name = "target"
+path = "/cache/target"
+# One target directory per branch. A gate of the branch holds it alone.
+key = ["branch", "rust-toolchain.toml"]
+mode = "exclusive"
+
+# Zig's global cache, and the store of the Zig packages (ci/remote/fetch-public.sh publishes each archive once, by rename).
+[[caches]]
+name = "zig"
+path = "/cache/zig"
+key = []
+mode = "rw"
+
+[environment]
+TZ = "UTC"
+# CI: a missing tool or a skipped step fails the gate, it does not pass as SKIPPED.
+CI = "1"
+CARGO_TARGET_DIR = "/cache/target"
+CARGO_TERM_COLOR = "never"
+CARGO_BUILD_JOBS = "4"
+NEXTEST_TEST_THREADS = "4"
+ZIG_GLOBAL_CACHE_DIR = "/cache/zig"
+# libghostty's build.rs reads its Zig packages from this store and runs Zig under a network denial: the gate has no network
+# at all (network.gate = "none"), so it declares that.
+BOTSTER_ZIG_PACKAGES = "/cache/zig/packages"
+BOTSTER_ZIG_NETWORK_DENIED = "1"
+
+[resources]
+# DRAFT: the largest profile that Contracts uses, until a docker gate of the Hub is measured. tmp.size_mib counts against it.
+profile = "xlarge"
+
+[tmp]
+size_mib = 4096

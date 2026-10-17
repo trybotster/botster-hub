@@ -10,7 +10,7 @@
 use anyhow::{bail, Context, Result};
 use botster_gate_kit::junit::parse_junit;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -103,6 +103,15 @@ pub fn nextest_args(slow: bool, members: &[String]) -> Vec<String> {
     args
 }
 
+/// Where nextest writes the JUnit file of a profile: the store of `.config/nextest.toml` (`[store] dir`), relative to the
+/// workspace root. It does not follow `CARGO_TARGET_DIR`.
+pub fn junit_path(root: &Path, profile: &str) -> PathBuf {
+    root.join(STORE_DIR).join(profile).join("junit.xml")
+}
+
+/// The nextest store, relative to the workspace root.
+const STORE_DIR: &str = "target/nextest";
+
 /// The tier's run: nextest, then the JUnit report.
 ///
 /// # Errors
@@ -150,7 +159,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         .args(nextest_args(slow, &members))
         .status()
         .context("run cargo nextest")?;
-    let junit = root.join(format!("target/nextest/{profile}/junit.xml"));
+    let junit = junit_path(root, profile);
     let times = parse_junit(
         &std::fs::read_to_string(&junit).with_context(|| format!("read {}", junit.display()))?,
     );
@@ -188,6 +197,25 @@ mod tests {
 
     fn times(rows: &[(&str, f64)]) -> BTreeMap<String, f64> {
         rows.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    /// The reader and `.config/nextest.toml` agree on the store, so the report is found whatever `CARGO_TARGET_DIR` is.
+    #[test]
+    fn the_junit_file_is_in_the_nextest_store_that_the_config_sets() {
+        let config = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.config/nextest.toml"),
+        )
+        .unwrap();
+        let store = config
+            .lines()
+            .skip_while(|l| l.trim() != "[store]")
+            .find_map(|l| l.trim().strip_prefix("dir = \"")?.strip_suffix('"'))
+            .expect("nextest.toml sets [store] dir");
+        assert_eq!(store, STORE_DIR);
+        assert_eq!(
+            junit_path(Path::new("/work"), "ci"),
+            Path::new("/work/target/nextest/ci/junit.xml")
+        );
     }
 
     #[test]

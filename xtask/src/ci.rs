@@ -1,7 +1,7 @@
 //! `cargo xtask ci`: the Hub's gate (repo plan section 5, the minimal gate). Each step runs, in order; the summary names
 //! each step's result and time, and the gate fails when a step fails.
 
-use crate::{budget, forbid_unsafe, lists, taint};
+use crate::{budget, forbid_unsafe, lists, taint, zig_packages};
 use anyhow::{bail, Result};
 use std::path::Path;
 use std::process::Command;
@@ -37,7 +37,7 @@ fn cargo(root: &Path, args: &[&str]) -> Result<()> {
 }
 
 /// The steps of the gate, in order.
-pub const STEPS: [Step; 8] = [
+pub const STEPS: [Step; 9] = [
     ("fmt", |root| cargo(root, &["fmt", "--all", "--check"])),
     ("clippy", |root| {
         cargo(
@@ -59,6 +59,7 @@ pub const STEPS: [Step; 8] = [
         botster_gate_kit::high_tier::command(root, &[])
     }),
     ("lists", |root| lists::command(root, &[])),
+    ("zig-packages", |root| zig_packages::command(root, &[])),
     ("test-budget", |root| budget::command(root, &[])),
     ("slow", |root| {
         budget::command(root, &["--slow".to_string()])
@@ -134,9 +135,36 @@ mod tests {
                 "unsafe-code",
                 "high-tier",
                 "lists",
+                "zig-packages",
                 "test-budget",
                 "slow"
             ]
+        );
+    }
+
+    /// The value of `key = "..."` on a line of a TOML file that this test reads as text.
+    fn quoted(file: &str, key: &str) -> String {
+        let text =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(file))
+                .unwrap();
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(key)?
+                    .trim_start()
+                    .strip_prefix("= \"")?
+                    .split('"')
+                    .next()
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| panic!("{file} has no {key}"))
+    }
+
+    /// The pool installs the tools of mise.toml: its Rust is the channel of rust-toolchain.toml.
+    #[test]
+    fn the_pool_installs_the_rust_toolchain_of_the_repository() {
+        assert_eq!(
+            quoted("mise.toml", "rust"),
+            quoted("rust-toolchain.toml", "channel")
         );
     }
 
