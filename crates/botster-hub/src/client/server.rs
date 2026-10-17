@@ -66,6 +66,8 @@ pub struct ServerConfig {
     pub busy_retry_ms: u64,
     /// The Hub's own uid: a peer with another uid is refused `auth_failed` (TB-L3).
     pub uid: u32,
+    /// The working directory of a created command that names none (HC A.9 sets no default; the operator's home).
+    pub default_cwd: String,
 }
 
 /// The numbers that this layer owns (HC CF-2 `[limits]`; the Hub's defaults, no HC number).
@@ -172,6 +174,7 @@ impl ServerConfig {
             outbox,
             busy_retry_ms: protocol.busy_retry_ms,
             uid,
+            default_cwd: "/".into(),
         }
     }
 }
@@ -757,6 +760,7 @@ fn kind_ctx<'a>(config: &'a ServerConfig, types: &'a SessionTypes) -> Ctx<'a> {
         cursor_idle: Duration::from_secs(config.limits.cursor_idle_seconds),
         max_watches: usize::try_from(config.limits.max_watches).unwrap_or(usize::MAX),
         busy_retry_ms: config.busy_retry_ms,
+        default_cwd: &config.default_cwd,
     }
 }
 
@@ -809,6 +813,7 @@ mod tests {
             },
             busy_retry_ms: 50,
             uid: me(),
+            default_cwd: "/tmp".into(),
         }
     }
 
@@ -876,8 +881,21 @@ mod tests {
             };
             botster_fake_core::FakeCore::open(&store, open, 7).unwrap()
         };
-        let mut owner = with_owner.then(|| {
-            crate::owner::Owner::new(
+        let owner = with_owner.then(|| {
+            // The spawn store is a real one on a short path; the owner ends its recovery as step 6b does.
+            let store = crate::store::SpawnStore::open(
+                dir.path(),
+                crate::store::StoreConfig {
+                    max_records: 16,
+                    store_queue: 8,
+                    retention_ms: 60_000,
+                    max_record_bytes: 4096,
+                    turn_sweeps: 1,
+                },
+                Arc::new(Count::default()),
+            )
+            .unwrap();
+            let mut owner = crate::owner::Owner::new(
                 core,
                 bridge.clone(),
                 phase.clone(),
@@ -895,10 +913,11 @@ mod tests {
                     chunk_rows: 1,
                 },
             )
-        });
-        if let Some(owner) = owner.as_mut() {
+            .with_store(store);
+            owner.store_mut().unwrap().end_recovery();
             owner.begin_adoption();
-        }
+            owner
+        });
         let server = Server::new(
             poll.registry().try_clone().unwrap(),
             bridge.clone(),
@@ -960,22 +979,24 @@ mod tests {
             }
         }
 
-        /// Runs owner turns until no work is left.
+        /// Runs owner turns until no work is left, and the spawn flow (the store thread is real) is idle.
         fn owner_settle(&mut self) {
             let Some(owner) = self.owner.as_mut() else {
                 return;
             };
-            for _ in 0..200 {
+            for _ in 0..5000 {
                 self.clock += Duration::from_millis(1);
                 let now = botster_core::contract::prelude::Now {
                     monotonic: self.clock,
                     unix: 1_000_000,
                 };
-                if !owner.turn(now).runnable {
+                let report = owner.turn(now);
+                if !report.runnable && owner.spawn_idle() {
                     return;
                 }
+                std::thread::sleep(Duration::from_millis(1));
             }
-            panic!("the owner is still runnable");
+            panic!("the owner did not settle");
         }
 
         /// A session through the bridge, as a client's spawn would make one.
@@ -1865,5 +1886,283 @@ mod tests {
             }
         }
         assert_eq!((oks, busy), (2, 1));
+    }
+
+    fn create_args(argv: &[&str]) -> Value {
+        json!({"command": {"argv": argv}})
+    }
+
+    impl Rig {
+        /// Core loses the session's worker with a known termination: the HC state is `ended`.
+        fn lose_worker(&mut self, name: &str) {
+            self.owner
+                .as_ref()
+                .unwrap()
+                .core()
+                .control("lose_worker", &json!({ "session": name }))
+                .unwrap();
+            self.pump();
+        }
+    }
+
+    /// EN-7 `en_7_accepted_returns_operation`, A.9: `create` answers the receipt; the id is minted by the Hub (32 hex
+    /// digits); the row is `starting` or later, its label is the id, and its type is the `command` device type (S2-HC-3).
+    #[test]
+    fn create_a_command_answers_the_receipt_and_the_session_exists() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        req(
+            &mut client,
+            1,
+            "create",
+            "session",
+            None,
+            create_args(&["/bin/sh"]),
+        );
+        rig.pump();
+        let res = receive(&mut client);
+        let ok = &res["ok"];
+        assert_eq!(ok["state"], "starting");
+        assert_eq!(ok["session"]["hub_id"], "h");
+        let session = ok["session"]["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(session.len(), 32);
+        assert!(session.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!ok["operation_id"].as_str().unwrap().is_empty());
+        req(
+            &mut client,
+            2,
+            "get",
+            "session",
+            Some(&session),
+            Value::Null,
+        );
+        rig.pump();
+        let row = receive(&mut client);
+        assert_eq!(row["ok"]["label"], session.as_str());
+        assert_eq!(
+            row["ok"]["session_type"],
+            json!({"id": "command", "source": "device"})
+        );
+    }
+
+    /// R-125 (as corrected): the create's `label` is the initial label; a size and an env reach the spawn.
+    #[test]
+    fn create_with_a_label_and_a_size() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        let args = json!({"command": {"argv": ["/bin/sh"], "cwd": "/", "env": {"A": "1"}},
+            "size": {"rows": 30, "cols": 100}, "label": "build"});
+        req(&mut client, 1, "create", "session", None, args);
+        rig.pump();
+        let session = receive(&mut client)["ok"]["session"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        req(
+            &mut client,
+            2,
+            "get",
+            "session",
+            Some(&session),
+            Value::Null,
+        );
+        rig.pump();
+        let row = receive(&mut client);
+        assert_eq!(row["ok"]["label"], "build");
+        assert_eq!(row["ok"]["size"], json!({"rows": 30, "cols": 100}));
+    }
+
+    /// A bad create is `invalid_arguments` with no session made and no record written (A.9, S2-HC-3).
+    #[test]
+    fn a_bad_create_is_refused_before_anything_is_made() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        let bad = [
+            json!({}),
+            json!({"command": {"argv": []}}),
+            json!({"command": {"argv": [""]}}),
+            json!({"command": {"argv": ["/bin/sh"]}, "target_id": "t"}),
+            json!({"command": {"argv": ["/bin/sh"]}, "agent_scopes": ["x"]}),
+            json!({"command": {"argv": ["/bin/sh"]}, "size": {"rows": 0, "cols": 80}}),
+            json!({"session_type_id": "command"}),
+            json!({"session_type_id": "nope"}),
+        ];
+        for (n, args) in bad.into_iter().enumerate() {
+            req(
+                &mut client,
+                n as u64 + 1,
+                "create",
+                "session",
+                None,
+                args.clone(),
+            );
+            rig.pump();
+            let res = receive(&mut client);
+            assert_eq!(res["err"]["code"], "invalid_arguments", "{args}");
+        }
+        req(&mut client, 20, "list", "session", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["items"], json!([]));
+    }
+
+    /// EN-8 and EN-7b are not served: a mutation with a key or an operation id does not run (no retry can double it).
+    #[test]
+    fn a_mutation_with_an_idempotency_key_does_not_run() {
+        let mut rig = owned(config());
+        let mut client = rig.control();
+        send(
+            &mut client,
+            &json!({"type": "req", "id": "1", "verb": "create", "kind": "session",
+                "idempotency_key": "k", "args": create_args(&["/bin/sh"])}),
+        );
+        rig.pump();
+        let res = receive(&mut client);
+        assert_eq!(res["err"]["code"], "unsupported");
+        assert_eq!(res["err"]["reason"], "idempotency_not_served");
+        assert_eq!(res["err"]["effect"], "none");
+        req(&mut client, 2, "list", "session", None, Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["items"], json!([]));
+    }
+
+    /// KR-1 `kr_1_session_update_label_and_task` (the label part), VB-4: the answer is the row; `null` deletes the label,
+    /// which falls back to the id; `task`, `if_rev` and a stranger are refused; an unknown session is `not_found`.
+    /// WRITE-1, EN-5: an update whose row answer is over the bound ran. The label is stored, and the error says
+    /// `effect: unknown`, not `none`.
+    #[test]
+    fn an_update_with_an_answer_over_the_bound_says_its_effect_is_unknown() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        let max = 4096;
+        rig.set_label("a", &"x".repeat(100));
+        req(&mut client, 1, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let base = body_len(&receive(&mut client));
+        let over = 100 + (max - base) + 1;
+        req(
+            &mut client,
+            2,
+            "update",
+            "session",
+            Some("a"),
+            json!({"patch": {"label": "y".repeat(over)}}),
+        );
+        rig.pump();
+        let answer = receive(&mut client);
+        assert_eq!(answer["err"]["code"], "response_too_large", "{answer}");
+        assert_eq!(answer["err"]["effect"], "unknown", "{answer}");
+        let stored = rig.owner.as_ref().unwrap().view()
+            [&botster_core::contract::prelude::SessionId("a".into())]
+            .labels
+            .get(crate::client::rows::LABEL_KEY)
+            .cloned();
+        assert_eq!(stored, Some("y".repeat(over)), "the label was written");
+    }
+
+    #[test]
+    fn update_sets_the_label_and_answers_the_row() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(
+            &mut client,
+            1,
+            "update",
+            "session",
+            Some("a"),
+            json!({"patch": {"label": "build"}}),
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["label"], "build");
+        req(
+            &mut client,
+            2,
+            "update",
+            "session",
+            Some("a"),
+            json!({"patch": {"label": null}}),
+        );
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"]["label"], "a");
+        let refused = [
+            (json!({"patch": {"task": "x"}}), "unsupported"),
+            (
+                json!({"patch": {"label": "x"}, "if_rev": "r"}),
+                "unsupported",
+            ),
+            (json!({"patch": {"id": "z"}}), "invalid_arguments"),
+            (json!({"patch": {"colour": "red"}}), "invalid_arguments"),
+            (json!({"patch": {"label": 5}}), "invalid_arguments"),
+            (json!({}), "invalid_arguments"),
+        ];
+        for (n, (args, code)) in refused.into_iter().enumerate() {
+            req(
+                &mut client,
+                n as u64 + 10,
+                "update",
+                "session",
+                Some("a"),
+                args.clone(),
+            );
+            rig.pump();
+            assert_eq!(receive(&mut client)["err"]["code"], code, "{args}");
+        }
+        req(
+            &mut client,
+            30,
+            "update",
+            "session",
+            Some("nope"),
+            json!({"patch": {"label": "x"}}),
+        );
+        req(
+            &mut client,
+            31,
+            "update",
+            "session",
+            None,
+            json!({"patch": {"label": "x"}}),
+        );
+        rig.pump();
+        let mut res = [receive(&mut client), receive(&mut client)];
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(res[0]["err"]["code"], "not_found");
+        assert_eq!(res[1]["err"]["code"], "invalid_arguments");
+    }
+
+    /// VB-5, A.2c: `delete` is for an `ended` or `lost` session; a running one is `wrong_state`; after the delete the row is
+    /// gone; an unknown session is `not_found`.
+    #[test]
+    fn delete_removes_an_ended_session_only() {
+        let mut rig = owned(config());
+        rig.make_session("a");
+        let mut client = rig.control();
+        req(&mut client, 1, "delete", "session", Some("a"), Value::Null);
+        rig.pump();
+        let res = receive(&mut client);
+        assert_eq!(res["err"]["code"], "wrong_state", "{res}");
+        assert_eq!(res["err"]["effect"], "none");
+        rig.lose_worker("a");
+        req(&mut client, 2, "get", "session", Some("a"), Value::Null);
+        rig.pump();
+        let row = receive(&mut client);
+        assert_eq!(
+            (
+                row["ok"]["state"].as_str(),
+                row["ok"]["failure_reason"].as_str()
+            ),
+            (Some("ended"), Some("worker_lost"))
+        );
+        req(&mut client, 3, "delete", "session", Some("a"), Value::Null);
+        rig.pump();
+        assert_eq!(receive(&mut client)["ok"], json!({}));
+        req(&mut client, 4, "get", "session", Some("a"), Value::Null);
+        req(&mut client, 5, "delete", "session", Some("a"), Value::Null);
+        rig.pump();
+        let mut res = [receive(&mut client), receive(&mut client)];
+        res.sort_by_key(|r| r["id"].as_str().unwrap().to_owned());
+        assert_eq!(res[0]["err"]["code"], "not_found");
+        assert_eq!(res[1]["err"]["code"], "not_found");
     }
 }
