@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 /// The caller of a `local-stream` connection: `operator`, with the peer uid (HC HS-7). Its tag is the Core `owner` and
 /// `client` of every route it attaches, so `RouteAdopted` gives the caller back after a Hub restart (A.3).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Caller {
     pub uid: u32,
 }
@@ -63,6 +63,10 @@ pub struct RouteEntry {
     pub core_route: RouteId,
     pub session: SessionId,
     pub owner: Caller,
+    /// Unix milliseconds when this Hub put the route in the table (steward R-127). A new route: the connect time. A
+    /// route adopted after a Hub restart: the Hub's adoption time, because the worker keeps no attach time and the Hub
+    /// persists no new field.
+    pub since: u64,
 }
 
 /// The owner's route tables.
@@ -313,6 +317,7 @@ pub fn connect<C: CoreApi>(
     core: &mut C,
     tables: &mut HubRouteTables,
     now: Instant,
+    since: u64,
     request: RouteConnectRequest,
 ) -> (RouteConnectAnswer, Option<RouteEnded>) {
     let RouteConnectRequest {
@@ -346,6 +351,7 @@ pub fn connect<C: CoreApi>(
                     core_route: attached.route,
                     session,
                     owner: reserved.caller,
+                    since,
                 },
             );
             (RouteConnectAnswer::Handed, None)
@@ -361,6 +367,15 @@ pub fn connect<C: CoreApi>(
             }),
         ),
     }
+}
+
+/// One route of a caller, for `list(route)` and `get(route)` (HC section 6, A.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteInfo {
+    pub route_id: String,
+    pub session: SessionId,
+    /// Unix milliseconds (see [`RouteEntry::since`]).
+    pub since: u64,
 }
 
 /// The owner's route state: the tables, the parameters, and the `route.ended` events that wait for the `routes` stream.
@@ -417,6 +432,35 @@ impl Routes {
         )
     }
 
+    /// The routes of `caller`, ordered by id. A route is limited to its owning caller (HC A.3).
+    pub fn routes_of(&self, caller: &Caller) -> Vec<RouteInfo> {
+        let mut routes: Vec<RouteInfo> = self
+            .tables
+            .routes()
+            .filter(|(_, entry)| &entry.owner == caller)
+            .map(|(id, entry)| RouteInfo {
+                route_id: id.clone(),
+                session: entry.session.clone(),
+                since: entry.since,
+            })
+            .collect();
+        routes.sort_by(|a, b| a.route_id.cmp(&b.route_id));
+        routes
+    }
+
+    /// The Core route of `route_id`, if `caller` owns it and, when `session` is given, it is on that session. A route of
+    /// another caller is `None`, as an unknown one is (HC A.3).
+    pub fn owned(
+        &self,
+        caller: &Caller,
+        route_id: &str,
+        session: Option<&SessionId>,
+    ) -> Option<RouteId> {
+        let entry = self.tables.route(route_id)?;
+        (&entry.owner == caller && session.is_none_or(|s| s == &entry.session))
+            .then_some(entry.core_route)
+    }
+
     /// [`reserve`] with the OS CSPRNG.
     pub fn reserve<C: CoreApi>(
         &mut self,
@@ -439,16 +483,17 @@ impl Routes {
         &mut self,
         core: &mut C,
         now: Instant,
+        since: u64,
         request: RouteConnectRequest,
     ) -> RouteConnectAnswer {
-        let (answer, end) = connect(core, &mut self.tables, now, request);
+        let (answer, end) = connect(core, &mut self.tables, now, since, request);
         self.push_end(end);
         answer
     }
 
     /// [`route_event`] for one Core event.
-    pub fn event(&mut self, event: &Event) {
-        let end = route_event(&mut self.tables, event);
+    pub fn event(&mut self, event: &Event, since: u64) {
+        let end = route_event(&mut self.tables, event, since);
         self.push_end(end);
     }
 
@@ -477,7 +522,7 @@ fn end_reason(reason: botster_core::contract::prelude::RouteCloseReason) -> Opti
 /// - `RouteClosed` with a tag in the table removes that entry: a failed reason gives one `route.ended { cause }`; a
 ///   healthy close gives none, because the worker already sent `route_closed`.
 /// - `RouteAdopted` with a tag and an owner this Hub made inserts the entry.
-pub fn route_event(tables: &mut HubRouteTables, event: &Event) -> Option<RouteEnded> {
+pub fn route_event(tables: &mut HubRouteTables, event: &Event, since: u64) -> Option<RouteEnded> {
     match event {
         Event::RouteClosed {
             reason,
@@ -505,6 +550,7 @@ pub fn route_event(tables: &mut HubRouteTables, event: &Event) -> Option<RouteEn
                         core_route: *route,
                         session: session.clone(),
                         owner,
+                        since,
                     },
                 );
             }
@@ -524,6 +570,9 @@ mod tests {
     };
     use botster_fake_core::{FakeCore, FakeStore};
     use std::io::Read;
+
+    /// The unix milliseconds that the tests give the route table.
+    const SINCE: u64 = 1_700_000_000_000;
 
     /// The fake Core's one format, as Core names it.
     const FORMAT: &str = "ghostsnp/1+raw";
@@ -638,6 +687,7 @@ mod tests {
         let answer = routes.connect(
             &mut core,
             now,
+            SINCE,
             RouteConnectRequest {
                 route_id: "gone".into(),
                 route_token: "t".into(),
@@ -807,6 +857,7 @@ mod tests {
             &mut core,
             &mut tables,
             now,
+            SINCE,
             RouteConnectRequest {
                 route_id: r.route_id.clone(),
                 route_token: r.route_token.clone(),
@@ -816,15 +867,14 @@ mod tests {
         );
         assert_eq!((answer, ended), (RouteConnectAnswer::Handed, None));
         let entry = tables.route(&r.route_id).expect("in the route table");
-        assert_eq!(
-            (entry.session.clone(), entry.owner.clone()),
-            (sid("a"), me())
-        );
+        assert_eq!((entry.session.clone(), entry.owner), (sid("a"), me()));
+        assert_eq!(entry.since, SINCE, "a new route: the connect time (R-127)");
         let (again, _peer) = stream_pair();
         let (answer, ended) = connect(
             &mut core,
             &mut tables,
             now,
+            SINCE,
             RouteConnectRequest {
                 route_id: r.route_id,
                 route_token: r.route_token,
@@ -851,6 +901,7 @@ mod tests {
             &mut core,
             &mut tables,
             Instant::now(),
+            SINCE,
             RouteConnectRequest {
                 route_id: "unknown".into(),
                 route_token: "t".into(),
@@ -906,11 +957,17 @@ mod tests {
             stream,
         };
         assert_eq!(
-            connect(&mut core, &mut tables, now, request_for(&first, one)).0,
+            connect(&mut core, &mut tables, now, SINCE, request_for(&first, one)).0,
             RouteConnectAnswer::Handed
         );
         let (two, mut client_end) = stream_pair();
-        let (answer, ended) = connect(&mut core, &mut tables, now, request_for(&second, two));
+        let (answer, ended) = connect(
+            &mut core,
+            &mut tables,
+            now,
+            SINCE,
+            request_for(&second, two),
+        );
         assert_eq!(answer, RouteConnectAnswer::Handed);
         assert_eq!(
             ended,
@@ -945,11 +1002,48 @@ mod tests {
         }
     }
 
+    /// HC A.3: a route belongs to its caller. Another caller does not list it and does not find it to detach.
+    /// R-127: a route adopted after a restart has the adoption time as `since`.
+    #[test]
+    fn an_adopted_route_since_is_the_adoption_time() {
+        let mut tables = HubRouteTables::with_params(&params());
+        route_event(&mut tables, &adopted("r1", "operator/501"), SINCE + 7);
+        assert_eq!(tables.route("r1").unwrap().since, SINCE + 7);
+    }
+
+    #[test]
+    fn a_route_is_visible_to_its_caller_only() {
+        let mut routes = Routes::new(params());
+        routes.event(&adopted("r2", "operator/501"), SINCE);
+        routes.event(&adopted("r1", "operator/501"), SINCE + 1);
+        routes.event(&adopted("r3", "operator/502"), SINCE);
+        let other = Caller { uid: 502 };
+        let listed = routes.routes_of(&me());
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| r.route_id.as_str())
+                .collect::<Vec<_>>(),
+            ["r1", "r2"],
+            "id-ordered, the caller's own"
+        );
+        assert_eq!(
+            (listed[0].session.clone(), listed[0].since),
+            (sid("a"), SINCE + 1)
+        );
+        assert_eq!(routes.routes_of(&other).len(), 1);
+        assert_eq!(routes.owned(&me(), "r1", None), Some(RouteId(9)));
+        assert_eq!(routes.owned(&other, "r1", None), None);
+        assert_eq!(routes.owned(&me(), "r1", Some(&sid("a"))), Some(RouteId(9)));
+        assert_eq!(routes.owned(&me(), "r1", Some(&sid("b"))), None);
+        assert_eq!(routes.owned(&me(), "none", None), None);
+    }
+
     #[test]
     fn route_adopted_rebuilds_only_this_hubs_routes() {
         let mut tables = HubRouteTables::with_params(&params());
         assert_eq!(
-            route_event(&mut tables, &adopted("r1", "operator/501")),
+            route_event(&mut tables, &adopted("r1", "operator/501"), SINCE),
             None
         );
         assert_eq!(
@@ -958,18 +1052,23 @@ mod tests {
                 core_route: RouteId(9),
                 session: sid("a"),
                 owner: me(),
+                since: SINCE,
             })
         );
-        route_event(&mut tables, &adopted("r2", "someone-else"));
+        route_event(&mut tables, &adopted("r2", "someone-else"), SINCE);
         assert!(tables.route("r2").is_none());
     }
 
     #[test]
     fn a_failed_close_ends_the_route_once_with_cores_cause() {
         let mut tables = HubRouteTables::with_params(&params());
-        route_event(&mut tables, &adopted("r1", "operator/501"));
+        route_event(&mut tables, &adopted("r1", "operator/501"), SINCE);
         assert_eq!(
-            route_event(&mut tables, &closed("r1", RouteCloseReason::PeerClosed)),
+            route_event(
+                &mut tables,
+                &closed("r1", RouteCloseReason::PeerClosed),
+                SINCE
+            ),
             Some(RouteEnded {
                 route_id: "r1".into(),
                 caller: me(),
@@ -978,7 +1077,11 @@ mod tests {
         );
         assert!(tables.route("r1").is_none());
         assert_eq!(
-            route_event(&mut tables, &closed("r1", RouteCloseReason::PeerClosed)),
+            route_event(
+                &mut tables,
+                &closed("r1", RouteCloseReason::PeerClosed),
+                SINCE
+            ),
             None,
             "a second close finds nothing"
         );
@@ -987,9 +1090,13 @@ mod tests {
     #[test]
     fn a_healthy_close_removes_the_route_with_no_event() {
         let mut tables = HubRouteTables::with_params(&params());
-        route_event(&mut tables, &adopted("r1", "operator/501"));
+        route_event(&mut tables, &adopted("r1", "operator/501"), SINCE);
         assert_eq!(
-            route_event(&mut tables, &closed("r1", RouteCloseReason::Detached)),
+            route_event(
+                &mut tables,
+                &closed("r1", RouteCloseReason::Detached),
+                SINCE
+            ),
             None
         );
         assert!(tables.route("r1").is_none());

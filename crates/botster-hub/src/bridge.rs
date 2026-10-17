@@ -7,7 +7,7 @@
 //!   4a, "Spawn flow") and the route handoff (client protocol design, sections 2.2 and 2.3).
 
 use crate::client::handoff::{
-    Reservation, ReserveRequest, RouteConnectAnswer, RouteConnectRequest,
+    Caller, Reservation, ReserveRequest, RouteConnectAnswer, RouteConnectRequest, RouteInfo,
 };
 use crate::phase::{SharedPhase, Wake};
 use crate::store::Lookup;
@@ -69,6 +69,15 @@ pub enum Request {
     ReserveRoute(Box<ReserveRequest>),
     /// A `route_connect` with the client's stream (TB-L2). On a refused `submit`, `Rejected` returns the stream to `io`.
     RouteConnect(Box<RouteConnectRequest>),
+    /// `list(route)` and `get(route)`: the routes of one caller (HC section 6, A.3).
+    Routes(Caller),
+    /// `invoke(session, detach)` and `delete(route)` (HC TS-10, A.7): Core `Detach`. A route of another caller, or one
+    /// that is not on `session` when it is given, is unknown. The answer is the op's `Completed`.
+    DetachRoute {
+        caller: Caller,
+        route_id: String,
+        session: Option<SessionId>,
+    },
 }
 
 impl Request {
@@ -180,6 +189,8 @@ pub enum Answer {
     RouteReserved(Reservation),
     /// The owner's step for a `route_connect`.
     RouteConnect(RouteConnectAnswer),
+    /// The answer to [`Request::Routes`]: the routes of the caller, id-ordered.
+    Routes(Vec<RouteInfo>),
     /// A failure that the Hub answers itself.
     Failed(Failure),
 }

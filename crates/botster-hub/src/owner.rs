@@ -17,8 +17,8 @@ use crate::store::{
 };
 use crate::watch::{Activity, Row, SpawnEnd, WatchFrame, WatchKey, WatchLimits, Watches};
 use botster_core::contract::prelude::{
-    ActivitySource, CoreApi, CoreError, ErrorCode, Event, LostReason, Now, Op, OpId, OpResult,
-    SessionId, SessionState, SpawnRequest, StartFailReason,
+    ActivitySource, CoreApi, CoreError, DetachReason, ErrorCode, Event, LostReason, Now, Op, OpId,
+    OpResult, SessionId, SessionState, SpawnRequest, StartFailReason,
 };
 use botster_hub_contract::prelude::{CloseReason, HubShutdownData};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -983,10 +983,44 @@ impl<C: CoreApi> Owner<C> {
                 };
                 reply.send(answer);
             }
+            Request::Routes(caller) => reply.send(Answer::Routes(
+                self.routes
+                    .as_ref()
+                    .map(|routes| routes.routes_of(&caller))
+                    .unwrap_or_default(),
+            )),
+            Request::DetachRoute {
+                caller,
+                route_id,
+                session,
+            } => {
+                let route = self
+                    .routes
+                    .as_ref()
+                    .and_then(|routes| routes.owned(&caller, &route_id, session.as_ref()));
+                match route {
+                    None => reply.send(Answer::CoreRefused(CoreError::new(
+                        ErrorCode::UnknownRoute,
+                        "no such route",
+                    ))),
+                    Some(route) => {
+                        reply.mark_dispatched();
+                        match self.core.begin(Op::Detach {
+                            route,
+                            reason: DetachReason::Detached,
+                        }) {
+                            Ok(op) => {
+                                self.waiters.insert(op, Waiter::Reply(reply));
+                            }
+                            Err(error) => reply.send(Answer::CoreRefused(error)),
+                        }
+                    }
+                }
+            }
             Request::RouteConnect(request) => {
                 reply.mark_dispatched();
                 let answer = match self.routes.as_mut() {
-                    Some(routes) => routes.connect(&mut self.core, self.now, *request),
+                    Some(routes) => routes.connect(&mut self.core, self.now, self.now_ms, *request),
                     // No route table: no token can be valid.
                     None => RouteConnectAnswer::Refused {
                         reason: CloseReason::RouteTokenInvalid,
@@ -1134,7 +1168,7 @@ impl<C: CoreApi> Owner<C> {
             Event::Silent { id, .. } => self.update_row(&id, |row| row.activity = Activity::Idle),
             Event::RouteClosed { .. } | Event::RouteAdopted { .. } => {
                 if let Some(routes) = self.routes.as_mut() {
-                    routes.event(&event);
+                    routes.event(&event, self.now_ms);
                 }
                 None
             }
